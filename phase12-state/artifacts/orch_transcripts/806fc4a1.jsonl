@@ -1,0 +1,12 @@
+{"timestamp": 1778324482.7827368, "type": "final_transcript_in", "language": "", "provider": "sarvam", "text": "Hello"}
+{"timestamp": 1778324482.7845488, "type": "llm_response", "provider": "mock", "latency_ms": 0.07562999962829053, "text": "Hello! How can I help you today?"}
+{"timestamp": 1778324482.7980936, "type": "tts_result", "provider": "mock", "latency_ms": 13.079657997877803, "wav_path": "/tmp/ai_responses/806fc4a1/1778324482785.wav"}
+{"timestamp": 1778324482.7990904, "type": "playback_request", "wav_path": "/tmp/ai_responses/806fc4a1/1778324482785.wav", "ok": true}
+{"timestamp": 1778324484.0496054, "type": "final_transcript_in", "language": "", "provider": "sarvam", "text": "હમ હમ."}
+{"timestamp": 1778324484.0506778, "type": "llm_response", "provider": "mock", "latency_ms": 0.3548599997884594, "text": "I heard you say: હમ હમ.. How can I help with that?"}
+{"timestamp": 1778324484.0639005, "type": "tts_result", "provider": "mock", "latency_ms": 12.650257998757297, "wav_path": "/tmp/ai_responses/806fc4a1/1778324484051.wav"}
+{"timestamp": 1778324484.0650759, "type": "playback_request", "wav_path": "/tmp/ai_responses/806fc4a1/1778324484051.wav", "ok": true}
+{"timestamp": 1778324485.202947, "type": "final_transcript_in", "language": "", "provider": "sarvam", "text": "Hello"}
+{"timestamp": 1778324485.2034478, "type": "llm_response", "provider": "mock", "latency_ms": 0.06460999793489464, "text": "Hello! How can I help you today?"}
+{"timestamp": 1778324485.2157547, "type": "tts_result", "provider": "mock", "latency_ms": 11.994017000688473, "wav_path": "/tmp/ai_responses/806fc4a1/1778324485203.wav"}
+{"timestamp": 1778324485.2168515, "type": "playback_request", "wav_path": "/tmp/ai_responses/806fc4a1/1778324485203.wav", "ok": true}

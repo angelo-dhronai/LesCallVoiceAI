@@ -1,0 +1,8 @@
+{"timestamp": 1778326335.0588272, "type": "final_transcript_in", "language": "", "provider": "sarvam", "text": "Hello"}
+{"timestamp": 1778326335.05943, "type": "llm_response", "provider": "mock", "latency_ms": 0.05813000097987242, "text": "Hello! How can I help you today?"}
+{"timestamp": 1778326335.0716693, "type": "tts_result", "provider": "mock", "latency_ms": 11.959659997955896, "wav_path": "/tmp/ai_responses/6f3285c7-c972-4d8f-a9be-e616a56b2dc4/1778326335059.wav"}
+{"timestamp": 1778326335.0725052, "type": "playback_request", "wav_path": "/tmp/ai_responses/6f3285c7-c972-4d8f-a9be-e616a56b2dc4/1778326335059.wav", "ok": true}
+{"timestamp": 1778326342.0895028, "type": "final_transcript_in", "language": "", "provider": "sarvam", "text": "Police"}
+{"timestamp": 1778326342.0899854, "type": "llm_response", "provider": "mock", "latency_ms": 0.08650000017951243, "text": "I heard you say: Police. How can I help with that?"}
+{"timestamp": 1778326342.1054704, "type": "tts_result", "provider": "mock", "latency_ms": 15.20357999834232, "wav_path": "/tmp/ai_responses/6f3285c7-c972-4d8f-a9be-e616a56b2dc4/1778326342090.wav"}
+{"timestamp": 1778326342.1062305, "type": "playback_request", "wav_path": "/tmp/ai_responses/6f3285c7-c972-4d8f-a9be-e616a56b2dc4/1778326342090.wav", "ok": true}

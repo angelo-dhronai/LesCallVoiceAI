@@ -41,6 +41,10 @@ class SarvamSTT(STTProvider):
     Uses a persistent httpx client for connection reuse.
     """
 
+    # Class-level flag: warmup runs at most once per process regardless of
+    # how many calls / pipeline instances are created (Issue 6).
+    _warmup_done_flag: bool = False
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -59,7 +63,13 @@ class SarvamSTT(STTProvider):
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self._timeout)
+            # keepalive_expiry=60: idle connections older than 60s are never
+            # reused, so a call after a long pause always gets a fresh TLS
+            # handshake instead of dying on a silently-dropped server socket.
+            self._client = httpx.AsyncClient(
+                timeout=self._timeout,
+                limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=60),
+            )
         return self._client
 
     async def transcribe(
@@ -104,6 +114,14 @@ class SarvamSTT(STTProvider):
         except httpx.TimeoutException as exc:
             logger.warning("[STT:Sarvam] Request timed out: %s", exc)
             raise
+        except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError) as exc:
+            # Stale or closed connection — discard the client so the next
+            # attempt (STT router retry or next turn) opens a fresh one.
+            logger.warning(
+                "[STT:Sarvam] Stale connection error: %s — resetting client for retry", exc
+            )
+            await self.close()
+            raise
 
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
@@ -133,12 +151,18 @@ class SarvamSTT(STTProvider):
         We fire a cheap HEAD request — Sarvam returns 404/405 for it, but the
         connection lands in httpx's per-host pool and the next POST reuses it.
         Errors are silently ignored.
+
+        Runs at most once per process (class-level flag) — Issue 6.
         """
+        if SarvamSTT._warmup_done_flag:
+            logger.debug("[STT:Sarvam] Warmup skipped — already done this process")
+            return
         try:
             import asyncio
             client = self._get_client()
             await asyncio.wait_for(client.head(self._api_url), timeout=3.0)
-            logger.info("[STT:Sarvam] Connection warmed")
+            SarvamSTT._warmup_done_flag = True
+            logger.info("[STT:Sarvam] Connection warmed (first time this process)")
         except Exception as exc:
             logger.debug("[STT:Sarvam] Warmup skipped: %s", exc)
 

@@ -104,6 +104,16 @@ SPEECH_HOLD_MIN_FRAMES = 10
 # single-word responses while tolerating normal conversational pauses.
 HARD_FLUSH_SILENCE_FRAMES = 30
 
+# Fallback phrases played when STT returns empty on substantial speech,
+# or when TTS receives an empty string or fails to play (feature 2 & 5).
+_STT_FALLBACK_PHRASES: dict[str, str] = {
+    "hi": "माफ़ कीजिए, आपकी आवाज़ स्पष्ट नहीं आई। कृपया दोबारा बताइए।",
+    "gu": "માફ કરશો, તમારો અવાજ સ્પષ્ટ સંભળાયો નથી. કૃપા કરીને ફરી કહેશો?",
+    "en": "Sorry, I couldn't hear you clearly. Could you please repeat that?",
+}
+# Minimum speech duration that triggers a language-fallback response on empty STT
+_STT_FALLBACK_MIN_SPEECH_MS = 800.0
+
 
 def _generate_keyboard_sound(sample_rate: int = 16000) -> bytes:
     """Generate a burst of keyboard typing clicks (PCM16 mono).
@@ -194,6 +204,12 @@ class VoicePipeline:
         self._vad_mute_until = 0.0
         self._barge_in_occurred = False
         self._mic_enabled = mic_enabled
+        # Warmup gate — set after all provider warmups complete (feature 6)
+        self._warmup_done: asyncio.Event = asyncio.Event()
+        # Greeting guard — False until the opening TTS utterance has fully
+        # played.  STT fallback phrases and barge-in are suppressed until this
+        # is True so startup noise / TTS echo never produce spurious output.
+        self._greeting_done: bool = False
 
         # VAD + buffering state
         self._audio_buffer = bytearray()
@@ -244,14 +260,36 @@ class VoicePipeline:
         logger.info("[PIPELINE] Starting voice pipeline")
         logger.info("=" * 60)
 
-        # Fire-and-forget connection warm-ups so the first user turn doesn't
-        # pay TLS handshake cost (~300ms each). Failures are silently ignored.
-        warmup_targets = []
+        # Await all provider warmups before starting the pipeline layers so the
+        # first live caller turn never pays TLS/API handshake cost (feature 6).
+        warmup_coros = []
         primary_stt = getattr(self.stt, "_primary", None)
         if primary_stt is not None and hasattr(primary_stt, "warmup"):
-            warmup_targets.append(("stt_primary", primary_stt.warmup()))
-        for name, coro in warmup_targets:
-            asyncio.create_task(coro, name=f"warm_{name}")
+            warmup_coros.append(primary_stt.warmup())
+            logger.info("[WARMUP] STT primary warmup queued")
+        if hasattr(self.tts, "warmup"):
+            warmup_coros.append(self.tts.warmup())
+            logger.info("[WARMUP] TTS warmup queued")
+        if hasattr(self.conversation, "warmup"):
+            warmup_coros.append(self.conversation.warmup())
+            logger.info("[WARMUP] LLM warmup queued")
+
+        if warmup_coros:
+            logger.info("[WARMUP] Running %d warmup(s) before first call...", len(warmup_coros))
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*warmup_coros, return_exceptions=True),
+                    timeout=5.0,
+                )
+                errs = [r for r in results if isinstance(r, Exception)]
+                logger.info("[WARMUP] Complete — %d ok, %d error(s)", len(results) - len(errs), len(errs))
+                for e in errs:
+                    logger.warning("[WARMUP] Error: %s", e)
+            except asyncio.TimeoutError:
+                logger.warning("[WARMUP] Timed out after 5s — proceeding anyway")
+        else:
+            logger.info("[WARMUP] No warmup methods available — proceeding directly")
+        self._warmup_done.set()
 
         self._tasks = [
             asyncio.create_task(self._audio_vad_layer(), name="audio_vad"),
@@ -259,6 +297,22 @@ class VoicePipeline:
             asyncio.create_task(self._conversation_layer(), name="conversation"),
             asyncio.create_task(self._tts_layer(), name="tts"),
         ]
+
+        # Issue 5: wait for the first inbound audio frame before playing the
+        # greeting.  With mod_audio_stream the WebSocket connects when the
+        # dialplan executes the application — which may be before FreeSWITCH
+        # sends CHANNEL_ANSWER.  Waiting for the first real audio frame
+        # guarantees the call is live before the agent speaks.
+        if hasattr(self.audio, '_pushed_frames'):
+            logger.info("[PIPELINE] Waiting for first audio frame to confirm call is established...")
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if getattr(self.audio, '_pushed_frames', 0) > 0:
+                    logger.info("[PIPELINE] First audio frame received — call established, queuing greeting")
+                    break
+                await asyncio.sleep(0.025)
+            else:
+                logger.warning("[PIPELINE] No audio in 5s — playing greeting anyway (call may not be answered yet)")
 
         # Agent speaks first — bilingual greeting
         opening = await self.conversation.generate_opening()
@@ -372,7 +426,14 @@ class VoicePipeline:
         # Barge-in uses a stricter threshold than turn-detection so TTS
         # echo / ambient noise can't masquerade as a sustained interrupt.
         if self._tts_playing:
-            if not ENABLE_BARGE_IN:
+            # Issue 4: never allow barge-in during the opening greeting.
+            # The greeting echo (via mod_audio_stream) is often loud enough to
+            # trip the barge-in threshold, cutting the greeting short and leaving
+            # no echo-cooldown window.  Once _greeting_done is True, barge-in
+            # is subject to the normal ENABLE_BARGE_IN flag.
+            if not ENABLE_BARGE_IN or not self._greeting_done:
+                if not self._greeting_done:
+                    logger.debug("[BARGE-IN] Suppressed — greeting not yet complete")
                 return
                     
             loud = self.vad.last_energy > self.vad.barge_in_threshold
@@ -611,7 +672,52 @@ class VoicePipeline:
                 stt_latency = (time.monotonic() - latency_start) * 1000
 
                 if not transcript_text or len(transcript_text.strip()) < 2:
-                    logger.info("[STT] Empty transcript — skipping")
+                    # Unsupported-language recovery: play a language-appropriate
+                    # "please repeat" phrase when the user clearly spoke but STT
+                    # produced nothing usable.
+                    #
+                    # ALL four guards must pass before queuing the fallback
+                    # (Issues 1 & 2):
+                    #   1. Duration ≥ threshold — actual user speech, not a click
+                    #   2. _greeting_done     — greeting has finished playing
+                    #   3. not _tts_playing   — agent is not currently speaking
+                    #   4. _vad_mute_until elapsed — not inside echo-cooldown window
+                    if segment.duration_ms >= _STT_FALLBACK_MIN_SPEECH_MS:
+                        if not self._greeting_done:
+                            logger.info(
+                                "[STT] Skipping fallback — greeting not yet complete "
+                                "(startup/warmup audio, %.0fms)", segment.duration_ms,
+                            )
+                        elif self._tts_playing:
+                            logger.info(
+                                "[STT] Skipping fallback — agent is currently speaking "
+                                "(%.0fms segment)", segment.duration_ms,
+                            )
+                        elif time.monotonic() < self._vad_mute_until:
+                            logger.info(
+                                "[STT] Skipping fallback — inside TTS echo-cooldown window "
+                                "(%.0fms segment, %.0fms remaining)",
+                                segment.duration_ms,
+                                (self._vad_mute_until - time.monotonic()) * 1000,
+                            )
+                        else:
+                            lang = self.conversation.state.language if self.conversation else "en"
+                            fallback = _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
+                            logger.info(
+                                "[STT] Unrecognized speech (%.0fms, lang=%s) — queuing language-fallback phrase",
+                                segment.duration_ms, lang,
+                            )
+                            try:
+                                self._tts_queue.put_nowait(Response(
+                                    text=fallback,
+                                    is_shortcut=True,
+                                    timestamp=time.monotonic(),
+                                ))
+                            except asyncio.QueueFull:
+                                logger.warning("[STT] TTS queue full — cannot play language-fallback phrase")
+                    else:
+                        logger.info("[STT] Empty transcript (%.0fms) — below fallback threshold, skipping",
+                                    segment.duration_ms)
                     continue
 
                 logger.info("[STT] %r (%.0fms latency)", transcript_text, stt_latency)
@@ -853,6 +959,17 @@ class VoicePipeline:
                 await asyncio.sleep(0.05)
 
             try:
+                # Silence protection (feature 5): never send blank text to TTS
+                if not response.text.strip():
+                    lang = self.conversation.state.language if self.conversation else "en"
+                    fallback = _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
+                    logger.warning("[TTS] Empty response text — substituting fallback phrase (lang=%s)", lang)
+                    response = Response(
+                        text=fallback,
+                        is_shortcut=True,
+                        timestamp=response.timestamp,
+                    )
+
                 logger.info("[TTS] Playing: %r (queued %.0fms ago)", response.text, age_ms)
 
                 self._tts_playing = True
@@ -872,14 +989,47 @@ class VoicePipeline:
                     await self.tts.stop()
                 except Exception:
                     pass
+                # Silence protection (feature 5): play fallback phrase to avoid dead air
+                lang = self.conversation.state.language if self.conversation else "en"
+                fallback = _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
+                logger.info("[TTS] Playing silence-protection fallback phrase (lang=%s)", lang)
+                try:
+                    await self.tts.speak(fallback)
+                except Exception:
+                    logger.warning("[TTS] Fallback phrase also failed — accepting silence")
             finally:
                 self._tts_playing = False
                 self._tts_end_time = time.monotonic()
+
+                # Issue 4 / Issue 1: mark greeting as done after the very first
+                # TTS utterance finishes.  From this point barge-in and STT
+                # fallback phrases are permitted.
+                if not self._greeting_done:
+                    self._greeting_done = True
+                    logger.info("[PIPELINE] Greeting complete — barge-in and STT fallback now active")
+
                 if self._barge_in_occurred:
                     self._barge_in_occurred = False
                 else:
-                    self._vad_mute_until = (
-                        time.monotonic() + TTS_ECHO_COOLDOWN_MS / 1000.0
-                    )
+                    # Issue 3: In telephony mode the echo of TTS audio returns
+                    # via mod_audio_stream with a delay of:
+                    #   injection_overhead + audio_playback_duration
+                    # The old 400 ms window expired long before the echo arrived,
+                    # so agent speech leaked into STT.  Use the actual audio
+                    # duration from TelephonySink (if available) to cover the
+                    # full echo window.
+                    audio_dur = getattr(self.sink, 'last_flush_duration', 0.0)
+                    if audio_dur > 0.0:
+                        # 700 ms covers injection pipeline overhead; audio_dur
+                        # covers the full playback window; 200 ms is safety buffer.
+                        mute_s = 0.7 + audio_dur + 0.2
+                        logger.info(
+                            "[ECHO-MUTE] Extended window %.1fs "
+                            "(audio=%.1fs + 0.7s injection + 0.2s buffer)",
+                            mute_s, audio_dur,
+                        )
+                    else:
+                        mute_s = TTS_ECHO_COOLDOWN_MS / 1000.0
+                    self._vad_mute_until = time.monotonic() + mute_s
 
         logger.info("[TTS] Layer stopped")

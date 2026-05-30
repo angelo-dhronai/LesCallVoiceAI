@@ -76,8 +76,12 @@ class SarvamTTS(StreamingTTS):
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
+            # keepalive_expiry=60: idle connections older than 60s are never
+            # reused, so a call after a long pause always gets a fresh TLS
+            # handshake instead of dying on a silently-dropped server socket.
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(STREAM_TIMEOUT, connect=CONNECT_TIMEOUT),
+                limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=60),
             )
         return self._client
 
@@ -172,10 +176,17 @@ class SarvamTTS(StreamingTTS):
             except httpx.TimeoutException:
                 logger.warning("[TTS:Sarvam] Stream timeout (attempt %d/%d) for %r",
                                attempt + 1, max_retries, text[:50])
-            except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
-                logger.warning("[TTS:Sarvam] Stream disconnected (attempt %d/%d): %s",
+                # Force new client on next attempt — timeout may mean the
+                # connection is in a bad state (partially sent request).
+                self._client = None
+            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
+                # Stale or dropped connection — always reset so the retry
+                # opens a fresh TLS socket.  ConnectError was previously
+                # swallowed by the generic handler below and caused no retry,
+                # leading to silent failure (no audio / elongated first word
+                # from a corrupted partial stream).
+                logger.warning("[TTS:Sarvam] Stale/dropped connection (attempt %d/%d): %s — resetting client",
                                attempt + 1, max_retries, exc)
-                # Force new client on reconnect
                 self._client = None
             except Exception:
                 logger.exception("[TTS:Sarvam] Stream error (attempt %d/%d)",

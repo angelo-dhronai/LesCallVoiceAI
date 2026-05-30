@@ -17,6 +17,16 @@ logger = logging.getLogger(__name__)
 
 MAX_SHORT_TERM_TURNS = 5
 
+# ---------------------------------------------------------------------------
+# Phone number extraction — Indian mobile numbers (10 digits, starts 6-9)
+# ---------------------------------------------------------------------------
+_PHONE_RE = re.compile(
+    r'(?<!\d)'
+    r'(?:(?:\+91|91)[-.\s]?)?'      # optional country code
+    r'([6-9]\d{4}[-.\s]?\d{5})'     # 10-digit Indian mobile
+    r'(?!\d)',
+)
+
 
 @dataclass
 class Turn:
@@ -69,6 +79,31 @@ class BookingData:
 
 
 @dataclass
+class CallState:
+    """
+    Persistent per-call state — accumulated for the entire conversation.
+
+    This is the canonical state object injected into every LLM prompt so
+    the agent never re-asks for information already collected.
+
+    Fields map directly to the requirements:
+      customer_name, customer_phone, selected_project, selected_location,
+      site_visit_requested, appointment_date, appointment_time,
+      language, conversation_stage.
+    """
+    customer_name: str | None = None
+    customer_phone: str | None = None       # stored internally; never read back verbatim
+    selected_project: str | None = None     # first confirmed project; locked for session
+    selected_location: str | None = None    # Surat / Vapi / Silvassa
+    site_visit_requested: bool = False
+    appointment_date: str | None = None
+    appointment_time: str | None = None
+    language: str = "hi"
+    conversation_stage: str = "GREETING"
+    booking_validated: bool = False         # True once all mandatory fields pass
+
+
+@dataclass
 class ContextMemory:
     """Structured info extracted from conversation."""
     user_name: str | None = None
@@ -100,6 +135,7 @@ class ConversationMemory:
         self._turns: list[Turn] = []
         self.context = ContextMemory()
         self.booking = BookingData()
+        self.call_state = CallState()
 
     @property
     def turns(self) -> list[Turn]:
@@ -128,6 +164,20 @@ class ConversationMemory:
 
     def _extract_context(self, text: str) -> None:
         lower = text.lower()
+
+        # Phone number — capture once; stored internally and never echoed back
+        if not self.call_state.customer_phone:
+            m = _PHONE_RE.search(text)
+            if m:
+                raw = re.sub(r'[-.\s]', '', m.group(0))
+                # Normalise: strip country code prefix, keep 10-digit number
+                if raw.startswith('+91'):
+                    raw = raw[3:]
+                elif raw.startswith('91') and len(raw) > 10:
+                    raw = raw[2:]
+                if len(raw) == 10 and raw[0] in '6789':
+                    self.call_state.customer_phone = raw
+                    logger.info("[MEMORY] Phone captured (stored internally, not echoed)")
 
         name_patterns = [
             r"(?:my name is|i'm|i am|this is|call me|mera naam|naam)\s+([A-Za-z][a-z]+)",
@@ -178,3 +228,4 @@ class ConversationMemory:
         self._turns.clear()
         self.context = ContextMemory()
         self.booking = BookingData()
+        self.call_state = CallState()

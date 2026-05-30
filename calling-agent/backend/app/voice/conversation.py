@@ -23,8 +23,35 @@ from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 
-from .memory import ConversationMemory, BookingData
+from .memory import ConversationMemory, BookingData, CallState
 from .stt.post_processor import match_location, match_bhk
+
+# ---------------------------------------------------------------------------
+# Known Pramukh Group projects — used for project-context locking
+# Keys are lowercase substrings; values are (canonical_name, location).
+# Longer keys listed first so _extract_project_from_text() matches
+# "aranya ii" before "aranya".
+# ---------------------------------------------------------------------------
+_KNOWN_PROJECTS: dict[str, tuple[str, str]] = {
+    "central park":  ("Central Park",  "Surat"),
+    "aranya ii":     ("Aranya II",     "Surat"),
+    "aranya 2":      ("Aranya II",     "Surat"),
+    "yogi woods":    ("Yogi Woods",    "Silvassa"),
+    "revanta":       ("Revanta",       "Surat"),
+    "vivanta":       ("Vivanta",       "Surat"),
+    "satva":         ("Satva",         "Surat"),
+    "agastya":       ("Agastya",       "Surat"),
+    "aranya":        ("Aranya",        "Surat"),
+    "aura":          ("Aura",          "Vapi"),
+    "sahaj":         ("Sahaj",         "Vapi"),
+    "vedanta":       ("Vedanta",       "Vapi"),
+    "sangath":       ("Sangath",       "Silvassa"),
+    "shivanta":      ("Shivanta",      "Silvassa"),
+    "swagat":        ("Swagat",        "Silvassa"),
+    "orbit":         ("Orbit",         "Surat"),
+    # legacy / alias names that may appear in STT output
+    "oak cove":      ("Oak Cove",      "Surat"),
+}
 
 # ---------------------------------------------------------------------------
 # Stages
@@ -527,6 +554,18 @@ _LANG_FALLBACKS: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
+# Repeat-request detection patterns (multilingual)
+# ---------------------------------------------------------------------------
+
+_REPEAT_DETECT_PATTERNS = [
+    "repeat", "say again", "say that again", "once more", "pardon",
+    "dobara bolo", "dobara", "phir se bolo", "phir se", "phir kaho",
+    "fari bol", "fari bolsho", "fari janavo",
+    "फिर बोलो", "दोबारा", "दोबारा बोलो", "एक बार फिर",
+    "ફરી બોલ", "ફરી",
+]
+
+# ---------------------------------------------------------------------------
 # Localized responses for shortcut intents
 # ---------------------------------------------------------------------------
 
@@ -628,6 +667,10 @@ class ConversationRouter:
     for natural responses and question handling.
     """
 
+    # Class-level warmup flag: LLM API connection warms at most once per
+    # process regardless of how many calls arrive (Issue 6).
+    _warmup_done_flag: bool = False
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -648,6 +691,12 @@ class ConversationRouter:
         self._speculative_yes: asyncio.Task | None = None
         self._speculative_no: asyncio.Task | None = None
         self._last_nudge_stage: str | None = None
+        # Last-response memory (feature 3)
+        self.last_agent_response: str = ""
+        self.last_agent_language: str = ""
+        # Name-capture confirmation mode (feature 4)
+        self._name_pending: str | None = None
+        self._name_confirmed: bool = False
 
         if not self._api_key:
             logger.warning("[CONV] OPENAI_API_KEY not set -- LLM calls will fail")
@@ -670,6 +719,9 @@ class ConversationRouter:
         greeting = _OPENING_GREETING
         self.memory.add_assistant(greeting)
         self.state.stage = STAGE_GREETING
+        # Store for last-response memory (feature 3)
+        self.last_agent_response = greeting
+        self.last_agent_language = self.state.language
         logger.info("[OPENING] Inbound welcome delivered")
         return EngineResult(text=greeting, is_shortcut=True, intent="greeting")
 
@@ -694,7 +746,20 @@ class ConversationRouter:
         Extracts structured data, advances the booking flow, and falls back
         to LLM for questions and natural phrasing.
         """
+        # Save name state before add_user may auto-extract a name (feature 4)
+        _prev_booking_name = self.memory.booking.user_name
+
         self.memory.add_user(text)
+
+        # Name-capture: if a new name was just extracted this turn, hold for confirmation
+        if (not self._name_confirmed
+                and not self._name_pending
+                and self.memory.booking.user_name
+                and self.memory.booking.user_name != _prev_booking_name):
+            self._name_pending = self.memory.booking.user_name
+            self.memory.booking.user_name = None
+            self.memory.context.user_name = None
+            logger.info("[NAME] Name pending confirmation: %r", self._name_pending)
 
         # --- Language detection + stabilization ---
         detected_lang, conf, src = await self.detect_language_v3(text)
@@ -823,12 +888,24 @@ class ConversationRouter:
         # STAGE-AWARE ROUTING
         # =============================================================
 
+        # --- Repeat request (feature 3) — replay last agent response ---
+        if self._is_repeat_request(text) and self.last_agent_response:
+            _cancel_llm()
+            resp = self.last_agent_response
+            logger.info("[REPEAT] Replaying last response (lang=%s): %r",
+                        self.last_agent_language, resp[:60])
+            self.memory.add_assistant(resp)
+            self._store_last_response(resp)
+            yield EngineResult(text=resp, is_shortcut=True, intent="repeat")
+            return
+
         # --- Farewell at any stage ---
         if intent == "farewell":
             _cancel_llm()
             self.state.is_closing = True
             resp = self._localized("closing", "Thank you for your time! We'll be in touch. Have a great day!")
             self.memory.add_assistant(resp)
+            self._store_last_response(resp)
             self.state.stage = STAGE_CLOSING
             yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
             return
@@ -847,11 +924,13 @@ class ConversationRouter:
                     self.state.language, _DECLINE_FAREWELL_RESPONSES["en"]
                 )
                 self.memory.add_assistant(resp)
+                self._store_last_response(resp)
                 yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
                 return
 
             resp = self._pick_objection_response()
             self.memory.add_assistant(resp)
+            self._store_last_response(resp)
             yield EngineResult(text=resp, is_shortcut=True, intent="objection")
             return
 
@@ -860,6 +939,7 @@ class ConversationRouter:
             _cancel_llm()
             resp = self._localized_list("gratitude", ["You're welcome!", "Happy to help!"])
             self.memory.add_assistant(resp)
+            self._store_last_response(resp)
             yield EngineResult(text=resp, is_shortcut=True, intent="gratitude")
             return
 
@@ -869,6 +949,7 @@ class ConversationRouter:
             lang = self.state.language
             resp = _IDENTITY_RESPONSES.get(lang, _IDENTITY_RESPONSES["en"])
             self.memory.add_assistant(resp)
+            self._store_last_response(resp)
             if self.state.stage == STAGE_GREETING:
                 self.state.stage = STAGE_DISCOVERY
             yield EngineResult(text=resp, is_shortcut=True, intent="identity_question")
@@ -888,6 +969,7 @@ class ConversationRouter:
             self.state.language_history = [new_lang] * 5
             resp = _LANG_SWITCH_RESPONSES.get(new_lang, _LANG_SWITCH_RESPONSES["hi"])
             self.memory.add_assistant(resp)
+            self._store_last_response(resp)
             yield EngineResult(text=resp, is_shortcut=True, intent="language_switch")
             return
 
@@ -897,6 +979,18 @@ class ConversationRouter:
 
         # Extract any structured info as a side effect (non-blocking)
         self._extract_data_from_input(text, intent)
+
+        # Name confirmation resolution (feature 4)
+        if self._name_pending:
+            if intent == "affirmation":
+                self.memory.booking.user_name = self._name_pending
+                self.memory.context.user_name = self._name_pending
+                self._name_confirmed = True
+                logger.info("[NAME] Confirmed name: %r", self._name_pending)
+                self._name_pending = None
+            elif intent == "negation":
+                logger.info("[NAME] Caller rejected name %r — clearing pending", self._name_pending)
+                self._name_pending = None
 
         # Lock language on first user response and advance from GREETING
         if self.state.stage == STAGE_GREETING:
@@ -931,6 +1025,7 @@ class ConversationRouter:
     def _extract_data_from_input(self, text: str, intent: str) -> None:
         """Extract structured data as a side effect — never blocks the flow."""
         lower = text.lower()
+        cs = self.memory.call_state
 
         if not self.memory.booking.location:
             loc = self._extract_location(text)
@@ -966,6 +1061,46 @@ class ConversationRouter:
             elif any(kw in lower or kw in text for kw in self_use_kw):
                 self.state.purpose = "self_use"
 
+        # ── Project detection (persistent context lock) ──────────────────
+        if not cs.selected_project:
+            proj_result = self._extract_project_from_text(text)
+            if proj_result:
+                proj_name, proj_loc = proj_result
+                cs.selected_project = proj_name
+                # Mirror back into state and booking for full consistency
+                self.state.project_recommended = proj_name
+                if not self.memory.booking.project:
+                    self.memory.booking.project = proj_name
+                # Auto-infer location from project if not yet captured
+                if not cs.selected_location:
+                    cs.selected_location = proj_loc
+                if not self.memory.booking.location:
+                    self.memory.booking.location = proj_loc
+                logger.info(
+                    "[STATE_UPDATE] selected_project=%r inferred_location=%r",
+                    proj_name, proj_loc,
+                )
+        elif self.state.project_recommended and not cs.selected_project:
+            # project_recommended set elsewhere (e.g. LLM), sync to call_state
+            cs.selected_project = self.state.project_recommended
+
+        # ── Site-visit intent detection ──────────────────────────────────
+        if not cs.site_visit_requested:
+            visit_kw = [
+                "site visit", "visit", "come see", "site tour", "show me",
+                "dekhna chahta", "dekhna chahti", "dekhne aana", "dekhna hai",
+                "joiyu", "jovu che", "aavvu che", "joyu",
+                "dikhao", "dikhaiye", "site pe aana",
+            ]
+            if any(kw in lower for kw in visit_kw):
+                cs.site_visit_requested = True
+                logger.info("[STATE_UPDATE] site_visit_requested=True (keyword match)")
+            elif intent == "affirmation" and self.state.stage == STAGE_INVITE_VISIT:
+                cs.site_visit_requested = True
+                logger.info("[STATE_UPDATE] site_visit_requested=True (affirmation in INVITE_VISIT)")
+
+        # ── Sync all layers into CallState ───────────────────────────────
+        self._update_call_state()
         self.state.discovery_turns += 1
 
     def _maybe_advance_stage(self) -> None:
@@ -995,9 +1130,16 @@ class ConversationRouter:
 
         elif self.state.stage == STAGE_CONFIRMATION:
             if b.confirmed:
-                self.state.stage = STAGE_CLOSING
-                self.state.is_closing = True
-                logger.info("[STAGE] CONFIRMATION → CLOSING")
+                valid, missing = self._validate_booking_for_closing()
+                if valid:
+                    self.state.stage = STAGE_CLOSING
+                    self.state.is_closing = True
+                    logger.info("[STAGE] CONFIRMATION → CLOSING (booking validated)")
+                else:
+                    logger.info(
+                        "[STAGE] CLOSING blocked — missing: %s",
+                        ", ".join(missing),
+                    )
 
         logger.info(
             "[STAGE-STATE] stage=%s turns=%d | loc=%s bhk=%s purpose=%s appt=%s confirmed=%s",
@@ -1009,6 +1151,121 @@ class ConversationRouter:
             b.appointment_time or "—",
             b.confirmed,
         )
+
+    # ------------------------------------------------------------------
+    # Call-state management helpers
+    # ------------------------------------------------------------------
+
+    def _extract_project_from_text(self, text: str) -> tuple[str, str] | None:
+        """Return (canonical_name, location) if a known project is mentioned.
+
+        Keys in _KNOWN_PROJECTS are sorted longest-first so multi-word names
+        like 'aranya ii' are matched before shorter substrings like 'aranya'.
+        """
+        lower = text.lower()
+        for key in sorted(_KNOWN_PROJECTS, key=len, reverse=True):
+            if key in lower:
+                return _KNOWN_PROJECTS[key]
+        return None
+
+    def _update_call_state(self) -> None:
+        """Sync CallState from ConversationState + BookingData.
+
+        Called after every data-extraction pass so the call_state is always
+        up to date before being injected into the system prompt.
+        """
+        cs = self.memory.call_state
+        b = self.memory.booking
+
+        # Customer name — prefer the confirmed booking name
+        if b.user_name and not cs.customer_name:
+            cs.customer_name = b.user_name
+            logger.info("[STATE_UPDATE] customer_name=%r (from booking)", cs.customer_name)
+        elif cs.customer_name and not b.user_name:
+            b.user_name = cs.customer_name
+
+        # Location
+        if b.location and not cs.selected_location:
+            cs.selected_location = b.location
+            logger.info("[STATE_UPDATE] selected_location=%r (from booking)", cs.selected_location)
+        elif cs.selected_location and not b.location:
+            b.location = cs.selected_location
+
+        # Project — also keep state.project_recommended in sync
+        if b.project and not cs.selected_project:
+            cs.selected_project = b.project
+            self.state.project_recommended = b.project
+            logger.info("[STATE_UPDATE] selected_project=%r (from booking)", cs.selected_project)
+        elif cs.selected_project and not b.project:
+            b.project = cs.selected_project
+            self.state.project_recommended = cs.selected_project
+        elif self.state.project_recommended and not cs.selected_project:
+            cs.selected_project = self.state.project_recommended
+            b.project = self.state.project_recommended
+
+        # Appointment
+        if b.appointment_time and not cs.appointment_time:
+            cs.appointment_time = b.appointment_time
+        elif cs.appointment_time and not b.appointment_time:
+            b.appointment_time = cs.appointment_time
+        if b.appointment_date and not cs.appointment_date:
+            cs.appointment_date = b.appointment_date
+
+        # Language + Stage always mirror live state
+        cs.language = self.state.language
+        cs.conversation_stage = self.state.stage
+
+        logger.info(
+            "[STATE] name=%s phone=%s project=%s loc=%s visit=%s "
+            "appt=%s stage=%s lang=%s",
+            cs.customer_name or "—",
+            ("***" + cs.customer_phone[-4:]) if cs.customer_phone else "—",
+            cs.selected_project or "—",
+            cs.selected_location or "—",
+            cs.site_visit_requested,
+            cs.appointment_time or "—",
+            cs.conversation_stage,
+            cs.language,
+        )
+
+    def _compute_missing_booking_fields(self) -> list[str]:
+        """Return list of still-missing mandatory booking fields.
+
+        No side effects — safe to call from _build_system_prompt.
+        """
+        cs = self.memory.call_state
+        b = self.memory.booking
+        missing: list[str] = []
+        if cs.site_visit_requested or b.appointment_time or cs.appointment_time:
+            if not (b.user_name or cs.customer_name):
+                missing.append("customer name")
+            if not cs.customer_phone:
+                missing.append("phone number")
+            if not (b.project or cs.selected_project):
+                missing.append("project selection")
+            if not (b.appointment_time or cs.appointment_time):
+                missing.append("visit date and time")
+        return missing
+
+    def _validate_booking_for_closing(self) -> tuple[bool, list[str]]:
+        """Validate mandatory booking fields; log results.
+
+        Returns (is_valid, missing_field_names).
+        Called by _maybe_advance_stage before allowing CLOSING.
+        """
+        cs = self.memory.call_state
+        missing = self._compute_missing_booking_fields()
+        valid = len(missing) == 0
+        logger.info(
+            "[BOOKING_VALIDATION] valid=%s site_visit=%s missing=%s",
+            valid,
+            cs.site_visit_requested,
+            missing if missing else "none",
+        )
+        if missing:
+            logger.info("[MISSING_REQUIRED_FIELDS] %s", ", ".join(missing))
+        cs.booking_validated = valid
+        return valid, missing
 
     # ------------------------------------------------------------------
     # Data extraction helpers
@@ -1251,6 +1508,11 @@ class ConversationRouter:
         if full_parts:
             full_text = " ".join(full_parts)
             self.memory.add_assistant(full_text)
+            # Last-response memory (feature 3)
+            self.last_agent_response = full_text
+            self.last_agent_language = self.state.language
+            logger.info("[LAST-RESPONSE] Stored LLM response (lang=%s, len=%d)",
+                        self.last_agent_language, len(full_text))
 
     def _build_flow_nudge(self) -> str | None:
         """Build a gentle nudge to return to the booking flow after a detour. Won't repeat the same nudge."""
@@ -1466,10 +1728,13 @@ class ConversationRouter:
         stage_goal = _stage_goals.get(self.state.stage, _stage_goals[STAGE_DISCOVERY])
 
         # ── Collected info ───────────────────────────────────────────────────
-        caller_name = b.user_name or self.memory.context.user_name
+        # Use confirmed name only; pending name gets its own confirmation block above
+        caller_name = b.user_name or (self.memory.context.user_name if not self._name_pending else None)
         collected_lines = []
         if caller_name:
             collected_lines.append(f"Caller name: {caller_name}")
+        if self._name_pending:
+            collected_lines.append(f"Name just given (UNCONFIRMED): {self._name_pending!r}")
         if self.state.purpose:
             collected_lines.append(f"Purpose: {self.state.purpose}")
         if b.location:
@@ -1482,9 +1747,38 @@ class ConversationRouter:
             collected_lines.append(f"Visit scheduled: {b.appointment_time}")
         collected_str = "\n".join(f"  · {c}" for c in collected_lines) or "  · Nothing collected yet"
 
+        # Name-capture confirmation instruction (feature 4)
+        name_confirm_block: list[str] = []
+        if self._name_pending:
+            name_confirm_block = [
+                "",
+                f"⚡ NAME CONFIRMATION REQUIRED: Caller just provided their name as {self._name_pending!r}.",
+                f"Your VERY NEXT response MUST confirm it: 'Your name is {self._name_pending}, right?' — nothing else first.",
+            ]
+
+        # ── Persistent CallState block ────────────────────────────────────────
+        cs = self.memory.call_state
+
+        # Build "already collected — do not re-ask" list
+        dont_reask: list[str] = []
+        if cs.customer_name:
+            dont_reask.append(f"caller's name ({cs.customer_name})")
+        if cs.customer_phone:
+            dont_reask.append("caller's phone number (stored; do not repeat back)")
+        if cs.selected_project:
+            dont_reask.append(f"which property ({cs.selected_project})")
+        if cs.selected_location:
+            dont_reask.append(f"city/location ({cs.selected_location})")
+        if cs.appointment_time:
+            dont_reask.append(f"visit time ({cs.appointment_time})")
+
+        # Missing mandatory fields block (when site visit is in scope)
+        missing_fields = self._compute_missing_booking_fields()
+
         parts = [
             # Language lock FIRST — highest priority
             lang_header.get(lang, lang_header["en"]),
+            *name_confirm_block,
             "",
             "━━ AGENT IDENTITY ━━",
             "You are Vishal Patel — a warm, genuine, experienced inbound sales agent for Pramukh Group.",
@@ -1499,6 +1793,35 @@ class ConversationRouter:
             f"Stage: {self.state.stage}  |  Language: {lang_name}  |  Turn: {self.state.turn_count}",
             "Known so far:",
             collected_str,
+            "",
+            "━━ PERSISTENT CALL STATE ━━",
+            f"  customer_name        : {cs.customer_name or '(not yet captured)'}",
+            f"  customer_phone       : {'captured (stored internally)' if cs.customer_phone else '(not yet captured)'}",
+            f"  selected_project     : {cs.selected_project or '(none yet)'}",
+            f"  selected_location    : {cs.selected_location or '(none yet)'}",
+            f"  site_visit_requested : {cs.site_visit_requested}",
+            f"  appointment_time     : {cs.appointment_time or '(none yet)'}",
+            f"  booking_validated    : {cs.booking_validated}",
+            *([
+                "",
+                "━━ ACTIVE PROJECT CONTEXT ━━",
+                f"The caller is discussing: {cs.selected_project}"
+                + (f" ({cs.selected_location})" if cs.selected_location else "") + ".",
+                f"ALL questions about location, amenities, pricing, distance, availability → answer in the context of {cs.selected_project}.",
+                f"DO NOT ask which property they are discussing. It is {cs.selected_project}.",
+            ] if cs.selected_project else []),
+            *([
+                "",
+                "━━ MANDATORY FIELDS STILL NEEDED ━━",
+                f"Site visit requested. Still need: {', '.join(missing_fields)}.",
+                "Collect ONE missing field per turn before confirming the booking.",
+            ] if missing_fields else []),
+            *([
+                "",
+                "━━ ALREADY COLLECTED — DO NOT RE-ASK ━━",
+                f"You already have: {'; '.join(dont_reask)}.",
+                "NEVER ask for any of these again. Use them naturally in your responses.",
+            ] if dont_reask else []),
             "",
             "━━ CURRENT GOAL ━━",
             stage_goal,
@@ -1540,6 +1863,9 @@ class ConversationRouter:
             "'Comparing builders' → smart — but see ours first. 30 years, zero stalls, RERA.",
             "",
             "━━ FIRM RULES ━━",
+            "✗ NEVER volunteer pricing, rates, payment plans, ROI, inventory levels, or discounts unprompted — only discuss these when the caller explicitly asks",
+            "✗ NEVER repeat the caller's phone number back to them unless they explicitly ask you to confirm it",
+            "✗ NEVER ask for information that is already listed in PERSISTENT CALL STATE or ALREADY COLLECTED",
             "✗ NEVER ask budget before you know purpose/location/config",
             "✗ NEVER give more than 2 time options for site visit",
             "✗ NEVER dump the whole portfolio on one caller",
@@ -1774,6 +2100,47 @@ class ConversationRouter:
         resp = fillers[self._filler_counter % len(fillers)]
         self._filler_counter += 1
         return resp
+
+    # ------------------------------------------------------------------
+    # Last-response memory + repeat detection (feature 3)
+    # ------------------------------------------------------------------
+
+    def _store_last_response(self, text: str) -> None:
+        """Cache the most recent agent utterance for repeat/translate requests."""
+        self.last_agent_response = text
+        self.last_agent_language = self.state.language
+        logger.debug("[LAST-RESPONSE] Stored shortcut response (lang=%s): %r",
+                     self.last_agent_language, text[:60])
+
+    def _is_repeat_request(self, text: str) -> bool:
+        """Return True if the caller is asking to repeat the last agent response."""
+        lower = text.lower().strip()
+        return any(p in lower for p in _REPEAT_DETECT_PATTERNS)
+
+    # ------------------------------------------------------------------
+    # LLM warmup (feature 6)
+    # ------------------------------------------------------------------
+
+    async def warmup(self) -> None:
+        """Warm up LLM API connection to reduce first-call latency.
+
+        Runs at most once per process (class-level flag) — Issue 6.
+        """
+        if ConversationRouter._warmup_done_flag:
+            logger.debug("[CONV] LLM warmup skipped — already done this process")
+            return
+        try:
+            client = self._get_client()
+            await client.chat.completions.create(
+                model=self._model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+            ConversationRouter._warmup_done_flag = True
+            logger.info("[CONV] LLM warmup complete (first time this process)")
+        except Exception as exc:
+            logger.warning("[CONV] LLM warmup failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Localization helpers

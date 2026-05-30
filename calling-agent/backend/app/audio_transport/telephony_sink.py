@@ -27,6 +27,9 @@ class TelephonySink(AudioSink):
         self._running = False
         self._conn_id = conn_id
         self.wav_queue: asyncio.Queue[str] = asyncio.Queue()
+        # Duration of the most recently flushed WAV (seconds).  Read by
+        # VoicePipeline._tts_layer to size the echo-suppression mute window.
+        self.last_flush_duration: float = 0.0
         
         if not os.path.exists(self._tmp_dir):
             os.makedirs(self._tmp_dir, exist_ok=True)
@@ -77,6 +80,13 @@ class TelephonySink(AudioSink):
                 wf.writeframes(self._pcm_buffer)
             
             pcm_size = len(self._pcm_buffer)
+            # Record duration so the pipeline can size its echo-suppression
+            # mute window to cover the full playback + injection latency.
+            self.last_flush_duration = pcm_size / (2 * self._sample_rate)
+            logger.debug(
+                "[%s] [TelephonySink] flush duration=%.2fs (%d bytes)",
+                self._conn_id, self.last_flush_duration, pcm_size,
+            )
             self._pcm_buffer.clear()
 
             # Phase B & C: Normalization

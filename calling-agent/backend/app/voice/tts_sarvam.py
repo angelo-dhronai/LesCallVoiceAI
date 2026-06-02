@@ -59,7 +59,7 @@ class SarvamTTS(StreamingTTS):
             sample_rate=sample_rate,
             output_device=output_device
         ))
-        self._api_key = api_key or os.environ.get("SARVAMAI_API_KEY", "")
+        self._api_key = api_key or os.environ.get("SARVAM_API_KEY") or os.environ.get("SARVAMAI_API_KEY", "")
         self._model = model
         self._speaker = speaker
         self._sample_rate = sample_rate
@@ -69,7 +69,7 @@ class SarvamTTS(StreamingTTS):
         self._output_device = output_device
 
         if not self._api_key:
-            logger.warning("[TTS:Sarvam] SARVAMAI_API_KEY not set — calls will fail")
+            logger.warning("[TTS:Sarvam] SARVAM_API_KEY not set — calls will fail")
 
     def set_language(self, lang: str) -> None:
         self._language = lang

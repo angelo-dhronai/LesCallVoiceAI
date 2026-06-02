@@ -12,8 +12,6 @@ import os
 # Add calling-agent to Python path to allow imports
 sys.path.insert(0, os.path.abspath('calling-agent'))
 
-from call_audit import audit_manager
-
 from backend.app.voice.pipeline import VoicePipeline
 from backend.app.voice.event_hub import EventHub
 from backend.app.audio_transport.telephony_source import TelephonySource
@@ -60,10 +58,10 @@ class TelephonySession:
     async def start(self):
         """Starts the AI pipeline and the playback injection loop."""
         self._running = True
+        logger.info("[SARVAM_CALL_ID] conn_id=%s — Sarvam requests for this call will use this ID", self.conn_id)
         self.pipeline_task = asyncio.create_task(self.pipeline.run_until_shutdown())
         self.playback_task = asyncio.create_task(self._playback_loop())
         self.event_task = asyncio.create_task(self._event_loop())
-        await audit_manager.create(self.conn_id, caller_number=self.caller_number)
         logger.info(f"[{self.conn_id}] Session started (Phase 14)")
         
     async def stop(self):
@@ -104,21 +102,6 @@ class TelephonySession:
         await self.sink.stop()
         self._print_summary()
 
-        # Close audit session — collect language from conversation state
-        try:
-            lang = "unknown"
-            fallback_used = False
-            if hasattr(self.pipeline, "conversation") and hasattr(self.pipeline.conversation, "state"):
-                lang = getattr(self.pipeline.conversation.state, "language", "unknown") or "unknown"
-            await audit_manager.close(
-                self.conn_id,
-                language_detected=lang,
-                stt_provider="sarvam",
-                fallback_used=fallback_used,
-            )
-        except Exception as exc:
-            logger.warning("[%s] Audit close failed: %r", self.conn_id, exc)
-
         logger.info(f"[{self.conn_id}] Session stopped")
 
     async def _event_loop(self):
@@ -128,13 +111,9 @@ class TelephonySession:
             while self._running:
                 event = await queue.get()
                 etype = event.get("type")
-                if etype == "user":
-                    if self.stats["first_transcript_t"] is None:
-                        self.stats["first_transcript_t"] = time.time()
-                        logger.info(f"[{self.conn_id}] First transcript received")
-                    audit_manager.add_event(self.conn_id, "Caller", event.get("text", ""))
-                elif etype == "agent":
-                    audit_manager.add_event(self.conn_id, "Agent", event.get("text", ""))
+                if etype == "user" and self.stats["first_transcript_t"] is None:
+                    self.stats["first_transcript_t"] = time.time()
+                    logger.info(f"[{self.conn_id}] First transcript received")
         except asyncio.CancelledError:
             pass
         finally:
@@ -147,6 +126,12 @@ class TelephonySession:
         if self.stats["first_audio_t"] is None:
             self.stats["first_audio_t"] = time.time()
         self.source.push_frame(pcm)
+
+    async def signal_call_active(self):
+        """Called by ws_audio_receiver on the first real audio frame.
+        Delegates to the pipeline to unblock greeting generation.
+        """
+        await self.pipeline.signal_call_active()
 
     async def _playback_loop(self):
         """Polls the TelephonySink for finalized WAV files and injects them."""

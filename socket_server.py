@@ -1685,6 +1685,7 @@ def handle(conn: socket.socket, addr) -> None:
     rtp: dict = {}
     log.info("=== TCP CONNECT from %s:%d === (T0)", addr[0], addr[1])
     log.info("[CALL_START] Outbound ESL connected from %s:%d", addr[0], addr[1])
+    log.info("[DIAL_ATTEMPT] peer=%s:%d t=%.3f", addr[0], addr[1], t0)
     log.info("STATE -> %s", state)
 
     conn.settimeout(10.0)
@@ -1788,10 +1789,17 @@ def handle(conn: socket.socket, addr) -> None:
                     rtp = extract_rtp_info(headers)
                     log_rtp_session_info(rtp)
                     log_tcpdump_commands(rtp)
+                    log.info("[ESL_STATUS] status=CONNECTED uuid=%s "
+                             "caller=%s codec=%s/%s",
+                             rtp.get("uuid", "?"),
+                             rtp.get("caller_number", "?"),
+                             rtp.get("read_codec", "?"),
+                             rtp.get("read_rate", "?"))
                 except Exception as _rtp_err:
                     log.error("extract_rtp_info failed (non-fatal, "
                               "call continues with empty rtp): %r",
                               _rtp_err)
+                    log.info("[ESL_STATUS] status=CONNECTED uuid=? (rtp extract failed)")
                 break
 
         if not got_channel_data:
@@ -1866,6 +1874,9 @@ def handle(conn: socket.socket, addr) -> None:
                          _t, AUDIO_STREAM_WS_URL,
                          AUDIO_STREAM_SAMPLE_RATE,
                          uuid_for_record)
+                log.info("[WS_STATUS] status=STARTED uuid=%s ws_url=%s sr=%d",
+                         uuid_for_record, AUDIO_STREAM_WS_URL,
+                         AUDIO_STREAM_SAMPLE_RATE)
             except OSError as e:
                 counters["audio_stream_err"] += 1
                 log.error("AUDIO_STREAM start sendmsg failed: %r "
@@ -2010,8 +2021,11 @@ def handle(conn: socket.socket, addr) -> None:
                     log.info("BACKGROUND_JOB Job-UUID=%s body[:200]=%r",
                              body_field(body, "Job-UUID"), body[:200])
                 elif ev == "CHANNEL_HANGUP":
-                    log.info("CHANNEL_HANGUP cause=%s",
-                             body_field(body, "Hangup-Cause"))
+                    _hup_cause = body_field(body, "Hangup-Cause")
+                    log.info("CHANNEL_HANGUP cause=%s", _hup_cause)
+                    log.info("[DIAL_RESULT] uuid=%s cause=%s uptime=%.3fs",
+                             uuid_for_record, _hup_cause,
+                             time.monotonic() - t0)
                     # Phase 12: drop the call from the playback
                     # registry FIRST so a concurrent listener
                     # dispatch becomes a no-op before we start
@@ -2055,14 +2069,19 @@ def handle(conn: socket.socket, addr) -> None:
                                 log.info("AUDIO_STREAM stop dispatched "
                                          "on CHANNEL_HANGUP  uuid=%s",
                                          uuid_for_record)
+                                log.info("[WS_STATUS] status=STOPPED uuid=%s trigger=CHANNEL_HANGUP",
+                                         uuid_for_record)
                             except OSError as e:
                                 counters["audio_stream_err"] += 1
                                 log.error("AUDIO_STREAM stop sendmsg "
                                           "failed on CHANNEL_HANGUP: %r",
                                           e)
                 elif ev == "CHANNEL_HANGUP_COMPLETE":
-                    log.info("CHANNEL_HANGUP_COMPLETE cause=%s",
-                             body_field(body, "Hangup-Cause"))
+                    _hup_cause_c = body_field(body, "Hangup-Cause")
+                    log.info("CHANNEL_HANGUP_COMPLETE cause=%s", _hup_cause_c)
+                    log.info("[DIAL_RESULT] uuid=%s cause=%s uptime=%.3fs (COMPLETE)",
+                             uuid_for_record, _hup_cause_c,
+                             time.monotonic() - t0)
                     # Phase 12: drop from registry then take the
                     # send_lock for teardown writes. Idempotent vs.
                     # CHANNEL_HANGUP if both events fire.
@@ -2450,12 +2469,34 @@ def classify(cp: dict, counters: dict, last_reply: str,
     return "INCONCLUSIVE — see checkpoints above"
 
 
+def _log_gateway_status() -> None:
+    """[GATEWAY_STATUS] — resolve and reachability check for the Plivo gateway.
+    Pure diagnostic; never raises."""
+    import socket as _sock
+    host = AUDIO_STREAM_WS_URL  # e.g. ws://127.0.0.1:9001
+    # Also check the Plivo SIP proxy from the gateway config file.
+    plivo_proxy = "16584853209835561.lzt.plivo.com"
+    for target in (plivo_proxy,):
+        try:
+            addrs = _sock.getaddrinfo(target, 5080, _sock.AF_UNSPEC,
+                                      _sock.SOCK_DGRAM)
+            resolved = addrs[0][4][0] if addrs else "?"
+            log.info("[GATEWAY_STATUS] host=%s resolved=%s status=OK",
+                     target, resolved)
+        except _sock.gaierror as e:
+            log.error("[GATEWAY_STATUS] host=%s status=DNS_FAIL err=%r",
+                      target, e)
+        except Exception as e:
+            log.error("[GATEWAY_STATUS] host=%s status=ERROR err=%r",
+                      target, e)
+
+
 def main() -> None:
-    # P4-A: pre-create the recordings directory so record_session does
-    # not fail on the first call before an operator has SSH'd in.
-    ensure_recording_dir()
-    import subprocess
-    subprocess.run(["fs_cli", "-x", "reloadxml"], capture_output=True)
+    # BIND FIRST — port 9000 must be available before any slow init so
+    # FreeSWITCH never gets ECONNREFUSED during the stop→start window.
+    # (Root cause of "Network Busy" / "All lines busy" errors: the old
+    # order ran reloadxml + DNS lookup BEFORE bind, blocking for 0.5-7s
+    # and causing ECONNREFUSED on inbound calls.)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST, PORT))
@@ -2471,6 +2512,7 @@ def main() -> None:
              HOST, PORT,
              AUDIO_STREAM_WS_URL or "(disabled)",
              AUDIO_STREAM_SAMPLE_RATE)
+
     # Phase 12 (P12-PL): start the playback-injection listener on a
     # daemon thread BEFORE we begin accepting outbound-ESL calls, so
     # the orchestrator (which may already be up) sees its peer
@@ -2490,6 +2532,33 @@ def main() -> None:
                  PLAYBACK_LISTEN_HOST, PLAYBACK_LISTEN_PORT)
     else:
         log.info("Phase-12 playback listener DISABLED via env")
+
+    # Run slow init (recording dir, DNS probe, reloadxml) in a daemon
+    # thread so it never delays port availability. Any call that arrives
+    # in the first few seconds before init completes is handled normally
+    # — recording_dir is created lazily and reloadxml is advisory only.
+    def _background_init() -> None:
+        # P4-A: pre-create the recordings directory.
+        ensure_recording_dir()
+        # Gateway DNS reachability check (informational only).
+        _log_gateway_status()
+        # Reload FreeSWITCH XML config so dialplan changes take effect.
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                ["fs_cli", "-x", "reloadxml"],
+                capture_output=True, timeout=10,
+            )
+            log.info("reloadxml complete (rc=%d)", result.returncode)
+        except Exception as _e:
+            log.warning("reloadxml failed (non-fatal): %r", _e)
+
+    _init_t = threading.Thread(
+        target=_background_init, daemon=True, name="bg-init"
+    )
+    _init_t.start()
+    log.info("background init started (recording-dir + DNS + reloadxml)")
+
     try:
         while True:
             conn, addr = srv.accept()

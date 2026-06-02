@@ -21,7 +21,6 @@ import uuid as uuidlib
 import wave
 
 from conversation_call_bridge import call_bridge
-from call_audit import audit_manager
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -422,6 +421,7 @@ async def handle_connection(websocket, path: str, args):
         conn_id,
         path,
     )
+    log.info("[CALL_CONNECTED] conn_id=%s WebSocket opened from FreeSWITCH", conn_id)
 
     # --------------------------------------------------------------
     # START AI SESSION
@@ -435,6 +435,7 @@ async def handle_connection(websocket, path: str, args):
             caller_number=caller_number,
         )
 
+        log.info("[CALL_SESSION_CREATED] conn_id=%s pipeline started", conn_id)
         log.info(
             "[CALL_BRIDGE] session created conn=%s",
             conn_id,
@@ -482,6 +483,10 @@ async def handle_connection(websocket, path: str, args):
             stt_fwd = None
 
     last_binary_t = None
+    # One-shot flag: fires signal_call_active() on the very first binary
+    # audio frame. Greeting is NOT generated at WebSocket connect — only
+    # when real audio arrives, confirming a live call.
+    _call_active_signaled = False
 
     try:
 
@@ -714,10 +719,17 @@ async def handle_connection(websocket, path: str, args):
                         stt_fwd.forward_audio(norm_msg)
 
                     # ------------------------------------------
-                    # CALL AUDIT — capture normalized PCM
+                    # SIGNAL CALL ACTIVE (first frame only)
                     # ------------------------------------------
 
-                    audit_manager.push_audio(conn_id, norm_msg)
+                    if not _call_active_signaled:
+                        _call_active_signaled = True
+                        log.info("[CALL_ANSWERED] First audio frame received — signaling pipeline conn_id=%s", conn_id)
+                        session = call_bridge.sessions.get(conn_id)
+                        if session is not None:
+                            asyncio.create_task(session.signal_call_active())
+                        else:
+                            log.warning("[CALL_ANSWERED] Session not found for conn_id=%s", conn_id)
 
                     # ------------------------------------------
                     # PUSH TO PIPELINE
@@ -768,6 +780,11 @@ async def handle_connection(websocket, path: str, args):
     except websockets.exceptions.ConnectionClosed as exc:
 
         log.info(
+            "[CALL_DISCONNECTED] conn_id=%s code=%s — FreeSWITCH WebSocket closed",
+            conn_id,
+            exc.code,
+        )
+        log.info(
             "[MEDIA_STREAM_CLOSED] conn=%s code=%s",
             conn_id,
             exc.code,
@@ -798,6 +815,12 @@ async def handle_connection(websocket, path: str, args):
         except Exception:
             pass
 
+        log.info(
+            "[CALL_DISCONNECTED] conn_id=%s frames=%d bytes=%d — session ended",
+            conn_id,
+            counters["binary_frames"],
+            counters["binary_bytes"],
+        )
         log.info(
             "[SESSION_END] conn=%s frames=%d bytes=%d",
             conn_id,

@@ -1,12 +1,12 @@
 Executive Summary
 
   This document provides a comprehensive architectural analysis of the voice calling agent project located in
-  /home/angelo/calling-agent/backend/app/voice. The system is an inbound real estate sales agent for Pramukh Group,
-  named Vishal Patel, designed to guide callers through a 9-stage consultative sales flow
+  /home/angelo/lescall/calling-agent/backend/app/voice. The system is an inbound real estate sales agent for Pramukh Group,
+  named Vishal Patel, designed to guide callers through a 6-stage consultative sales flow
   (GREETING → DISCOVERY → PROJECT_MATCH → INVITE_VISIT → CONFIRMATION → CLOSING). The agent answers the call with
-  a bilingual inbound welcome ("Hello! Good afternoon — thanks for calling Pramukh Group. This is Vishal Patel here.
-  Pramukh Group mein aapka swagat hai. How can I help you today?"), detects the caller's language from their first
-  response, and mirrors it throughout the conversation.
+  a bilingual inbound welcome ("Hello! Namaste — this is Vishal Patel calling from Pramukh Group. Hope I haven't
+  caught you at a bad time."), detects the caller's language from their first response, and mirrors it throughout
+  the conversation.
 
   The architecture follows a modular pipeline design with clear separation of concerns: audio input, voice activity
   detection (VAD), speech-to-text (STT) with fallback and post-processing, conversation routing/engine, text-to-speech
@@ -25,25 +25,49 @@ Executive Summary
 
   Architecture Overview
 
-  End-to-End Call Flow
+  End-to-End Call Flow (Production Telephony Path)
 
-  1. Audio Capture: MicrophoneStream captures audio frames (20ms PCM16 chunks) with optional noise suppression
+  0. FreeSWITCH receives inbound call → answers → dispatches uuid_audio_stream to mod_audio_stream
+  0b. mod_audio_stream opens WebSocket to ws_audio_receiver.py (port 9001)
+  0c. ws_audio_receiver.py calls conversation_call_bridge.get_or_create() → TelephonySession.start()
+  0d. VoicePipeline.start() runs; greeting enqueued to TTS queue immediately
+  1. Audio Capture: TelephonySource receives PCM frames pushed by ws_audio_receiver.py (PCMU→PCM16, 8k→16k)
   2. Voice Activity Detection: VAD processes frames to detect speech/silence boundaries with calibration
   3. Turn Management: TurnManager accumulates speech and triggers on semantic completion + silence
-  4. Speech-to-Tree: STTRouter attempts primary (Sarvam) then fallback (OpenAI Whisper) transcription
+  4. Speech-to-Text: STTRouter attempts primary (Sarvam saarika:v2.5) then fallback (OpenAI Whisper) transcription
   5. Post-processing: Domain-specific corrections applied to STT output (city names, BHK, phonetic corrections)
   6. Conversation Routing: ConversationRouter detects intent, manages stage flow, extracts structured data
-  7. LLM Processing: LLMConversationEngine generates responses with stage-aware system prompts
-  8. Text-to-Speech: StreamingTTS implementations (Sarvam/Cartesia) stream audio to speaker sink
+  7. LLM Processing: OpenAI GPT-4o-mini generates responses with stage-aware system prompts (streaming)
+  8. Text-to-Speech: SarvamTTS (bulbul:v3) streams PCM to TelephonySink → WAV file → FreeSWITCH playback
   9. Event Broadcasting: EventHub decouples pipeline from WebSocket clients for monitoring
+
+  Production Telephony Bridge Architecture
+
+  FreeSWITCH (inbound call)
+      ↓ mod_audio_stream WebSocket (port 9001)
+  ws_audio_receiver.py  — PCMU→PCM16, 8k→16k normalization; pushes frames to call_bridge
+      ↓ conversation_call_bridge.py
+  TelephonySession (one per conn_id)
+      ↓ TelephonySource.push_frame()   ↑ TelephonySink.wav_queue
+  VoicePipeline (pipeline.py)
+      → audio_vad_layer → stt_worker → conversation_layer → tts_layer
+  TelephonySink.flush() → WAV file → conversation_call_bridge._playback_loop()
+      ↓ TCP 127.0.0.1:9004 (length-prefixed JSON playback_request)
+  socket_server.py (ESL controller) → bgapi uuid_audio_stream playback → FreeSWITCH
+
+  Key process boundaries: ws_audio_receiver.py and conversation_call_bridge.py are
+  in the same Python process (ws_audio_receiver imports from conversation_call_bridge).
+  socket_server.py runs as a SEPARATE process communicating over TCP port 9004.
 
   Audio Ingestion Flow
 
-  MicrophoneStream → NoiseGate (optional) → VAD → TurnManager (speech detection)
-                                                ↓
-                                        Audio buffered during speech
-                                                ↓
-                                        On turn trigger: AudioSegment → STT Worker
+  FreeSWITCH/mod_audio_stream → ws_audio_receiver.py (decode PCMU, resample to 16k)
+                                    ↓ TelephonySource.push_frame()
+                                 TelephonySource queue → VAD → TurnManager (speech detection)
+                                                             ↓
+                                                     Audio buffered during speech
+                                                             ↓
+                                                     On turn trigger: AudioSegment → STT Worker
 
   STT Flow
 
@@ -418,6 +442,8 @@ Executive Summary
     - _process_vad_frame(): Core VAD processing with barge-in and echo logic
     - _flush_pipeline_queues(): Queue draining for barge-in
     - start() / stop() / run_until_shutdown(): Pipeline lifecycle
+    - _generate_keyboard_sound(): Generates ~700ms of typing-click PCM (currently DISABLED)
+    - _play_keyboard_loop(): Loops keyboard sound while LLM processes (currently DISABLED via kb_stop.set())
   - Inputs: Audio from microphone, configuration via constructor/environment
   - Outputs:
     - Audio output to speaker
@@ -990,6 +1016,42 @@ Executive Summary
     - Under-matching causing unnecessary LLM calls for simple phrases
     - Incorrect normalization causing missed matches
     - Dict maintenance: keeping shortcuts relevant to use case
+
+  Production Telephony Bridge Files (not in calling-agent/backend)
+
+  ws_audio_receiver.py (project root)
+
+  - Purpose: Phase 15 audio normalization receiver — receives audio from FreeSWITCH via WebSocket
+  - Responsibilities:
+    - Accept WebSocket connections from mod_audio_stream (port 9001)
+    - Decode PCMU → PCM16 (audioop.ulaw2lin)
+    - Resample 8k → 16k (audioop.ratecv)
+    - Create/look up TelephonySession via conversation_call_bridge.call_bridge
+    - Push normalized PCM frames to the AI pipeline
+    - Debug audio capture to /tmp/phase15_audio_debug/
+  - Trigger for session creation: WebSocket open from FreeSWITCH
+  - Env vars: TELEPHONY_INPUT_CODEC (default pcmu), TELEPHONY_TARGET_SR (default 16000)
+
+  conversation_call_bridge.py (project root)
+
+  - Purpose: Bridge between ws_audio_receiver and VoicePipeline — one TelephonySession per call
+  - Responsibilities:
+    - SessionManager.get_or_create(): idempotent session creation per conn_id
+    - TelephonySession.start(): starts pipeline.run_until_shutdown(), playback loop, event loop
+    - Playback loop: reads WAV paths from TelephonySink.wav_queue and sends playback_request to socket_server
+    - Timing observability: tracks first_audio_t, first_transcript_t, first_response_t, first_playback_t
+  - Who calls it: ws_audio_receiver.py (global call_bridge import)
+  - What it calls: VoicePipeline, TelephonySource, TelephonySink, EventHub, audit_manager
+  - Playback injection: TCP 127.0.0.1:9004 (4-byte BE length + JSON playback_request)
+  - API keys: both STT and TTS use SARVAMAI_API_KEY (with 'I')
+
+  socket_server.py (project root, SEPARATE PROCESS)
+
+  - Purpose: ESL (FreeSWITCH Event Socket Layer) controller — phases 1–9
+  - Responsibilities: handshake with FreeSWITCH, record_session, uuid_audio_stream start/stop, playback
+  - Listens on port 9004 for playback_request from conversation_call_bridge
+  - Injects playback back to FreeSWITCH via ESL bgapi uuid_audio_stream
+  - Does NOT contain STT, TTS, LLM, or VAD logic
 
   Dependency Map
 

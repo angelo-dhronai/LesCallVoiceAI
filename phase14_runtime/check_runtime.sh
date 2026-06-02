@@ -66,6 +66,32 @@ else
     PASS=0
 fi
 
+# 5. Check FreeSWITCH
+echo "--- FreeSWITCH Status ---"
+if systemctl is-active --quiet freeswitch 2>/dev/null; then
+    echo "[OK] freeswitch service is active"
+else
+    echo "[FAIL] freeswitch service is NOT active"
+    PASS=0
+fi
+
+# Check SIP ports
+if ss -ltn 2>/dev/null | grep -qE ":(5060|5080) "; then
+    echo "[OK] freeswitch SIP port (5060/5080) is listening"
+else
+    echo "[FAIL] freeswitch SIP port (5060/5080) is NOT listening"
+    PASS=0
+fi
+
+# 6. Disk space warning
+echo "--- Disk Space ---"
+AVAIL_KB=$(df -k / | awk 'NR==2{print $4}')
+if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt 2097152 ]; then
+    echo "[WARN] Less than 2GB free on /: $(df -h / | awk 'NR==2{print $4}') available"
+else
+    echo "[OK] Disk space: $(df -h / | awk 'NR==2{print $4}') free"
+fi
+
 echo "------------------------------------------------"
 if [ $PASS -eq 1 ]; then
     echo "OVERALL STATUS: PASS"

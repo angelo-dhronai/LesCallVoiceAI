@@ -284,19 +284,18 @@ async def _run() -> None:
     )
 
     # Import here to allow conditional LLM engine based on env
-    import os
     from .conversation_engine import MockConversationEngine
+    from .llm_config import GEMINI_API_KEY
 
-    # Use real LLM if API key available, else mock
+    # Use real LLM if Gemini API key available, else mock
     engine: ConversationEngine
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
-    if openai_key:
+    if GEMINI_API_KEY:
         from .conversation_engine_llm import LLMConversationEngine
         engine = LLMConversationEngine()
-        logger.info("[LOOP] Using LLM conversation engine (OpenAI)")
+        logger.info("[LOOP] Using LLM conversation engine (Gemini)")
     else:
         engine = MockConversationEngine(system_prompt="You are a helpful voice assistant.")
-        logger.info("[LOOP] Using mock conversation engine (no OPENAI_API_KEY)")
+        logger.info("[LOOP] Using mock conversation engine (no GEMINI_API_KEY)")
 
     loop = VoiceLoop(conversation=engine)
 

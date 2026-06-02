@@ -23,7 +23,7 @@ import numpy as np
 
 from .audio_input import SAMPLE_RATE, SAMPLES_PER_FRAME
 from .vad import VoiceActivityDetector
-from .stt.router import STTRouter
+from .stt.router import STTRouter, UNSUPPORTED_SCRIPT_TRANSCRIPT
 from .tts_stream import StreamingTTS, MockStreamingTTS
 from .tts_sarvam import SarvamTTS
 from .turn_manager import TurnManager, TurnManagerConfig
@@ -70,7 +70,7 @@ class Response:
 QUEUE_SIZE_AUDIO = 40
 QUEUE_SIZE_STT = 3
 QUEUE_SIZE_TRANSCRIPT = 3
-QUEUE_SIZE_TTS = 3
+QUEUE_SIZE_TTS = 10
 
 MAX_SPEECH_SECONDS = 4
 MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_SPEECH_SECONDS
@@ -208,6 +208,10 @@ class VoicePipeline:
         # Phase 17: Hysteresis tuning
         self._speech_onset_min_frames =  SPEECH_ONSET_MIN_FRAMES
         self._speech_hold_min_frames = SPEECH_HOLD_MIN_FRAMES
+
+        # Consecutive unsupported-script detection counter.
+        # A single occurrence is treated as noise/echo; fallback fires on 2nd+.
+        self._unsupported_script_streak: int = 0
        
 
         logger.info(
@@ -615,28 +619,96 @@ class VoicePipeline:
             except asyncio.CancelledError:
                 break
 
+            # Phase 3 — credit gate: do not call Sarvam STT until the call is
+            # active (greeting has been sent).  Without this guard, ambient noise
+            # or early caller audio arrives before the greeting and triggers
+            # unnecessary STT requests, draining Sarvam credits before the first
+            # word of the conversation.
+            if not self._call_active:
+                logger.info(
+                    "[STT-WORKER] Call not active — dropping audio segment "
+                    "(credit guard, %.0fms)",
+                    segment.duration_ms,
+                )
+                continue
+
             try:
                 latency_start = time.monotonic()
-                # STT always auto-detects. Forcing a language here was the
-                # root cause of broken mid-call switching: when locked to
-                # Hindi, English audio was transcribed as Devanagari junk,
-                # so the language-switch intent never matched. Output language
-                # is governed by the conversation engine, not STT input.
+
+                # Language hint for Sarvam STT.
+                # Before language is detected (first caller turn): use "unknown"
+                # so Sarvam auto-detects among all languages.  After the first
+                # turn the conversation engine has detected and locked the caller's
+                # language; send that as the hint so Sarvam doesn't mis-detect
+                # quiet/noisy telephony audio as Bengali, Punjabi, Malayalam, etc.
+                # Note: turn_count is incremented by the conversation layer after
+                # processing each transcript, so turn_count > 0 means at least
+                # one caller utterance has been handled and language is detected.
+                lang_hint = (
+                    self.conversation.state.language
+                    if self.conversation.state.turn_count > 0
+                    else "unknown"
+                )
+
                 logger.info(
                     "[STT-WORKER] Submitting segment: %.0fms audio (%d bytes) "
-                    "queued %.0fms ago",
+                    "queued %.0fms ago  lang_hint=%s (turn=%d)",
                     segment.duration_ms,
                     len(segment.audio),
                     (time.monotonic() - segment.timestamp) * 1000,
+                    lang_hint,
+                    self.conversation.state.turn_count,
                 )
                 transcript_text = await self.stt.transcribe(
-                    segment.audio, sample_rate=SAMPLE_RATE, language="unknown",
+                    segment.audio, sample_rate=SAMPLE_RATE, language=lang_hint,
                 )
                 stt_latency = (time.monotonic() - latency_start) * 1000
+
+                # Phase 5 — unsupported script fallback: Sarvam sometimes
+                # auto-detects noisy audio as Malayalam, Tamil, Korean, etc.
+                # The STT router returns UNSUPPORTED_SCRIPT_TRANSCRIPT in that
+                # case.  A single occurrence may be noise, echo, or a brief
+                # corrupted frame — don't play the fallback immediately.
+                # Only play the "couldn't hear you clearly" prompt after 2
+                # consecutive wrong-script detections, which indicates a
+                # persistent audio or language problem rather than a one-off.
+                if transcript_text == UNSUPPORTED_SCRIPT_TRANSCRIPT:
+                    self._unsupported_script_streak += 1
+                    lang = self.conversation.state.language
+                    logger.info(
+                        "[STT-WORKER] Unsupported script detected "
+                        "(streak=%d, lang_hint=%s, lang=%s)",
+                        self._unsupported_script_streak, lang_hint, lang,
+                    )
+                    if self._unsupported_script_streak >= 2:
+                        _unsupported_fallbacks = {
+                            "hi": "क्षमा कीजिए, आपकी बात स्पष्ट नहीं सुन पाया। कृपया दोबारा कहें।",
+                            "gu": "માફ કરશો, હું તમારી વાત સ્પષ્ટ રીતે સાંભળી શક્યો નથી. કૃપા કરીને ફરી કહો.",
+                            "en": "Sorry, I couldn't hear you clearly. Could you repeat that?",
+                        }
+                        fallback = _unsupported_fallbacks.get(lang, _unsupported_fallbacks["en"])
+                        logger.info(
+                            "[STT-WORKER] Streak=%d — playing fallback (lang=%s): %r",
+                            self._unsupported_script_streak, lang, fallback,
+                        )
+                        try:
+                            self._tts_queue.put_nowait(Response(
+                                text=fallback,
+                                is_shortcut=True,
+                                timestamp=time.monotonic(),
+                            ))
+                        except asyncio.QueueFull:
+                            logger.warning("[STT-WORKER] TTS queue full — dropping unsupported-script fallback")
+                    else:
+                        logger.info("[STT-WORKER] Streak=1 — treating as noise, not playing fallback")
+                    continue
 
                 if not transcript_text or len(transcript_text.strip()) < 2:
                     logger.info("[STT] Empty transcript — skipping")
                     continue
+
+                # Valid transcript — reset the unsupported-script streak counter.
+                self._unsupported_script_streak = 0
 
                 logger.info("[STT] %r (%.0fms latency)", transcript_text, stt_latency)
 

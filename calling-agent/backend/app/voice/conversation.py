@@ -23,6 +23,7 @@ from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 
+from .llm_config import GEMINI_API_KEY, GEMINI_BASE_URL, GEMINI_MODEL
 from .memory import ConversationMemory, BookingData
 from .stt.post_processor import match_location, match_bhk
 
@@ -631,11 +632,11 @@ class ConversationRouter:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gpt-4o-mini",
+        model: str = GEMINI_MODEL,
         timeout: float = LLM_TIMEOUT,
         default_language: str = "hi",
     ) -> None:
-        self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self._api_key = api_key or GEMINI_API_KEY
         self._model = model
         self._timeout = timeout
         self._client: AsyncOpenAI | None = None
@@ -650,12 +651,13 @@ class ConversationRouter:
         self._last_nudge_stage: str | None = None
 
         if not self._api_key:
-            logger.warning("[CONV] OPENAI_API_KEY not set -- LLM calls will fail")
+            logger.warning("[CONV] GEMINI_API_KEY not set -- LLM calls will fail")
 
     def _get_client(self) -> AsyncOpenAI:
         if self._client is None:
             self._client = AsyncOpenAI(
                 api_key=self._api_key,
+                base_url=GEMINI_BASE_URL,
                 timeout=self._timeout,
             )
         return self._client
@@ -1252,27 +1254,6 @@ class ConversationRouter:
             full_text = " ".join(full_parts)
             self.memory.add_assistant(full_text)
 
-    def _build_flow_nudge(self) -> str | None:
-        """Build a gentle nudge to return to the booking flow after a detour. Won't repeat the same nudge."""
-        missing = self.memory.booking.next_missing_field()
-        if not missing:
-            return None
-
-        stage_map = {
-            "location": STAGE_LOCATION,
-            "property_type": STAGE_PROPERTY_TYPE,
-            "appointment": STAGE_SCHEDULING,
-        }
-        target_stage = stage_map.get(missing)
-        if not target_stage:
-            return None
-
-        if self._last_nudge_stage == target_stage:
-            return None
-
-        self._last_nudge_stage = target_stage
-        return self._get_proactive_prompt(target_stage)
-
     # ------------------------------------------------------------------
     # Parallel LLM helpers
     # ------------------------------------------------------------------
@@ -1301,23 +1282,6 @@ class ConversationRouter:
         system = self._build_system_prompt()
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(self.memory.get_history_for_llm())
-
-        # Final language enforcement — closest to generation for maximum effect
-        lang_names = {"hi": "Hindi", "gu": "Gujarati", "en": "English"}
-        lang_name = lang_names.get(self.state.language, "Hindi")
-        _lang_script_note = {
-            "hi": "Use Hindi (Devanagari script preferred, or romanized Hindi). NOT Gujarati, NOT English.",
-            "gu": "Use Gujarati (Gujarati script preferred, or romanized Gujarati). NOT Hindi, NOT English.",
-            "en": "Use English only. NOT Hindi, NOT Gujarati.",
-        }
-        messages.append({
-            "role": "system",
-            "content": (
-                f"FINAL INSTRUCTION: Your ENTIRE response must be in {lang_name}. "
-                f"{_lang_script_note.get(self.state.language, '')} "
-                f"Do NOT mix languages. Do NOT switch mid-sentence."
-            ),
-        })
 
         _SENTENCE_END = re.compile(r'[.!?।]\s')
         deadline = time.monotonic() + LLM_STREAM_TIMEOUT_S
@@ -1522,7 +1486,7 @@ class ConversationRouter:
             "ADAPT: Follow the stage as a loose roadmap, not a rigid script.",
             "If the caller is engaged on a topic, stay with them — don't rush to the next stage.",
             "ONE question per turn only. Never stack questions.",
-            "3 sentences max per response. Phone call — brevity is warmth.",
+            "CRITICAL — BREVITY: 2 sentences MAXIMUM per response. This is a spoken phone call — responses longer than 2 sentences will be cut off mid-word.",
             "Mirror their energy: excited → warm and enthusiastic, cautious → softer and reassuring.",
             "NEVER sound like an IVR, chatbot, or scripted call center agent.",
             "",
@@ -1543,7 +1507,8 @@ class ConversationRouter:
             "✗ NEVER ask budget before you know purpose/location/config",
             "✗ NEVER give more than 2 time options for site visit",
             "✗ NEVER dump the whole portfolio on one caller",
-            "✗ NEVER make up prices or dates not listed above",
+            "✗ NEVER mention ANY project name not listed in PROJECT PORTFOLIO above — use ONLY the exact project names listed there",
+            "✗ NEVER make up prices, dates, locations, or project details not listed above",
             "✗ NEVER say 'When can you come?' — always give exactly TWO specific time options",
             "✗ NEVER ask 'Do you have any questions?' or 'Any questions about the property?' — only answer questions when the caller asks one",
             "✗ NEVER push the conversation to a new topic if the caller is still on the current one",

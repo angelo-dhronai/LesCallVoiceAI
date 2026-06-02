@@ -80,6 +80,13 @@ _GARBAGE_SCRIPT_TOKENS = {
     "અ", "આ", "ઓ", "હા", "ના",
 }
 
+# Sentinel returned by validate_transcript (and propagated through STTRouter) when
+# the transcript was rejected specifically because it contained an unsupported script
+# (e.g. Malayalam, Tamil, Korean).  Callers that see this value should play a
+# language-appropriate "couldn't hear you" fallback prompt instead of silently
+# dropping the turn, which would leave the caller wondering why the agent went quiet.
+UNSUPPORTED_SCRIPT_TRANSCRIPT = "\x00UNSUPPORTED_SCRIPT\x00"
+
 # Unicode blocks the agent SUPPORTS: Latin (en), Devanagari (hi), Gujarati (gu).
 # Everything else is a Sarvam auto-detect mis-fire on noisy/short audio.
 # Supported languages: English, Hindi, Gujarati ONLY.
@@ -134,10 +141,11 @@ def validate_transcript(text: str) -> str:
 
     # Unsupported-script filter — Sarvam's auto-detect sometimes transcribes
     # noisy/short audio into Korean, Malayalam, Tamil, etc. which are never
-    # valid user input. Reject immediately.
+    # valid user input. Return the sentinel so callers can play a "couldn't
+    # hear you" fallback instead of silently ignoring the turn.
     if _UNSUPPORTED_SCRIPT_RE.search(text):
         logger.info("[STT-FILTER] reason=unsupported_script text=%r", text)
-        return ""
+        return UNSUPPORTED_SCRIPT_TRANSCRIPT
 
     # Hallucination filter
     for hallucination in _HALLUCINATIONS:
@@ -357,6 +365,15 @@ class STTRouter:
                     return "", False
 
                 validated = validate_transcript(text)
+                if validated == UNSUPPORTED_SCRIPT_TRANSCRIPT:
+                    # Propagate the sentinel directly — do NOT post-process it,
+                    # do NOT retry (script won't change between retries).
+                    logger.info(
+                        "[STT] %s attempt %d: %r -> rejected (unsupported script)",
+                        label, attempt, text,
+                    )
+                    return UNSUPPORTED_SCRIPT_TRANSCRIPT, False
+
                 if validated:
                     processed = self._post_process(validated, language)
                     logger.info(

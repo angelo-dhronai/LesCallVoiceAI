@@ -84,7 +84,7 @@ class TelephonySink(AudioSink):
             if self._sample_rate != 8000:
                 norm_filename = f"pb_{self._conn_id}_{uuid.uuid4().hex[:8]}.wav"
                 norm_filepath = os.path.join(self._tmp_dir, norm_filename)
-                
+
                 if self._normalize_to_8k(raw_filepath, norm_filepath):
                     final_filepath = norm_filepath
                     # Cleanup raw file
@@ -93,7 +93,21 @@ class TelephonySink(AudioSink):
                     except Exception:
                         pass
                 else:
-                    logger.warning("[%s] [TelephonySink] Normalization failed, using raw file", self._conn_id)
+                    # Normalization failed — FreeSWITCH expects 8kHz PCM and cannot
+                    # play the raw 16kHz file.  Passing it would cause a silent
+                    # "wave.open failed" error in FreeSWITCH.  Drop the chunk and
+                    # log loudly so the operator knows ffmpeg is unavailable/broken.
+                    logger.error(
+                        "[%s] [TelephonySink] ffmpeg normalization FAILED — dropping "
+                        "audio chunk to prevent FreeSWITCH playback error.  "
+                        "Ensure ffmpeg is installed and accessible.",
+                        self._conn_id,
+                    )
+                    try:
+                        os.remove(raw_filepath)
+                    except Exception:
+                        pass
+                    return
 
             # Phase E: Ensure permissions
             try:

@@ -14,6 +14,7 @@ import logging
 
 from openai import AsyncOpenAI
 
+from .llm_config import GEMINI_API_KEY, GEMINI_BASE_URL, GEMINI_MODEL
 from .conversation_engine import ConversationEngine, Message
 from .memory import ConversationMemory
 
@@ -76,12 +77,12 @@ class LLMConversationEngine(ConversationEngine):
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gpt-4o-mini",
+        model: str = GEMINI_MODEL,
         max_turns: int = MAX_HISTORY_TURNS,
         timeout: float = LLM_TIMEOUT,
     ) -> None:
         super().__init__(system_prompt="")
-        self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self._api_key = api_key or GEMINI_API_KEY
         self._model = model
         self._max_turns = max_turns
         self._timeout = timeout
@@ -92,12 +93,13 @@ class LLMConversationEngine(ConversationEngine):
         self.memory: ConversationMemory | None = None
 
         if not self._api_key:
-            logger.warning("[LLM] OPENAI_API_KEY not set -- calls will fail")
+            logger.warning("[LLM] GEMINI_API_KEY not set -- calls will fail")
 
     def _get_client(self) -> AsyncOpenAI:
         if self._client is None:
             self._client = AsyncOpenAI(
                 api_key=self._api_key,
+                base_url=GEMINI_BASE_URL,
                 timeout=self._timeout,
             )
         return self._client

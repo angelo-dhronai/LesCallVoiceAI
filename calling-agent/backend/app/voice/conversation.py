@@ -778,13 +778,14 @@ class ConversationRouter:
             or src == "script_gu_markers"
         )
 
-        # Decay the lock after 5 turns — prevents rapid English/Hindi flipping
-        # caused by Hinglish speech or single-token ambiguity. 3 turns was too
-        # short: a bilingual caller saying a few English words mid-Hindi
-        # conversation would cause the agent to switch and stay switched.
+        # Decay the lock after 20 turns — prevents rapid language flipping while
+        # still allowing long calls to adapt if the caller genuinely changes
+        # language. An explicit language_switch intent resets lock_turns to -10
+        # so it persists for 30 turns before decaying, giving strong persistence
+        # after a deliberate switch request.
         if self.state.language_locked:
             self.state.language_lock_turns += 1
-            if self.state.language_lock_turns > 5:
+            if self.state.language_lock_turns > 20:
                 self.state.language_locked = False
                 logger.info("[LANG] Lock expired after %d turns", self.state.language_lock_turns)
 
@@ -888,16 +889,38 @@ class ConversationRouter:
         # STAGE-AWARE ROUTING
         # =============================================================
 
-        # --- Repeat request (feature 3) — replay last agent response ---
+        # --- Repeat request (feature 3) — replay or re-render last agent response ---
         if self._is_repeat_request(text) and self.last_agent_response:
-            _cancel_llm()
-            resp = self.last_agent_response
-            logger.info("[REPEAT] Replaying last response (lang=%s): %r",
-                        self.last_agent_language, resp[:60])
-            self.memory.add_assistant(resp)
-            self._store_last_response(resp)
-            yield EngineResult(text=resp, is_shortcut=True, intent="repeat")
-            return
+            # Check if caller also requested a language change (e.g. "repeat in Gujarati")
+            _repeat_has_lang = any(
+                p in text.lower()
+                for p in [
+                    "gujarati", "hindi", "english",
+                    "ગુજરાતી", "gu ma", "gu mein",
+                    "हिंदी", "हिन्दी", "hindi mein", "hindi mai",
+                    "english mein", "english mai",
+                ]
+            )
+            if _repeat_has_lang:
+                # Extract desired language and re-render via LLM in the new language
+                new_lang = self._extract_requested_language(text)
+                if new_lang != self.state.language:
+                    logger.info("[REPEAT] Language-change repeat: %s -> %s", self.state.language, new_lang)
+                    self.state.language = new_lang
+                    self.state.language_locked = True
+                    self.state.language_lock_turns = -10
+                    self.state.language_history = [new_lang] * 5
+                logger.info("[REPEAT+LANG] Re-rendering last response in %s", self.state.language)
+                # LLM will see the updated language in the system prompt and re-render
+            else:
+                _cancel_llm()
+                resp = self.last_agent_response
+                logger.info("[REPEAT] Replaying last response (lang=%s): %r",
+                            self.last_agent_language, resp[:60])
+                self.memory.add_assistant(resp)
+                self._store_last_response(resp)
+                yield EngineResult(text=resp, is_shortcut=True, intent="repeat")
+                return
 
         # --- Farewell at any stage ---
         if intent == "farewell":
@@ -965,11 +988,15 @@ class ConversationRouter:
             )
             self.state.language = new_lang
             self.state.language_locked = True
-            self.state.language_lock_turns = 0
+            # Start at -10 so the lock persists for 30 turns (20 - (-10)) before
+            # decaying — explicit caller requests should stick much longer.
+            self.state.language_lock_turns = -10
             self.state.language_history = [new_lang] * 5
             resp = _LANG_SWITCH_RESPONSES.get(new_lang, _LANG_SWITCH_RESPONSES["hi"])
             self.memory.add_assistant(resp)
             self._store_last_response(resp)
+            logger.info("[LANG-LOCK] explicit_switch lang=%s lock_turns=%d (persists ~30 turns)",
+                        new_lang, self.state.language_lock_turns)
             yield EngineResult(text=resp, is_shortcut=True, intent="language_switch")
             return
 
@@ -998,7 +1025,7 @@ class ConversationRouter:
             # Lock language from first user response to bilingual greeting
             if not self.state.language_locked:
                 self.state.language_locked = True
-                logger.info("[LANG] Locked language to %s from greeting response",
+                logger.info("[LANG-LOCK] greeting_response lang=%s locked=True (decays after 20 turns)",
                             self.state.language)
             self.state.stage = STAGE_DISCOVERY
 

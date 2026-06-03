@@ -210,11 +210,21 @@ _PHONETIC_CORRECTIONS: dict[str, str] = {
     "tick che": "theek che",
     "thick che": "theek che",
     "take care": "theek che",
-    # "kem cho" (how are you) misheard
+    # "kem cho" (how are you) — Sarvam frequently transcribes this as "gameshow"
+    # because the phoneme pattern /k-ɛ-m/ /tʃ-oʊ/ sounds like "game" + "show"
+    "game show": "kem cho",
+    "gameshow": "kem cho",
+    "game show game show": "kem cho",
     "came show": "kem cho",
     "come show": "kem cho",
     "cam show": "kem cho",
     "kim cho": "kem cho",
+    "game cho": "kem cho",
+    "gem show": "kem cho",
+    # "kaise ho" (how are you, Hindi) misheard
+    "kaisa ho": "kaise ho",
+    "kaisey ho": "kaise ho",
+    "kese ho": "kaise ho",
     # "haan" / "ha" (yes) misheard
     "han": "haan",
     "hahn": "haan",

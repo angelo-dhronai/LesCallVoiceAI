@@ -80,6 +80,27 @@ _GARBAGE_SCRIPT_TOKENS = {
     "અ", "આ", "ઓ", "હા", "ના",
 }
 
+# Marathi uses Devanagari (shared with Hindi) so the unsupported-script regex
+# cannot catch it. Sarvam auto-detect sometimes transcribes Gujarati/Hindi speech
+# as Marathi. These markers split into two tiers:
+#   HIGH_CONFIDENCE — single occurrence is sufficient to reject (these words
+#     literally do not exist in Hindi or Gujarati under any reading).
+#   NORMAL — require 2+ hits to avoid false positives.
+_MARATHI_HIGH_CONFIDENCE = [
+    "आहे",   # Marathi copula "is/are" — Hindi equivalent is "है" (different word)
+    "आहेत",  # "they are" — Hindi: हैं
+    "आहात",  # "you are" formal — Hindi: हो/हैं
+]
+_MARATHI_MARKERS = [
+    "मला",   # "to me" (Hindi: मुझे)
+    "तुला",  # "to you" informal (Hindi: तुम्हें)
+    "होय",   # "yes" (Hindi: हाँ)
+    "कसे",   # "how" (Hindi: कैसे)
+    "कसा",   # "how" masculine (Hindi: कैसा)
+    "नाही",  # "no/not" Marathi form (Hindi: नहीं — different spelling)
+    "आपण",   # "we/you" Marathi pronoun (Hindi: हम/आप)
+]
+
 # Unicode blocks the agent SUPPORTS: Latin (en), Devanagari (hi), Gujarati (gu).
 # Everything else is a Sarvam auto-detect mis-fire on noisy/short audio.
 # Supported languages: English, Hindi, Gujarati ONLY.
@@ -137,6 +158,18 @@ def validate_transcript(text: str) -> str:
     # valid user input. Reject immediately.
     if _UNSUPPORTED_SCRIPT_RE.search(text):
         logger.info("[STT-FILTER] reason=unsupported_script text=%r", text)
+        return ""
+
+    # Marathi rejection: Marathi shares Devanagari with Hindi so the script
+    # regex cannot filter it. High-confidence copulas (आहे/आहेत/आहात) reject
+    # on a single hit since they never appear in Hindi or Gujarati.
+    # Other Marathi markers require 2+ hits to avoid false positives.
+    if any(m in text for m in _MARATHI_HIGH_CONFIDENCE):
+        logger.info("[STT-FILTER] reason=marathi_copula text=%r", text)
+        return ""
+    _marathi_hits = sum(1 for m in _MARATHI_MARKERS if m in text)
+    if _marathi_hits >= 2:
+        logger.info("[STT-FILTER] reason=marathi_transcript hits=%d text=%r", _marathi_hits, text)
         return ""
 
     # Hallucination filter

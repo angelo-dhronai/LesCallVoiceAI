@@ -70,7 +70,10 @@ class Response:
 QUEUE_SIZE_AUDIO = 40
 QUEUE_SIZE_STT = 3
 QUEUE_SIZE_TRANSCRIPT = 3
-QUEUE_SIZE_TTS = 3
+# Raised from 3 to 8: streamed LLM responses produce multiple sentence-level
+# chunks in quick succession. A queue of 3 caused drops when the TTS layer was
+# busy playing an earlier chunk while new ones arrived.
+QUEUE_SIZE_TTS = 8
 
 MAX_SPEECH_SECONDS = 4
 MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_SPEECH_SECONDS
@@ -628,20 +631,20 @@ class VoicePipeline:
 
             try:
                 latency_start = time.monotonic()
-                # Issue 1: when language is locked to Hindi or Gujarati, pass
-                # that code to Sarvam. Auto-detect ("unknown") sometimes misfires
-                # on telephony audio, returning Bengali/Punjabi/Malayalam which
-                # the unsupported-script filter then rejects, causing false
-                # "couldn't hear you" responses.
-                # English stays on "unknown" — English speakers often code-switch
-                # and Sarvam handles bilingual audio well with auto-detect.
-                # Pre-lock (GREETING stage) also uses "unknown" to allow the
-                # first-turn language to be detected freely.
+                # Pass the locked conversation language to Sarvam to prevent
+                # auto-detect misfires (Bengali/Punjabi/Malayalam/Marathi on
+                # Gujarati/Hindi audio). "unknown" is only used pre-lock (first
+                # turn / GREETING stage) to allow free language detection.
+                # English is also passed explicitly when locked — Sarvam handles
+                # English-IN well and it prevents misclassification on accented
+                # English with Indian words.
                 _stt_lang = "unknown"
                 if self.conversation:
                     _st = self.conversation.state
-                    if _st.language_locked and _st.language in ("hi", "gu"):
+                    if _st.language_locked and _st.language in ("hi", "gu", "en"):
                         _stt_lang = _st.language
+                        logger.debug("[STT-WORKER] lang_locked=%s -> stt_lang=%s",
+                                     _st.language, _stt_lang)
                 logger.info(
                     "[STT-WORKER] Submitting segment: %.0fms audio (%d bytes) "
                     "queued %.0fms ago lang=%s",

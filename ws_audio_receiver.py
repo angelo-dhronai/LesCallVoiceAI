@@ -839,7 +839,10 @@ async def main_async(args):
         args.host,
         args.port,
         max_size=2**20,
-        ping_interval=None,
+        # Send WebSocket pings every 20s so FreeSWITCH mod_audio_stream
+        # does not idle-timeout the connection at ~30s and drop the call.
+        ping_interval=20,
+        ping_timeout=10,
     ):
 
         await asyncio.Future()

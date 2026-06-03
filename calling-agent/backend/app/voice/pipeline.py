@@ -115,39 +115,6 @@ _STT_FALLBACK_PHRASES: dict[str, str] = {
 _STT_FALLBACK_MIN_SPEECH_MS = 800.0
 
 
-def _generate_keyboard_sound(sample_rate: int = 16000) -> bytes:
-    """Generate a burst of keyboard typing clicks (PCM16 mono).
-
-    Returns ~700ms of audio: 4 clicks spaced ~120ms apart with a trailing
-    silence gap so the burst can be looped naturally.
-    """
-    rng = np.random.default_rng(7)
-    frames: list[bytes] = []
-
-    click_s = 0.022   # 22ms per click
-    gap_s   = 0.110   # 110ms silent gap between clicks
-    n_clicks = 4
-
-    click_n = int(sample_rate * click_s)
-    gap_n   = int(sample_rate * gap_s)
-
-    for i in range(n_clicks):
-        t = np.linspace(0, click_s, click_n, endpoint=False)
-        # Decaying white-noise burst with a mild tonal component
-        noise = rng.standard_normal(click_n)
-        decay = np.exp(-t / 0.005)            # 5 ms time-constant
-        freq  = 900 + (i * 300 % 600)
-        click = (noise * 0.55 + np.sin(2 * np.pi * freq * t) * 0.45) * decay * 0.22
-        click = np.clip(click, -1.0, 1.0)
-        frames.append((click * 32767).astype(np.int16).tobytes())
-        if i < n_clicks - 1:
-            frames.append(bytes(gap_n * 2))   # silent gap (int16 = 2 bytes/sample)
-
-    # 320 ms trailing silence so looped bursts feel natural
-    frames.append(bytes(int(sample_rate * 0.32) * 2))
-    return b"".join(frames)
-
-
 class VoicePipeline:
     """
     Production voice pipeline with independent async layers.
@@ -166,6 +133,7 @@ class VoicePipeline:
         conversation: ConversationRouter | None = None,
         event_hub: EventHub | None = None,
         mic_enabled: bool = True,
+        skip_greeting: bool = False,
     ) -> None:
         self.audio = audio_source or LocalMicSource(sample_rate=SAMPLE_RATE)
         self.sink = audio_sink or LocalSpeakerSink(sample_rate=SAMPLE_RATE)
@@ -204,12 +172,16 @@ class VoicePipeline:
         self._vad_mute_until = 0.0
         self._barge_in_occurred = False
         self._mic_enabled = mic_enabled
+        # Issue 4: skip greeting on reconnect — caller already heard it
+        self._skip_greeting: bool = skip_greeting
         # Warmup gate — set after all provider warmups complete (feature 6)
         self._warmup_done: asyncio.Event = asyncio.Event()
         # Greeting guard — False until the opening TTS utterance has fully
         # played.  STT fallback phrases and barge-in are suppressed until this
         # is True so startup noise / TTS echo never produce spurious output.
-        self._greeting_done: bool = False
+        # When skip_greeting=True we mark it done immediately so barge-in
+        # and STT fallback are active from the start.
+        self._greeting_done: bool = skip_greeting
 
         # VAD + buffering state
         self._audio_buffer = bytearray()
@@ -250,10 +222,6 @@ class VoicePipeline:
             min_words_long=3,
         ))
 
-        # Keyboard sound state — tracks the current thinking-sound task
-        self._keyboard_stop: asyncio.Event = asyncio.Event()
-        self._keyboard_stop.set()  # start in "stopped" state
-
     async def start(self) -> None:
         self._running = True
         logger.info("=" * 60)
@@ -262,33 +230,35 @@ class VoicePipeline:
 
         # Await all provider warmups before starting the pipeline layers so the
         # first live caller turn never pays TLS/API handshake cost (feature 6).
+        # Issue 3: only log "queued" for warmups that will actually run
+        # (guarded by class-level _warmup_done_flag inside each provider).
         warmup_coros = []
         primary_stt = getattr(self.stt, "_primary", None)
         if primary_stt is not None and hasattr(primary_stt, "warmup"):
+            if not getattr(primary_stt.__class__, "_warmup_done_flag", False):
+                logger.info("[WARMUP] STT primary warmup queued")
             warmup_coros.append(primary_stt.warmup())
-            logger.info("[WARMUP] STT primary warmup queued")
         if hasattr(self.tts, "warmup"):
+            if not getattr(self.tts.__class__, "_warmup_done_flag", False):
+                logger.info("[WARMUP] TTS warmup queued")
             warmup_coros.append(self.tts.warmup())
-            logger.info("[WARMUP] TTS warmup queued")
         if hasattr(self.conversation, "warmup"):
+            if not getattr(self.conversation.__class__, "_warmup_done_flag", False):
+                logger.info("[WARMUP] LLM warmup queued")
             warmup_coros.append(self.conversation.warmup())
-            logger.info("[WARMUP] LLM warmup queued")
 
         if warmup_coros:
-            logger.info("[WARMUP] Running %d warmup(s) before first call...", len(warmup_coros))
             try:
                 results = await asyncio.wait_for(
                     asyncio.gather(*warmup_coros, return_exceptions=True),
                     timeout=5.0,
                 )
                 errs = [r for r in results if isinstance(r, Exception)]
-                logger.info("[WARMUP] Complete — %d ok, %d error(s)", len(results) - len(errs), len(errs))
-                for e in errs:
-                    logger.warning("[WARMUP] Error: %s", e)
+                if errs:
+                    for e in errs:
+                        logger.warning("[WARMUP] Error: %s", e)
             except asyncio.TimeoutError:
                 logger.warning("[WARMUP] Timed out after 5s — proceeding anyway")
-        else:
-            logger.info("[WARMUP] No warmup methods available — proceeding directly")
         self._warmup_done.set()
 
         self._tasks = [
@@ -298,11 +268,15 @@ class VoicePipeline:
             asyncio.create_task(self._tts_layer(), name="tts"),
         ]
 
-        # Issue 5: wait for the first inbound audio frame before playing the
-        # greeting.  With mod_audio_stream the WebSocket connects when the
-        # dialplan executes the application — which may be before FreeSWITCH
-        # sends CHANNEL_ANSWER.  Waiting for the first real audio frame
-        # guarantees the call is live before the agent speaks.
+        # Issue 4: skip greeting on reconnect — caller already heard it.
+        if self._skip_greeting:
+            logger.info("[PIPELINE] Greeting suppressed — already greeted this call (reconnect)")
+            return
+
+        # Wait for the first inbound audio frame before playing the greeting.
+        # With mod_audio_stream the WebSocket connects when the dialplan executes
+        # the application — which may be before FreeSWITCH sends CHANNEL_ANSWER.
+        # Waiting for the first real audio frame guarantees the call is live.
         if hasattr(self.audio, '_pushed_frames'):
             logger.info("[PIPELINE] Waiting for first audio frame to confirm call is established...")
             deadline = time.monotonic() + 5.0
@@ -654,20 +628,30 @@ class VoicePipeline:
 
             try:
                 latency_start = time.monotonic()
-                # STT always auto-detects. Forcing a language here was the
-                # root cause of broken mid-call switching: when locked to
-                # Hindi, English audio was transcribed as Devanagari junk,
-                # so the language-switch intent never matched. Output language
-                # is governed by the conversation engine, not STT input.
+                # Issue 1: when language is locked to Hindi or Gujarati, pass
+                # that code to Sarvam. Auto-detect ("unknown") sometimes misfires
+                # on telephony audio, returning Bengali/Punjabi/Malayalam which
+                # the unsupported-script filter then rejects, causing false
+                # "couldn't hear you" responses.
+                # English stays on "unknown" — English speakers often code-switch
+                # and Sarvam handles bilingual audio well with auto-detect.
+                # Pre-lock (GREETING stage) also uses "unknown" to allow the
+                # first-turn language to be detected freely.
+                _stt_lang = "unknown"
+                if self.conversation:
+                    _st = self.conversation.state
+                    if _st.language_locked and _st.language in ("hi", "gu"):
+                        _stt_lang = _st.language
                 logger.info(
                     "[STT-WORKER] Submitting segment: %.0fms audio (%d bytes) "
-                    "queued %.0fms ago",
+                    "queued %.0fms ago lang=%s",
                     segment.duration_ms,
                     len(segment.audio),
                     (time.monotonic() - segment.timestamp) * 1000,
+                    _stt_lang,
                 )
                 transcript_text = await self.stt.transcribe(
-                    segment.audio, sample_rate=SAMPLE_RATE, language="unknown",
+                    segment.audio, sample_rate=SAMPLE_RATE, language=_stt_lang,
                 )
                 stt_latency = (time.monotonic() - latency_start) * 1000
 
@@ -766,20 +750,12 @@ class VoicePipeline:
                 break
 
             try:
-                # Start keyboard-click sound immediately so the caller hears
-                # something while the LLM processes their message.
-                kb_stop = asyncio.Event()
-                kb_task = asyncio.create_task(
-                    self._play_keyboard_loop(kb_stop), name="keyboard_sound"
-                )
-
                 async def _run_generation():
 
                     latency_start = time.monotonic()
 
                     first_result = None
                     first_chunk_ms = 0.0
-                    first_chunk_sent = False
 
                     full_text_parts: list[str] = []
 
@@ -794,13 +770,6 @@ class VoicePipeline:
                             first_chunk_ms = (
                                 time.monotonic() - latency_start
                             ) * 1000
-
-                        # Stop keyboard sound on the very first response chunk
-                        # (whether a filler or real answer) so audio doesn't
-                        # overlap with the agent's spoken reply.
-                        if not first_chunk_sent:
-                            kb_stop.set()
-                            first_chunk_sent = True
 
                         full_text_parts.append(result.text)
 
@@ -819,9 +788,6 @@ class VoicePipeline:
                             logger.warning(
                                 "[ENGINE] TTS queue full -- dropping chunk"
                             )
-
-                    # Safety: ensure keyboard is stopped even if no chunks
-                    kb_stop.set()
 
                     engine_latency = (
                         time.monotonic() - latency_start
@@ -857,13 +823,7 @@ class VoicePipeline:
                     _run_generation()
                 )
 
-                try:
-                    await self._current_generation_task
-                finally:
-                    # Always stop keyboard, even on cancellation or exception
-                    kb_stop.set()
-                    if not kb_task.done():
-                        kb_task.cancel()
+                await self._current_generation_task
 
             except asyncio.CancelledError:
 
@@ -872,7 +832,7 @@ class VoicePipeline:
             except Exception:
 
                 logger.exception("[ENGINE] Processing failed")
-                
+
                 try:
                     self._tts_queue.put_nowait(Response(
                         text="Sorry, could you say that again?",
@@ -883,34 +843,6 @@ class VoicePipeline:
                     pass
 
         logger.info("[ENGINE] Layer stopped")
-
-    # -----------------------------------------------------------------------
-    # Keyboard sound — plays while the LLM is thinking
-    # -----------------------------------------------------------------------
-
-    async def _play_keyboard_loop(self, stop: asyncio.Event) -> None:
-        """Write keyboard-click PCM frames to the audio sink until stop is set.
-
-        Loops the pre-generated burst so the caller hears continuous typing
-        during LLM processing.  Stops within one frame (~20 ms) of stop being
-        set, so there is no audible overlap with the agent's spoken response.
-        """
-        sound = _generate_keyboard_sound(SAMPLE_RATE)
-        frame_size = SAMPLES_PER_FRAME * 2   # int16 = 2 bytes per sample
-        try:
-            while not stop.is_set():
-                for offset in range(0, len(sound), frame_size):
-                    if stop.is_set():
-                        return
-                    frame = sound[offset : offset + frame_size]
-                    if len(frame) < frame_size:
-                        frame = frame + b"\x00" * (frame_size - len(frame))
-                    await self.sink.write_frame(frame)
-                    await asyncio.sleep(0)  # yield to event loop
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.debug("[KEYBOARD] Sound error — skipping")
 
     # -----------------------------------------------------------------------
     # Layer 4: TTS Playback

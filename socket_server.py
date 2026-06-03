@@ -2315,10 +2315,12 @@ def handle(conn: socket.socket, addr) -> None:
         # reordering broke the validated playback path. The legacy
         # checkpoint (T4_playback_execute) is the canonical signal.
         playback_executed = "T4_playback_execute" in cp
-        playback_played = (
-            playback_executed
-            and "FILE PLAYED" in (last_execute_app_resp or "").upper()
-        )
+        # Issue 6: FreeSWITCH URL-encodes Application-Response values
+        # (e.g. "FILE%20PLAYED"). URL-decode before checking so the
+        # PHASE-5 REGRESSION SUSPECTED log is not a false alarm.
+        from urllib.parse import unquote as _unquote
+        _resp_decoded = _unquote(last_execute_app_resp or "").upper()
+        playback_played = playback_executed and "FILE PLAYED" in _resp_decoded
         if not playback_executed:
             log.critical(
                 "PHASE-5 REGRESSION: no CHANNEL_EXECUTE for "

@@ -1061,6 +1061,13 @@ class ConversationRouter:
             elif any(kw in lower or kw in text for kw in self_use_kw):
                 self.state.purpose = "self_use"
 
+        # ── Budget extraction ─────────────────────────────────────────────
+        if not self.memory.booking.budget:
+            budget = self._extract_budget(text)
+            if budget:
+                self.memory.booking.budget = budget
+                logger.info("[DISCOVERY] Budget extracted: %s", budget)
+
         # ── Project detection (persistent context lock) ──────────────────
         if not cs.selected_project:
             proj_result = self._extract_project_from_text(text)
@@ -1211,6 +1218,27 @@ class ConversationRouter:
         if b.appointment_date and not cs.appointment_date:
             cs.appointment_date = b.appointment_date
 
+        # Property type (BHK)
+        if b.property_type and not cs.property_type:
+            cs.property_type = b.property_type
+            logger.info("[STATE_UPDATE] property_type=%r (from booking)", cs.property_type)
+        elif cs.property_type and not b.property_type:
+            b.property_type = cs.property_type
+
+        # Purpose
+        if self.state.purpose and not cs.purpose:
+            cs.purpose = self.state.purpose
+            logger.info("[STATE_UPDATE] purpose=%r (from state)", cs.purpose)
+        elif cs.purpose and not self.state.purpose:
+            self.state.purpose = cs.purpose
+
+        # Budget
+        if b.budget and not cs.budget:
+            cs.budget = b.budget
+            logger.info("[STATE_UPDATE] budget=%r (from booking)", cs.budget)
+        elif cs.budget and not b.budget:
+            b.budget = cs.budget
+
         # Language + Stage always mirror live state
         cs.language = self.state.language
         cs.conversation_stage = self.state.stage
@@ -1270,6 +1298,29 @@ class ConversationRouter:
     # ------------------------------------------------------------------
     # Data extraction helpers
     # ------------------------------------------------------------------
+
+    def _extract_budget(self, text: str) -> str | None:
+        """Extract budget range from user input (lakh/crore amounts)."""
+        lower = text.lower()
+        # Crore patterns: "1 crore", "1.5 crore", "डेढ़ करोड़", etc.
+        m = re.search(r"(\d+(?:\.\d+)?)\s*(?:crore|cr\.?|करोड़|karod|cr\b)", lower)
+        if m:
+            return f"{m.group(1)} crore"
+        # Lakh patterns: "70 lakh", "50-60 lakh", "70L", etc.
+        m = re.search(r"(\d+(?:\.\d+)?)\s*(?:lakh|lac|l\b|लाख|lakh)", lower)
+        if m:
+            return f"{m.group(1)} lakh"
+        # Range: "50 to 70 lakh"
+        m = re.search(r"(\d+)\s*(?:to|-)\s*(\d+)\s*(?:lakh|lac|l\b|लाख)", lower)
+        if m:
+            return f"{m.group(1)}-{m.group(2)} lakh"
+        # Gujarati/Hindi script numbers with lakh
+        if "લાખ" in text or "करोड़" in text:
+            m = re.search(r"(\d+(?:\.\d+)?)\s*(?:લાખ|करोड़)", text)
+            if m:
+                unit = "lakh" if "લાખ" in text else "crore"
+                return f"{m.group(1)} {unit}"
+        return None
 
     def _extract_location(self, text: str) -> str | None:
         loc = match_location(text)
@@ -1741,6 +1792,8 @@ class ConversationRouter:
             collected_lines.append(f"Location interest: {b.location}")
         if b.property_type:
             collected_lines.append(f"Configuration: {b.property_type}")
+        if b.budget:
+            collected_lines.append(f"Budget: {b.budget}")
         if self.state.project_recommended:
             collected_lines.append(f"Project discussed: {self.state.project_recommended}")
         if b.appointment_time:
@@ -1760,6 +1813,7 @@ class ConversationRouter:
         cs = self.memory.call_state
 
         # Build "already collected — do not re-ask" list
+        # Issues 7 & 8: include ALL collected fields so the LLM never re-asks.
         dont_reask: list[str] = []
         if cs.customer_name:
             dont_reask.append(f"caller's name ({cs.customer_name})")
@@ -1769,6 +1823,12 @@ class ConversationRouter:
             dont_reask.append(f"which property ({cs.selected_project})")
         if cs.selected_location:
             dont_reask.append(f"city/location ({cs.selected_location})")
+        if cs.property_type or b.property_type:
+            dont_reask.append(f"property size/configuration ({cs.property_type or b.property_type})")
+        if cs.purpose or self.state.purpose:
+            dont_reask.append(f"purpose ({cs.purpose or self.state.purpose})")
+        if cs.budget or b.budget:
+            dont_reask.append(f"budget ({cs.budget or b.budget})")
         if cs.appointment_time:
             dont_reask.append(f"visit time ({cs.appointment_time})")
 
@@ -1799,6 +1859,9 @@ class ConversationRouter:
             f"  customer_phone       : {'captured (stored internally)' if cs.customer_phone else '(not yet captured)'}",
             f"  selected_project     : {cs.selected_project or '(none yet)'}",
             f"  selected_location    : {cs.selected_location or '(none yet)'}",
+            f"  property_type        : {cs.property_type or '(none yet)'}",
+            f"  purpose              : {cs.purpose or '(none yet)'}",
+            f"  budget               : {cs.budget or '(none yet)'}",
             f"  site_visit_requested : {cs.site_visit_requested}",
             f"  appointment_time     : {cs.appointment_time or '(none yet)'}",
             f"  booking_validated    : {cs.booking_validated}",

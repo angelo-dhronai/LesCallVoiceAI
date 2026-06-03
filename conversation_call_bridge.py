@@ -27,20 +27,22 @@ PLAYBACK_PORT = 9004
 
 class TelephonySession:
     """Manages one AI pipeline per phone call."""
-    def __init__(self, conn_id: str, sample_rate: int, caller_number: str = ""):
+    def __init__(self, conn_id: str, sample_rate: int, caller_number: str = "",
+                 skip_greeting: bool = False):
         self.conn_id = conn_id
         self.sample_rate = sample_rate
         self.caller_number = caller_number
         self.source = TelephonySource(sample_rate=sample_rate)
         self.sink = TelephonySink(sample_rate=sample_rate, conn_id=conn_id)
         self.hub = EventHub()
-        
+
         # Initialize VoicePipeline with telephony endpoints
         self.pipeline = VoicePipeline(
             audio_source=self.source,
             audio_sink=self.sink,
             event_hub=self.hub,
-            mic_enabled=True  # Ensure it's enabled to listen
+            mic_enabled=True,
+            skip_greeting=skip_greeting,
         )
         self.pipeline_task = None
         self.playback_task = None
@@ -254,13 +256,43 @@ class TelephonySession:
 
 class SessionManager:
     """Manages all active telephony sessions."""
+
+    # Issue 3 & 4: process-level registry of greeted calls.
+    # Prevents duplicate greetings when FreeSWITCH reconnects the WebSocket
+    # for the same call (e.g., transient network glitch). TTL of 5 minutes
+    # covers any realistic reconnect window; entries older than that are
+    # considered a genuinely new call that should get a fresh greeting.
+    _greeted: Dict[str, float] = {}
+    _GREETING_TTL_S: float = 300.0
+
     def __init__(self):
         self.sessions: Dict[str, TelephonySession] = {}
 
     async def get_or_create(self, conn_id: str, sample_rate: int, caller_number: str = "") -> TelephonySession:
         if conn_id not in self.sessions:
-            session = TelephonySession(conn_id, sample_rate, caller_number=caller_number)
+            now = time.time()
+            # Prune stale greeted entries to avoid unbounded growth
+            expired = [k for k, ts in SessionManager._greeted.items()
+                       if now - ts > SessionManager._GREETING_TTL_S]
+            for k in expired:
+                del SessionManager._greeted[k]
+
+            # Skip greeting if this conn_id was already greeted recently
+            skip_greeting = (
+                conn_id in SessionManager._greeted
+                and now - SessionManager._greeted[conn_id] < SessionManager._GREETING_TTL_S
+            )
+            if skip_greeting:
+                logger.info("[BRIDGE] Reconnect detected for conn_id=%s — greeting suppressed", conn_id)
+
+            session = TelephonySession(conn_id, sample_rate, caller_number=caller_number,
+                                       skip_greeting=skip_greeting)
             self.sessions[conn_id] = session
+
+            # Mark as greeted on first creation (before start so no race)
+            if not skip_greeting:
+                SessionManager._greeted[conn_id] = now
+
             await session.start()
         return self.sessions[conn_id]
 

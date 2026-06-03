@@ -47,6 +47,7 @@ class BookingData:
     project: str | None = None              # caller-named Pramukh project
     property_status: str | None = None      # "ready_made" / "under_construction"
     transaction_type: str | None = None     # "rent" / "buy"
+    budget: str | None = None              # caller's stated budget (e.g. "70 lakh")
 
     def summary(self) -> str:
         parts = []
@@ -62,6 +63,8 @@ class BookingData:
             parts.append(f"Location: {self.location}")
         if self.property_type:
             parts.append(f"Type: {self.property_type}")
+        if self.budget:
+            parts.append(f"Budget: {self.budget}")
         if self.appointment_date:
             parts.append(f"Date: {self.appointment_date}")
         if self.appointment_time:
@@ -95,6 +98,9 @@ class CallState:
     customer_phone: str | None = None       # stored internally; never read back verbatim
     selected_project: str | None = None     # first confirmed project; locked for session
     selected_location: str | None = None    # Surat / Vapi / Silvassa
+    property_type: str | None = None        # "2 BHK", "3 BHK", etc.
+    purpose: str | None = None              # "self_use" / "investment"
+    budget: str | None = None              # caller's stated budget
     site_visit_requested: bool = False
     appointment_date: str | None = None
     appointment_time: str | None = None

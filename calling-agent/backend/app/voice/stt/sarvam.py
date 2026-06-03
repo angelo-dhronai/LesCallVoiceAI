@@ -2,7 +2,7 @@
 Sarvam AI Speech-to-Text provider.
 
 Uses the Sarvam REST API with multipart WAV upload.
-Requires SARVAMAI_API_KEY environment variable.
+Requires SARVAM_API_KEY environment variable.
 """
 
 from __future__ import annotations
@@ -52,14 +52,17 @@ class SarvamSTT(STTProvider):
         timeout: float = SARVAM_TIMEOUT,
         model: str = "saarika:v2.5",
     ) -> None:
-        self._api_key = api_key or os.environ.get("SARVAMAI_API_KEY", "")
+        self._api_key = api_key or os.environ.get("SARVAM_API_KEY", "")
         self._api_url = api_url
         self._timeout = timeout
         self._model = model
         self._client: httpx.AsyncClient | None = None
 
         if not self._api_key:
-            logger.warning("[STT:Sarvam] SARVAMAI_API_KEY not set — calls will fail")
+            logger.warning("[STT:Sarvam] SARVAM_API_KEY not set — calls will fail")
+        else:
+            masked = self._api_key[:6] + "…" + self._api_key[-4:]
+            logger.info("[STT:Sarvam] API key loaded: %s", masked)
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:

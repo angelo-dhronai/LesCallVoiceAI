@@ -4,7 +4,22 @@ load_dotenv()
 
 import asyncio
 import logging
+import os
 import sys
+
+
+def _validate_env() -> None:
+    """Fail fast if required API keys are missing. Logs a masked key on success."""
+    key = os.environ.get("SARVAM_API_KEY", "").strip()
+    if not key:
+        print(
+            "FATAL: SARVAM_API_KEY is not set. "
+            "Add it to calling-agent/.env and restart.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    masked = key[:6] + "…" + key[-4:]
+    print(f"[startup] SARVAM_API_KEY loaded: {masked}", flush=True)
 
 
 def main() -> None:
@@ -13,6 +28,8 @@ def main() -> None:
         format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    _validate_env()
 
     if "--test" in sys.argv:
         from app.voice.main_loop import _run_test

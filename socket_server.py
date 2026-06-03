@@ -314,6 +314,7 @@ import json
 import struct
 import wave
 import contextlib
+import urllib.parse
 
 HOST = "0.0.0.0"
 PORT = 9000
@@ -1965,7 +1966,7 @@ def handle(conn: socket.socket, addr) -> None:
                 counters["events_total"] += 1
                 app = body_field(body, "Application")
                 app_data = body_field(body, "Application-Data")
-                app_resp = body_field(body, "Application-Response")
+                app_resp = urllib.parse.unquote(body_field(body, "Application-Response"))
 
                 if ev == "CHANNEL_ANSWER":
                     log.info("[%s] [CHANNEL STATE] CHANNEL_ANSWER received at +%.3fs", registered_uuid, now)

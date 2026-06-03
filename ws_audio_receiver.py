@@ -98,7 +98,10 @@ class _Phase15AudioDebugger:
 
         if not self.raw_fp:
 
-            self.raw_fp = open(self.raw_path, "wb")
+            try:
+                self.raw_fp = open(self.raw_path, "wb")
+            except PermissionError:
+                return
 
         self.raw_fp.write(data)
 

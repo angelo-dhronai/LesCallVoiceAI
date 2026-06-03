@@ -37,11 +37,16 @@ class BookingData:
     project: str | None = None              # caller-named Pramukh project
     property_status: str | None = None      # "ready_made" / "under_construction"
     transaction_type: str | None = None     # "rent" / "buy"
+    budget: str | None = None              # e.g. "80 lakh", "1 crore"
+    phone: str | None = None               # 10-digit Indian mobile
+    timeline: str | None = None            # "immediately", "3 months", "6 months", "1 year"
 
     def summary(self) -> str:
         parts = []
         if self.user_name:
             parts.append(f"Name: {self.user_name}")
+        if self.phone:
+            parts.append(f"Phone: {self.phone}")
         if self.project:
             parts.append(f"Project: {self.project}")
         if self.property_status:
@@ -52,6 +57,10 @@ class BookingData:
             parts.append(f"Location: {self.location}")
         if self.property_type:
             parts.append(f"Type: {self.property_type}")
+        if self.timeline:
+            parts.append(f"Timeline: {self.timeline}")
+        if self.budget:
+            parts.append(f"Budget: {self.budget}")
         if self.appointment_date:
             parts.append(f"Date: {self.appointment_date}")
         if self.appointment_time:

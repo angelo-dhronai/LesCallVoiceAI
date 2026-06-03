@@ -16,6 +16,7 @@ from backend.app.voice.pipeline import VoicePipeline
 from backend.app.voice.event_hub import EventHub
 from backend.app.audio_transport.telephony_source import TelephonySource
 from backend.app.audio_transport.telephony_sink import TelephonySink
+from backend.app.agent.brain import VoiceAgent
 
 logger = logging.getLogger("call_bridge")
 
@@ -33,12 +34,16 @@ class TelephonySession:
         self.sink = TelephonySink(sample_rate=sample_rate, conn_id=conn_id)
         self.hub = EventHub()
         
+        # One VoiceAgent per call — stateful across all turns for this caller
+        self.agent = VoiceAgent()
+
         # Initialize VoicePipeline with telephony endpoints
         self.pipeline = VoicePipeline(
             audio_source=self.source,
             audio_sink=self.sink,
             event_hub=self.hub,
-            mic_enabled=True  # Ensure it's enabled to listen
+            conversation=self.agent,
+            mic_enabled=True,
         )
         self.pipeline_task = None
         self.playback_task = None
@@ -238,25 +243,65 @@ class TelephonySession:
 
 
 class SessionManager:
-    """Manages all active telephony sessions."""
+    """
+    Manages all active telephony sessions.
+
+    One session = one phone call. FreeSWITCH sometimes opens multiple
+    WebSocket connections for the same underlying call (different channels,
+    reconnects, or leg-B). We use the FreeSWITCH Call-UUID (conn_id) to
+    deduplicate. If conn_id is unknown (random fallback), we still create
+    the session but only if no other session is currently active — this
+    prevents a second greeting from firing when FS reconnects.
+
+    Primary vs alias: the first conn_id to create a session is "primary"
+    and owns it (session.stop() fires when it disconnects). Subsequent
+    conn_ids that arrive while a primary is active become aliases — they
+    share the session for audio/signal routing but do NOT stop it on disconnect.
+    """
+
     def __init__(self):
         self.sessions: Dict[str, TelephonySession] = {}
+        self._primary_ids: set = set()
+
+    @property
+    def has_active_session(self) -> bool:
+        return bool(self._primary_ids)
 
     async def get_or_create(self, conn_id: str, sample_rate: int, caller_number: str = "") -> TelephonySession:
-        if conn_id not in self.sessions:
-            session = TelephonySession(conn_id, sample_rate, caller_number=caller_number)
-            self.sessions[conn_id] = session
-            await session.start()
-        return self.sessions[conn_id]
+        if conn_id in self.sessions:
+            return self.sessions[conn_id]
+
+        if self.has_active_session:
+            # Another session is already running — alias this conn_id to it so
+            # audio and signal_call_active routing works, but don't start a new pipeline.
+            existing_primary = next(iter(self._primary_ids))
+            existing_session = self.sessions[existing_primary]
+            logger.warning(
+                "[SESSION_DEDUP] New conn_id=%s arrived while session=%s is active — reusing existing",
+                conn_id, existing_primary,
+            )
+            self.sessions[conn_id] = existing_session
+            return existing_session
+
+        session = TelephonySession(conn_id, sample_rate, caller_number=caller_number)
+        self.sessions[conn_id] = session
+        self._primary_ids.add(conn_id)
+        await session.start()
+        return session
 
     def push_audio(self, conn_id: str, pcm: bytes):
         if conn_id in self.sessions:
             self.sessions[conn_id].push_audio(pcm)
 
     async def remove(self, conn_id: str):
-        if conn_id in self.sessions:
-            session = self.sessions.pop(conn_id)
+        if conn_id not in self.sessions:
+            return
+        session = self.sessions.pop(conn_id)
+        if conn_id in self._primary_ids:
+            # Primary disconnected — stop the session
+            self._primary_ids.discard(conn_id)
             await session.stop()
+        # Alias: just remove the mapping; primary still owns the session lifecycle
 
 # Global registry
 call_bridge = SessionManager()

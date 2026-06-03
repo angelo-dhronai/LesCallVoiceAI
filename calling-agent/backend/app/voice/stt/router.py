@@ -80,31 +80,25 @@ _GARBAGE_SCRIPT_TOKENS = {
     "અ", "આ", "ઓ", "હા", "ના",
 }
 
-# Unicode blocks the agent SUPPORTS: Latin (en), Devanagari (hi), Gujarati (gu).
-# Everything else is a Sarvam auto-detect mis-fire on noisy/short audio.
-# Supported languages: English, Hindi, Gujarati ONLY.
-# Malayalam, Tamil, Telugu, Kannada, Bengali, Korean, Arabic, etc. are all
-# rejected here — they are never valid caller input for this agent.
+# Transcripts in these scripts are passed through to the LLM.
+# The LLM responds in Hindi when it sees an unsupported Indian language.
+# Only block scripts that are pure Sarvam noise hallucinations (non-Indian):
+#   Korean, Chinese, Japanese, Arabic, Myanmar, Tibetan, Sinhala.
+# Indian language scripts (Punjabi, Kannada, Tamil, etc.) are valid caller
+# input — Sarvam transcribes them correctly and the LLM can handle them.
 _UNSUPPORTED_SCRIPT_RE = re.compile(
     r"["
-    r"ঀ-৿"           # Bengali / Assamese
-    r"਀-੿"           # Gurmukhi (Punjabi)
-    r"଀-୿"           # Oriya (Odia)
-    r"஀-௿"           # Tamil
-    r"ఀ-౿"           # Telugu
-    r"ಀ-೿"           # Kannada
-    r"ഀ-ൿ"           # Malayalam
-    r"඀-෿"           # Sinhala
     r"؀-ۿ"           # Arabic
     r"ༀ-࿿"           # Tibetan
     r"က-႟"           # Myanmar
-    r"ᄀ-ᇿ"  # Hangul Jamo (Korean)
-    r"가-힣"  # Hangul Syllables (Korean)
-    r"㄰-㆏"  # Hangul Compatibility Jamo (Korean)
-    r"ꥠ-꥿"  # Hangul Jamo Extended-A (Korean)
-    r"ힰ-퟿"  # Hangul Jamo Extended-B (Korean)
-    r"぀-ヿ"  # Hiragana / Katakana (Japanese)
-    r"一-鿿"  # CJK Unified Ideographs (Chinese/Japanese)
+    r"඀-෿"           # Sinhala
+    r"ᄀ-ᇿ"           # Hangul Jamo (Korean)
+    r"가-힣"           # Hangul Syllables (Korean)
+    r"㄰-㆏"           # Hangul Compatibility Jamo (Korean)
+    r"ꥠ-꥿"           # Hangul Jamo Extended-A (Korean)
+    r"ힰ-퟿"           # Hangul Jamo Extended-B (Korean)
+    r"぀-ヿ"           # Hiragana / Katakana (Japanese)
+    r"一-鿿"           # CJK Unified Ideographs (Chinese/Japanese)
     r"]"
 )
 
@@ -132,9 +126,10 @@ def validate_transcript(text: str) -> str:
         logger.info("[STT-FILTER] reason=too_short text=%r", text)
         return ""
 
-    # Unsupported-script filter — Sarvam's auto-detect sometimes transcribes
-    # noisy/short audio into Korean, Malayalam, Tamil, etc. which are never
-    # valid user input. Reject immediately.
+    # Block non-Indian scripts that are pure Sarvam noise hallucinations
+    # (Korean, Chinese, Japanese, Arabic, etc.). Indian language scripts
+    # (Punjabi, Kannada, Tamil, Bengali, etc.) are allowed through — the
+    # LLM reads them and responds in Hindi per its language instructions.
     if _UNSUPPORTED_SCRIPT_RE.search(text):
         logger.info("[STT-FILTER] reason=unsupported_script text=%r", text)
         return ""

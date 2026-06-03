@@ -27,9 +27,8 @@ from .stt.router import STTRouter
 from .tts_stream import StreamingTTS, MockStreamingTTS
 from .tts_sarvam import SarvamTTS
 from .turn_manager import TurnManager, TurnManagerConfig
-from .conversation import ConversationRouter
-from .memory import ConversationMemory
 from .event_hub import EventHub
+from ..agent.brain import VoiceAgent
 
 from ..audio_transport.base import AudioSource, AudioSink
 from ..audio_transport.local_mic_source import LocalMicSource
@@ -105,6 +104,17 @@ SPEECH_HOLD_MIN_FRAMES = 10
 HARD_FLUSH_SILENCE_FRAMES = 30
 
 
+def _detect_tts_language(text: str) -> str:
+    """Detect language from script for Sarvam TTS voice selection."""
+    for ch in text:
+        cp = ord(ch)
+        if 0x0A80 <= cp <= 0x0AFF:   # Gujarati block
+            return "gu"
+        if 0x0900 <= cp <= 0x097F:   # Devanagari block (Hindi)
+            return "hi"
+    return "en"
+
+
 def _generate_keyboard_sound(sample_rate: int = 16000) -> bytes:
     """Generate a burst of keyboard typing clicks (PCM16 mono).
 
@@ -153,7 +163,7 @@ class VoicePipeline:
         vad: VoiceActivityDetector | None = None,
         stt: STTRouter | None = None,
         tts: StreamingTTS | None = None,
-        conversation: ConversationRouter | None = None,
+        conversation: VoiceAgent | None = None,
         event_hub: EventHub | None = None,
         mic_enabled: bool = True,
     ) -> None:
@@ -171,7 +181,7 @@ class VoicePipeline:
         self.vad = vad
         
         self.stt = stt or STTRouter()
-        self.conversation = conversation or ConversationRouter()
+        self.conversation = conversation or VoiceAgent()
         self._hub = event_hub
 
         # TTS uses the sink
@@ -792,15 +802,6 @@ class VoicePipeline:
             except Exception:
 
                 logger.exception("[ENGINE] Processing failed")
-                
-                try:
-                    self._tts_queue.put_nowait(Response(
-                        text="Sorry, could you say that again?",
-                        is_shortcut=True,
-                        timestamp=time.monotonic(),
-                    ))
-                except asyncio.QueueFull:
-                    pass
 
         logger.info("[ENGINE] Layer stopped")
 
@@ -884,8 +885,8 @@ class VoicePipeline:
                 self._tts_playing = True
                 self._tts_start_time = time.monotonic()
 
-                if hasattr(self.tts, 'set_language') and self.conversation:
-                    self.tts.set_language(self.conversation.state.language)
+                if hasattr(self.tts, 'set_language'):
+                    self.tts.set_language(_detect_tts_language(response.text))
 
                 await self.tts.speak(response.text)
 

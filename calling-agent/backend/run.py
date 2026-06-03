@@ -22,7 +22,7 @@ def main() -> None:
         asyncio.run(_run())
     else:
         from app.voice.pipeline import VoicePipeline
-        from app.voice.conversation import ConversationRouter
+        from app.agent.brain import VoiceAgent
 
         web_enabled = "--web" in sys.argv
 
@@ -33,7 +33,7 @@ def main() -> None:
                 hub = EventHub()
 
             pipeline = VoicePipeline(
-                conversation=ConversationRouter(),
+                conversation=VoiceAgent(),
                 event_hub=hub,
                 mic_enabled=not web_enabled,  # web UI gates mic; CLI mode keeps it on
             )

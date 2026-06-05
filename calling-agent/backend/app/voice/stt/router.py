@@ -22,8 +22,9 @@ import time
 import logging
 from collections import Counter
 
-from .base import STTProvider, STTResult
+from .base import STTProvider, STTResult  # noqa: F401 — re-exported for pipeline
 from .sarvam import SarvamSTT, SarvamRateLimitError
+from .sarvam_ws import SarvamWSSTT
 from .openai_whisper import OpenAIWhisperSTT
 from .post_processor import post_process_transcript
 
@@ -67,18 +68,82 @@ _REPETITION_THRESHOLD = 0.6
 _REPEATED_CHAR_RE = re.compile(r"^(.{1,3}[- ]?)\1{2,}[-]?$")
 
 _GARBAGE_SINGLE_WORDS = {
-    "shoe", "care", "shoes", "show", "sure",
-    # Common single-word noise transcriptions Sarvam emits on near-silence
+    "shoe", "care", "shoes", "show",
+    # Confirmed noise-only transcriptions on near-silence — these words have no
+    # conversational meaning as a standalone response.  "sure", "yeah", "oh",
+    # "well" are NOT included because callers legitimately respond with a single
+    # word affirmation/reaction.
     "the", "a", "an", "is", "it", "to", "of", "huh", "hmm", "uh", "um",
-    "ah", "oh", "you", "yeah", "well",
+    "ah",
 }
 
-# Single Devanagari/Gujarati tokens that frequently surface as STT garbage on
-# noise/breath/clicks.
+# Single Devanagari/Gujarati tokens that surface as STT garbage on noise/breath/clicks.
+# INTENTIONALLY narrow: "हा" (yes), "ना"/"ना" (no), "ओके"/"ઓ કે" (OK) are valid
+# single-word responses and are NOT included.  Only pure phoneme/vowel artifacts
+# with zero conversational meaning are blocked here.
 _GARBAGE_SCRIPT_TOKENS = {
-    "अ", "आ", "ओ", "ओके", "हा", "ना", "न", "ह", "ओ के",
-    "અ", "આ", "ઓ", "હા", "ના",
+    "अ", "आ", "ओ", "न", "ह",   # Devanagari single-consonant/vowel noise
+    "અ", "આ", "ઓ",              # Gujarati single-vowel noise
 }
+
+# ---------------------------------------------------------------------------
+# Transcript quality scoring — rejects function-word-only fragments
+# ---------------------------------------------------------------------------
+# Pure connective/particle words in Hindi and Gujarati that have zero
+# semantic content when they appear ALONE.  Verbs, nouns, pronouns,
+# question words, and copulas are deliberately excluded — e.g. "hai"
+# (is), "che" / "cho" (are), "kem" (how), "ji" (yes/sir) all carry
+# meaning and must NOT be flagged.  The sets are intentionally narrow so
+# valid short utterances (greetings, short answers) are never rejected.
+_HINDI_FUNC_QUALITY = frozenset({
+    # Conjunctions
+    "और", "या", "लेकिन", "परंतु", "मगर", "तथा", "व", "अथवा",
+    "इसलिए", "क्योंकि",
+    # Particles / connectors
+    "जैसे", "कि", "भी", "तो", "ही", "बस", "जैसा", "सिर्फ",
+})
+
+_GUJARATI_FUNC_QUALITY = frozenset({
+    # Conjunctions
+    "અને", "અથવા", "પણ", "જ", "ત્યારે",
+    "જ્યારે", "કારણ", "જો", "તેથી",
+    # Relative pronoun / particles
+    "જે", "તો",
+})
+
+_QUALITY_THRESHOLD = 0.3  # reject if quality score is below this
+
+
+def _score_transcript_quality(text: str) -> float:
+    """
+    Score 0.0 (garbage) → 1.0 (good).
+
+    Short phrases composed entirely or mostly of function words / connectors
+    are almost certainly STT noise or auto-detect misfires.  Longer
+    transcripts are penalised proportionally but rarely rejected outright.
+    """
+    # Strip trailing punctuation from each token before checking membership
+    words = [w.strip("।?!.,।") for w in text.strip().split()]
+    words = [w for w in words if w]
+    if not words:
+        return 0.0
+
+    func_count = sum(
+        1 for w in words
+        if w in _HINDI_FUNC_QUALITY or w in _GUJARATI_FUNC_QUALITY
+    )
+    ratio = func_count / len(words)
+
+    # Short phrases (≤3 words) are very suspicious when ≥60 % function words
+    if len(words) <= 3 and ratio >= 0.6:
+        return max(0.0, 0.3 - ratio)   # 0.6→-0.3 → 0.0,  1.0→-0.7 → 0.0
+
+    # Medium phrases (4-5 words) need ≥80 % to trigger rejection
+    if len(words) <= 5 and ratio >= 0.8:
+        return 0.1
+
+    # Partial penalty for high function-word density in longer phrases
+    return max(0.3, 1.0 - ratio * 0.4)
 
 # Marathi uses Devanagari (shared with Hindi) so the unsupported-script regex
 # cannot catch it. Sarvam auto-detect sometimes transcribes Gujarati/Hindi speech
@@ -212,6 +277,15 @@ def validate_transcript(text: str) -> str:
         logger.info("[STT-FILTER] reason=garbage_script_token text=%r", text)
         return ""
 
+    # Quality scoring: reject function-word-only short fragments.
+    # Uses the ORIGINAL text so Devanagari/Gujarati characters are intact.
+    # Applied after all other filters to minimise false-positive rejections
+    # on valid short utterances (greetings, single-word answers).
+    quality = _score_transcript_quality(text)
+    if quality < _QUALITY_THRESHOLD:
+        logger.info("[STT-FILTER] reason=low_quality score=%.2f text=%r", quality, text)
+        return ""
+
     return cleaned
 
 
@@ -242,7 +316,7 @@ class STTRouter:
         max_retries: int = MAX_RETRIES,
         min_confidence: float = MIN_CONFIDENCE,
     ) -> None:
-        self._primary = primary or SarvamSTT()
+        self._primary = primary or SarvamWSSTT()
         self._fallback = fallback or OpenAIWhisperSTT()
         self._min_length = min_length
         self._max_retries = max_retries
@@ -261,7 +335,7 @@ class STTRouter:
         audio_bytes: bytes,
         sample_rate: int = 16_000,
         language: str = "en",
-    ) -> str:
+    ) -> STTResult:
         duration_ms = len(audio_bytes) / (sample_rate * 2) * 1000
         logger.info("[STT] Audio segment: %.0f ms, %d bytes", duration_ms, len(audio_bytes))
 
@@ -274,14 +348,14 @@ class STTRouter:
                 "[STT] Sarvam rate-limited (%.0fs remaining) — routing to fallback",
                 remaining,
             )
-            text, _ = await self._try_provider(
+            text, _, _ = await self._try_provider(
                 self._fallback, "fallback", audio_bytes, sample_rate, language
             )
-            return text
+            return STTResult(text=text)
 
         # ── Try primary (Sarvam) ─────────────────────────────────────────
         try:
-            text, had_error = await self._try_provider(
+            text, had_error, detected_lang = await self._try_provider(
                 self._primary, "primary", audio_bytes, sample_rate, language
             )
         except SarvamRateLimitError as exc:
@@ -299,16 +373,16 @@ class STTRouter:
                 backoff,
                 exc.retry_after,
             )
-            text, _ = await self._try_provider(
+            text, _, _ = await self._try_provider(
                 self._fallback, "fallback", audio_bytes, sample_rate, language
             )
-            return text
+            return STTResult(text=text)
 
         if text:
             # Successful Sarvam call → reset rate-limit strike counter
             self._sarvam_rl_count = 0
             logger.info("[STT] Primary succeeded: %r", text)
-            return text
+            return STTResult(text=text, detected_language=detected_lang)
 
         if not had_error:
             # Sarvam processed the audio cleanly but found no speech.
@@ -317,18 +391,18 @@ class STTRouter:
             logger.info(
                 "[STT] Primary returned no speech (clean empty) — skipping fallback"
             )
-            return ""
+            return STTResult(text="")
 
         # ── Primary had a genuine API/network error → try fallback ───────
         logger.info("[STT] Primary errored — routing to fallback provider")
-        text, _ = await self._try_provider(
+        text, _, _ = await self._try_provider(
             self._fallback, "fallback", audio_bytes, sample_rate, language
         )
         if text:
             logger.info("[STT] Fallback succeeded: %r", text)
         else:
             logger.warning("[STT] Both providers failed — returning empty transcript")
-        return text
+        return STTResult(text=text)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -346,19 +420,22 @@ class STTRouter:
         audio_bytes: bytes,
         sample_rate: int,
         language: str,
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, bool, str | None]:
         """
         Attempt transcription with up to (max_retries + 1) attempts.
 
         Returns
         -------
-        (transcript, had_error)
+        (transcript, had_error, detected_language)
             transcript : str
                 Clean, post-processed text; empty string if nothing usable.
             had_error : bool
                 True if at least one attempt raised an exception (network /
                 HTTP error). False means the provider responded cleanly but
                 found no speech — the caller should NOT fall back in this case.
+            detected_language : str | None
+                BCP-47 language code returned by the provider (e.g. "gu-IN"),
+                or None if the provider did not report one.
         """
         had_error = False
 
@@ -369,6 +446,7 @@ class STTRouter:
                 )
                 text = result.text
                 confidence = result.confidence
+                detected_lang = result.detected_language
 
                 if confidence < self._min_confidence:
                     logger.info(
@@ -376,18 +454,14 @@ class STTRouter:
                         "provider=%s attempt=%d",
                         confidence, text, label, attempt,
                     )
-                    # Low confidence from the provider is treated as a clean
-                    # "no usable speech" result, not an error.
-                    return "", False
+                    return "", False, None
 
                 if len(text) < self._min_length:
                     logger.info(
                         "[STT] %s short/empty transcript %r (attempt %d) — no speech",
                         label, text, attempt,
                     )
-                    # Provider responded but found no speech → not an error,
-                    # return immediately without further retries.
-                    return "", False
+                    return "", False, None
 
                 validated = validate_transcript(text)
                 if validated:
@@ -396,17 +470,15 @@ class STTRouter:
                         "[STT] %s attempt %d: %r -> validated %r -> processed %r",
                         label, attempt, text, validated, processed,
                     )
-                    return processed, False
+                    return processed, False, detected_lang
 
                 logger.info(
                     "[STT] %s transcript %r rejected by validation (attempt %d)",
                     label, text, attempt,
                 )
-                # Rejected by validation — treated as clean empty, no retry benefit
-                return "", False
+                return "", False, None
 
             except SarvamRateLimitError:
-                # Re-raise immediately so the caller can handle backoff
                 raise
 
             except Exception as exc:
@@ -422,4 +494,4 @@ class STTRouter:
                     label, attempt + 1, self._max_retries + 1,
                 )
 
-        return "", had_error
+        return "", had_error, None

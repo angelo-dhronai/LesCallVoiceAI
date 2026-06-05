@@ -221,6 +221,35 @@ _PHONETIC_CORRECTIONS: dict[str, str] = {
     "kim cho": "kem cho",
     "game cho": "kem cho",
     "gem show": "kem cho",
+    # "kem cho" transcribed in Devanagari by Sarvam hi-IN model
+    # Sarvam renders /k-ɛ-m/ as गेम (game) and /tʃ-oʊ/ as छो
+    "गेम छो": "kem cho",
+    "गेम शो": "kem cho",
+    "गेम चो": "kem cho",
+    "केम छो": "kem cho",
+    "केम चो": "kem cho",
+    # "kem cho" with various Sarvam noise prefixes in Devanagari
+    "गे छो": "kem cho",
+    # "hu chu" / "hu chhu" (I am, Gujarati) in Devanagari via hi-IN model
+    "हु छू": "hu chu",
+    "हू छू": "hu chu",
+    "हु चू": "hu chu",
+    "तुम छो": "kem cho",   # hi-IN misread of "kem cho"
+    "और शायद": "kem cho", # hi-IN random output for short Gujarati greeting
+    # "shu che" / "shu chhe" (what is it, Gujarati) in Devanagari
+    "शु छे": "shu che",
+    "शु चे": "shu che",
+    "शू छे": "shu che",
+    "शू चे": "shu che",
+    # "maja ma" / "maja maa" (I'm fine, Gujarati) in Devanagari
+    "माजा मा": "maja ma",
+    "माजा मां": "maja ma",
+    # "mane property joiye che" variants from hi-IN model
+    "मने प्रॉपर्टी जोईए छे": "mane property joiye che",
+    "मने प्रोपर्टी जोईए छे": "mane property joiye che",
+    # "vapi ma 2 bhk joiye che" variants
+    "वापी मा 2 बीएचके जोईए छे": "vapi ma 2 bhk joiye che",
+    "सूरत मा 2 बीएचके जोईए छे": "surat ma 2 bhk joiye che",
     # "kaise ho" (how are you, Hindi) misheard
     "kaisa ho": "kaise ho",
     "kaisey ho": "kaise ho",
@@ -282,6 +311,37 @@ _REAL_ESTATE_CORRECTIONS: dict[str, str] = {
     "flat": "flat",
 }
 
+# Project name corrections — common STT misrecognitions of Pramukh Group project names.
+# Only high-confidence, unambiguous corrections included.
+_PROJECT_NAME_CORRECTIONS: dict[str, str] = {
+    # Aranya variants
+    "aranya 2": "aranya ii",
+    "aranya two": "aranya ii",
+    "aranya to": "aranya ii",
+    # Yogi Woods variants
+    "yogi wood": "yogi woods",
+    "yoga woods": "yogi woods",
+    "yogi weds": "yogi woods",
+    "yogiwoods": "yogi woods",
+    "yogi ward": "yogi woods",
+    # Satva variants (satwa is an alternate transliteration)
+    "satwa": "satva",
+    "saatva": "satva",
+    # Sahaj variants
+    "sahaj": "sahaj",  # pass-through — already correct, included for docstring clarity
+    # Sangath variants (sangath is not a common Hindi/Gujarati word in this context)
+    "sangat ": "sangath ",  # trailing space ensures we don't mangle "sangat" mid-word
+    # Vivanta variants
+    "vivant ": "vivanta ",
+    # Central Park variants
+    "central park": "central park",  # pass-through
+    # Orbit variants
+    "orbit series": "orbit series",  # pass-through
+    # Agastya variants
+    "agasthya": "agastya",
+    "agastya": "agastya",  # pass-through
+}
+
 # ---------------------------------------------------------------------------
 # Fuzzy location matching
 # ---------------------------------------------------------------------------
@@ -341,10 +401,13 @@ def post_process_transcript(text: str, language: str = "en") -> str:
     result = _normalize_bhk(result)
     result = _apply_corrections(result, _CITY_CORRECTIONS)
     result = _apply_corrections(result, _REAL_ESTATE_CORRECTIONS)
+    result = _apply_corrections(result, _PROJECT_NAME_CORRECTIONS)
 
-    if language in ("hi", "en"):
+    # "unknown" = first turn, language not yet locked — apply all Indic corrections
+    # so Gujarati/Hindi content is normalised regardless of detection order.
+    if language in ("hi", "en", "unknown"):
         result = _apply_corrections(result, _HINDI_CORRECTIONS)
-    if language in ("gu", "en"):
+    if language in ("gu", "en", "unknown"):
         result = _apply_corrections(result, _GUJARATI_CORRECTIONS)
 
     if result != text:

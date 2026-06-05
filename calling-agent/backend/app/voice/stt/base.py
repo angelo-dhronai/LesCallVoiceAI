@@ -25,6 +25,7 @@ class STTResult:
     """STT transcription result with confidence score."""
     text: str
     confidence: float = 1.0
+    detected_language: str | None = None
 
 
 def normalize_pcm_audio(

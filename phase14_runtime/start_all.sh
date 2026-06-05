@@ -63,7 +63,7 @@ if [ -f "/home/angelo/lescall/calling-agent/.env" ]; then
     set +a
 fi
 
-nohup /home/angelo/lescall/calling-agent/venv/bin/python /home/angelo/lescall/ws_audio_receiver.py >> "$RUN_DIR/ws_audio_receiver.log" 2>&1 &
+nohup /home/angelo/lescall/calling-agent/venv/bin/python /home/angelo/lescall/ws_audio_receiver.py --sample-rate 8000 >> "$RUN_DIR/ws_audio_receiver.log" 2>&1 &
 WS_PID=$!
 echo $WS_PID > "$RUN_DIR/ws_audio_receiver.pid"
 

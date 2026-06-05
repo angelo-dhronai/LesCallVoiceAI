@@ -27,7 +27,7 @@ from call_audit import audit_manager
 # CONFIG
 # ---------------------------------------------------------------------
 
-INPUT_CODEC = os.environ.get("TELEPHONY_INPUT_CODEC", "pcmu").lower()
+INPUT_CODEC = os.environ.get("TELEPHONY_INPUT_CODEC", "l16").lower()
 TARGET_SR = int(os.environ.get("TELEPHONY_TARGET_SR", "16000"))
 
 PHASE15_DEBUG_DIR = "/tmp/phase15_audio_debug"
@@ -121,13 +121,11 @@ class _Phase15AudioDebugger:
         ff_ratio = data.count(b"\xff") / size
         zero_ratio = data.count(b"\x00") / size
 
-        is_ulaw_like = size == 160
-
-        codec_guess = "pcmu" if is_ulaw_like else "pcm16"
+        codec_guess = INPUT_CODEC
 
         try:
 
-            if is_ulaw_like:
+            if INPUT_CODEC == "pcmu":
 
                 lin_data = audioop.ulaw2lin(data, 2)
 
@@ -154,8 +152,7 @@ class _Phase15AudioDebugger:
         log.info("[AUDIO_DEBUG] min=%d", min_v)
         log.info("[AUDIO_DEBUG] max=%d", max_v)
         log.info(
-            "[AUDIO_DEBUG] ulaw_like=%s ff_ratio=%.2f zero_ratio=%.2f",
-            is_ulaw_like,
+            "[AUDIO_DEBUG] ff_ratio=%.2f zero_ratio=%.2f",
             ff_ratio,
             zero_ratio,
         )
@@ -415,6 +412,7 @@ async def handle_connection(websocket, path: str, args):
         "text_frames": 0,
         "stalls": 0,
         "max_gap_ms": 0.0,
+        "audio_packets_forwarded": 0,
     }
 
     log.info(
@@ -612,12 +610,17 @@ async def handle_connection(websocket, path: str, args):
                     performed_ulaw_decode = False
 
                     # ------------------------------------------
-                    # DECODE ONLY TRUE 160B PCMU
+                    # DECODE PCMU (only if explicitly configured)
                     # ------------------------------------------
+                    # mod_audio_stream delivers L16 PCM directly from the
+                    # FreeSWITCH media bug (switch_core_media_bug_read always
+                    # returns decoded L16). Default INPUT_CODEC is "l16" so
+                    # this block is skipped. Only set TELEPHONY_INPUT_CODEC=pcmu
+                    # if a custom mod_audio_stream variant delivers raw PCMU bytes.
 
                     if INPUT_CODEC == "pcmu":
 
-                        if len(norm_msg) == 160:
+                        if len(norm_msg) > 0:
 
                             norm_msg = audioop.ulaw2lin(
                                 norm_msg,
@@ -627,16 +630,9 @@ async def handle_connection(websocket, path: str, args):
                             performed_ulaw_decode = True
 
                             log.debug(
-                                "[ULAW_DECODE] conn=%s decoded 160B PCMU -> %dB PCM16",
+                                "[ULAW_DECODE] conn=%s decoded %dB PCMU -> %dB PCM16",
                                 conn_id,
-                                len(norm_msg),
-                            )
-
-                        else:
-
-                            log.debug(
-                                "[ULAW_BYPASS] conn=%s frame=%dB assumed PCM16",
-                                conn_id,
+                                len(norm_msg) // 2,
                                 len(norm_msg),
                             )
 
@@ -727,6 +723,7 @@ async def handle_connection(websocket, path: str, args):
                         conn_id,
                         norm_msg,
                     )
+                    counters["audio_packets_forwarded"] += 1
 
                     queued = 0
 
@@ -799,10 +796,11 @@ async def handle_connection(websocket, path: str, args):
             pass
 
         log.info(
-            "[SESSION_END] conn=%s frames=%d bytes=%d",
+            "[SESSION_END] conn=%s frames_received=%d bytes=%d frames_forwarded=%d",
             conn_id,
             counters["binary_frames"],
             counters["binary_bytes"],
+            counters["audio_packets_forwarded"],
         )
 
 # ---------------------------------------------------------------------

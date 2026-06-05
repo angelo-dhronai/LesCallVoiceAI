@@ -98,11 +98,13 @@ class VoiceActivityDetector:
                     self._calibration_target,
                 )
 
-        # Ignore absolute silence
-        if energy < self._minimum_rms_floor:
-            return False
-
-        # Calibration phase
+        # Calibration phase: sample ALL frames including silence so calibration
+        # always completes in 25 frames (500ms). The rms_floor guard must not
+        # run here — PCMU comfort-noise (0xFF → energy=0) would block every frame
+        # and leave the VAD permanently uncalibrated, preventing all STT.
+        # _finish_calibration() clamps threshold to minimum_threshold (150/260)
+        # when the sampled frames are all silence, which is the correct baseline
+        # for a telephony channel before the caller first speaks.
         if not self._calibrated:
             self._calibration_energies.append(energy)
 
@@ -111,8 +113,11 @@ class VoiceActivityDetector:
 
             return False
 
-        is_speech_result = energy > self._threshold
-        return is_speech_result
+        # Post-calibration: ignore absolute silence (below the noise floor).
+        if energy < self._minimum_rms_floor:
+            return False
+
+        return energy > self._threshold
 
     def _finish_calibration(self) -> None:
         arr = np.array(self._calibration_energies)

@@ -2260,8 +2260,13 @@ def handle(conn: socket.socket, addr) -> None:
         log.info("counters: %s", counters)
         log.info("last_command_reply=%r", last_command_reply)
         log.info("last_execute_app_response=%r", last_execute_app_resp)
+        # URL-decode FreeSWITCH Application-Response before classify() so
+        # "PLAYBACK%20ERROR" is seen as "PLAYBACK ERROR" — consistent with
+        # the playback_played check below that already does this decode.
+        from urllib.parse import unquote as _url_unquote
+        _last_app_resp_clean = _url_unquote(last_execute_app_resp or "")
         verdict = classify(cp, counters, last_command_reply,
-                           last_execute_app_resp)
+                           _last_app_resp_clean)
         log.info("VERDICT: %s", verdict)
         log.info("-------------------------------------")
         # Phase 3: only emits when the verdict is CASE C/H — no noise

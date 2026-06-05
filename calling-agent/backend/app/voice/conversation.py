@@ -94,6 +94,14 @@ _EMOJI_RE = re.compile(
     re.UNICODE,
 )
 
+# Gujarati copula markers in Devanagari (STT sometimes writes Gujarati in
+# Devanagari when language_code=hi-IN). These copulas are exclusively Gujarati
+# and NEVER appear as word-stems in Hindi. One hit is sufficient for detection.
+# Word-boundary anchors prevent false matches inside Hindi words like "छोटा".
+_STRONG_GU_DEVA_RE = re.compile(
+    r"(?<!\w)(?:छे|छो|छु|छुं|छीए|केम|तमे|नथी|हसे|जोइए)(?!\w)"
+)
+
 
 @dataclass
 class EngineResult:
@@ -203,6 +211,10 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
     _lang_switch_phrases = [
         "hindi me", "hindi mai", "hindi mein", "hindi boliye", "hindi bolo",
         "hindi me baat", "hindi mai baat", "hindi mein baat",
+        # Gujarati postposition "ma" (in) — "hindi ma", "english ma"
+        "hindi ma", "hindi maa", "hindi ma vaat", "hindi ma baat",
+        "hindi ma bol", "hindi ma karo",
+        "english ma", "english maa", "english ma vaat", "english ma baat",
         "english me", "english mai", "english mein", "english boliye", "english bolo",
         "english me baat", "english mai baat", "english mein baat",
         "gujarati ma", "gujarati maa", "gujarati mai", "gujarati mein", "gujarati boliye", "gujarati bolo",
@@ -222,6 +234,12 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
         "can you talk english", "can you talk hindi", "can you talk gujarati",
         "could you speak english", "could you speak hindi", "could you speak gujarati",
         "talk english", "talk hindi", "talk gujarati",
+        # Romanized question forms — "kya aap hindi mein baat kar sakte hain"
+        "kya aap hindi", "kya aap english", "kya aap gujarati",
+        "kya hindi", "kya english", "kya gujarati",
+        # "vaat" = Gujarati for "talk/speech" — covers "hindi ma vaat karvi che"
+        "hindi vaat", "english vaat", "gujarati vaat",
+        "hindi ma vaat", "english ma vaat",
     ]
     if any(p in lower for p in _lang_switch_phrases):
         return "language_switch"
@@ -237,8 +255,22 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
         "अंग्रेज़ी में बात", "अंग्रेजी में बात", "इंग्लिश में बात",
         "गुजराती में", "गुजराती बोल", "गुजराती में बात",
         "गुजराती में बोलो", "हिंदी में बोलो",
+        # Gujarati-syntax "ma" postposition in Devanagari — hi-IN STT
+        # renders "Gujarati ma vaat karo" as "गुजराती मा वात करो".
+        "गुजराती मा", "गुजराती माँ",
+        "हिंदी मा", "हिंदी माँ",
+        "इंग्लिश मा", "इंग्लिश माँ",
     ]
     if any(p in text for p in _lang_switch_devanagari):
+        return "language_switch"
+    # Broader Devanagari catch-all: language name + any postposition or verb.
+    # Catches STT variants that spell the postposition differently.
+    if re.search(
+        r"(?:\u0917\u0941\u091C\u0930\u093E\u0924\u0940|\u0939\u093F\u0902\u0926\u0940|\u0939\u093F\u0928\u094D\u0926\u0940|\u0905\u0902\u0917\u094D\u0930\u0947\u091C\u0940|\u0906\u0928\u094D\u0917\u094D\u0930\u0947\u091C\u0940|\u0907\u0902\u0917\u094D\u0932\u093F\u0936)"
+        r"[^\n]{0,12}"
+        r"(?:\u092E\u093E|\u092E\u093E\u0901|\u092E\u0947\u0902|\u092E\u0947|\u092E\u0947\u0901|\u0935\u093E\u0924|\u092C\u093E\u0924|\u092C\u094B\u0932|\u0915\u0930\u094B|kariye|karo)",
+        text,
+    ):
         return "language_switch"
     # Gujarati script — comprehensive list including common colloquial forms
     if any(w in text for w in [
@@ -246,12 +278,13 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
         "ઇંગ્લિશમાં", "ગુજરાતી બોલ", "ગુજ બોલ",
         "અંગ્રેજી બોલ", "હિન્દી બોલ", "ઇંગ્લિશ બોલ",
         "ગુજ માં", "ગુ માં",
+        "ગુજ મા", "ગુ મા", "ગુજરાતી મા",
     ]):
         return "language_switch"
     # Catch-all: any mention of a language name with "baat/bol/bolo" nearby
-    if re.search(r"(?:english|hindi|gujarati|इंग्लिश|अंग्रेज़ी|अंग्रेजी|हिंदी|हिन्दी|गुजराती|ગુજરાતી|અંગ્રેજી|હિન્દી|ઇંગ્લિશ).{0,15}(?:बात|बोल|bol|baat|bolo|boliye|વાત|બોલ)", lower):
+    if re.search(r"(?:english|hindi|gujarati|इंग्लिश|अंग्रेज़ी|अंग्रेजी|हिंदी|हिन्दी|गुजराती|ગુજરાતી|અંગ્રેજી|હિન્દી|ઇંગ્લિશ).{0,15}(?:बात|बोल|bol|baat|bolo|boliye|vaat|vat|વાત|બોલ)", lower):
         return "language_switch"
-    if re.search(r"(?:बात|बोल|bol|baat|bolo|boliye|વાત|બોલ).{0,15}(?:english|hindi|gujarati|इंग्लिश|अंग्रेज़ी|अंग्रेजी|हिंदी|हिन्दी|गुजराती|ગુજરાતી|અંગ્રેજી|હિન્દી|ઇંગ્લિશ)", lower):
+    if re.search(r"(?:बात|बोल|bol|baat|bolo|boliye|vaat|vat|વાત|બોલ).{0,15}(?:english|hindi|gujarati|इंग्लिश|अंग्रेज़ी|अंग्रेजी|हिंदी|हिन्दी|गुजराती|ગુજરાતી|અંગ્રેજી|હિન્દી|ઇંગ્લિશ)", lower):
         return "language_switch"
 
     # Two language names co-mentioned within a 30-char window — strong signal
@@ -573,13 +606,13 @@ _LOCALIZED_RESPONSES: dict[str, dict[str, list[str] | str]] = {
     "hi": {
         "greeting": ["हेलो! Pramukh Group से बात कर रहा हूँ।", "हेलो! बोलिए, कैसे मदद कर सकता हूँ?"],
         "farewell": "अच्छा, फिर मिलते हैं! Pramukh Group से कॉल के लिए धन्यवाद।",
-        "gratitude": ["आपका स्वागत है!", "खुशी हुई!"],
+        "gratitude": ["शुक्रिया! तो बताइए, आप किस शहर में प्रॉपर्टी देख रहे हैं?", "आपका स्वागत है! तो आगे बात करते हैं।"],
         "closing": "बहुत अच्छा! हम आपको डिटेल्स भेज देंगे। धन्यवाद!",
     },
     "gu": {
         "greeting": ["હેલો! Pramukh Group તરફથી બોલું છું.", "હેલો! બોલો, કેવી રીતે મદદ કરી શકું?"],
         "farewell": "સારું, ફરી મળીશું! Pramukh Group તરફથી કૉલ માટે આભાર.",
-        "gratitude": ["આપનું સ્વાગત છે!", "ખુશી થઈ!"],
+        "gratitude": ["આભાર! તો બોલો, ક્યા શહેરમાં property જોવી છે?", "આપનું સ્વાગત છે! ચાલો આગળ વાત કરીએ."],
         "closing": "ખૂબ સરસ! અમે તમને ડિટેલ્સ મોકલીશું. આભાર!",
     },
 }
@@ -717,11 +750,12 @@ class ConversationRouter:
         """Inbound warm welcome — agent answers the call.
         Bilingual so caller can respond in their preferred language."""
         greeting = _OPENING_GREETING
-        self.memory.add_assistant(greeting)
+        self.memory.add_assistant(greeting, language=self.state.language)
         self.state.stage = STAGE_GREETING
         # Store for last-response memory (feature 3)
         self.last_agent_response = greeting
         self.last_agent_language = self.state.language
+        self.memory.qa_tracker.observe_agent_turn(greeting, self.memory.turn_index)
         logger.info("[OPENING] Inbound welcome delivered")
         return EngineResult(text=greeting, is_shortcut=True, intent="greeting")
 
@@ -749,7 +783,21 @@ class ConversationRouter:
         # Save name state before add_user may auto-extract a name (feature 4)
         _prev_booking_name = self.memory.booking.user_name
 
-        self.memory.add_user(text)
+        # Context-aware name capture: if agent just asked for name, treat this
+        # short response as the caller's name (even without "my name is" prefix)
+        if not self.memory.booking.user_name:
+            ctx_name = self._extract_name_if_asked(text)
+            if ctx_name:
+                self.memory.booking.user_name = ctx_name
+                self.memory.context.user_name = ctx_name
+                self.memory.call_state.customer_name = ctx_name
+                _prev_booking_name = ctx_name  # treat as already known
+                logger.info("[NAME] Context-aware capture: %r", ctx_name)
+
+        self.memory.add_user(text, language=self.state.language)
+
+        # QA: record this user turn against any pending asked-fields
+        self.memory.qa_tracker.observe_user_turn(text, self.memory.turn_index)
 
         # Name-capture: if a new name was just extracted this turn, hold for confirmation
         if (not self._name_confirmed
@@ -789,12 +837,22 @@ class ConversationRouter:
                 self.state.language_locked = False
                 logger.info("[LANG] Lock expired after %d turns", self.state.language_lock_turns)
 
-        # If user consistently speaks Gujarati (2+ consecutive turns with clear
-        # Gujarati detection), override the lock — the user IS speaking Gujarati.
+        # Override an incorrect Hindi/English lock to Gujarati when the evidence is clear.
+        # Two-tier threshold:
+        #   - Strong Devanagari Gujarati markers (छे/छो/छु/केम/etc.) are EXCLUSIVELY
+        #     Gujarati — a single turn's evidence is sufficient to override the lock.
+        #   - All other Gujarati signals require 2 consecutive turns for confidence.
+        # This prevents a Gujarati caller from receiving 2 Hindi responses before the
+        # system adapts, while still requiring consistency for weaker signals.
         if is_gujarati_detected and self.state.language_locked and prev_lang != "gu":
             recent_gu = sum(1 for l in history[-2:] if l == "gu")
-            if recent_gu >= 2:
-                logger.info("[LANG] Overriding lock to Gujarati after consistent detection")
+            single_strong = (recent_gu >= 1 and src == "script_gu_markers")
+            if recent_gu >= 2 or single_strong:
+                logger.info(
+                    "[LANG] Overriding lock to Gujarati (src=%s, recent_gu=%d, "
+                    "single_strong=%s)",
+                    src, recent_gu, single_strong,
+                )
                 self.state.language = "gu"
                 self.state.language_locked = False
                 self.state.language_lock_turns = 0
@@ -917,7 +975,7 @@ class ConversationRouter:
                 resp = self.last_agent_response
                 logger.info("[REPEAT] Replaying last response (lang=%s): %r",
                             self.last_agent_language, resp[:60])
-                self.memory.add_assistant(resp)
+                self.memory.add_assistant(resp, language=self.state.language)
                 self._store_last_response(resp)
                 yield EngineResult(text=resp, is_shortcut=True, intent="repeat")
                 return
@@ -927,7 +985,7 @@ class ConversationRouter:
             _cancel_llm()
             self.state.is_closing = True
             resp = self._localized("closing", "Thank you for your time! We'll be in touch. Have a great day!")
-            self.memory.add_assistant(resp)
+            self.memory.add_assistant(resp, language=self.state.language)
             self._store_last_response(resp)
             self.state.stage = STAGE_CLOSING
             yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
@@ -946,13 +1004,13 @@ class ConversationRouter:
                 resp = _DECLINE_FAREWELL_RESPONSES.get(
                     self.state.language, _DECLINE_FAREWELL_RESPONSES["en"]
                 )
-                self.memory.add_assistant(resp)
+                self.memory.add_assistant(resp, language=self.state.language)
                 self._store_last_response(resp)
                 yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
                 return
 
             resp = self._pick_objection_response()
-            self.memory.add_assistant(resp)
+            self.memory.add_assistant(resp, language=self.state.language)
             self._store_last_response(resp)
             yield EngineResult(text=resp, is_shortcut=True, intent="objection")
             return
@@ -961,7 +1019,7 @@ class ConversationRouter:
         if intent == "gratitude":
             _cancel_llm()
             resp = self._localized_list("gratitude", ["You're welcome!", "Happy to help!"])
-            self.memory.add_assistant(resp)
+            self.memory.add_assistant(resp, language=self.state.language)
             self._store_last_response(resp)
             yield EngineResult(text=resp, is_shortcut=True, intent="gratitude")
             return
@@ -971,7 +1029,7 @@ class ConversationRouter:
             _cancel_llm()
             lang = self.state.language
             resp = _IDENTITY_RESPONSES.get(lang, _IDENTITY_RESPONSES["en"])
-            self.memory.add_assistant(resp)
+            self.memory.add_assistant(resp, language=lang)
             self._store_last_response(resp)
             if self.state.stage == STAGE_GREETING:
                 self.state.stage = STAGE_DISCOVERY
@@ -993,7 +1051,7 @@ class ConversationRouter:
             self.state.language_lock_turns = -10
             self.state.language_history = [new_lang] * 5
             resp = _LANG_SWITCH_RESPONSES.get(new_lang, _LANG_SWITCH_RESPONSES["hi"])
-            self.memory.add_assistant(resp)
+            self.memory.add_assistant(resp, language=new_lang)
             self._store_last_response(resp)
             logger.info("[LANG-LOCK] explicit_switch lang=%s lock_turns=%d (persists ~30 turns)",
                         new_lang, self.state.language_lock_turns)
@@ -1058,42 +1116,70 @@ class ConversationRouter:
             loc = self._extract_location(text)
             if loc:
                 self.memory.booking.location = loc
+                self.memory.qa_tracker.mark_extracted("location", loc)
                 logger.info("[DISCOVERY] Location extracted: %s", loc)
 
         if not self.memory.booking.property_type:
             bhk = self._extract_bhk(text)
             if bhk:
                 self.memory.booking.property_type = bhk.upper()
+                self.memory.qa_tracker.mark_extracted("bhk", bhk.upper())
                 logger.info("[DISCOVERY] Config extracted: %s", bhk)
 
         if not self.memory.booking.appointment_time:
-            t = self._extract_time_preference(text)
+            t = self._extract_time_preference(text, stage=self.state.stage)
             if t:
                 self.memory.booking.appointment_time = t
                 logger.info("[DISCOVERY] Time extracted: %s", t)
 
         if not self.state.purpose:
-            invest_kw = [
-                "investment", "invest", "rental income", "returns", "appreciation",
-                "kiraya", "kiraye", "nivesh", "نیویش",
+            # Multi-word / script phrases: safe to use substring matching (rare false positives)
+            invest_kw_exact = [
+                "rental income", "rental return", "return on investment",
+                "kiraya", "kiraye",
                 "रिटर्न", "निवेश", "ભાડું", "રોકાણ",
             ]
-            self_use_kw = [
-                "self use", "self-use", "own use", "family", "stay", "live", "rehna",
-                "apne liye", "ghar", "makan", "rahega",
+            self_use_kw_exact = [
+                "self use", "self-use", "own use",
+                "apne liye", "rehna",
                 "ઘર", "રહેવા", "ખુદ", "ફેમિલી",
             ]
-            if any(kw in lower or kw in text for kw in invest_kw):
+            # Single English words that need word-boundary matching to avoid
+            # false positives ("returns my call", "staying on topic", etc.)
+            _invest_bound_re = re.compile(
+                r'\b(?:investment|investing|investor|invest|appreciation|'
+                r'rental income|rental return|profit|yield)\b'
+                r'|\breturn on investment\b',
+                re.IGNORECASE
+            )
+            _self_use_bound_re = re.compile(
+                r'\b(?:family|families|stay|staying|live|living|reside|residing|'
+                r'ghar|makan|rahega|settle|settling)\b', re.IGNORECASE
+            )
+            if (any(kw in lower or kw in text for kw in invest_kw_exact)
+                    or _invest_bound_re.search(lower)):
                 self.state.purpose = "investment"
-            elif any(kw in lower or kw in text for kw in self_use_kw):
+                self.memory.qa_tracker.mark_extracted("purpose", "investment")
+            elif (any(kw in lower or kw in text for kw in self_use_kw_exact)
+                    or _self_use_bound_re.search(lower)):
                 self.state.purpose = "self_use"
+                self.memory.qa_tracker.mark_extracted("purpose", "self_use")
 
         # ── Budget extraction ─────────────────────────────────────────────
         if not self.memory.booking.budget:
             budget = self._extract_budget(text)
             if budget:
                 self.memory.booking.budget = budget
+                self.memory.qa_tracker.mark_extracted("budget", budget)
                 logger.info("[DISCOVERY] Budget extracted: %s", budget)
+
+        # ── Timeline extraction ───────────────────────────────────────────
+        if not cs.timeline:
+            timeline = self._extract_timeline(text)
+            if timeline:
+                cs.timeline = timeline
+                self.memory.qa_tracker.mark_extracted("timeline", timeline)
+                logger.info("[DISCOVERY] Timeline extracted: %s", timeline)
 
         # ── Project detection (persistent context lock) ──────────────────
         if not cs.selected_project:
@@ -1143,17 +1229,18 @@ class ConversationRouter:
         dt = self.state.discovery_turns
 
         if self.state.stage == STAGE_DISCOVERY:
-            # Advance only after genuine discovery conversation — need location
-            # plus sufficient turns, OR very many turns regardless.
-            # Kept deliberately slow so the agent doesn't rush callers.
-            if (b.location and dt >= 5) or dt >= 10:
+            _has_name = bool(b.user_name or self.memory.call_state.customer_name)
+            # Advance once name + location are known (3+ turns) or after 10 turns.
+            # Name gate ensures agent collects caller identity before pitching projects.
+            if (_has_name and b.location and dt >= 3) or dt >= 10:
                 self.state.stage = STAGE_PROJECT_MATCH
-                logger.info("[STAGE] DISCOVERY → PROJECT_MATCH (loc=%s, turns=%d)",
-                            b.location, dt)
+                logger.info("[STAGE] DISCOVERY → PROJECT_MATCH (name=%s, loc=%s, turns=%d)",
+                            b.user_name, b.location, dt)
 
         elif self.state.stage == STAGE_PROJECT_MATCH:
-            # Give plenty of project-discussion turns before inviting a visit.
-            if dt >= 14:
+            # Advance to visit invitation after sufficient project discussion.
+            # Reduced from 14 to 9 turns — keep momentum.
+            if dt >= 9:
                 self.state.stage = STAGE_INVITE_VISIT
                 logger.info("[STAGE] PROJECT_MATCH → INVITE_VISIT")
 
@@ -1195,10 +1282,12 @@ class ConversationRouter:
 
         Keys in _KNOWN_PROJECTS are sorted longest-first so multi-word names
         like 'aranya ii' are matched before shorter substrings like 'aranya'.
+        Word-boundary matching prevents short names (aura, orbit, satva) from
+        spuriously matching inside unrelated words.
         """
         lower = text.lower()
         for key in sorted(_KNOWN_PROJECTS, key=len, reverse=True):
-            if key in lower:
+            if re.search(r'\b' + re.escape(key) + r'\b', lower):
                 return _KNOWN_PROJECTS[key]
         return None
 
@@ -1269,6 +1358,10 @@ class ConversationRouter:
         # Language + Stage always mirror live state
         cs.language = self.state.language
         cs.conversation_stage = self.state.stage
+
+        # Sync name into QA tracker when confirmed
+        if cs.customer_name and not self.memory.qa_tracker.is_answered("name"):
+            self.memory.qa_tracker.mark_extracted("name", cs.customer_name)
 
         logger.info(
             "[STATE] name=%s phone=%s project=%s loc=%s visit=%s "
@@ -1374,13 +1467,130 @@ class ConversationRouter:
             return f"{m.group(1)} bhk"
         return None
 
-    def _extract_time_preference(self, text: str) -> str | None:
+    def _extract_timeline(self, text: str) -> str | None:
+        """Extract caller's stated purchase/move-in timeline."""
+        lower = text.lower()
+        # Immediate / ready now
+        if re.search(r"\b(immediate|right away|asap|ready now|abhi|abhi chahiye|turant)\b", lower):
+            return "immediate"
+        if any(w in lower for w in ["अभी", "तुरंत", "હમણાં"]):
+            return "immediate"
+        # Within N months
+        m = re.search(r"(\d+)\s*(?:month|mahine|महीने|maheena|महीनों|mashina|mashin)", lower)
+        if m:
+            return f"{m.group(1)} months"
+        # Within N years
+        m = re.search(r"(\d+)\s*(?:year|saal|साल|varsh|वर्ष|varsha)", lower)
+        if m:
+            return f"{m.group(1)} year(s)"
+        # End of year / this year
+        if re.search(r"\b(end of year|this year|is saal|is varsh|2025|2026)\b", lower):
+            return "this year"
+        # 6 months / half year
+        if re.search(r"\b(6 months?|six months?|chhe mahine|6 mahine)\b", lower):
+            return "6 months"
+        # 3 months / quarter
+        if re.search(r"\b(3 months?|three months?|teen mahine|quarter)\b", lower):
+            return "3 months"
+        return None
+
+    # Name extraction signals — checked against the last agent response
+    _NAME_ASK_SIGNALS = [
+        "your name", "naam", "aapka naam", "naam kya", "naam batao",
+        "naam bataiye", "naam bata", "apna naam", "apna name",
+        "what should i call", "may i know your name", "introduce yourself",
+        "aapka naam kya hai", "naam bataiye", "naam kya hai",
+        "आपका नाम", "नाम बताइए", "नाम क्या", "अपना नाम",
+        "tamaru naam", "tamaro naam", "tamaru", "aapnu naam",
+        "tamaru naam shu che", "tamaro naam shu che",
+        "તમારું નામ", "નામ", "શું નામ",
+    ]
+
+    _NAME_BLOCKLIST = {
+        "a", "the", "just", "not", "is", "interested", "busy",
+        "calling", "looking", "available", "free", "here", "there",
+        "good", "fine", "okay", "sure", "ready", "happy", "sorry",
+        "glad", "trying", "going", "coming", "waiting", "talking",
+        "asking", "wondering", "thinking", "planning", "searching",
+        "surat", "vapi", "silvassa", "pramukh", "vishal", "patel",
+        "yes", "no", "haan", "nahi", "ji", "ha", "na",
+        # possessive/pronoun words that precede a name — not a name themselves
+        "mera", "meri", "mere", "naam", "my", "name",
+        "maro", "mari", "maru", "apnu", "apna", "aapka",
+        "tamaru", "tamaro", "tamari", "ame", "tame",
+    }
+
+    # Romanized "my name is/was" phrases — user is stating their name will follow,
+    # not that the phrase itself IS the name.
+    _MY_NAME_PHRASES = frozenset({
+        "mera naam", "meri naam", "maro naam", "maru naam",
+        "my name", "my name is", "i am", "i'm",
+        "tamaro naam", "tamaru naam", "apna naam",
+    })
+
+    def _extract_name_if_asked(self, user_text: str) -> str | None:
+        """Return a name candidate when the agent's last response asked for the name
+        and the user replied with a short phrase that looks like a name.
+
+        This covers the common case where the caller just says their name
+        (e.g. "Rahul") without the "my name is" prefix.
+        """
+        if not self.last_agent_response:
+            return None
+
+        agent_lower = self.last_agent_response.lower()
+        if not any(s in agent_lower for s in self._NAME_ASK_SIGNALS):
+            return None
+
+        user_text = user_text.strip()
+        # Reject pure "my name" phrases — the actual name wasn't captured yet
+        lower_text = user_text.lower()
+        if lower_text in self._MY_NAME_PHRASES or any(
+            lower_text == phrase for phrase in self._MY_NAME_PHRASES
+        ):
+            return None
+        # Must be short — names are 1-3 words
+        words = user_text.split()
+        if len(words) == 0 or len(words) > 4:
+            return None
+        # Must not contain question markers
+        if "?" in user_text:
+            return None
+        if any(w in user_text.lower() for w in ["what", "kya", "kon", "kaun", "kahan", "kyun"]):
+            return None
+        # Must not be a location or BHK
+        if match_location(user_text) or match_bhk(user_text):
+            return None
+        # Must not be entirely lowercase short common words
+        if all(w.lower() in self._NAME_BLOCKLIST for w in words):
+            return None
+        # Take consecutive title-cased or long-enough words as the name
+        name_parts = []
+        for w in words:
+            clean = re.sub(r"[^A-Za-z]", "", w)
+            if len(clean) < 2:
+                break
+            if clean[0].isupper() or len(clean) >= 3:
+                name_parts.append(clean.capitalize())
+        if not name_parts:
+            return None
+        candidate = " ".join(name_parts)
+        if candidate.lower() in self._NAME_BLOCKLIST:
+            return None
+        return candidate
+
+    def _extract_time_preference(self, text: str, stage: str | None = None) -> str | None:
         """
         Match user-stated time/day to an available slot.
 
         Returns None when the user gave a SPECIFIC time that isn't on the
         slot list — never silently fudges to a different slot. The engine's
         scheduling reprompt path then offers the real available slots back.
+
+        The ``stage`` parameter gates the bare-affirmation heuristic (Step 5):
+        mapping a lone "yes/ok/haan" to the first slot only makes sense when
+        the agent just offered slots (INVITE_VISIT/CONFIRMATION).  In earlier
+        stages the same words are general affirmations and must NOT book time.
         """
         lower = text.lower()
 
@@ -1463,10 +1673,16 @@ class ConversationRouter:
                     return f"{slot['day']} at {slot['time']}"
 
         # --- Step 5: bare affirmation → first available slot ---
-        if re.search(r"\b(yes|yeah|ok|okay|sure|haan|ha|ji|theek|first|pehla)\b", lower):
-            return f"{_AVAILABLE_SLOTS[0]['day']} at {_AVAILABLE_SLOTS[0]['time']}"
-        if any(w in text for w in ("ठीक", "हां", "हाँ", "જી", "હા", "બરાબર", "ઠીક")):
-            return f"{_AVAILABLE_SLOTS[0]['day']} at {_AVAILABLE_SLOTS[0]['time']}"
+        # ONLY apply when the agent is actively offering time slots (INVITE_VISIT or
+        # CONFIRMATION stage).  In DISCOVERY/GREETING/PROJECT_MATCH stages the same
+        # words ("yes", "haan", "ji") are general affirmations — mapping them to a
+        # slot would silently pre-book a visit the caller never agreed to schedule.
+        _scheduling_stages = (STAGE_INVITE_VISIT, STAGE_CONFIRMATION)
+        if stage is None or stage in _scheduling_stages:
+            if re.search(r"\b(yes|yeah|ok|okay|sure|haan|ha|ji|theek|first|pehla)\b", lower):
+                return f"{_AVAILABLE_SLOTS[0]['day']} at {_AVAILABLE_SLOTS[0]['time']}"
+            if any(w in text for w in ("ठीक", "हां", "हाँ", "જી", "હા", "બરાબર", "ઠીક")):
+                return f"{_AVAILABLE_SLOTS[0]['day']} at {_AVAILABLE_SLOTS[0]['time']}"
 
         return None
 
@@ -1585,10 +1801,12 @@ class ConversationRouter:
 
         if full_parts:
             full_text = " ".join(full_parts)
-            self.memory.add_assistant(full_text)
+            self.memory.add_assistant(full_text, language=self.state.language)
             # Last-response memory (feature 3)
             self.last_agent_response = full_text
             self.last_agent_language = self.state.language
+            # QA: detect which field this agent response is asking about
+            self.memory.qa_tracker.observe_agent_turn(full_text, self.memory.turn_index)
             logger.info("[LAST-RESPONSE] Stored LLM response (lang=%s, len=%d)",
                         self.last_agent_language, len(full_text))
 
@@ -1599,9 +1817,9 @@ class ConversationRouter:
             return None
 
         stage_map = {
-            "location": STAGE_LOCATION,
-            "property_type": STAGE_PROPERTY_TYPE,
-            "appointment": STAGE_SCHEDULING,
+            "location": STAGE_DISCOVERY,
+            "property_type": STAGE_DISCOVERY,
+            "appointment": STAGE_INVITE_VISIT,
         }
         target_stage = stage_map.get(missing)
         if not target_stage:
@@ -1714,6 +1932,7 @@ class ConversationRouter:
 
     def _build_system_prompt(self) -> str:  # noqa: C901
         b = self.memory.booking
+        cs = self.memory.call_state
         lang = self.state.language
         lang_name = {"hi": "Hindi", "gu": "Gujarati", "en": "English"}.get(lang, "English")
 
@@ -1774,29 +1993,42 @@ class ConversationRouter:
                 "Ask for their name — ONE question only."
             ),
             STAGE_DISCOVERY: (
-                "STEP 1 — If you do not yet have the caller's name, ask for it warmly in their language. "
-                "ONE question only: nothing else until they answer. "
-                "STEP 2 — Once you have their name, listen fully to what they want. "
-                "Respond directly to whatever they just said before asking anything new. "
-                "Collect naturally, one question per turn, in this order: "
-                "(1) what they are looking for, (2) self-use or investment, "
-                "(3) location, (4) size/config, (5) timeline. Budget LAST and always softly. "
-                "Acknowledge everything they volunteer before you move to the next question. "
-                "NEVER skip ahead — only ask the next question after the current one is answered."
+                "You are a proactive property sales consultant. Your mission: qualify this caller "
+                "and build enough rapport to earn a site visit.\n"
+                "\n"
+                "MANDATORY FLOW — after EVERY caller response:\n"
+                "  1. Acknowledge what they just said (1 sentence, genuinely).\n"
+                "  2. Check QUALIFICATION STATUS below — ask the NEXT MISSING FIELD in priority order.\n"
+                "  3. If all core fields are captured, pivot to a project recommendation naturally.\n"
+                "\n"
+                "COLLECTION PRIORITY (one question per turn, skip if already known):\n"
+                "  1. Name  2. City (Surat / Vapi / Silvassa)  3. Configuration (1/2/3 BHK)\n"
+                "  4. Budget (comfortable range — ask softly)  5. Purpose (self-use or investment)\n"
+                "  6. Timeline (when planning to buy)  7. Phone / WhatsApp\n"
+                "\n"
+                "Do NOT wait for the caller to volunteer information — ask for it warmly.\n"
+                "Do NOT skip fields — every answer helps you match the right property.\n"
+                "If the caller volunteers a field before you ask, capture it and move to the next one."
             ),
             STAGE_PROJECT_MATCH: (
-                "Pick 1–2 projects that genuinely fit what this specific caller described. "
-                "Name the project, say WHY it fits THEM in 1-2 specific reasons. "
-                "Never list the whole portfolio. Make it feel like a personal recommendation."
+                "You have enough information. Now be the expert.\n"
+                "Pick EXACTLY ONE project that fits what this caller described — budget, location, purpose.\n"
+                "Name the project. Give 2 specific reasons why it fits THEM personally.\n"
+                "Never list the whole portfolio — make it feel like a personal recommendation.\n"
+                "End your recommendation with a natural bridge toward a site visit:\n"
+                "'Photos don't do it justice — would you like to see it in person?'"
             ),
             STAGE_INVITE_VISIT: (
-                "Build natural curiosity — photos don't capture the feeling of being there. "
-                "Invite for a visit warmly. Give EXACTLY TWO time options. "
-                "Ask for their WhatsApp to share location and details."
+                "The caller is interested. Your only goal now: book the site visit.\n"
+                "Give EXACTLY TWO specific time options (from the available slots).\n"
+                "When they pick a slot, confirm: date, time, and their name for the register.\n"
+                "Ask for WhatsApp to send the site address and directions.\n"
+                "Do NOT give more options — scarcity creates urgency."
             ),
             STAGE_CONFIRMATION: (
-                "Confirm the visit: day and time. Ask if family is joining. "
-                "Offer to WhatsApp the site address."
+                "Confirm the visit details: day, time, property, and caller's name.\n"
+                "Ask if any family member is joining (great buying decisions involve family).\n"
+                "Offer to WhatsApp the exact site address and parking instructions."
             ),
             STAGE_CLOSING: (
                 "Warm, genuine close using caller's name. Express real excitement about meeting them. "
@@ -1821,11 +2053,37 @@ class ConversationRouter:
             collected_lines.append(f"Configuration: {b.property_type}")
         if b.budget:
             collected_lines.append(f"Budget: {b.budget}")
+        if cs.timeline:
+            collected_lines.append(f"Timeline: {cs.timeline}")
         if self.state.project_recommended:
             collected_lines.append(f"Project discussed: {self.state.project_recommended}")
         if b.appointment_time:
             collected_lines.append(f"Visit scheduled: {b.appointment_time}")
         collected_str = "\n".join(f"  · {c}" for c in collected_lines) or "  · Nothing collected yet"
+
+        # ── Qualification status (for DISCOVERY stage guidance) ───────────────
+        _qname = b.user_name or cs.customer_name
+        _qloc = b.location or cs.selected_location
+        _qprop = b.property_type or cs.property_type
+        _qpurpose = self.state.purpose or cs.purpose
+        _qbudget = b.budget or cs.budget
+        qual_needed: list[str] = []
+        if not _qname:
+            qual_needed.append("Name")
+        # Priority order per sales flow: location → config → budget → purpose → timeline → phone
+        if not _qloc:
+            qual_needed.append("City (Surat / Vapi / Silvassa)")
+        if not _qprop:
+            qual_needed.append("Configuration (1/2/3 BHK)")
+        if not _qbudget:
+            qual_needed.append("Budget (comfortable range — ask warmly)")
+        if not _qpurpose:
+            qual_needed.append("Purpose (self-use or investment)")
+        if not cs.timeline:
+            qual_needed.append("Timeline (when planning to buy)")
+        if not cs.customer_phone:
+            qual_needed.append("Phone / WhatsApp")
+        _qual_next = qual_needed[0] if qual_needed else None
 
         # Name-capture confirmation instruction (feature 4)
         name_confirm_block: list[str] = []
@@ -1837,8 +2095,6 @@ class ConversationRouter:
             ]
 
         # ── Persistent CallState block ────────────────────────────────────────
-        cs = self.memory.call_state
-
         # Build "already collected — do not re-ask" list
         # Issues 7 & 8: include ALL collected fields so the LLM never re-asks.
         dont_reask: list[str] = []
@@ -1856,6 +2112,8 @@ class ConversationRouter:
             dont_reask.append(f"purpose ({cs.purpose or self.state.purpose})")
         if cs.budget or b.budget:
             dont_reask.append(f"budget ({cs.budget or b.budget})")
+        if cs.timeline:
+            dont_reask.append(f"timeline ({cs.timeline})")
         if cs.appointment_time:
             dont_reask.append(f"visit time ({cs.appointment_time})")
 
@@ -1912,6 +2170,19 @@ class ConversationRouter:
                 f"You already have: {'; '.join(dont_reask)}.",
                 "NEVER ask for any of these again. Use them naturally in your responses.",
             ] if dont_reask else []),
+            *([
+                "",
+                "━━ QUALIFICATION STATUS ━━",
+                f"  Still needed (in priority order): {' → '.join(qual_needed)}",
+                f"  ⚡ NEXT FIELD TO ASK: {_qual_next}",
+                "  After acknowledging what the caller said, ask for this field — warmly, naturally.",
+                "  Do NOT skip it. Do NOT ask two questions at once.",
+            ] if qual_needed else [
+                "",
+                "━━ QUALIFICATION STATUS ━━",
+                "  ✅ All core qualification fields captured.",
+                "  Your priority now: recommend a matching project and book the site visit.",
+            ]),
             "",
             "━━ CURRENT GOAL ━━",
             stage_goal,
@@ -1926,15 +2197,11 @@ class ConversationRouter:
             "MATCH: Budget+Vapi→Sahaj/Aura | Mid+Surat→Aranya II | Premium+Surat→Revanta/Satva | Luxury→Vivanta/Agastya | Ready→Satva/Aura/Sahaj",
             "",
             "━━ CONVERSATION GUIDELINES ━━",
-            "LISTEN FIRST: Always acknowledge what the caller just said before moving forward.",
-            "If they asked a question — ANSWER IT FULLY before continuing with the flow.",
-            "If they shared something personal — validate it genuinely before asking next question.",
-            "MATCH THE CALLER: Only respond to what they actually said. If they talk about price, talk price. If they describe their needs, echo and affirm those needs. Never pivot to a new topic in the same breath.",
-            "PACE: Speak at the caller's pace. If they are slow or thoughtful, slow down. Let silences breathe.",
-            "PATIENT: Do not advance to the next topic until the caller has clearly finished on the current one.",
-            "ADAPT: Follow the stage as a loose roadmap, not a rigid script.",
-            "If the caller is engaged on a topic, stay with them — don't rush to the next stage.",
-            "ONE question per turn only. Never stack questions.",
+            "LISTEN + QUALIFY: Acknowledge what the caller said, THEN always move the qualification forward.",
+            "Every turn must do two things: (1) respond to what was said, (2) ask the next missing field.",
+            "If they asked a question — ANSWER IT, then smoothly return to qualification.",
+            "SALES-DRIVEN: You are not a chatbot waiting for direction. You are a sales consultant guiding a conversation toward a booking.",
+            "PACE: Speak at the caller's pace. One question at a time. Never stack questions.",
             "3 sentences max per response. Phone call — brevity is warmth.",
             "Mirror their energy: excited → warm and enthusiastic, cautious → softer and reassuring.",
             "NEVER sound like an IVR, chatbot, or scripted call center agent.",
@@ -1953,10 +2220,13 @@ class ConversationRouter:
             "'Comparing builders' → smart — but see ours first. 30 years, zero stalls, RERA.",
             "",
             "━━ FIRM RULES ━━",
+            "✗ NEVER use hollow filler phrases: 'खुशी हुई', 'आपका जवाब सुनकर खुशी हुई', 'Happy to help', "
+            "'It was a pleasure', 'आपकी बात सुनकर', 'ખુશી થઈ', 'Glad to hear'. "
+            "Every sentence must either gather missing info, handle an objection, recommend a project, or push toward a site visit.",
             "✗ NEVER volunteer pricing, rates, payment plans, ROI, inventory levels, or discounts unprompted — only discuss these when the caller explicitly asks",
             "✗ NEVER repeat the caller's phone number back to them unless they explicitly ask you to confirm it",
             "✗ NEVER ask for information that is already listed in PERSISTENT CALL STATE or ALREADY COLLECTED",
-            "✗ NEVER ask budget before you know purpose/location/config",
+            "✗ NEVER ask budget before you know the caller's city and configuration (BHK size)",
             "✗ NEVER give more than 2 time options for site visit",
             "✗ NEVER dump the whole portfolio on one caller",
             "✗ NEVER make up prices or dates not listed above",
@@ -1969,6 +2239,12 @@ class ConversationRouter:
             "✓ No bullet points, lists, markdown, or emojis in your spoken responses",
             "✓ Only say things that are a direct, natural response to what the caller just said",
         ]
+
+        # QA tracker block — second layer of anti-repetition enforcement
+        qa_block = self.memory.qa_tracker.to_prompt_block()
+        if qa_block:
+            parts.append("")
+            parts.append(qa_block)
 
         context_str = self.memory.context.to_prompt_string()
         if context_str:
@@ -2035,21 +2311,30 @@ class ConversationRouter:
     def _has_gujarati_markers_devanagari(text: str) -> bool:
         """Detect Gujarati words written in Devanagari by STT.
 
-        Requires at least 2 distinct markers to avoid flipping language on a
-        single mishearing — words like 'माने' / 'छे' can appear in Hindi
-        utterances or as STT noise and shouldn't single-handedly switch the
-        agent to Gujarati.
+        Two-tier detection:
+        - Strong copulas (छे/छो/छु/केम/तमे/नथी/हसे/जोइए): exclusively Gujarati,
+          never appear as word-stems in Hindi. ONE hit is sufficient.
+          Word-boundary matching prevents false matches inside Hindi words like छोटा.
+        - Weak markers: ambiguous — require 2+ hits for confidence.
+
+        This fixes the regression where short Gujarati greetings like "kem cho"
+        get transcribed as "गेम छो" (Devanagari via hi-IN STT), producing only
+        one marker hit ("छो") that the old >= 2 threshold would reject.
         """
+        # Strong tier: one word-boundary match is enough
+        if _STRONG_GU_DEVA_RE.search(text):
+            return True
+
+        # Weak tier: ambiguous markers, need 2+ hits
         markers = [
-            "छे", "छु", "छो", "छीए", "छुं",
-            "जोइए", "जोईए", "जोइये",
-            "माने", "तमे", "तमने", "अमने", "अमारा", "तमारा",
+            "जोईए", "जोइये",
+            "माने", "तमने", "अमने", "अमारा", "तमारा",
             "बरोबर", "सारु", "सारुं", "माजामा",
-            "केम", "शुं", "क्यां",
-            "आवजो", "बोलो",
             "केमछो", "केम छो",
-            "हसे", "हतु", "हती",
-            "कालो", "अत्यारे",
+            "शुं", "क्यां",
+            "आवजो",
+            "हतु", "हती",
+            "अत्यारे",
             "जोवा", "जोई", "जोवुं",
             "बतावो", "जणावो",
         ]

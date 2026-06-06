@@ -27,7 +27,6 @@ from .vad import VoiceActivityDetector
 from .stt.router import STTRouter
 from .tts_stream import StreamingTTS, MockStreamingTTS
 from .tts_sarvam import SarvamTTS
-from .tts_sarvam_ws import SarvamWSTTS
 from .turn_manager import TurnManager, TurnManagerConfig
 from .conversation import ConversationRouter
 from .memory import ConversationMemory
@@ -79,10 +78,10 @@ QUEUE_SIZE_TTS = 8
 
 MAX_SPEECH_SECONDS = 4
 MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_SPEECH_SECONDS
-# Raised 300→500ms: 300ms segments were too short for reliable STT, producing
-# garbled single-syllable transcripts.  500ms is the minimum that consistently
-# yields a complete word and keeps utterances well above the noise floor.
-MIN_SPEECH_MS = 500.0
+# 300ms minimum: short inbound responses like "haan", "yes", "ha" are
+# valid single-word answers that must reach STT. 300ms is enough audio to
+# distinguish real speech from a click/breath without missing short replies.
+MIN_SPEECH_MS = 300.0
 BARGE_IN_COOLDOWN_MS = 400.0
 # Lowered 5→3 frames: telephony callers often speak immediately after hearing
 # the agent; requiring 5 sustained frames (100ms) was causing their first
@@ -159,7 +158,7 @@ class VoicePipeline:
         self._hub = event_hub
 
         # TTS uses the sink
-        self.tts = tts or SarvamWSTTS(audio_sink=self.sink)
+        self.tts = tts or SarvamTTS(audio_sink=self.sink)
         if tts and hasattr(tts, 'set_sink'):
             tts.set_sink(self.sink)
 
@@ -670,12 +669,12 @@ class VoicePipeline:
                 # English-IN well and it prevents misclassification on accented
                 # English with Indian words.
                 _stt_lang = "unknown"
-                if self.conversation:
-                    _st = self.conversation.state
-                    if _st.language_locked and _st.language in ("hi", "gu", "en"):
-                        _stt_lang = _st.language
-                        logger.debug("[STT-WORKER] lang_locked=%s -> stt_lang=%s",
-                                     _st.language, _stt_lang)
+                # Always use unknown for auto-detection — prevents the feedback loop
+                # where language_locked forces STT to a specific language, causing
+                # cross-language transcripts to be mis-detected and keeping the lock
+                # active. Sarvam's auto-detection on each turn enables true dynamic
+                # language switching as required.
+                logger.debug("[STT-WORKER] stt_lang=unknown (auto-detect every turn)")
                 _seg_samples = np.frombuffer(segment.audio, dtype=np.int16).astype(np.float32)
                 _seg_rms = float(np.sqrt(np.mean(_seg_samples ** 2))) if len(_seg_samples) else 0.0
                 logger.info(
@@ -693,24 +692,22 @@ class VoicePipeline:
                 transcript_text = stt_result.text
                 stt_latency = (time.monotonic() - latency_start) * 1000
 
-                # Lock conversation language from Sarvam's native detection result.
-                # Only applied on the first successful transcript (pre-lock) so
-                # subsequent turns use the explicit language code directly.
+                # Update conversation language from Sarvam's native detection result.
+                # Applied on every turn — no lock. Enables truly dynamic language switching.
                 if (
                     stt_result.detected_language
                     and self.conversation
-                    and not self.conversation.state.language_locked
                     and transcript_text
                 ):
                     _bcp47_to_short = {"en-IN": "en", "hi-IN": "hi", "gu-IN": "gu"}
                     short = _bcp47_to_short.get(stt_result.detected_language)
                     if short:
                         logger.info(
-                            "[STT] Language auto-detected by Sarvam: %s → locking to %s",
+                            "[STT] Language auto-detected by Sarvam: %s → %s",
                             stt_result.detected_language, short,
                         )
                         self.conversation.state.language = short
-                        self.conversation.state.language_locked = True
+                        # Do NOT lock — allow every utterance to update language dynamically
 
                 # Duration-aware plausibility: natural speech maxes at ~4 words/sec.
                 # A transcript with far more words than the audio can contain is a
@@ -734,6 +731,32 @@ class VoicePipeline:
                             _word_count, segment.duration_ms, _max_plausible,
                             transcript_text[:80],
                         )
+
+                # Guard against very short segments producing a single ambiguous word
+                # that could spuriously trigger location/name/budget extraction.
+                # Segments < 700ms yielding a single word are more likely noise than
+                # meaningful input — unless the segment is clearly an affirmation/negation
+                # (yes/no/haan/ji etc.) which must pass through for flow logic to work.
+                if (
+                    transcript_text
+                    and len(transcript_text.split()) == 1
+                    and segment.duration_ms < 700.0
+                ):
+                    _single = transcript_text.strip().lower()
+                    _affirmation_negation = {
+                        "yes", "yeah", "yep", "ok", "okay", "sure",
+                        "haan", "ha", "ji", "haan", "na", "nahi", "no",
+                        "nope", "theek", "barobar", "aavjo",
+                        "हां", "हाँ", "जी", "ठीक", "हा", "ना", "नहीं",
+                        "હા", "જી", "ઠીક", "ના", "નહીં",
+                    }
+                    if _single not in _affirmation_negation:
+                        logger.info(
+                            "[STT-WORKER] Single-word fragment %r from %.0fms segment — "
+                            "below duration threshold, skipping",
+                            transcript_text, segment.duration_ms,
+                        )
+                        continue
 
                 if not transcript_text or len(transcript_text.strip()) < 2:
                     # Unsupported-language recovery: play a language-appropriate
@@ -828,6 +851,23 @@ class VoicePipeline:
                 continue
             except asyncio.CancelledError:
                 break
+
+            # Drain any newer transcripts — only process the most recent one.
+            # When the caller speaks multiple times while the agent was processing
+            # (or barge-in produced several quick segments), responding to stale
+            # earlier transcripts causes the agent to reply out of context.
+            # Note: all drained transcripts had their QA observer called in the STT
+            # worker already; we only skip conversation engine processing here.
+            while not self._transcript_queue.empty():
+                try:
+                    newer = self._transcript_queue.get_nowait()
+                    logger.info(
+                        "[ENGINE] Skipping stale transcript %r in favor of: %r",
+                        transcript.text[:50], newer.text[:50],
+                    )
+                    transcript = newer
+                except asyncio.QueueEmpty:
+                    break
 
             try:
                 async def _run_generation():

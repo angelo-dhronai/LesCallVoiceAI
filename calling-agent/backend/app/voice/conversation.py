@@ -166,7 +166,8 @@ _OBJECTION_PATTERNS = [
     "not looking", "no need", "wrong number", "remove my number",
     # "later" / "not now" — deferral is an objection, treat it kindly
     "talk later", "later please", "maybe later", "some other time",
-    "another time", "not right now",
+    "another time", "not right now", "call me later", "call later",
+    "call back later", "call you later",
     "baad mein baat", "baad me baat", "baadme baat",
     "phir baat", "phir karte", "phir baat karenge",
     "abhi nahi", "abhi nai", "abhi busy",
@@ -730,6 +731,7 @@ class ConversationRouter:
         # Name-capture confirmation mode (feature 4)
         self._name_pending: str | None = None
         self._name_confirmed: bool = False
+        self._name_pending_turn: int = 0   # turn index when _name_pending was set
 
         if not self._api_key:
             logger.warning("[CONV] OPENAI_API_KEY not set -- LLM calls will fail")
@@ -805,6 +807,7 @@ class ConversationRouter:
                 and self.memory.booking.user_name
                 and self.memory.booking.user_name != _prev_booking_name):
             self._name_pending = self.memory.booking.user_name
+            self._name_pending_turn = self.state.turn_count
             self.memory.booking.user_name = None
             self.memory.context.user_name = None
             logger.info("[NAME] Name pending confirmation: %r", self._name_pending)
@@ -826,14 +829,14 @@ class ConversationRouter:
             or src == "script_gu_markers"
         )
 
-        # Decay the lock after 20 turns — prevents rapid language flipping while
-        # still allowing long calls to adapt if the caller genuinely changes
-        # language. An explicit language_switch intent resets lock_turns to -10
-        # so it persists for 30 turns before decaying, giving strong persistence
-        # after a deliberate switch request.
+        # Decay the lock after 10 turns — allows the call to re-evaluate language
+        # within a reasonable window when the caller switches naturally.
+        # An explicit language_switch intent resets lock_turns to -10 so it
+        # persists for 20 turns before decaying, giving strong persistence after
+        # a deliberate switch request.
         if self.state.language_locked:
             self.state.language_lock_turns += 1
-            if self.state.language_lock_turns > 20:
+            if self.state.language_lock_turns > 10:
                 self.state.language_locked = False
                 logger.info("[LANG] Lock expired after %d turns", self.state.language_lock_turns)
 
@@ -854,6 +857,27 @@ class ConversationRouter:
                     src, recent_gu, single_strong,
                 )
                 self.state.language = "gu"
+                self.state.language_locked = False
+                self.state.language_lock_turns = 0
+
+        # Override a Gujarati lock to Hindi/English when the caller clearly switches.
+        # Mirrors the Gujarati override above: 2 consecutive non-Gujarati turns confirm
+        # the switch so a single code-switched word doesn't flip the language.
+        if (
+            not is_gujarati_detected
+            and self.state.language_locked
+            and prev_lang == "gu"
+            and detected_lang in ("hi", "en")
+            and conf >= 0.7
+        ):
+            recent_non_gu = sum(1 for l in history[-2:] if l != "gu")
+            if recent_non_gu >= 2:
+                logger.info(
+                    "[LANG] Overriding Gujarati lock to %s "
+                    "(recent_non_gu=%d, src=%s, conf=%.2f)",
+                    detected_lang, recent_non_gu, src, conf,
+                )
+                self.state.language = detected_lang
                 self.state.language_locked = False
                 self.state.language_lock_turns = 0
 
@@ -966,7 +990,7 @@ class ConversationRouter:
                     logger.info("[REPEAT] Language-change repeat: %s -> %s", self.state.language, new_lang)
                     self.state.language = new_lang
                     self.state.language_locked = True
-                    self.state.language_lock_turns = -10
+                    self.state.language_lock_turns = -7
                     self.state.language_history = [new_lang] * 5
                 logger.info("[REPEAT+LANG] Re-rendering last response in %s", self.state.language)
                 # LLM will see the updated language in the system prompt and re-render
@@ -1046,14 +1070,14 @@ class ConversationRouter:
             )
             self.state.language = new_lang
             self.state.language_locked = True
-            # Start at -10 so the lock persists for 30 turns (20 - (-10)) before
-            # decaying — explicit caller requests should stick much longer.
-            self.state.language_lock_turns = -10
+            # Start at -7 so the lock persists for 17 turns before decaying.
+            # Explicit caller requests should persist but allow natural switching.
+            self.state.language_lock_turns = -7
             self.state.language_history = [new_lang] * 5
             resp = _LANG_SWITCH_RESPONSES.get(new_lang, _LANG_SWITCH_RESPONSES["hi"])
             self.memory.add_assistant(resp, language=new_lang)
             self._store_last_response(resp)
-            logger.info("[LANG-LOCK] explicit_switch lang=%s lock_turns=%d (persists ~30 turns)",
+            logger.info("[LANG-LOCK] explicit_switch lang=%s lock_turns=%d (persists ~17 turns)",
                         new_lang, self.state.language_lock_turns)
             yield EngineResult(text=resp, is_shortcut=True, intent="language_switch")
             return
@@ -1076,16 +1100,20 @@ class ConversationRouter:
             elif intent == "negation":
                 logger.info("[NAME] Caller rejected name %r — clearing pending", self._name_pending)
                 self._name_pending = None
+            elif self.state.turn_count - self._name_pending_turn >= 2:
+                # Caller neither confirmed nor denied after 2 turns — auto-accept.
+                # They likely just said their name and kept talking naturally.
+                self.memory.booking.user_name = self._name_pending
+                self.memory.context.user_name = self._name_pending
+                self.memory.call_state.customer_name = self._name_pending
+                self._name_confirmed = True
+                logger.info("[NAME] Auto-accepted name after 2 turns: %r", self._name_pending)
+                self._name_pending = None
 
-        # Lock language on first user response and advance from GREETING
+        # Advance from GREETING on first user response
         if self.state.stage == STAGE_GREETING:
-
-            # Lock language from first user response to bilingual greeting
-            if not self.state.language_locked:
-                self.state.language_locked = True
-                logger.info("[LANG-LOCK] greeting_response lang=%s locked=True (decays after 20 turns)",
-                            self.state.language)
             self.state.stage = STAGE_DISCOVERY
+            logger.info("[STAGE] GREETING → DISCOVERY")
 
         # =============================================================
         # SOFT STAGE ADVANCEMENT based on collected data
@@ -1230,9 +1258,11 @@ class ConversationRouter:
 
         if self.state.stage == STAGE_DISCOVERY:
             _has_name = bool(b.user_name or self.memory.call_state.customer_name)
-            # Advance once name + location are known (3+ turns) or after 10 turns.
-            # Name gate ensures agent collects caller identity before pitching projects.
-            if (_has_name and b.location and dt >= 3) or dt >= 10:
+            _has_location = bool(b.location or self.memory.call_state.selected_location)
+            # Advance once BOTH name + location are known (3+ turns), so the agent
+            # doesn't pitch projects before knowing who the caller is and where they
+            # want to buy. Fallback at 12 turns ensures the flow never stalls.
+            if (_has_name and _has_location and dt >= 3) or dt >= 12:
                 self.state.stage = STAGE_PROJECT_MATCH
                 logger.info("[STAGE] DISCOVERY → PROJECT_MATCH (name=%s, loc=%s, turns=%d)",
                             b.user_name, b.location, dt)
@@ -1514,6 +1544,10 @@ class ConversationRouter:
         "asking", "wondering", "thinking", "planning", "searching",
         "surat", "vapi", "silvassa", "pramukh", "vishal", "patel",
         "yes", "no", "haan", "nahi", "ji", "ha", "na",
+        # Greetings — never a name
+        "hello", "helo", "hellow", "hi", "hey", "namaste", "namaskar",
+        "kem", "kemcho", "hallo", "halo", "bolo", "suno", "suniye",
+        "boliye",
         # possessive/pronoun words that precede a name — not a name themselves
         "mera", "meri", "mere", "naam", "my", "name",
         "maro", "mari", "maru", "apnu", "apna", "aapka",
@@ -2484,6 +2518,7 @@ class ConversationRouter:
         """Cache the most recent agent utterance for repeat/translate requests."""
         self.last_agent_response = text
         self.last_agent_language = self.state.language
+        self.memory.qa_tracker.observe_agent_turn(text, self.memory.turn_index)
         logger.debug("[LAST-RESPONSE] Stored shortcut response (lang=%s): %r",
                      self.last_agent_language, text[:60])
 

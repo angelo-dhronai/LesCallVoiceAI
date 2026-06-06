@@ -24,7 +24,6 @@ from collections import Counter
 
 from .base import STTProvider, STTResult  # noqa: F401 — re-exported for pipeline
 from .sarvam import SarvamSTT, SarvamRateLimitError
-from .sarvam_ws import SarvamWSSTT
 from .openai_whisper import OpenAIWhisperSTT
 from .post_processor import post_process_transcript
 
@@ -316,7 +315,7 @@ class STTRouter:
         max_retries: int = MAX_RETRIES,
         min_confidence: float = MIN_CONFIDENCE,
     ) -> None:
-        self._primary = primary or SarvamWSSTT()
+        self._primary = primary or SarvamSTT()
         self._fallback = fallback or OpenAIWhisperSTT()
         self._min_length = min_length
         self._max_retries = max_retries

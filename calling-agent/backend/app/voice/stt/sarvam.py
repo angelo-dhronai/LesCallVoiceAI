@@ -144,8 +144,9 @@ class SarvamSTT(STTProvider):
         data = response.json()
         transcript = data.get("transcript", "").strip()
         confidence = float(data.get("confidence", 1.0))
-        logger.info("[STT:Sarvam] Transcript: %r (confidence=%.2f)", transcript, confidence)
-        return STTResult(text=transcript, confidence=confidence)
+        detected_lang = data.get("language_code") or None
+        logger.info("[STT:Sarvam] Transcript: %r (confidence=%.2f, lang=%s)", transcript, confidence, detected_lang)
+        return STTResult(text=transcript, confidence=confidence, detected_language=detected_lang)
 
     async def warmup(self) -> None:
         """Pre-open a TLS connection to the Sarvam host so the first real

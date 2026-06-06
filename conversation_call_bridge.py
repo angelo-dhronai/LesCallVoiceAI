@@ -259,11 +259,10 @@ class SessionManager:
 
     # Issue 3 & 4: process-level registry of greeted calls.
     # Prevents duplicate greetings when FreeSWITCH reconnects the WebSocket
-    # for the same call (e.g., transient network glitch). TTL of 5 minutes
-    # covers any realistic reconnect window; entries older than that are
-    # considered a genuinely new call that should get a fresh greeting.
+    # for the same call (e.g., transient network glitch). TTL of 30 minutes
+    # covers long calls where a mid-call reconnect should not replay the greeting.
     _greeted: Dict[str, float] = {}
-    _GREETING_TTL_S: float = 300.0
+    _GREETING_TTL_S: float = 1800.0
 
     def __init__(self):
         self.sessions: Dict[str, TelephonySession] = {}

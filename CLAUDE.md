@@ -95,8 +95,10 @@ Five independent async tasks connected by bounded queues:
 ### STT Layer (`app/voice/stt/`)
 
 - **`stt/router.py` — STTRouter**: always tries Sarvam first. On HTTP 429, exponential backoff (60s → 300s max) and routes to Whisper. On clean empty transcript (no speech), returns `""` immediately — Whisper is **not** called. Only genuine API errors trigger fallback.
-- **`stt/sarvam.py` — SarvamSTT**: multipart WAV POST to `api.sarvam.ai/speech-to-text`, model `saarika:v2.5`. Uses persistent `httpx.AsyncClient` with 60s keepalive expiry.
-- **`stt/router.py` — `validate_transcript()`**: rejects hallucinations (YouTube phrases), unsupported scripts (Korean, Tamil, Malayalam, etc.), filler words, repetition, and single-word noise tokens before any text reaches the conversation engine.
+- **`stt/sarvam.py` — SarvamSTT**: multipart WAV POST to `api.sarvam.ai/speech-to-text`, model `saaras:v3`, mode `codemix`. PCM audio is amplitude-normalized before upload (telephony audio is often quiet). Returns `language_probability` field used for language locking. Uses persistent `httpx.AsyncClient` with 60s keepalive expiry.
+- **`stt/router.py` — `validate_transcript()`**: rejects hallucinations (YouTube phrases + Devanagari equivalents), unsupported scripts (Korean, Tamil, Malayalam, etc.), Marathi (shares Devanagari with Hindi — caught by specific word markers), filler words, repetition, single-word noise tokens, and function-word-only fragments (quality score < 0.3). Returns `""` to reject; caller skips Whisper fallback on clean empty results.
+- **Language locking** (`pipeline.py`): After Sarvam returns `language_probability ≥ 0.75`, the detected BCP-47 code (e.g. `hi-IN`) is locked in `_stt_locked_language` and passed on every subsequent STT call, preventing mid-call language bounce.
+- **Audio normalization** (`stt/base.py`): PCM amplitude is boosted before upload to compensate for quiet telephone callers.
 
 ### Conversation Engine (`app/voice/conversation.py`)
 

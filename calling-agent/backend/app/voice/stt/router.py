@@ -347,14 +347,14 @@ class STTRouter:
                 "[STT] Sarvam rate-limited (%.0fs remaining) — routing to fallback",
                 remaining,
             )
-            text, _, _ = await self._try_provider(
+            text, _, _, _ = await self._try_provider(
                 self._fallback, "fallback", audio_bytes, sample_rate, language
             )
             return STTResult(text=text)
 
         # ── Try primary (Sarvam) ─────────────────────────────────────────
         try:
-            text, had_error, detected_lang = await self._try_provider(
+            text, had_error, detected_lang, lang_prob = await self._try_provider(
                 self._primary, "primary", audio_bytes, sample_rate, language
             )
         except SarvamRateLimitError as exc:
@@ -372,7 +372,7 @@ class STTRouter:
                 backoff,
                 exc.retry_after,
             )
-            text, _, _ = await self._try_provider(
+            text, _, _, _ = await self._try_provider(
                 self._fallback, "fallback", audio_bytes, sample_rate, language
             )
             return STTResult(text=text)
@@ -381,7 +381,7 @@ class STTRouter:
             # Successful Sarvam call → reset rate-limit strike counter
             self._sarvam_rl_count = 0
             logger.info("[STT] Primary succeeded: %r", text)
-            return STTResult(text=text, detected_language=detected_lang)
+            return STTResult(text=text, detected_language=detected_lang, language_probability=lang_prob)
 
         if not had_error:
             # Sarvam processed the audio cleanly but found no speech.
@@ -394,7 +394,7 @@ class STTRouter:
 
         # ── Primary had a genuine API/network error → try fallback ───────
         logger.info("[STT] Primary errored — routing to fallback provider")
-        text, _, _ = await self._try_provider(
+        text, _, _, _ = await self._try_provider(
             self._fallback, "fallback", audio_bytes, sample_rate, language
         )
         if text:
@@ -419,13 +419,13 @@ class STTRouter:
         audio_bytes: bytes,
         sample_rate: int,
         language: str,
-    ) -> tuple[str, bool, str | None]:
+    ) -> tuple[str, bool, str | None, float | None]:
         """
         Attempt transcription with up to (max_retries + 1) attempts.
 
         Returns
         -------
-        (transcript, had_error, detected_language)
+        (transcript, had_error, detected_language, language_probability)
             transcript : str
                 Clean, post-processed text; empty string if nothing usable.
             had_error : bool
@@ -435,6 +435,8 @@ class STTRouter:
             detected_language : str | None
                 BCP-47 language code returned by the provider (e.g. "gu-IN"),
                 or None if the provider did not report one.
+            language_probability : float | None
+                Confidence in the detected language (0.0–1.0), or None.
         """
         had_error = False
 
@@ -446,6 +448,7 @@ class STTRouter:
                 text = result.text
                 confidence = result.confidence
                 detected_lang = result.detected_language
+                lang_prob = result.language_probability
 
                 if confidence < self._min_confidence:
                     logger.info(
@@ -453,29 +456,31 @@ class STTRouter:
                         "provider=%s attempt=%d",
                         confidence, text, label, attempt,
                     )
-                    return "", False, None
+                    return "", False, None, None
 
                 if len(text) < self._min_length:
                     logger.info(
                         "[STT] %s short/empty transcript %r (attempt %d) — no speech",
                         label, text, attempt,
                     )
-                    return "", False, None
+                    return "", False, None, None
 
                 validated = validate_transcript(text)
                 if validated:
                     processed = self._post_process(validated, language)
                     logger.info(
-                        "[STT] %s attempt %d: %r -> validated %r -> processed %r",
+                        "[STT] %s attempt %d: RAW=%r -> validated=%r -> POST=%r lang=%s prob=%s",
                         label, attempt, text, validated, processed,
+                        detected_lang,
+                        f"{lang_prob:.2f}" if lang_prob is not None else "n/a",
                     )
-                    return processed, False, detected_lang
+                    return processed, False, detected_lang, lang_prob
 
                 logger.info(
                     "[STT] %s transcript %r rejected by validation (attempt %d)",
                     label, text, attempt,
                 )
-                return "", False, None
+                return "", False, None, None
 
             except SarvamRateLimitError:
                 raise
@@ -493,4 +498,4 @@ class STTRouter:
                     label, attempt + 1, self._max_retries + 1,
                 )
 
-        return "", had_error, None
+        return "", had_error, None, None

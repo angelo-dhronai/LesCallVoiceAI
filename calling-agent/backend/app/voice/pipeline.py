@@ -109,6 +109,11 @@ SPEECH_HOLD_MIN_FRAMES = 10
 # tolerating normal intra-utterance breathing pauses.
 HARD_FLUSH_SILENCE_FRAMES = 50
 
+# Minimum Sarvam language_probability to lock language for subsequent STT calls.
+# Below this threshold we keep auto-detecting so noisy first turns don't
+# permanently mis-lock (e.g. background music detected as Tamil).
+_LANG_LOCK_PROB_THRESHOLD = 0.75
+
 # Fallback phrases played when STT returns empty on substantial speech,
 # or when TTS receives an empty string or fails to play (feature 2 & 5).
 _STT_FALLBACK_PHRASES: dict[str, str] = {
@@ -197,6 +202,11 @@ class VoicePipeline:
         self._speech_onset_frames = 0  # debounce: frames since speech started
         self._silence_frames = 0       # debounce: frames since last speech
         self._pre_speech_buffer: list[bytes] = []  # look-back to recover onset clip
+
+        # STT language lock — set to BCP-47 code (e.g. "hi-IN") after Sarvam
+        # returns a confident detection (language_probability >= threshold).
+        # "unknown" is only used pre-lock to allow free language detection.
+        self._stt_locked_language: str | None = None
 
         # Diagnostic counters — logged at session end to trace audio path
         self._vad_frames_seen: int = 0
@@ -668,13 +678,14 @@ class VoicePipeline:
                 # English is also passed explicitly when locked — Sarvam handles
                 # English-IN well and it prevents misclassification on accented
                 # English with Indian words.
-                _stt_lang = "unknown"
-                # Always use unknown for auto-detection — prevents the feedback loop
-                # where language_locked forces STT to a specific language, causing
-                # cross-language transcripts to be mis-detected and keeping the lock
-                # active. Sarvam's auto-detection on each turn enables true dynamic
-                # language switching as required.
-                logger.debug("[STT-WORKER] stt_lang=unknown (auto-detect every turn)")
+                # Use locked language if we have a confident detection from a
+                # prior turn; otherwise let Sarvam auto-detect.
+                _stt_lang = self._stt_locked_language or "unknown"
+                logger.debug(
+                    "[STT-WORKER] stt_lang=%s (%s)",
+                    _stt_lang,
+                    "locked" if self._stt_locked_language else "auto-detect",
+                )
                 _seg_samples = np.frombuffer(segment.audio, dtype=np.int16).astype(np.float32)
                 _seg_rms = float(np.sqrt(np.mean(_seg_samples ** 2))) if len(_seg_samples) else 0.0
                 logger.info(
@@ -693,7 +704,8 @@ class VoicePipeline:
                 stt_latency = (time.monotonic() - latency_start) * 1000
 
                 # Update conversation language from Sarvam's native detection result.
-                # Applied on every turn — no lock. Enables truly dynamic language switching.
+                # Also lock the STT language when detection confidence is high enough
+                # so subsequent chunks don't bounce between languages mid-call.
                 if (
                     stt_result.detected_language
                     and self.conversation
@@ -702,12 +714,26 @@ class VoicePipeline:
                     _bcp47_to_short = {"en-IN": "en", "hi-IN": "hi", "gu-IN": "gu"}
                     short = _bcp47_to_short.get(stt_result.detected_language)
                     if short:
-                        logger.info(
-                            "[STT] Language auto-detected by Sarvam: %s → %s",
-                            stt_result.detected_language, short,
-                        )
                         self.conversation.state.language = short
-                        # Do NOT lock — allow every utterance to update language dynamically
+
+                        lang_prob = stt_result.language_probability
+                        if (
+                            lang_prob is not None
+                            and lang_prob >= _LANG_LOCK_PROB_THRESHOLD
+                            and self._stt_locked_language != stt_result.detected_language
+                        ):
+                            self._stt_locked_language = stt_result.detected_language
+                            logger.info(
+                                "[STT] Language locked: %s → %s (prob=%.2f)",
+                                stt_result.detected_language, short, lang_prob,
+                            )
+                        else:
+                            logger.info(
+                                "[STT] Language detected: %s → %s (prob=%s, lock=%s)",
+                                stt_result.detected_language, short,
+                                f"{lang_prob:.2f}" if lang_prob is not None else "n/a",
+                                self._stt_locked_language or "none",
+                            )
 
                 # Duration-aware plausibility: natural speech maxes at ~4 words/sec.
                 # A transcript with far more words than the audio can contain is a

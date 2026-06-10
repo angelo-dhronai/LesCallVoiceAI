@@ -43,6 +43,7 @@ class TelephonySession:
             event_hub=self.hub,
             mic_enabled=True,
             skip_greeting=skip_greeting,
+            call_id=conn_id,
         )
         self.pipeline_task = None
         self.playback_task = None

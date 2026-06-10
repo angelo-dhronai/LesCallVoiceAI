@@ -20,4 +20,5 @@ tail -qf "${FILES[@]}" | awk '
 /ERROR|CRITICAL|Failed|failed|Error|error|Exception|Traceback/ { printf "\033[0;31m[ERROR] %s\033[0m\n", $0; fflush(); next }
 /transcript|STT|stt_stream_worker/                              { printf "\033[0;35m[STT]   %s\033[0m\n", $0; fflush(); next }
 /LLM|TTS|Conversation/                                          { printf "\033[0;32m[AI]    %s\033[0m\n", $0; fflush(); next }
+/CREDITS/                                                        { printf "\033[0;33m[CREDIT] %s\033[0m\n", $0; fflush(); next }
 '

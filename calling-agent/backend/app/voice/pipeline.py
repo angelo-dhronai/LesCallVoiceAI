@@ -31,6 +31,9 @@ from .turn_manager import TurnManager, TurnManagerConfig
 from .conversation import ConversationRouter
 from .memory import ConversationMemory
 from .event_hub import EventHub
+from .tracking_stt import TrackingSarvamSTT, TrackingWhisperSTT
+from .tracking_tts import TrackingSarvamTTS
+from .credit_tracker import SarvamCreditTracker
 
 from ..audio_transport.base import AudioSource, AudioSink
 from ..audio_transport.local_mic_source import LocalMicSource
@@ -144,10 +147,12 @@ class VoicePipeline:
         event_hub: EventHub | None = None,
         mic_enabled: bool = True,
         skip_greeting: bool = False,
+        call_id: str | None = None,
     ) -> None:
+        self._call_id = call_id
         self.audio = audio_source or LocalMicSource(sample_rate=SAMPLE_RATE)
         self.sink = audio_sink or LocalSpeakerSink(sample_rate=SAMPLE_RATE)
-        
+
         # Phase 17: Adjust VAD for telephony mode
         if vad is None:
             vad = VoiceActivityDetector(
@@ -157,15 +162,26 @@ class VoicePipeline:
                 maximum_threshold=3000.0 if TELEPHONY_MODE else 1500.0,
             )
         self.vad = vad
-        
-        self.stt = stt or STTRouter()
+
+        if stt is None:
+            _get_cid = lambda: self._call_id
+            self.stt = STTRouter(
+                primary=TrackingSarvamSTT(call_id_provider=_get_cid),
+                fallback=TrackingWhisperSTT(call_id_provider=_get_cid),
+            )
+        else:
+            self.stt = stt
+
         self.conversation = conversation or ConversationRouter()
         self._hub = event_hub
 
-        # TTS uses the sink
-        self.tts = tts or SarvamTTS(audio_sink=self.sink)
-        if tts and hasattr(tts, 'set_sink'):
-            tts.set_sink(self.sink)
+        if tts is None:
+            _get_cid = lambda: self._call_id
+            self.tts = TrackingSarvamTTS(call_id_provider=_get_cid, audio_sink=self.sink)
+        else:
+            self.tts = tts
+            if hasattr(tts, 'set_sink'):
+                tts.set_sink(self.sink)
 
         # Inter-layer queues
         self._stt_queue: asyncio.Queue[AudioSegment] = asyncio.Queue(maxsize=QUEUE_SIZE_STT)
@@ -246,6 +262,8 @@ class VoicePipeline:
 
     async def start(self) -> None:
         self._running = True
+        if self._call_id:
+            SarvamCreditTracker.get().start_call(self._call_id)
         logger.info("=" * 60)
         logger.info("[PIPELINE] Starting voice pipeline")
         logger.info("=" * 60)
@@ -332,6 +350,8 @@ class VoicePipeline:
 
     async def stop(self) -> None:
         self._running = False
+        if self._call_id:
+            SarvamCreditTracker.get().end_call(self._call_id)
         await self.audio.stop()
         for task in self._tasks:
             task.cancel()

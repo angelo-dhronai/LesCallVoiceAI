@@ -135,6 +135,13 @@ class CachedTTS(TrackingSarvamTTS):
                 # Each frame is 2 bytes (PCM16 mono)
                 frames_per_chunk = _PCM_CHUNK_BYTES // 2
 
+                # Mirror the live speak() path: mark the sink running before
+                # writing. Without this, TelephonySink.write_frame() drops every
+                # frame (guarded by `if not self._running`) and flush() finds an
+                # empty buffer — silently dropping the cached greeting, which is
+                # the first thing the caller should hear.
+                await effective_sink.start()
+
                 while True:
                     if self._cancelled:
                         logger.info(

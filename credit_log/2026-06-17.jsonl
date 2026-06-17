@@ -1,0 +1,132 @@
+{"type": "call_start", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:00:43.026Z"}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:01:21.906Z", "provider": "sarvam", "audio_seconds": 0.52, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:01:25.976Z", "chars": 79, "completed": true}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:01:34.467Z", "provider": "sarvam", "audio_seconds": 1.96, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:01:38.461Z", "chars": 72, "completed": true}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:01:49.566Z", "provider": "sarvam", "audio_seconds": 1.82, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:01:54.080Z", "chars": 112, "completed": true}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:02:06.843Z", "provider": "sarvam", "audio_seconds": 3.64, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:02:11.111Z", "chars": 101, "completed": true}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:02:23.284Z", "provider": "sarvam", "audio_seconds": 3.32, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:02:25.159Z", "chars": 187, "completed": false}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:02:27.329Z", "provider": "sarvam", "audio_seconds": 1.3, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:02:32.771Z", "chars": 101, "completed": true}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:02:49.293Z", "provider": "sarvam", "audio_seconds": 4.0, "billed_seconds": 4.0}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:02:51.025Z", "provider": "sarvam", "audio_seconds": 1.14, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:02:51.432Z", "chars": 86, "completed": false}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:02:53.185Z", "provider": "sarvam", "audio_seconds": 1.04, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:03:05.967Z", "chars": 346, "completed": false}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:03:07.752Z", "provider": "sarvam", "audio_seconds": 1.12, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:03:12.039Z", "chars": 144, "completed": true}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:03:25.814Z", "provider": "sarvam", "audio_seconds": 3.92, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:03:31.232Z", "chars": 155, "completed": true}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:03:59.620Z", "provider": "sarvam", "audio_seconds": 4.0, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:04:04.542Z", "chars": 127, "completed": true}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:04:18.477Z", "provider": "sarvam", "audio_seconds": 2.74, "billed_seconds": 3.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:04:24.539Z", "chars": 164, "completed": true}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:04:42.541Z", "provider": "sarvam", "audio_seconds": 4.0, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:04:44.369Z", "chars": 132, "completed": false}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:04:50.162Z", "provider": "sarvam", "audio_seconds": 4.0, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:04:52.494Z", "chars": 247, "completed": false}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:04:54.889Z", "provider": "sarvam", "audio_seconds": 1.56, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:05:02.016Z", "chars": 184, "completed": true}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:05:21.650Z", "provider": "sarvam", "audio_seconds": 4.0, "billed_seconds": 4.0}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:05:23.395Z", "provider": "sarvam", "audio_seconds": 1.3, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:05:23.514Z", "chars": 193, "completed": false}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:05:28.343Z", "provider": "sarvam", "audio_seconds": 3.94, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:05:40.754Z", "chars": 179, "completed": true}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:06:04.069Z", "provider": "sarvam", "audio_seconds": 4.0, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:06:08.269Z", "chars": 151, "completed": false}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:06:09.495Z", "provider": "sarvam", "audio_seconds": 0.58, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:06:14.554Z", "chars": 177, "completed": false}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:06:15.737Z", "provider": "sarvam", "audio_seconds": 0.52, "billed_seconds": 1.0}
+{"type": "stt_event", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:06:23.559Z", "provider": "sarvam", "audio_seconds": 0.6, "billed_seconds": 1.0}
+{"type": "call_end", "call_id": "bd950f27-ddf9-43b3-b4ed-e07681bd8294", "ts": "2026-06-17T11:06:24.931Z", "start_time": "2026-06-17T11:00:43.026Z", "stt_sarvam_seconds": 55.02, "stt_sarvam_billed_seconds": 63.0, "stt_sarvam_calls": 23, "stt_whisper_seconds": 0.0, "stt_whisper_calls": 0, "tts_chars": 2937, "tts_calls": 19, "tts_cancelled_calls": 8, "est_stt_cost": 0.525, "est_tts_cost": 8.811}
+{"type": "call_start", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:11.923Z"}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:25.749Z", "provider": "sarvam", "audio_seconds": 0.74, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:27.461Z", "chars": 93, "completed": false}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:28.367Z", "provider": "sarvam", "audio_seconds": 0.32, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:30.304Z", "chars": 17, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:34.146Z", "provider": "sarvam", "audio_seconds": 1.1, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:37.102Z", "chars": 126, "completed": false}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:39.172Z", "provider": "sarvam", "audio_seconds": 0.92, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:41.805Z", "chars": 11, "completed": true}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:43.999Z", "chars": 135, "completed": false}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:45.025Z", "provider": "sarvam", "audio_seconds": 0.36, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:48.140Z", "chars": 73, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:34:58.798Z", "provider": "sarvam", "audio_seconds": 2.9, "billed_seconds": 3.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:35:00.665Z", "chars": 128, "completed": false}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:35:02.221Z", "provider": "sarvam", "audio_seconds": 0.74, "billed_seconds": 1.0}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:35:04.000Z", "provider": "sarvam", "audio_seconds": 0.9, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:35:08.585Z", "chars": 130, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:35:19.514Z", "provider": "sarvam", "audio_seconds": 2.9, "billed_seconds": 3.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:35:27.181Z", "chars": 163, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:35:47.439Z", "provider": "sarvam", "audio_seconds": 4.0, "billed_seconds": 4.0}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:35:48.765Z", "provider": "sarvam", "audio_seconds": 0.38, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:35:53.288Z", "chars": 147, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:10.857Z", "provider": "sarvam", "audio_seconds": 3.76, "billed_seconds": 4.0}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:12.604Z", "provider": "sarvam", "audio_seconds": 1.12, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:13.610Z", "chars": 21, "completed": true}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:15.806Z", "chars": 122, "completed": false}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:22.970Z", "provider": "sarvam", "audio_seconds": 4.0, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:25.559Z", "chars": 126, "completed": false}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:26.544Z", "provider": "sarvam", "audio_seconds": 0.38, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:29.927Z", "chars": 78, "completed": false}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:32.289Z", "provider": "sarvam", "audio_seconds": 1.34, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:35.982Z", "chars": 78, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:46.627Z", "provider": "sarvam", "audio_seconds": 3.98, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:48.856Z", "chars": 299, "completed": false}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:51.496Z", "provider": "sarvam", "audio_seconds": 1.8, "billed_seconds": 2.0}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:52.965Z", "provider": "sarvam", "audio_seconds": 0.38, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:36:58.880Z", "chars": 220, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:37:15.714Z", "provider": "sarvam", "audio_seconds": 1.54, "billed_seconds": 2.0}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:37:17.264Z", "provider": "sarvam", "audio_seconds": 1.04, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:37:22.935Z", "chars": 176, "completed": true}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:37:24.583Z", "chars": 80, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:37:38.353Z", "provider": "sarvam", "audio_seconds": 2.42, "billed_seconds": 3.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:37:41.308Z", "chars": 98, "completed": false}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:37:47.352Z", "provider": "sarvam", "audio_seconds": 4.0, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:37:54.373Z", "chars": 177, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:38:07.727Z", "provider": "sarvam", "audio_seconds": 1.64, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:38:14.487Z", "chars": 188, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:38:30.365Z", "provider": "sarvam", "audio_seconds": 0.9, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:38:33.110Z", "chars": 145, "completed": false}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:38:39.021Z", "provider": "sarvam", "audio_seconds": 4.0, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:38:47.590Z", "chars": 189, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:39:08.830Z", "provider": "sarvam", "audio_seconds": 3.68, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:39:09.286Z", "chars": 189, "completed": false}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:39:10.206Z", "provider": "sarvam", "audio_seconds": 0.32, "billed_seconds": 1.0}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:39:12.259Z", "provider": "sarvam", "audio_seconds": 0.86, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:39:12.936Z", "chars": 11, "completed": true}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:39:18.114Z", "chars": 173, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:39:41.790Z", "provider": "sarvam", "audio_seconds": 4.0, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:39:49.373Z", "chars": 141, "completed": true}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:40:05.299Z", "provider": "sarvam", "audio_seconds": 0.64, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:40:07.419Z", "chars": 170, "completed": false}
+{"type": "stt_event", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:40:10.366Z", "provider": "sarvam", "audio_seconds": 1.04, "billed_seconds": 2.0}
+{"type": "call_end", "call_id": "785055c5-1a6d-4c4d-9ee6-61319f1cd10a", "ts": "2026-06-17T11:40:11.147Z", "start_time": "2026-06-17T11:34:11.923Z", "stt_sarvam_seconds": 58.1, "stt_sarvam_billed_seconds": 70.0, "stt_sarvam_calls": 32, "stt_whisper_seconds": 0.0, "stt_whisper_calls": 0, "tts_chars": 3704, "tts_calls": 29, "tts_cancelled_calls": 12, "est_stt_cost": 0.583333, "est_tts_cost": 11.112}
+{"type": "call_start", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:41:54.464Z"}
+{"type": "stt_event", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:42:18.581Z", "provider": "sarvam", "audio_seconds": 1.3, "billed_seconds": 2.0}
+{"type": "stt_event", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:42:24.642Z", "provider": "sarvam", "audio_seconds": 1.12, "billed_seconds": 2.0}
+{"type": "tts_event", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:42:28.413Z", "chars": 83, "completed": true}
+{"type": "stt_event", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:42:45.575Z", "provider": "sarvam", "audio_seconds": 2.2, "billed_seconds": 3.0}
+{"type": "tts_event", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:42:48.201Z", "chars": 11, "completed": true}
+{"type": "tts_event", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:42:51.891Z", "chars": 104, "completed": true}
+{"type": "stt_event", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:43:03.154Z", "provider": "sarvam", "audio_seconds": 2.62, "billed_seconds": 3.0}
+{"type": "stt_event", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:43:03.364Z", "provider": "sarvam", "audio_seconds": 0.42, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:43:07.980Z", "chars": 152, "completed": true}
+{"type": "stt_event", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:43:22.778Z", "provider": "sarvam", "audio_seconds": 3.28, "billed_seconds": 4.0}
+{"type": "stt_event", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:43:29.645Z", "provider": "sarvam", "audio_seconds": 0.78, "billed_seconds": 1.0}
+{"type": "call_end", "call_id": "32034396-deb1-4f5f-b504-5bf67f29661d", "ts": "2026-06-17T11:43:30.765Z", "start_time": "2026-06-17T11:41:54.464Z", "stt_sarvam_seconds": 11.72, "stt_sarvam_billed_seconds": 16.0, "stt_sarvam_calls": 7, "stt_whisper_seconds": 0.0, "stt_whisper_calls": 0, "tts_chars": 350, "tts_calls": 4, "tts_cancelled_calls": 0, "est_stt_cost": 0.133333, "est_tts_cost": 1.05}
+{"type": "call_start", "call_id": "0f372e69-d9e3-450f-a110-0663da562470", "ts": "2026-06-17T11:58:38.321Z"}
+{"type": "stt_event", "call_id": "0f372e69-d9e3-450f-a110-0663da562470", "ts": "2026-06-17T11:58:51.180Z", "provider": "sarvam", "audio_seconds": 3.28, "billed_seconds": 4.0}
+{"type": "tts_event", "call_id": "0f372e69-d9e3-450f-a110-0663da562470", "ts": "2026-06-17T11:58:54.848Z", "chars": 163, "completed": false}
+{"type": "stt_event", "call_id": "0f372e69-d9e3-450f-a110-0663da562470", "ts": "2026-06-17T11:58:56.166Z", "provider": "sarvam", "audio_seconds": 0.48, "billed_seconds": 1.0}
+{"type": "stt_event", "call_id": "0f372e69-d9e3-450f-a110-0663da562470", "ts": "2026-06-17T11:59:04.798Z", "provider": "sarvam", "audio_seconds": 2.64, "billed_seconds": 3.0}
+{"type": "tts_event", "call_id": "0f372e69-d9e3-450f-a110-0663da562470", "ts": "2026-06-17T11:59:08.881Z", "chars": 117, "completed": true}
+{"type": "stt_event", "call_id": "0f372e69-d9e3-450f-a110-0663da562470", "ts": "2026-06-17T11:59:19.854Z", "provider": "sarvam", "audio_seconds": 2.68, "billed_seconds": 3.0}
+{"type": "tts_event", "call_id": "0f372e69-d9e3-450f-a110-0663da562470", "ts": "2026-06-17T11:59:24.158Z", "chars": 111, "completed": true}
+{"type": "stt_event", "call_id": "0f372e69-d9e3-450f-a110-0663da562470", "ts": "2026-06-17T11:59:33.859Z", "provider": "sarvam", "audio_seconds": 0.36, "billed_seconds": 1.0}
+{"type": "tts_event", "call_id": "0f372e69-d9e3-450f-a110-0663da562470", "ts": "2026-06-17T11:59:39.159Z", "chars": 152, "completed": true}
+{"type": "stt_event", "call_id": "0f372e69-d9e3-450f-a110-0663da562470", "ts": "2026-06-17T11:59:55.562Z", "provider": "sarvam", "audio_seconds": 4.0, "billed_seconds": 4.0}
+{"type": "call_end", "call_id": "0f372e69-d9e3-450f-a110-0663da562470", "ts": "2026-06-17T11:59:59.460Z", "start_time": "2026-06-17T11:58:38.321Z", "stt_sarvam_seconds": 13.44, "stt_sarvam_billed_seconds": 16.0, "stt_sarvam_calls": 6, "stt_whisper_seconds": 0.0, "stt_whisper_calls": 0, "tts_chars": 543, "tts_calls": 4, "tts_cancelled_calls": 1, "est_stt_cost": 0.133333, "est_tts_cost": 1.629}

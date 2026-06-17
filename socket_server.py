@@ -322,11 +322,17 @@ PORT = 9000
 END = b"\n\n"
 
 # The ONE Phase-2 probe. Bytes literal → no platform line-ending mangling.
+# Was tone_stream://%(2000,4000,440) — a 2s-on/4s-off (~6s) 440Hz diagnostic
+# beep that callers heard at the start of every call AND, because it runs
+# with event-lock:true holding the channel, delayed the AI greeting by ~6s.
+# Replaced with a brief silence: keeps the playback CHANNEL_EXECUTE /
+# CHANNEL_EXECUTE_COMPLETE event sequence the WAITING classifier depends on,
+# but is inaudible and near-instant so the AI greeting injects immediately.
 PLAYBACK_PAYLOAD = (
     b"sendmsg\n"
     b"call-command: execute\n"
     b"execute-app-name: playback\n"
-    b"execute-app-arg: tone_stream://%(2000,4000,440)\n"
+    b"execute-app-arg: silence_stream://250,0\n"
     b"event-lock: true\n"
     b"\n"
 )

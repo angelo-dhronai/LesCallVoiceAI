@@ -528,17 +528,28 @@ def extract_rtp_info(headers: dict) -> dict:
     — guessing here would produce subtly wrong tcpdump filters."""
     g = headers.get
 
-    # Caller-Caller-ID-Number is URL-encoded (e.g. %2B919599761331 → +919...).
-    # Strip leading + and any non-digit chars so the value is safe as a URL
-    # path segment forwarded to ws_audio_receiver.py.
     from urllib.parse import unquote
-    raw_caller = g("Caller-Caller-ID-Number", "") or g("Channel-Caller-ID-Number", "")
+
+    # For outbound calls (Channel-Direction=outbound), the channel was
+    # originated by us so Caller-Caller-ID-Number is our own number.
+    # Use Caller-Destination-Number instead so ws_audio_receiver.py
+    # records the called party's number in the audit folder.
+    direction = (g("Channel-Direction", "") or g("Caller-Direction", "")).lower()
+    if direction == "outbound":
+        raw_caller = (g("Caller-Destination-Number", "")
+                      or g("Channel-Destination-Number", ""))
+        log.info("OUTBOUND call detected — using destination number as "
+                 "caller_number: %r", raw_caller)
+    else:
+        raw_caller = g("Caller-Caller-ID-Number", "") or g("Channel-Caller-ID-Number", "")
+
     caller_number = re.sub(r"[^\d]", "", unquote(raw_caller)) if raw_caller else ""
 
     return {
         "uuid":             g("Channel-Call-UUID") or g("Unique-ID", "unknown"),
         "channel_name":     g("Channel-Name", ""),
         "caller_number":    caller_number,
+        "call_direction":   direction or "inbound",
         "local_ip":         g("variable_local_media_ip", ""),
         "local_port":       g("variable_local_media_port", ""),
         "remote_ip":        g("variable_remote_media_ip", ""),

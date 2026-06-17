@@ -37,6 +37,12 @@ MIN_CONFIDENCE = 0.4
 _RL_INITIAL_BACKOFF_S = 60.0
 _RL_MAX_BACKOFF_S = 300.0
 
+# Global (process-wide) Sarvam rate-limit state shared across all STTRouter
+# instances. When any call hits a 429, all concurrent calls immediately route
+# to Whisper instead of pile-driving the same rate-limited endpoint.
+_global_rl_until: float = 0.0
+_global_rl_count: int = 0
+
 _FILLER_WORDS = {"um", "uh", "like", "you know"}
 _FILLER_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(w) for w in _FILLER_WORDS) + r")\b",
@@ -335,17 +341,21 @@ class STTRouter:
         sample_rate: int = 16_000,
         language: str = "en",
     ) -> STTResult:
+        global _global_rl_until, _global_rl_count
+
         duration_ms = len(audio_bytes) / (sample_rate * 2) * 1000
         logger.info("[STT] Audio segment: %.0f ms, %d bytes", duration_ms, len(audio_bytes))
 
         now = time.monotonic()
 
-        # ── Sarvam rate-limited: route directly to fallback ──────────────
-        if now < self._sarvam_rl_until:
-            remaining = self._sarvam_rl_until - now
+        # ── Sarvam rate-limited (global or per-instance): route to fallback ──
+        rl_until = max(self._sarvam_rl_until, _global_rl_until)
+        if now < rl_until:
+            remaining = rl_until - now
             logger.warning(
-                "[STT] Sarvam rate-limited (%.0fs remaining) — routing to fallback",
+                "[STT] Sarvam rate-limited (%.0fs remaining, global=%s) — routing to fallback",
                 remaining,
+                now < _global_rl_until,
             )
             text, _, _, _ = await self._try_provider(
                 self._fallback, "fallback", audio_bytes, sample_rate, language
@@ -358,17 +368,20 @@ class STTRouter:
                 self._primary, "primary", audio_bytes, sample_rate, language
             )
         except SarvamRateLimitError as exc:
-            # Apply exponential backoff; reset on the next successful call
-            self._sarvam_rl_count += 1
+            # Apply exponential backoff on both per-instance and global state
+            # so all concurrent calls immediately know Sarvam is rate-limiting.
+            _global_rl_count += 1
+            self._sarvam_rl_count = _global_rl_count
             backoff = min(
-                _RL_INITIAL_BACKOFF_S * (2 ** (self._sarvam_rl_count - 1)),
+                _RL_INITIAL_BACKOFF_S * (2 ** (_global_rl_count - 1)),
                 _RL_MAX_BACKOFF_S,
             )
-            self._sarvam_rl_until = time.monotonic() + backoff
+            _global_rl_until = time.monotonic() + backoff
+            self._sarvam_rl_until = _global_rl_until
             logger.warning(
-                "[STT] Sarvam rate-limited (strike %d) — backoff %.0fs, "
+                "[STT] Sarvam rate-limited (strike %d, GLOBAL) — backoff %.0fs, "
                 "retry-after=%s — routing to fallback",
-                self._sarvam_rl_count,
+                _global_rl_count,
                 backoff,
                 exc.retry_after,
             )
@@ -378,8 +391,9 @@ class STTRouter:
             return STTResult(text=text)
 
         if text:
-            # Successful Sarvam call → reset rate-limit strike counter
+            # Successful Sarvam call → reset both per-instance and global counters
             self._sarvam_rl_count = 0
+            _global_rl_count = 0
             logger.info("[STT] Primary succeeded: %r", text)
             return STTResult(text=text, detected_language=detected_lang, language_probability=lang_prob)
 

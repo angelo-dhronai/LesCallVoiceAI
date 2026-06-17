@@ -112,8 +112,8 @@ def main() -> None:
             json={
                 "text": "Hello.",
                 "target_language_code": "en-IN",
-                "speaker": "shubh",
-                "model": "bulbul:v3",
+                "speaker": "simran",
+                "model": "bulbul:v2",
                 "speech_sample_rate": 16000,
                 "output_audio_codec": "linear16",
             },

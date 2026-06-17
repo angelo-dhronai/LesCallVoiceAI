@@ -1,0 +1,1331 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LesCall Dashboard</title>
+<style>
+/* ================================================================ TOKENS */
+:root {
+  --bg:           #edf3f7;
+  --surface:      #ffffff;
+  --surface2:     #f0f6f9;
+  --surface3:     #e3eef4;
+  --border:       #cddde8;
+  --border2:      #b8ceda;
+  --sidebar-bg:   #084868;
+  --sidebar-brd:  rgba(255,255,255,.1);
+  --sidebar-txt:  rgba(255,255,255,.62);
+  --sidebar-hov:  rgba(255,255,255,.07);
+  --sidebar-act:  rgba(24,176,104,.22);
+  --topbar-bg:    #ffffff;
+  --topbar-brd:   #dde8ef;
+  --accent:       #18b068;
+  --accent-glow:  rgba(24,176,104,.12);
+  --accent-dim:   #0e8c50;
+  --accent-lt:    #22d484;
+  --success:      #16a34a;
+  --success-bg:   rgba(22,163,74,.1);
+  --warn:         #d97706;
+  --warn-bg:      rgba(217,119,6,.1);
+  --error:        #dc2626;
+  --error-bg:     rgba(220,38,38,.1);
+  --purple:       #7c3aed;
+  --cyan:         #0891b2;
+  --text:         #0a2a3a;
+  --text-s:       #3d6a82;
+  --text-d:       #7aa4b8;
+  --term-bg:      #061018;
+  --term-txt:     #7ab8cc;
+  --log-bg:       #061018;
+  --log-bar:      #0a1a28;
+  --sh: 0 1px 3px rgba(8,72,104,.07);
+  --sh2: 0 2px 8px rgba(8,72,104,.1);
+  --r: 10px; --rs: 6px;
+  --mono: 'SF Mono','Cascadia Code','Fira Code',monospace;
+}
+[data-theme="dark"] {
+  --bg:         #060f18; --surface:  #0c2030; --surface2: #102840;
+  --surface3:   #183454; --border:   #183650; --border2:  #1e4464;
+  --sidebar-bg: #04101c; --sidebar-brd: rgba(255,255,255,.08);
+  --topbar-bg:  #081828; --topbar-brd: #183650;
+  --success:    #22c55e; --success-bg: rgba(34,197,94,.1);
+  --warn:       #f59e0b; --warn-bg: rgba(245,158,11,.1);
+  --error:      #ef4444; --error-bg: rgba(239,68,68,.1);
+  --purple:     #a78bfa; --cyan: #22d3ee;
+  --text:       #d4ecf7; --text-s: #6aa8c0; --text-d: #38607a;
+  --sh: 0 1px 4px rgba(0,0,0,.3); --sh2: 0 3px 14px rgba(0,0,0,.35);
+}
+/* ================================================================ RESET */
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;font-size:14px;line-height:1.6;min-height:100vh;overflow-x:hidden}
+a{color:inherit;text-decoration:none} button{cursor:pointer;font-family:inherit}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:var(--surface2)}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--accent-dim)}
+
+/* ================================================================ LAYOUT */
+.layout{display:flex;min-height:100vh}
+
+/* -- sidebar -- */
+.sidebar{
+  width:220px;flex-shrink:0;background:var(--sidebar-bg);
+  display:flex;flex-direction:column;position:fixed;top:0;left:0;height:100vh;z-index:100;
+  box-shadow:2px 0 14px rgba(4,16,28,.35);
+}
+.sidebar-logo{
+  padding:14px 14px 12px;border-bottom:1px solid var(--sidebar-brd);
+}
+.logo-box{
+  background:#fff;border-radius:8px;padding:8px 12px;
+  display:flex;align-items:center;justify-content:center;
+}
+.logo-img{height:40px;width:auto;display:block}
+
+.sidebar-nav{flex:1;padding:8px 0;overflow-y:auto}
+.nav-sec{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:rgba(255,255,255,.3);padding:14px 18px 5px}
+.nav-item{
+  display:flex;align-items:center;gap:10px;padding:9px 18px;
+  font-size:13px;font-weight:500;color:var(--sidebar-txt);
+  cursor:pointer;transition:all .15s;border-left:3px solid transparent;user-select:none;
+}
+.nav-item:hover{color:#fff;background:var(--sidebar-hov)}
+.nav-item.active{color:#fff;background:var(--sidebar-act);border-left-color:var(--accent)}
+.nav-item .ic{font-size:15px;width:20px;text-align:center;flex-shrink:0}
+.nav-badge{margin-left:auto;font-size:10px;font-weight:700;border-radius:10px;padding:1px 7px;min-width:18px;text-align:center}
+.nav-badge.g{background:var(--accent);color:#fff}
+.nav-badge.r{background:var(--error);color:#fff}
+
+.sidebar-foot{padding:14px 18px;border-top:1px solid var(--sidebar-brd)}
+.rpill{
+  display:flex;align-items:center;gap:8px;
+  background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.1);
+  border-radius:20px;padding:7px 12px;font-size:12px;font-weight:500;color:rgba(255,255,255,.75);
+}
+.rdot{width:8px;height:8px;border-radius:50%;flex-shrink:0;transition:background .3s}
+.rdot.healthy{background:var(--accent);box-shadow:0 0 7px var(--accent)}
+.rdot.degraded{background:var(--warn);animation:pulse 2s infinite}
+.rdot.unknown{background:rgba(255,255,255,.25)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* -- main -- */
+.content{margin-left:220px;flex:1;display:flex;flex-direction:column;min-height:100vh}
+
+.topbar{
+  background:var(--topbar-bg);border-bottom:1px solid var(--topbar-brd);
+  padding:0 24px;height:54px;display:flex;align-items:center;gap:12px;
+  position:sticky;top:0;z-index:50;box-shadow:var(--sh);
+}
+.topbar-title{font-size:15px;font-weight:600;color:var(--text);flex:1}
+.topbar-right{display:flex;align-items:center;gap:8px}
+.icon-btn{
+  background:var(--surface);border:1px solid var(--border);color:var(--text-s);
+  border-radius:var(--rs);padding:6px 12px;font-size:12px;font-weight:500;transition:all .15s;
+}
+.icon-btn:hover{border-color:var(--accent);color:var(--accent)}
+.theme-btn{background:var(--surface2);border:1px solid var(--border);border-radius:20px;padding:5px 10px;font-size:13px;transition:all .15s;color:var(--text-s)}
+.theme-btn:hover{border-color:var(--accent);color:var(--accent)}
+
+.page{padding:22px 26px;flex:1}
+.tab-panel{display:none}.tab-panel.active{display:block}
+
+/* ================================================================ COMPONENTS */
+.sec-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.sec-title{font-size:16px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:8px}
+.sec-sub{font-size:12px;color:var(--text-d);margin-top:2px}
+
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:18px}
+.g2{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin-bottom:18px}
+
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:18px 20px;box-shadow:var(--sh);transition:border-color .2s,box-shadow .2s}
+.stat:hover{border-color:var(--accent);box-shadow:0 2px 10px var(--accent-glow)}
+.stat-lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-d);margin-bottom:8px}
+.stat-val{font-size:26px;font-weight:700;line-height:1.1;color:var(--text)}
+.stat-val.b{color:var(--accent)}.stat-val.g{color:var(--success)}.stat-val.a{color:var(--warn)}.stat-val.r{color:var(--error)}
+.stat-sub{font-size:11px;color:var(--text-d);margin-top:5px}
+
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--sh)}
+.card-head{padding:13px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.card-ht{font-size:13px;font-weight:600;color:var(--text)}
+.card-hs{font-size:11px;color:var(--text-d);margin-left:auto}
+.card-body{padding:18px}
+
+/* table */
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:9px 14px;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-d);background:var(--surface2);border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:9px 14px;border-bottom:1px solid var(--border);color:var(--text);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--surface2)}
+.tm{font-family:var(--mono);font-size:12px}
+.td{color:var(--text-s)}
+
+/* input */
+.inp{background:var(--surface);border:1px solid var(--border);border-radius:var(--rs);padding:7px 12px;color:var(--text);font-size:13px;outline:none;transition:border-color .15s,box-shadow .15s;font-family:inherit}
+.inp:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-glow)}
+.inp::placeholder{color:var(--text-d)}
+.inp-sm{padding:5px 10px;font-size:12px}
+select.inp{cursor:pointer}
+textarea.inp{resize:vertical;min-height:70px}
+
+/* buttons */
+.btn{display:inline-flex;align-items:center;gap:7px;border:none;border-radius:var(--rs);padding:8px 16px;font-size:13px;font-weight:600;font-family:inherit;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-p{background:var(--accent);color:#fff}
+.btn-p:hover{background:var(--accent-dim);box-shadow:0 3px 10px var(--accent-glow);transform:translateY(-1px)}
+.btn-p:disabled{background:var(--border2);color:var(--text-d);cursor:default;transform:none;box-shadow:none}
+.btn-d{background:var(--error);color:#fff}
+.btn-d:hover{background:#b91c1c;transform:translateY(-1px)}
+.btn-d:disabled{background:var(--border2);color:var(--text-d);cursor:default;transform:none}
+.btn-w{background:var(--warn);color:#fff}
+.btn-w:hover{background:#b45309;transform:translateY(-1px)}
+.btn-w:disabled{background:var(--border2);color:var(--text-d);cursor:default;transform:none}
+.btn-gh{background:var(--surface2);border:1px solid var(--border);color:var(--text-s)}
+.btn-gh:hover{border-color:var(--accent);color:var(--accent)}
+.btn-sm{padding:5px 12px;font-size:12px}
+
+/* badges */
+.badge{display:inline-flex;align-items:center;gap:4px;padding:2px 9px;border-radius:12px;font-size:11px;font-weight:600;white-space:nowrap}
+.bg{background:var(--success-bg);color:var(--success)}
+.bb{background:var(--accent-glow);color:var(--accent)}
+.ba{background:var(--warn-bg);color:var(--warn)}
+.br{background:var(--error-bg);color:var(--error)}
+.bz{background:var(--surface2);color:var(--text-s);border:1px solid var(--border)}
+
+/* chart */
+.chart-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:18px 20px;margin-bottom:18px;box-shadow:var(--sh)}
+.chart-t{font-size:11px;font-weight:700;color:var(--text-d);text-transform:uppercase;letter-spacing:.07em;margin-bottom:14px}
+.bar-chart{display:flex;align-items:flex-end;gap:3px;height:72px}
+.bar-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;height:100%;justify-content:flex-end}
+.bar{width:100%;background:var(--accent-glow);border:1px solid rgba(24,176,104,.25);border-radius:3px 3px 0 0;min-height:2px;transition:all .25s;position:relative;cursor:default}
+.bar:hover{background:var(--accent);border-color:var(--accent)}
+.bar-tip{position:absolute;bottom:calc(100% + 5px);left:50%;transform:translateX(-50%);background:var(--sidebar-bg);color:#fff;border-radius:5px;padding:3px 8px;font-size:11px;white-space:nowrap;display:none;z-index:20;pointer-events:none}
+.bar:hover .bar-tip{display:block}
+.bar-lbl{font-size:9px;color:var(--text-d)}
+
+/* log viewer */
+.log-viewer{background:var(--log-bg);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;height:540px;display:flex;flex-direction:column}
+.log-tb{background:var(--log-bar);border-bottom:1px solid rgba(255,255,255,.08);padding:8px 14px;display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap}
+.fchip{background:none;border:1px solid rgba(255,255,255,.15);color:rgba(255,255,255,.45);border-radius:20px;padding:3px 10px;font-size:11px;font-weight:600;transition:all .15s;cursor:pointer}
+.fchip.on-all{border-color:rgba(255,255,255,.6);color:#fff}
+.fchip.on-error{border-color:#ef4444;color:#ef4444}
+.fchip.on-stt{border-color:#a78bfa;color:#a78bfa}
+.fchip.on-ai{border-color:var(--accent);color:var(--accent)}
+.fchip.on-credits{border-color:#f59e0b;color:#f59e0b}
+.fchip.on-call{border-color:#22d3ee;color:#22d3ee}
+.log-body{flex:1;overflow-y:auto;padding:6px 8px;font-family:var(--mono);font-size:12px;line-height:1.65}
+.log-ln{display:block;padding:1px 4px;border-radius:2px;white-space:pre-wrap;word-break:break-all}
+.log-ln:hover{background:rgba(255,255,255,.04)}
+.log-sr{margin-left:auto;display:flex;align-items:center;gap:7px}
+.ldot{width:6px;height:6px;border-radius:50%;background:var(--accent)}
+.ldot.off{background:#ef4444}
+
+/* terminal */
+.terminal{background:var(--term-bg);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;display:flex;flex-direction:column}
+.term-bar{background:var(--log-bar);border-bottom:1px solid rgba(255,255,255,.08);padding:8px 14px;display:flex;align-items:center;gap:8px;flex-shrink:0}
+.term-dots{display:flex;gap:5px}
+.tdot{width:11px;height:11px;border-radius:50%}
+.term-body{flex:1;overflow-y:auto;padding:12px 14px;font-family:var(--mono);font-size:12.5px;line-height:1.7;min-height:180px;max-height:320px;color:var(--term-txt)}
+.tl{display:block;white-space:pre-wrap;word-break:break-all}
+.tl.ok{color:var(--accent)}.tl.err{color:#ef4444}.tl.cmd{color:#22d484;font-weight:600}.tl.sys{color:rgba(122,184,204,.6)}
+.tcur{display:inline-block;width:8px;height:14px;background:var(--accent);vertical-align:text-bottom;animation:blink .9s step-end infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+
+/* control */
+.ctrl-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px}
+.ctrl-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:22px;display:flex;flex-direction:column;gap:14px;box-shadow:var(--sh)}
+.ctrl-lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-d)}
+.ctrl-status{font-size:22px;font-weight:700;color:var(--text)}
+.ctrl-actions{display:flex;gap:10px;flex-wrap:wrap}
+
+/* service health */
+.svc-row{display:flex;align-items:center;gap:14px;padding:14px 18px;border-bottom:1px solid var(--border)}
+.svc-row:last-child{border-bottom:none}
+.svc-ic{width:38px;height:38px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0}
+.svc-ic.up{background:var(--success-bg)}.svc-ic.dn{background:var(--error-bg)}
+.svc-nm{font-size:13px;font-weight:600;color:var(--text)}
+.svc-dt{font-size:11px;color:var(--text-d);margin-top:2px}
+.svc-st{margin-left:auto;flex-shrink:0}
+
+/* conversations */
+.conv-layout{display:grid;grid-template-columns:280px 1fr;gap:14px;height:calc(100vh - 178px);min-height:500px}
+.conv-list{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;display:flex;flex-direction:column;box-shadow:var(--sh)}
+.conv-items{overflow-y:auto;flex:1}
+.conv-item{padding:11px 14px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .1s;border-left:3px solid transparent}
+.conv-item:hover{background:var(--surface2)}
+.conv-item.active{background:var(--accent-glow);border-left-color:var(--accent)}
+.conv-caller{font-size:13px;font-weight:600;color:var(--text)}
+.conv-meta{font-size:11px;color:var(--text-d);margin-top:2px;display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+.conv-tag{background:var(--surface2);border:1px solid var(--border);border-radius:4px;padding:0 5px;font-size:10px;color:var(--text-s)}
+.conv-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);display:flex;flex-direction:column;overflow:hidden;box-shadow:var(--sh)}
+.conv-head{padding:14px 18px;border-bottom:1px solid var(--border);flex-shrink:0;background:var(--surface2)}
+.conv-msgs{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:10px;background:var(--bg)}
+.conv-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--text-d);font-size:13px;gap:8px}
+.msg{max-width:72%;display:flex;flex-direction:column;gap:3px}
+.msg.ag{align-self:flex-end;align-items:flex-end}.msg.ca{align-self:flex-start;align-items:flex-start}
+.msg-lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px}
+.msg.ag .msg-lbl{color:var(--accent)}.msg.ca .msg-lbl{color:var(--text-d)}
+.msg-bub{padding:10px 14px;border-radius:12px;font-size:13px;line-height:1.55}
+.msg.ag .msg-bub{background:var(--accent);color:#fff;border-radius:12px 12px 3px 12px}
+.msg.ca .msg-bub{background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:12px 12px 12px 3px}
+.msg-ts{font-size:10px;color:var(--text-d)}
+
+/* outbound */
+.ob-form{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:22px;margin-bottom:18px;box-shadow:var(--sh)}
+.ob-form-grid{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:10px;align-items:end}
+.ob-lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-d);margin-bottom:5px}
+.ob-status{display:inline-flex;align-items:center;gap:4px;padding:2px 9px;border-radius:12px;font-size:11px;font-weight:600}
+.ob-status.pending{background:var(--warn-bg);color:var(--warn)}
+.ob-status.called{background:var(--success-bg);color:var(--success)}
+.ob-status.failed{background:var(--error-bg);color:var(--error)}
+
+/* pagination */
+.pages{display:flex;align-items:center;gap:8px;padding:12px 14px;border-top:1px solid var(--border)}
+.pgbtn{background:var(--surface2);border:1px solid var(--border);color:var(--text-s);border-radius:var(--rs);padding:5px 11px;font-size:12px;font-weight:500;transition:all .15s}
+.pgbtn:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+.pgbtn:disabled{opacity:.35;cursor:default}
+.pginf{font-size:12px;color:var(--text-d);margin:0 4px}
+
+/* period tabs */
+.ptabs{display:flex;gap:6px;margin-bottom:16px}
+.ptab{background:var(--surface);border:1px solid var(--border);color:var(--text-s);border-radius:var(--rs);padding:6px 16px;font-size:12px;font-weight:600;transition:all .15s}
+.ptab.active{background:var(--accent);border-color:var(--accent);color:#fff}
+
+/* utils */
+.mt4{margin-top:4px}.mt8{margin-top:8px}.mt14{margin-top:14px}.mt18{margin-top:18px}
+.flex-r{display:flex;gap:14px;align-items:flex-start}.f1{flex:1}
+.dim{color:var(--text-d)}.soft{color:var(--text-s)}.mono{font-family:var(--mono);font-size:12px}
+.trunc{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}
+.spin{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;display:inline-block}
+@keyframes spin{to{transform:rotate(360deg)}}
+.divider{border:none;border-top:1px solid var(--border);margin:18px 0}
+.notice{background:var(--surface2);border:1px solid var(--border);border-radius:var(--rs);padding:12px 16px;font-size:12px;color:var(--text-s)}
+.notice strong{color:var(--text)}
+
+/* responsive */
+@media(max-width:1100px){.g4{grid-template-columns:repeat(2,1fr)}.conv-layout{grid-template-columns:1fr;height:auto}.conv-list{max-height:280px}.ctrl-grid{grid-template-columns:1fr}.ob-form-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:768px){.sidebar{display:none}.content{margin-left:0}.g4,.g3{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- SIDEBAR -->
+<aside class="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-box">
+      <img src="/static/img/logo-nobg.png" alt="LesCall" class="logo-img">
+    </div>
+  </div>
+  <nav class="sidebar-nav">
+    <div class="nav-sec">Monitoring</div>
+    <div class="nav-item active" data-tab="overview"><span class="ic">◈</span>Overview</div>
+    <div class="nav-item" data-tab="live-calls"><span class="ic">🔴</span>Live Calls<span class="nav-badge g" id="nav-active">0</span></div>
+    <div class="nav-item" data-tab="conversations"><span class="ic">💬</span>Conversations</div>
+    <div class="nav-item" data-tab="history"><span class="ic">📋</span>Call History</div>
+    <div class="nav-item" data-tab="logs"><span class="ic">📄</span>Live Logs</div>
+    <div class="nav-sec">Campaigns</div>
+    <div class="nav-item" data-tab="outbound"><span class="ic">📞</span>Outbound Calls</div>
+    <div class="nav-sec">Finance</div>
+    <div class="nav-item" data-tab="sarvam"><span class="ic">₹</span>Sarvam Usage</div>
+    <div class="nav-sec">System</div>
+    <div class="nav-item" data-tab="control"><span class="ic">⚙</span>Runtime Control</div>
+    <div class="nav-item" data-tab="health"><span class="ic">🩺</span>Health</div>
+  </nav>
+  <div class="sidebar-foot">
+    <div class="rpill">
+      <div class="rdot unknown" id="sidebar-dot"></div>
+      <span id="sidebar-status">Checking…</span>
+    </div>
+  </div>
+</aside>
+
+<!-- MAIN -->
+<div class="content">
+  <div class="topbar">
+    <span class="topbar-title" id="topbar-title">Overview</span>
+    <div class="topbar-right">
+      <span style="font-size:11px;color:var(--text-d)" id="last-refresh"></span>
+      <button class="icon-btn" onclick="refreshAll()">↻ Refresh</button>
+      <button class="theme-btn" id="theme-btn" onclick="toggleTheme()">🌙</button>
+    </div>
+  </div>
+
+  <div class="page">
+
+  <!-- OVERVIEW -->
+  <div class="tab-panel active" id="tab-overview">
+    <div class="g4">
+      <div class="stat"><div class="stat-lbl">Today's Calls</div><div class="stat-val b" id="s-today-calls">—</div><div class="stat-sub" id="s-today-active">— active now</div></div>
+      <div class="stat"><div class="stat-lbl">Credits Today</div><div class="stat-val" id="s-today-cost">—</div><div class="stat-sub" id="s-today-cost-sub">STT + TTS</div></div>
+      <div class="stat"><div class="stat-lbl">This Month</div><div class="stat-val" id="s-month-cost">—</div><div class="stat-sub" id="s-month-calls">—</div></div>
+      <div class="stat"><div class="stat-lbl">Runtime</div><div class="stat-val" id="s-runtime">—</div><div class="stat-sub">FreeSWITCH → AI pipeline</div></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-t">Calls per Hour — Today (UTC)</div>
+      <div class="bar-chart" id="hourly-chart"></div>
+    </div>
+    <div class="g3">
+      <div class="stat"><div class="stat-lbl">This Week</div><div class="stat-val b" id="s-week-calls">—</div><div class="stat-sub" id="s-week-cost">—</div></div>
+      <div class="stat"><div class="stat-lbl">STT Today</div><div class="stat-val" id="s-stt-sec">—</div><div class="stat-sub" id="s-stt-cost">—</div></div>
+      <div class="stat"><div class="stat-lbl">TTS Today</div><div class="stat-val" id="s-tts-chars">—</div><div class="stat-sub" id="s-tts-cost">—</div></div>
+    </div>
+  </div>
+
+  <!-- LIVE CALLS -->
+  <div class="tab-panel" id="tab-live-calls">
+    <div class="sec-head">
+      <div><div class="sec-title"><span style="color:var(--error)">●</span>Active Calls</div><div class="sec-sub" id="live-updated">Auto-refreshes every 15 seconds</div></div>
+    </div>
+    <div class="card">
+      <div class="tw"><table>
+        <thead><tr><th>Status</th><th>Call ID</th><th>Started (UTC)</th><th>Duration</th><th>Info</th></tr></thead>
+        <tbody id="live-table"><tr><td colspan="5" style="text-align:center;padding:40px;color:var(--text-d)">Loading…</td></tr></tbody>
+      </table></div>
+    </div>
+  </div>
+
+  <!-- CONVERSATIONS -->
+  <div class="tab-panel" id="tab-conversations">
+    <div class="sec-head">
+      <div class="sec-title">💬 Conversations</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span style="font-size:12px;color:var(--text-d)" id="conv-count-label"></span>
+        <button class="icon-btn btn-sm" onclick="loadConversations()">↻</button>
+      </div>
+    </div>
+    <div class="conv-layout">
+      <div class="conv-list">
+        <div class="card-head" style="padding:10px 14px">
+          <span class="card-ht">Recent Calls</span>
+          <span class="card-hs" id="conv-list-count"></span>
+        </div>
+        <div style="padding:8px 10px;border-bottom:1px solid var(--border)">
+          <input class="inp" style="width:100%;font-size:12px" placeholder="Search by number…" id="conv-search" oninput="filterConvList()">
+        </div>
+        <div class="conv-items" id="conv-list-items">
+          <div style="padding:32px;text-align:center;color:var(--text-d)"><div class="spin" style="margin:0 auto 8px"></div>Loading…</div>
+        </div>
+      </div>
+      <div class="conv-panel">
+        <div class="conv-head">
+          <div style="font-size:14px;font-weight:600;color:var(--text)" id="conv-title">Select a call</div>
+          <div style="font-size:12px;color:var(--text-d);margin-top:3px" id="conv-sub">Choose a recording from the list on the left</div>
+        </div>
+        <div class="conv-msgs" id="conv-msgs">
+          <div class="conv-empty"><span style="font-size:28px">💬</span><span>Select a call to view its transcript</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- HISTORY -->
+  <div class="tab-panel" id="tab-history">
+    <div class="card">
+      <div class="card-head">
+        <span class="card-ht">Call History</span>
+        <div style="display:flex;gap:8px;align-items:center;margin-left:auto">
+          <input class="inp inp-sm" placeholder="Search call ID…" id="hist-search" style="width:200px" oninput="loadHistory()">
+          <select class="inp inp-sm" id="hist-days" onchange="loadHistory()">
+            <option value="1">Today</option><option value="7" selected>Last 7 days</option>
+            <option value="30">Last 30 days</option><option value="90">Last 90 days</option>
+          </select>
+        </div>
+      </div>
+      <div class="tw"><table>
+        <thead><tr><th>End Time</th><th>Call ID</th><th>STT (s)</th><th>TTS Chars</th><th>STT ₹</th><th>TTS ₹</th><th>Total</th><th>API Calls</th></tr></thead>
+        <tbody id="hist-table"><tr><td colspan="8" style="text-align:center;padding:32px;color:var(--text-d)">Loading…</td></tr></tbody>
+      </table></div>
+      <div class="pages" id="hist-pages"></div>
+    </div>
+  </div>
+
+  <!-- LOGS -->
+  <div class="tab-panel" id="tab-logs">
+    <div class="log-viewer">
+      <div class="log-tb">
+        <span style="font-size:11px;font-weight:600;color:rgba(255,255,255,.35)">Filter:</span>
+        <button class="fchip on-all" data-cat="all" onclick="toggleLogFilter(this)">All</button>
+        <button class="fchip" data-cat="error" onclick="toggleLogFilter(this)">Errors</button>
+        <button class="fchip" data-cat="stt" onclick="toggleLogFilter(this)">STT</button>
+        <button class="fchip" data-cat="ai" onclick="toggleLogFilter(this)">AI</button>
+        <button class="fchip" data-cat="credits" onclick="toggleLogFilter(this)">Credits</button>
+        <button class="fchip" data-cat="call" onclick="toggleLogFilter(this)">Calls</button>
+        <div class="log-sr">
+          <div class="ldot" id="log-dot"></div>
+          <span id="log-status" style="font-size:11px;color:rgba(255,255,255,.4)">Connecting…</span>
+          <button class="fchip" style="margin-left:6px" onclick="clearLogs()">Clear</button>
+          <button class="fchip" id="as-btn" onclick="toggleAS()">↓ Auto</button>
+        </div>
+      </div>
+      <div class="log-body" id="log-body"></div>
+    </div>
+  </div>
+
+  <!-- OUTBOUND CALLS -->
+  <div class="tab-panel" id="tab-outbound">
+    <div class="sec-head">
+      <div><div class="sec-title">📞 Outbound Campaign Manager</div>
+      <div class="sec-sub">Import contacts, run campaigns, classify outcomes</div></div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-gh btn-sm" onclick="loadOutbound()">↻ Refresh</button>
+        <button class="btn btn-d btn-sm" onclick="clearAllContacts()" title="Delete all contacts">🗑 Clear All</button>
+      </div>
+    </div>
+
+    <!-- ── Stats row ── -->
+    <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:10px;margin-bottom:14px" id="ob-stats-grid">
+      <div class="stat" style="padding:12px 14px"><div class="stat-lbl">Total</div><div class="stat-val b" id="os-total">0</div></div>
+      <div class="stat" style="padding:12px 14px"><div class="stat-lbl">Not Called</div><div class="stat-val" id="os-not_called">0</div></div>
+      <div class="stat" style="padding:12px 14px"><div class="stat-lbl">Answered</div><div class="stat-val g" id="os-answered">0</div></div>
+      <div class="stat" style="padding:12px 14px"><div class="stat-lbl">No Answer</div><div class="stat-val a" id="os-no_answer">0</div></div>
+      <div class="stat" style="padding:12px 14px"><div class="stat-lbl">Declined</div><div class="stat-val r" id="os-declined">0</div></div>
+      <div class="stat" style="padding:12px 14px"><div class="stat-lbl">Busy</div><div class="stat-val a" id="os-busy">0</div></div>
+      <div class="stat" style="padding:12px 14px"><div class="stat-lbl">Failed</div><div class="stat-val r" id="os-failed">0</div></div>
+    </div>
+
+    <!-- ── Disposition stats row ── -->
+    <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:18px" id="ob-disp-grid">
+      <div class="stat" style="padding:10px 12px"><div class="stat-lbl" style="font-size:9px">Interested</div><div class="stat-val b" style="font-size:18px" id="od-interested">0</div></div>
+      <div class="stat" style="padding:10px 12px"><div class="stat-lbl" style="font-size:9px">Site Visit Booked</div><div class="stat-val g" style="font-size:18px" id="od-site_visit_booked">0</div></div>
+      <div class="stat" style="padding:10px 12px"><div class="stat-lbl" style="font-size:9px">Inquiry</div><div class="stat-val" style="font-size:18px" id="od-inquiry">0</div></div>
+      <div class="stat" style="padding:10px 12px"><div class="stat-lbl" style="font-size:9px">In Doubt</div><div class="stat-val a" style="font-size:18px" id="od-in_doubt">0</div></div>
+      <div class="stat" style="padding:10px 12px"><div class="stat-lbl" style="font-size:9px">Contact Later</div><div class="stat-val a" style="font-size:18px" id="od-to_contact_later">0</div></div>
+      <div class="stat" style="padding:10px 12px"><div class="stat-lbl" style="font-size:9px">Rejected</div><div class="stat-val r" style="font-size:18px" id="od-rejected">0</div></div>
+    </div>
+
+    <!-- ── Import section ── -->
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-head" style="cursor:pointer" onclick="toggleSection('ob-import')">
+        <span class="card-ht">➕ Add Contacts</span>
+        <span class="card-hs">Manual entry or file upload (CSV / Excel / TXT)</span>
+        <span style="margin-left:auto;color:var(--text-d)" id="ob-import-arrow">▼</span>
+      </div>
+      <div id="ob-import" style="padding:18px">
+        <!-- Manual -->
+        <div style="font-size:12px;font-weight:700;color:var(--text-d);text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px">Manual Entry</div>
+        <div class="ob-form-grid">
+          <div>
+            <div class="ob-lbl">Phone Number *</div>
+            <input class="inp" id="ob-phone" placeholder="+91 9876543210" style="width:100%">
+          </div>
+          <div>
+            <div class="ob-lbl">Name</div>
+            <input class="inp" id="ob-name" placeholder="Contact name" style="width:100%">
+          </div>
+          <div>
+            <div class="ob-lbl">Notes</div>
+            <input class="inp" id="ob-notes" placeholder="Optional notes" style="width:100%">
+          </div>
+          <div style="display:flex;align-items:flex-end">
+            <button class="btn btn-p" onclick="addOutboundContact()" style="height:36px;width:100%">+ Add</button>
+          </div>
+        </div>
+        <hr class="divider" style="margin:16px 0">
+        <!-- File upload -->
+        <div style="font-size:12px;font-weight:700;color:var(--text-d);text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px">Bulk Upload</div>
+        <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
+          <div style="flex:1;min-width:220px">
+            <div class="ob-lbl">File (CSV, Excel .xlsx, or plain text)</div>
+            <input type="file" id="ob-file" accept=".csv,.txt,.xlsx,.xls" class="inp" style="width:100%;padding:5px 10px">
+          </div>
+          <div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0;padding-top:18px">
+            <button class="btn btn-p" onclick="uploadContacts()">⬆ Upload File</button>
+          </div>
+          <div style="font-size:11px;color:var(--text-d);line-height:1.7;max-width:340px;padding-top:20px">
+            <strong>CSV/TXT:</strong> one number per line, or comma/semicolon separated.<br>
+            <strong>Excel:</strong> numbers anywhere in the sheet — first column is best.<br>
+            Duplicates are silently skipped.
+          </div>
+        </div>
+        <div id="ob-msg" style="font-size:12px;margin-top:10px;display:none;padding:8px 12px;border-radius:6px"></div>
+      </div>
+    </div>
+
+    <!-- ── Campaign controls ── -->
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-head">
+        <span class="card-ht">🚀 Campaign Runner</span>
+        <span class="card-hs" id="campaign-status-label">Idle</span>
+      </div>
+      <div style="padding:16px 18px;display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap">
+        <div>
+          <div class="ob-lbl">Who to Call</div>
+          <select class="inp" id="camp-filter">
+            <option value="not_called">Not Called Yet</option>
+            <option value="no_answer">No Answer (retry)</option>
+            <option value="to_contact_later">To Contact Later</option>
+            <option value="all">All Contacts</option>
+          </select>
+        </div>
+        <div>
+          <div class="ob-lbl">Delay Between Calls (sec)</div>
+          <input type="number" class="inp" id="camp-delay" value="4" min="1" max="60" style="width:80px">
+        </div>
+        <div>
+          <div class="ob-lbl">Max Calls (0 = all)</div>
+          <input type="number" class="inp" id="camp-max" value="0" min="0" style="width:80px">
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-p" id="camp-start-btn" onclick="startCampaign()">▶ Start Campaign</button>
+          <button class="btn btn-d" id="camp-stop-btn" onclick="stopCampaign()" disabled>■ Stop</button>
+        </div>
+      </div>
+      <!-- Progress bar -->
+      <div id="camp-progress-wrap" style="padding:0 18px 16px;display:none">
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-d);margin-bottom:4px">
+          <span id="camp-prog-label">Calling <span id="camp-cur-phone"></span>…</span>
+          <span id="camp-prog-pct">0%</span>
+        </div>
+        <div style="height:8px;background:var(--surface2);border-radius:4px;overflow:hidden">
+          <div id="camp-prog-bar" style="height:100%;background:var(--accent);border-radius:4px;width:0%;transition:width .4s"></div>
+        </div>
+        <div style="display:flex;gap:12px;margin-top:8px;font-size:11px;flex-wrap:wrap">
+          <span>✅ <span id="cp-answered">0</span> answered</span>
+          <span>📵 <span id="cp-no_answer">0</span> no answer</span>
+          <span>🔴 <span id="cp-declined">0</span> declined</span>
+          <span>📶 <span id="cp-busy">0</span> busy</span>
+          <span>❌ <span id="cp-failed">0</span> failed</span>
+          <span>⏭ <span id="cp-skipped">0</span> skipped</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Filters ── -->
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+      <span style="font-size:11px;font-weight:700;color:var(--text-d);text-transform:uppercase">Call Status:</span>
+      <button class="ptab active" onclick="setOBFilter('cs','all',this)" style="padding:4px 12px;font-size:11px">All</button>
+      <button class="ptab" onclick="setOBFilter('cs','not_called',this)" style="padding:4px 12px;font-size:11px">Not Called</button>
+      <button class="ptab" onclick="setOBFilter('cs','answered',this)" style="padding:4px 12px;font-size:11px">Answered</button>
+      <button class="ptab" onclick="setOBFilter('cs','no_answer',this)" style="padding:4px 12px;font-size:11px">No Answer</button>
+      <button class="ptab" onclick="setOBFilter('cs','declined',this)" style="padding:4px 12px;font-size:11px">Declined</button>
+      <button class="ptab" onclick="setOBFilter('cs','busy',this)" style="padding:4px 12px;font-size:11px">Busy</button>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+      <span style="font-size:11px;font-weight:700;color:var(--text-d);text-transform:uppercase">Disposition:</span>
+      <button class="ptab active" onclick="setOBFilter('dp','all',this)" style="padding:4px 12px;font-size:11px;background:var(--surface2);color:var(--text-s);border-color:var(--border)" id="dp-all-btn">All</button>
+      <button class="ptab" onclick="setOBFilter('dp','interested',this)" style="padding:4px 12px;font-size:11px">Interested</button>
+      <button class="ptab" onclick="setOBFilter('dp','site_visit_booked',this)" style="padding:4px 12px;font-size:11px">Site Visit</button>
+      <button class="ptab" onclick="setOBFilter('dp','inquiry',this)" style="padding:4px 12px;font-size:11px">Inquiry</button>
+      <button class="ptab" onclick="setOBFilter('dp','in_doubt',this)" style="padding:4px 12px;font-size:11px">In Doubt</button>
+      <button class="ptab" onclick="setOBFilter('dp','to_contact_later',this)" style="padding:4px 12px;font-size:11px">Contact Later</button>
+      <button class="ptab" onclick="setOBFilter('dp','rejected',this)" style="padding:4px 12px;font-size:11px">Rejected</button>
+      <input class="inp inp-sm" id="ob-search" placeholder="Search phone/name…" style="width:180px;margin-left:auto" oninput="filterContacts()">
+    </div>
+
+    <!-- ── Contact table ── -->
+    <div class="card">
+      <div class="card-head">
+        <span class="card-ht">Contacts</span>
+        <span class="card-hs" id="ob-count">0 contacts</span>
+      </div>
+      <div class="tw">
+        <table>
+          <thead><tr><th>#</th><th>Phone</th><th>Name</th><th>Call Status</th><th>Disposition</th><th>Last Called</th><th>Calls</th><th>Notes</th><th>Actions</th></tr></thead>
+          <tbody id="ob-table"><tr><td colspan="9" style="text-align:center;padding:32px;color:var(--text-d)">No contacts yet — add one above.</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- SARVAM -->
+  <div class="tab-panel" id="tab-sarvam">
+    <div class="ptabs">
+      <button class="ptab active" onclick="loadSarvam('today',this)">Today</button>
+      <button class="ptab" onclick="loadSarvam('week',this)">Last 7 Days</button>
+      <button class="ptab" onclick="loadSarvam('month',this)">Last 30 Days</button>
+    </div>
+    <div class="g4">
+      <div class="stat"><div class="stat-lbl">Total Calls</div><div class="stat-val b" id="sv-calls">—</div><div class="stat-sub">Completed</div></div>
+      <div class="stat"><div class="stat-lbl">STT Cost (est.)</div><div class="stat-val" id="sv-stt">—</div><div class="stat-sub" id="sv-stt-s">—</div></div>
+      <div class="stat"><div class="stat-lbl">TTS Cost (est.)</div><div class="stat-val" id="sv-tts">—</div><div class="stat-sub" id="sv-tts-c">—</div></div>
+      <div class="stat"><div class="stat-lbl">Total Cost (est.)</div><div class="stat-val a" id="sv-total">—</div><div class="stat-sub">Sarvam only</div></div>
+    </div>
+    <div class="flex-r">
+      <div class="f1">
+        <div class="card">
+          <div class="card-head"><span class="card-ht">Daily Breakdown</span></div>
+          <div class="tw"><table>
+            <thead><tr><th>Date</th><th>Calls</th><th>STT (s)</th><th>TTS Chars</th><th>STT ₹</th><th>TTS ₹</th><th>Total ₹</th></tr></thead>
+            <tbody id="sv-daily"></tbody>
+          </table></div>
+        </div>
+      </div>
+      <div style="width:300px;flex-shrink:0">
+        <div class="card">
+          <div class="card-head"><span class="card-ht">Top 10 Costliest Calls</span></div>
+          <div class="tw"><table>
+            <thead><tr><th>Call ID</th><th>TTS ₹</th><th>Total ₹</th></tr></thead>
+            <tbody id="sv-top"></tbody>
+          </table></div>
+        </div>
+      </div>
+    </div>
+    <div class="notice mt14"><strong>Pricing:</strong> STT ₹0.5/min (saaras:v3) · TTS ₹3.0/1K chars (bulbul:v3) · Estimates only.</div>
+  </div>
+
+  <!-- RUNTIME CONTROL -->
+  <div class="tab-panel" id="tab-control">
+    <div class="sec-head"><div><div class="sec-title">⚙ Runtime Control</div><div class="sec-sub">Start, stop, or restart the calling agent</div></div></div>
+    <div class="ctrl-grid">
+      <div class="ctrl-card">
+        <div class="ctrl-lbl">Agent Status</div>
+        <div class="ctrl-status" id="ctrl-status">Checking…</div>
+        <div style="font-size:12px;color:var(--text-d);margin-top:-8px">socket_server + ws_audio_receiver</div>
+        <div class="ctrl-actions">
+          <button class="btn btn-p" id="btn-start" onclick="runtimeAction('start')" disabled>▶ Start Agent</button>
+          <button class="btn btn-d" id="btn-stop" onclick="runtimeAction('stop')" disabled>■ Stop Agent</button>
+          <button class="btn btn-w" id="btn-restart" onclick="runtimeAction('restart')" disabled>↻ Restart</button>
+        </div>
+      </div>
+      <div class="ctrl-card" style="gap:10px">
+        <div class="ctrl-lbl">Quick Info</div>
+        <div style="display:flex;flex-direction:column;gap:8px;font-size:12px">
+          <div style="display:flex;gap:8px;align-items:center"><span class="dim" style="width:90px">ESL Port</span><span class="badge bz">9000</span><span id="qi-9000" class="badge bz">—</span></div>
+          <div style="display:flex;gap:8px;align-items:center"><span class="dim" style="width:90px">Media WS</span><span class="badge bz">9001</span><span id="qi-9001" class="badge bz">—</span></div>
+          <div style="display:flex;gap:8px;align-items:center"><span class="dim" style="width:90px">Log dir</span><span class="mono dim" id="qi-logdir" style="font-size:11px">—</span></div>
+          <div style="display:flex;gap:8px;align-items:center"><span class="dim" style="width:90px">Last cmd</span><span id="qi-lastcmd" class="dim" style="font-size:11px">—</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="terminal">
+      <div class="term-bar">
+        <div class="term-dots"><div class="tdot" style="background:#ef4444"></div><div class="tdot" style="background:#f59e0b"></div><div class="tdot" style="background:#22c55e"></div></div>
+        <span style="font-size:12px;color:rgba(255,255,255,.4);margin-left:8px" id="term-label">Ready</span>
+        <div style="margin-left:auto;display:flex;gap:8px">
+          <div class="ldot off" id="term-dot"></div>
+          <button class="fchip" onclick="clearTerm()">Clear</button>
+        </div>
+      </div>
+      <div class="term-body" id="term-body">
+        <span class="tl sys">LesCall Runtime Control — use buttons above to start/stop.</span>
+        <span class="tcur"></span>
+      </div>
+    </div>
+    <div class="notice mt14"><strong>Scripts:</strong> <span class="mono">phase14_runtime/start_all.sh</span> and <span class="mono">phase14_runtime/stop_all.sh</span></div>
+  </div>
+
+  <!-- HEALTH -->
+  <div class="tab-panel" id="tab-health">
+    <div class="sec-head"><div class="sec-title">🩺 Health Overview</div></div>
+    <div class="g3">
+      <div class="stat"><div class="stat-lbl">Overall Status</div><div class="stat-val" id="h-overall">—</div><div class="stat-sub" id="h-checked">—</div></div>
+      <div class="stat"><div class="stat-lbl">Services Running</div><div class="stat-val b" id="h-svc-count">—</div><div class="stat-sub">of expected processes</div></div>
+      <div class="stat"><div class="stat-lbl">Ports Listening</div><div class="stat-val b" id="h-port-count">—</div><div class="stat-sub">9000 (ESL) · 9001 (Media WS)</div></div>
+    </div>
+    <hr class="divider">
+    <div class="sec-head" style="margin-bottom:12px"><div class="sec-title" style="font-size:14px">Runtime Health Details</div></div>
+    <div class="card mt4"><div id="health-svc-body"><div style="padding:24px;color:var(--text-d);text-align:center">Loading…</div></div></div>
+    <div class="mt18">
+      <div class="card">
+        <div class="card-head"><span class="card-ht">Port Status</span></div>
+        <div class="tw"><table>
+          <thead><tr><th>Port</th><th>Service</th><th>Status</th></tr></thead>
+          <tbody id="health-ports"></tbody>
+        </table></div>
+      </div>
+    </div>
+    <div class="notice mt14"><strong>Log directory:</strong> <span class="mono" id="h-logdir">—</span></div>
+  </div>
+
+  </div><!-- .page -->
+</div><!-- .content -->
+</div><!-- .layout -->
+
+<script>
+// ── dark mode (persisted) ──────────────────────────────────────────────────
+(function(){
+  const t=localStorage.getItem('lc-theme')||'light';
+  document.documentElement.setAttribute('data-theme',t);
+  const b=document.getElementById('theme-btn');
+  if(b) b.textContent=t==='dark'?'☀️':'🌙';
+})();
+function toggleTheme(){
+  const cur=document.documentElement.getAttribute('data-theme');
+  const nxt=cur==='dark'?'light':'dark';
+  document.documentElement.setAttribute('data-theme',nxt);
+  localStorage.setItem('lc-theme',nxt);
+  document.getElementById('theme-btn').textContent=nxt==='dark'?'☀️':'🌙';
+}
+
+// ── state ──────────────────────────────────────────────────────────────────
+const TABS={overview:'Overview','live-calls':'Live Calls',conversations:'Conversations',
+  history:'Call History',logs:'Live Logs',outbound:'Outbound Calls',
+  sarvam:'Sarvam Usage',control:'Runtime Control',health:'Health'};
+let curTab='overview',logESS=null,cmdESS=null,logFilter='all',logAS=true,logLines=[];
+const MAXLOG=1000;
+let convData=[],histPage=1,histPages=1;
+
+// ── nav ────────────────────────────────────────────────────────────────────
+document.querySelectorAll('.nav-item[data-tab]').forEach(el=>{
+  el.addEventListener('click',()=>switchTab(el.dataset.tab));
+});
+function switchTab(n){
+  document.querySelectorAll('.nav-item').forEach(e=>e.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(e=>e.classList.remove('active'));
+  document.querySelector(`.nav-item[data-tab="${n}"]`)?.classList.add('active');
+  document.getElementById('tab-'+n)?.classList.add('active');
+  document.getElementById('topbar-title').textContent=TABS[n]||n;
+  curTab=n; onActivate(n);
+}
+function onActivate(t){
+  if(t==='overview')loadOverview();
+  else if(t==='live-calls')loadLive();
+  else if(t==='conversations')loadConversations();
+  else if(t==='history')loadHistory();
+  else if(t==='logs')initLogs();
+  else if(t==='outbound')loadOutbound();
+  else if(t==='sarvam')loadSarvam('today',document.querySelector('.ptab.active'));
+  else if(t==='control')initControl();
+  else if(t==='health')loadHealth();
+}
+
+// ── helpers ────────────────────────────────────────────────────────────────
+const R=(n,d=2)=>(n==null||isNaN(n))?'—':Number(n).toFixed(d);
+const RP=(n)=>(n==null||isNaN(n))?'—':'₹'+Number(n).toFixed(4);
+function fmtDur(s){if(!s||s<=0)return'—';const m=Math.floor(s/60),sc=Math.floor(s%60);return m+':'+String(sc).padStart(2,'0')}
+function fmtTs(ts){if(!ts)return'—';try{return new Date(ts).toLocaleString('en-IN',{dateStyle:'short',timeStyle:'short'})}catch{return ts.slice(0,16)}}
+function shortId(id){return id?id.slice(0,8)+'…':'—'}
+function elapsed(st){try{return fmtDur((Date.now()-new Date(st).getTime())/1000)}catch{return'—'}}
+function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+async function api(p,opts){const r=await fetch(p,opts);if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}
+function stamp(){document.getElementById('last-refresh').textContent='Updated '+new Date().toLocaleTimeString()}
+
+// ── health poll ────────────────────────────────────────────────────────────
+async function pollHealth(){
+  try{
+    const d=await api('/api/runtime/status');
+    const ok=d.overall==='healthy';
+    const dot=document.getElementById('sidebar-dot');
+    dot.className='rdot '+(ok?'healthy':'degraded');
+    document.getElementById('sidebar-status').textContent=ok?'Healthy':'Degraded';
+    updateCtrlBtns(d);
+  }catch(e){}
+}
+setInterval(pollHealth,10000);
+
+function updateCtrlBtns(d){
+  const running=d.services&&Object.values(d.services).some(s=>s.running);
+  const bs=document.getElementById('btn-start'),bst=document.getElementById('btn-stop'),br=document.getElementById('btn-restart');
+  if(bs)bs.disabled=running||d.cmd_running;
+  if(bst)bst.disabled=!running||d.cmd_running;
+  if(br)br.disabled=d.cmd_running;
+  const el=document.getElementById('ctrl-status');
+  if(el){
+    if(d.cmd_running){el.textContent='Running command…';el.style.color='var(--warn)'}
+    else if(running){el.textContent='● Online';el.style.color='var(--success)'}
+    else{el.textContent='○ Offline';el.style.color='var(--error)'}
+  }
+  const p9=d.ports?.['9000'],p1=d.ports?.['9001'];
+  const e9=document.getElementById('qi-9000'),e1=document.getElementById('qi-9001');
+  if(e9){e9.className='badge '+(p9?'bg':'br');e9.textContent=p9?'● UP':'✕ DOWN'}
+  if(e1){e1.className='badge '+(p1?'bg':'br');e1.textContent=p1?'● UP':'✕ DOWN'}
+  const ld=document.getElementById('qi-logdir');if(ld&&d.logs_dir)ld.textContent=d.logs_dir;
+  const lc=document.getElementById('qi-lastcmd');if(lc)lc.textContent=d.cmd_last?d.cmd_last+(d.cmd_exit!=null?' (exit '+d.cmd_exit+')':''):'—';
+}
+
+// ── overview ───────────────────────────────────────────────────────────────
+async function loadOverview(){
+  try{
+    const d=await api('/api/overview');
+    document.getElementById('s-today-calls').textContent=d.today.call_count??'0';
+    document.getElementById('s-today-active').textContent=(d.active_calls??0)+' active now';
+    document.getElementById('s-today-cost').textContent=RP(d.today.est_total_cost);
+    document.getElementById('s-today-cost-sub').textContent='STT '+RP(d.today.est_stt_cost)+' · TTS '+RP(d.today.est_tts_cost);
+    document.getElementById('s-month-cost').textContent=RP(d.month.est_total_cost);
+    document.getElementById('s-month-calls').textContent=(d.month.call_count??0)+' calls in 30 days';
+    document.getElementById('s-week-calls').textContent=d.week.call_count??'0';
+    document.getElementById('s-week-cost').textContent=RP(d.week.est_total_cost)+' est. total';
+    document.getElementById('s-stt-sec').textContent=R(d.today.stt_sarvam_billed_seconds,1)+'s billed';
+    document.getElementById('s-stt-cost').textContent=RP(d.today.est_stt_cost)+' (STT)';
+    document.getElementById('s-tts-chars').textContent=(d.today.tts_chars??0).toLocaleString()+' chars';
+    document.getElementById('s-tts-cost').textContent=RP(d.today.est_tts_cost)+' (TTS)';
+    const rt=document.getElementById('s-runtime'),ok=d.runtime_status==='healthy';
+    rt.textContent=ok?'✓ Healthy':'⚠ Degraded';rt.className='stat-val '+(ok?'g':'a');
+    document.getElementById('nav-active').textContent=d.active_calls??0;
+    renderHourly(d.hourly_calls||[]);stamp();
+  }catch(e){console.error(e)}
+}
+function renderHourly(data){
+  const el=document.getElementById('hourly-chart');
+  const mx=Math.max(...data.map(h=>h.count),1);
+  el.innerHTML='';
+  data.forEach(h=>{
+    const pct=(h.count/mx)*100,col=document.createElement('div');
+    col.className='bar-col';
+    col.innerHTML=`<div class="bar" style="height:${Math.max(pct,2)}%"><div class="bar-tip">${h.count} calls at ${h.hour}:00</div></div><div class="bar-lbl">${h.hour%6===0?h.hour+'h':''}</div>`;
+    el.appendChild(col);
+  });
+}
+
+// ── live calls ─────────────────────────────────────────────────────────────
+async function loadLive(){
+  try{
+    const d=await api('/api/calls/active');
+    document.getElementById('live-updated').textContent='Updated '+new Date().toLocaleTimeString();
+    document.getElementById('nav-active').textContent=d.count??0;
+    const tb=document.getElementById('live-table');
+    if(!d.active_calls?.length){
+      tb.innerHTML='<tr><td colspan="5" style="text-align:center;padding:48px;color:var(--text-d)">No active calls right now</td></tr>';
+      return;
+    }
+    tb.innerHTML=d.active_calls.map(c=>`<tr>
+      <td><span class="badge bg">● ACTIVE</span></td>
+      <td class="tm">${esc(c.call_id)}</td>
+      <td class="td">${fmtTs(c.start_time)}</td>
+      <td><strong>${elapsed(c.start_time)}</strong></td>
+      <td class="td" style="font-size:12px">Inbound call in progress</td>
+    </tr>`).join('');
+  }catch(e){console.error(e)}
+}
+
+// ── conversations ──────────────────────────────────────────────────────────
+async function loadConversations(){
+  const li=document.getElementById('conv-list-items');
+  li.innerHTML='<div style="padding:32px;text-align:center;color:var(--text-d)"><div class="spin" style="margin:0 auto 8px"></div>Loading…</div>';
+  try{
+    // Sorted newest-first by date (server-side fix). Short TTL (15s) means new calls appear fast.
+    const d=await api('/api/calls/recordings?limit=100&page=1');
+    convData=d.recordings||[];
+    const lc=document.getElementById('conv-list-count');
+    if(lc) lc.textContent=convData.length+' recordings';
+    renderConvList(convData);
+  }catch(e){
+    document.getElementById('conv-list-items').innerHTML='<div style="padding:24px;color:var(--error);text-align:center">Error loading</div>';
+  }
+}
+
+function renderConvList(recs){
+  const el=document.getElementById('conv-list-items');
+  if(!recs.length){el.innerHTML='<div style="padding:32px;text-align:center;color:var(--text-d)">No recordings found</div>';return}
+  el.innerHTML='';
+  recs.forEach(r=>{
+    const ph=r.caller&&r.caller!=='unknown'&&r.caller.length>4?'+'+r.caller.replace(/\D/g,''):r.caller||'Unknown';
+    const dur=fmtDur(r.duration_seconds);
+    const item=document.createElement('div');
+    item.className='conv-item';
+    item.innerHTML=`
+      <div class="conv-caller">${esc(ph)}</div>
+      <div class="conv-meta">
+        <span>${fmtTs(r.folder_dt)}</span>
+        ${dur!=='—'?`<span class="conv-tag">⏱ ${dur}</span>`:''}
+        ${r.language_detected?`<span class="conv-tag">${r.language_detected.toUpperCase()}</span>`:''}
+        ${r.transcript_count?`<span class="conv-tag">${r.transcript_count} turns</span>`:''}
+      </div>`;
+    item.addEventListener('click',()=>loadTranscript(item,r.folder,ph,r.folder_dt||'',r.duration_seconds||0,r.language_detected||''));
+    el.appendChild(item);
+  });
+}
+
+function filterConvList(){
+  const q=document.getElementById('conv-search').value.toLowerCase().trim();
+  renderConvList(q?convData.filter(r=>(r.caller||'').toLowerCase().includes(q)||(r.folder_dt||'').includes(q)):convData);
+}
+
+async function loadTranscript(itemEl,folder,caller,dt,dur,lang){
+  document.querySelectorAll('.conv-item').forEach(e=>e.classList.remove('active'));
+  itemEl.classList.add('active');
+  document.getElementById('conv-title').textContent=caller;
+  document.getElementById('conv-sub').textContent=fmtTs(dt)+(dur?' · '+fmtDur(Number(dur)):'')+(lang?' · '+lang.toUpperCase():'');
+  const msgs=document.getElementById('conv-msgs');
+  msgs.innerHTML='<div style="text-align:center;padding:60px"><div class="spin"></div></div>';
+  try{
+    const d=await api('/api/calls/recordings/'+encodeURIComponent(folder)+'/transcript');
+    if(!d.messages?.length){msgs.innerHTML='<div class="conv-empty"><span style="font-size:24px">📭</span><span>No transcript for this call</span></div>';return}
+    msgs.innerHTML=d.messages.map(m=>{
+      const cls=m.speaker==='Agent'?'ag':'ca';
+      return`<div class="msg ${cls}">
+        <div class="msg-lbl">${esc(m.speaker)}</div>
+        <div class="msg-bub">${esc(m.text)}</div>
+        ${m.timestamp?`<div class="msg-ts">${esc(m.timestamp)}</div>`:''}
+      </div>`;
+    }).join('');
+    msgs.scrollTop=msgs.scrollHeight;
+  }catch(e){msgs.innerHTML='<div class="conv-empty" style="color:var(--error)"><span>⚠</span><span>Error loading transcript</span></div>';}
+}
+
+// ── history ────────────────────────────────────────────────────────────────
+async function loadHistory(page){
+  page=page||1;histPage=page;
+  const search=document.getElementById('hist-search').value;
+  const days=document.getElementById('hist-days').value;
+  const tb=document.getElementById('hist-table');
+  tb.innerHTML='<tr><td colspan="8" style="text-align:center;padding:24px"><div class="spin"></div></td></tr>';
+  try{
+    const d=await api(`/api/calls/history?page=${page}&limit=50&search=${encodeURIComponent(search)}&days=${days}`);
+    histPages=d.pages||1;
+    tb.innerHTML=d.calls?.length
+      ?d.calls.map(c=>`<tr>
+        <td class="td" style="font-size:12px">${fmtTs(c.end_time)}</td>
+        <td class="tm trunc" title="${esc(c.call_id)}">${shortId(c.call_id)}</td>
+        <td>${R(c.stt_sarvam_billed_seconds,1)}s</td><td>${(c.tts_chars||0).toLocaleString()}</td>
+        <td>${RP(c.est_stt_cost)}</td><td>${RP(c.est_tts_cost)}</td>
+        <td><strong>${RP(c.est_total_cost)}</strong></td>
+        <td class="td">${c.stt_sarvam_calls||0} STT / ${c.tts_calls||0} TTS</td>
+      </tr>`).join('')
+      :'<tr><td colspan="8" style="text-align:center;padding:40px;color:var(--text-d)">No calls found</td></tr>';
+    document.getElementById('hist-pages').innerHTML=
+      `<button class="pgbtn" onclick="loadHistory(${page-1})" ${page<=1?'disabled':''}>← Prev</button>
+       <span class="pginf">Page ${page} of ${histPages}</span>
+       <button class="pgbtn" onclick="loadHistory(${page+1})" ${page>=histPages?'disabled':''}>Next →</button>`;
+  }catch(e){tb.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--error);padding:24px">Error</td></tr>'}
+}
+
+// ── logs ───────────────────────────────────────────────────────────────────
+function initLogs(){if(logESS)return;connectLogs()}
+function connectLogs(){
+  logESS=new EventSource('/api/logs/stream?categories='+(logFilter==='all'?'all':logFilter));
+  const dot=document.getElementById('log-dot'),st=document.getElementById('log-status');
+  logESS.onopen=()=>{dot.classList.remove('off');st.textContent='Live'};
+  logESS.onerror=()=>{dot.classList.add('off');st.textContent='Reconnecting…'};
+  logESS.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type==='log')appendLog(m.line,m.color,m.category)}catch{}};
+}
+function appendLog(line,color,cat){
+  if(logFilter!=='all'&&cat!==logFilter)return;
+  const el=document.getElementById('log-body'),span=document.createElement('span');
+  span.className='log-ln';span.style.color=color||'#7ab8cc';span.textContent=line;
+  el.appendChild(span);logLines.push(span);
+  if(logLines.length>MAXLOG){const o=logLines.shift();o?.parentNode?.removeChild(o)}
+  if(logAS)el.scrollTop=el.scrollHeight;
+}
+function toggleLogFilter(btn){
+  const cat=btn.dataset.cat;
+  document.querySelectorAll('.fchip[data-cat]').forEach(b=>b.className='fchip');
+  btn.classList.add('on-'+cat);logFilter=cat;
+  if(logESS){logESS.close();logESS=null}clearLogs();connectLogs();
+}
+function clearLogs(){document.getElementById('log-body').innerHTML='';logLines=[]}
+function toggleAS(){logAS=!logAS;document.getElementById('as-btn').textContent='↓ Auto: '+(logAS?'ON':'OFF')}
+
+// ── outbound campaign ──────────────────────────────────────────────────────
+let _obCsFilter='all', _obDpFilter='all', _obAllContacts=[], _campPollTimer=null;
+
+const CS_LABELS={not_called:'Not Called',answered:'Answered',no_answer:'No Answer',busy:'Busy',declined:'Declined',failed:'Failed'};
+const CS_COLORS={not_called:'bz',answered:'bg',no_answer:'ba',busy:'ba',declined:'br',failed:'br'};
+const DP_LABELS={not_classified:'Unclassified',interested:'Interested',site_visit_booked:'Site Visit Booked',
+  inquiry:'Inquiry',in_doubt:'In Doubt',to_contact_later:'Contact Later',rejected:'Rejected'};
+const DP_COLORS={not_classified:'bz',interested:'bb',site_visit_booked:'bg',
+  inquiry:'bb',in_doubt:'ba',to_contact_later:'ba',rejected:'br'};
+
+function toggleSection(id){
+  const el=document.getElementById(id);
+  const arrow=document.getElementById(id+'-arrow');
+  const hidden=el.style.display==='none';
+  el.style.display=hidden?'block':'none';
+  if(arrow)arrow.textContent=hidden?'▲':'▼';
+}
+
+async function loadOutbound(){
+  try{
+    const [dc, ds]=await Promise.all([
+      api('/api/outbound/contacts?call_status='+_obCsFilter+'&disposition='+_obDpFilter),
+      api('/api/outbound/stats')
+    ]);
+    _obAllContacts=dc.contacts||[];
+    renderOutbound(_obAllContacts);
+    renderOBStats(ds);
+  }catch(e){console.error(e)}
+}
+
+function renderOBStats(ds){
+  const s=ds.stats||{}, d=ds.dispositions||{};
+  const ids=['total','not_called','answered','no_answer','declined','busy','failed'];
+  ids.forEach(k=>{const el=document.getElementById('os-'+k);if(el)el.textContent=s[k]??0});
+  ['interested','site_visit_booked','inquiry','in_doubt','to_contact_later','rejected'].forEach(k=>{
+    const el=document.getElementById('od-'+k);if(el)el.textContent=d[k]??0;
+  });
+}
+
+function setOBFilter(type, val, btn){
+  if(type==='cs'){
+    _obCsFilter=val;
+    document.querySelectorAll('[onclick*="setOBFilter(\'cs\'"]').forEach(b=>b.classList.remove('active'));
+  } else {
+    _obDpFilter=val;
+    document.querySelectorAll('[onclick*="setOBFilter(\'dp\'"]').forEach(b=>b.classList.remove('active'));
+  }
+  btn.classList.add('active');
+  loadOutbound();
+}
+
+function filterContacts(){
+  const q=document.getElementById('ob-search').value.toLowerCase().trim();
+  renderOutbound(q?_obAllContacts.filter(c=>(c.phone||'').includes(q)||(c.name||'').toLowerCase().includes(q)):_obAllContacts);
+}
+
+function renderOutbound(contacts){
+  const cnt=document.getElementById('ob-count');
+  if(cnt)cnt.textContent=contacts.length+' contact'+(contacts.length!==1?'s':'');
+  const tb=document.getElementById('ob-table');
+  if(!contacts.length){
+    tb.innerHTML='<tr><td colspan="9" style="text-align:center;padding:32px;color:var(--text-d)">No contacts match — try changing the filters or add contacts above.</td></tr>';
+    return;
+  }
+  tb.innerHTML=contacts.map((c,i)=>{
+    const cs=c.call_status||'not_called';
+    const dp=c.disposition||'not_classified';
+    return`<tr id="ob-row-${c.id}">
+      <td class="td" style="font-size:12px">${i+1}</td>
+      <td class="tm">${esc(c.phone)}</td>
+      <td style="max-width:120px">${esc(c.name||'—')}</td>
+      <td><span class="badge ${CS_COLORS[cs]||'bz'}">${CS_LABELS[cs]||cs}</span></td>
+      <td>
+        <select class="inp inp-sm" style="width:130px" onchange="setDisposition('${c.id}',this.value)">
+          ${Object.entries(DP_LABELS).map(([v,l])=>`<option value="${v}" ${dp===v?'selected':''}>${l}</option>`).join('')}
+        </select>
+      </td>
+      <td class="td" style="font-size:11px">${c.last_called_at?fmtTs(c.last_called_at):'—'}</td>
+      <td class="td" style="font-size:12px;text-align:center">${c.call_count||0}</td>
+      <td style="max-width:140px;color:var(--text-s);font-size:11px">${esc(c.notes||'')}</td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-p btn-sm" onclick="dialContact('${c.id}',this)">📞 Call</button>
+        <button class="btn btn-d btn-sm" style="margin-left:4px" onclick="deleteOBContact('${c.id}')">✕</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function setDisposition(id, disposition){
+  try{
+    await fetch('/api/outbound/contacts/'+id,{method:'PATCH',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({disposition})});
+    // reload stats silently
+    const ds=await api('/api/outbound/stats');renderOBStats(ds);
+  }catch(e){console.error(e)}
+}
+
+async function dialContact(id, btn){
+  const orig=btn.textContent;
+  btn.disabled=true; btn.textContent='⏳';
+  showOBMsg('Dialing — AI will connect when answered…','var(--accent)');
+  try{
+    const d=await api('/api/outbound/dial/'+id,{method:'POST'});
+    if(d.ok){
+      showOBMsg('Call initiated to '+d.phone,'var(--success)');
+      btn.textContent='✓';
+      setTimeout(()=>{btn.textContent=orig;btn.disabled=false;loadOutbound()},5000);
+    }else{
+      showOBMsg('Call failed: '+(d.reason||'error'),'var(--error)');
+      btn.textContent=orig;btn.disabled=false;
+    }
+  }catch(e){showOBMsg(String(e),'var(--error)');btn.textContent=orig;btn.disabled=false;}
+}
+
+async function addOutboundContact(){
+  const phone=document.getElementById('ob-phone').value.trim();
+  const name=document.getElementById('ob-name').value.trim();
+  const notes=document.getElementById('ob-notes').value.trim();
+  if(!phone){showOBMsg('Phone number is required','var(--error)');return}
+  try{
+    const d=await api('/api/outbound/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,name,notes})});
+    if(d.ok){
+      document.getElementById('ob-phone').value='';
+      document.getElementById('ob-name').value='';
+      document.getElementById('ob-notes').value='';
+      showOBMsg('Contact added ✓','var(--success)');
+      loadOutbound();
+    }else{showOBMsg(d.reason||'Error','var(--error)')}
+  }catch(e){showOBMsg(String(e),'var(--error)')}
+}
+
+async function uploadContacts(){
+  const fileEl=document.getElementById('ob-file');
+  if(!fileEl.files?.length){showOBMsg('Please select a file first','var(--warn)');return}
+  const file=fileEl.files[0];
+  const form=new FormData();
+  form.append('file',file);
+  showOBMsg('Uploading and parsing '+file.name+'…','var(--accent)');
+  try{
+    const r=await fetch('/api/outbound/contacts/upload',{method:'POST',body:form});
+    const d=await r.json();
+    if(d.ok){
+      showOBMsg(`✓ Added ${d.added} numbers. Duplicates skipped: ${d.duplicates}. Parse errors: ${d.parse_errors||0}.`,'var(--success)');
+      fileEl.value='';
+      loadOutbound();
+    }else{showOBMsg('Upload failed: '+(d.reason||'error'),'var(--error)')}
+  }catch(e){showOBMsg(String(e),'var(--error)')}
+}
+
+async function deleteOBContact(id){
+  if(!confirm('Remove this contact?'))return;
+  try{await fetch('/api/outbound/contacts/'+id,{method:'DELETE'});loadOutbound()}catch(e){console.error(e)}
+}
+
+async function clearAllContacts(){
+  if(!confirm('Delete ALL contacts? This cannot be undone.'))return;
+  try{await fetch('/api/outbound/contacts/all',{method:'DELETE'});loadOutbound()}catch(e){console.error(e)}
+}
+
+function showOBMsg(text,color){
+  const el=document.getElementById('ob-msg');
+  if(!el)return;
+  el.textContent=text;el.style.color=color||'var(--text)';
+  el.style.background=color==='var(--success)'?'var(--success-bg)':color==='var(--error)'?'var(--error-bg)':color==='var(--warn)'?'var(--warn-bg)':'var(--surface2)';
+  el.style.display='block';
+  clearTimeout(el._t);
+  el._t=setTimeout(()=>{el.style.display='none'},5000);
+}
+
+// ── Campaign ───────────────────────────────────────────────────────────────
+async function startCampaign(){
+  const filter=document.getElementById('camp-filter').value;
+  const delay=parseFloat(document.getElementById('camp-delay').value)||4;
+  const maxCalls=parseInt(document.getElementById('camp-max').value)||0;
+  try{
+    const d=await api('/api/outbound/campaign/start',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({call_status_filter:filter,delay_seconds:delay,max_calls:maxCalls})});
+    if(d.ok){
+      document.getElementById('camp-start-btn').disabled=true;
+      document.getElementById('camp-stop-btn').disabled=false;
+      document.getElementById('camp-progress-wrap').style.display='block';
+      document.getElementById('campaign-status-label').textContent='Running…';
+      startCampPoll();
+    }else{showOBMsg('Could not start: '+(d.reason||'error'),'var(--error)')}
+  }catch(e){showOBMsg(String(e),'var(--error)')}
+}
+
+async function stopCampaign(){
+  await fetch('/api/outbound/campaign/stop',{method:'POST'});
+  document.getElementById('campaign-status-label').textContent='Stopping…';
+}
+
+function startCampPoll(){
+  if(_campPollTimer)clearInterval(_campPollTimer);
+  _campPollTimer=setInterval(pollCampaign,2000);
+}
+
+async function pollCampaign(){
+  try{
+    const d=await api('/api/outbound/campaign/status');
+    const pct=d.total>0?Math.round((d.completed/d.total)*100):0;
+    document.getElementById('camp-prog-bar').style.width=pct+'%';
+    document.getElementById('camp-prog-pct').textContent=pct+'%';
+    document.getElementById('camp-cur-phone').textContent=d.current_phone||'';
+    document.getElementById('camp-prog-label').textContent=d.running?
+      `Calling ${d.current_phone||'…'} (${d.completed}/${d.total})`:`Campaign done — ${d.completed}/${d.total} processed`;
+    ['answered','no_answer','declined','busy','failed','skipped'].forEach(k=>{
+      const el=document.getElementById('cp-'+k);if(el)el.textContent=d[k]||0;
+    });
+    if(!d.running){
+      document.getElementById('camp-start-btn').disabled=false;
+      document.getElementById('camp-stop-btn').disabled=true;
+      document.getElementById('campaign-status-label').textContent=
+        d.error?'Error: '+d.error:`Done — ${d.answered} answered of ${d.total}`;
+      clearInterval(_campPollTimer);_campPollTimer=null;
+      loadOutbound(); // refresh table after campaign
+    }
+  }catch(e){console.error(e)}
+}
+
+// ── sarvam ─────────────────────────────────────────────────────────────────
+async function loadSarvam(period,btn){
+  if(btn){document.querySelectorAll('.ptab').forEach(b=>b.classList.remove('active'));btn.classList.add('active')}
+  try{
+    const d=await api('/api/sarvam/usage?period='+period);const s=d.summary||{};
+    document.getElementById('sv-calls').textContent=s.call_count??'0';
+    document.getElementById('sv-stt').textContent=RP(s.est_stt_cost);
+    document.getElementById('sv-stt-s').textContent=R(s.stt_sarvam_billed_seconds,1)+' billed s';
+    document.getElementById('sv-tts').textContent=RP(s.est_tts_cost);
+    document.getElementById('sv-tts-c').textContent=(s.tts_chars||0).toLocaleString()+' chars';
+    document.getElementById('sv-total').textContent=RP(s.est_total_cost);
+    const daily=d.daily||{},days=Object.keys(daily).sort();
+    document.getElementById('sv-daily').innerHTML=days.length
+      ?days.map(day=>{const r=daily[day]||{};return`<tr>
+        <td class="td" style="font-size:12px">${day}</td><td>${r.call_count??0}</td>
+        <td>${R(r.stt_sarvam_billed_seconds,1)}</td><td>${(r.tts_chars||0).toLocaleString()}</td>
+        <td>${RP(r.est_stt_cost)}</td><td>${RP(r.est_tts_cost)}</td>
+        <td><strong>${RP(r.est_total_cost)}</strong></td></tr>`}).join('')
+      :'<tr><td colspan="7" style="text-align:center;padding:24px;color:var(--text-d)">No data</td></tr>';
+    const top=d.top_calls||[];
+    document.getElementById('sv-top').innerHTML=top.length
+      ?top.map(c=>`<tr><td class="tm" style="font-size:11px">${shortId(c.call_id)}</td><td>${RP(c.est_tts_cost)}</td><td><strong>${RP(c.est_total_cost)}</strong></td></tr>`).join('')
+      :'<tr><td colspan="3" style="text-align:center;padding:24px;color:var(--text-d)">No data</td></tr>';
+  }catch(e){console.error(e)}
+}
+
+// ── runtime control ────────────────────────────────────────────────────────
+function initControl(){loadCtrlStatus();connectCmdStream()}
+async function loadCtrlStatus(){try{const d=await api('/api/runtime/status');updateCtrlBtns(d)}catch(e){}}
+function connectCmdStream(){
+  if(cmdESS)return;
+  cmdESS=new EventSource('/api/runtime/output/stream');
+  const dot=document.getElementById('term-dot');
+  cmdESS.onopen=()=>{if(dot)dot.classList.remove('off')};
+  cmdESS.onerror=()=>{if(dot)dot.classList.add('off')};
+  cmdESS.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type!=='keepalive')appendTerm(m)}catch{}};
+}
+function appendTerm(m){
+  const el=document.getElementById('term-body');if(!el)return;
+  el.querySelector('.tcur')?.remove();
+  if(m.type==='cmd_start'){
+    const s=document.createElement('span');s.className='tl cmd';
+    s.textContent='$ '+m.cmd+' ['+new Date(m.ts).toLocaleTimeString()+']';
+    el.appendChild(s);document.getElementById('term-label').textContent='Running: '+m.cmd;
+    document.getElementById('term-dot')?.classList.remove('off');loadCtrlStatus();
+  }else if(m.type==='cmd_end'){
+    const s=document.createElement('span');s.className='tl '+(m.ok?'ok':'err');
+    s.textContent=m.ok?'✓ Done (exit 0)':'✗ Failed (exit '+m.exit_code+')';
+    el.appendChild(s);document.getElementById('term-label').textContent=m.ok?'Last: success':'Last: FAILED';
+    document.getElementById('term-dot')?.classList.add('off');setTimeout(loadCtrlStatus,1500);
+  }else if(m.type==='line'){
+    const s=document.createElement('span');s.className='tl';const t=m.text||'';
+    if(t.includes('[OK]')||t.toLowerCase().includes('started'))s.style.color='#18b068';
+    else if(t.includes('[FAIL]')||t.toLowerCase().includes('error'))s.style.color='#ef4444';
+    else if(t.includes('Stopping')||t.includes('Killing'))s.style.color='#f59e0b';
+    else s.style.color='#7ab8cc';
+    s.textContent=t;el.appendChild(s);
+  }else if(m.type==='error'){
+    const s=document.createElement('span');s.className='tl err';s.textContent='✗ '+m.text;el.appendChild(s);
+  }
+  const cur=document.createElement('span');cur.className='tcur';el.appendChild(cur);
+  el.scrollTop=el.scrollHeight;
+}
+async function runtimeAction(action){
+  const el=document.getElementById('ctrl-status');
+  if(el){el.textContent={start:'Starting…',stop:'Stopping…',restart:'Restarting…'}[action]||'Working…';el.style.color='var(--warn)'}
+  ['btn-start','btn-stop','btn-restart'].forEach(id=>{const b=document.getElementById(id);if(b)b.disabled=true});
+  try{
+    const r=await fetch('/api/runtime/'+action,{method:'POST'});const d=await r.json();
+    if(!d.ok){appendTerm({type:'error',text:d.reason||'rejected'});await loadCtrlStatus()}
+  }catch(e){appendTerm({type:'error',text:String(e)});await loadCtrlStatus()}
+}
+function clearTerm(){const el=document.getElementById('term-body');el.innerHTML='<span class="tcur"></span>'}
+
+// ── health ─────────────────────────────────────────────────────────────────
+async function loadHealth(){
+  try{
+    const d=await api('/api/runtime/status');
+    const ok=d.overall==='healthy',svcs=d.services||{},ports=d.ports||{};
+    const ov=document.getElementById('h-overall');ov.textContent=ok?'✓ Healthy':'⚠ Degraded';ov.className='stat-val '+(ok?'g':'a');
+    document.getElementById('h-checked').textContent='Checked '+fmtTs(d.checked_at);
+    const run=Object.values(svcs).filter(s=>s.running).length,tot=Object.keys(svcs).length;
+    document.getElementById('h-svc-count').textContent=run+' / '+tot;
+    document.getElementById('h-svc-count').className='stat-val '+(run===tot&&tot>0?'g':'a');
+    const pu=Object.values(ports).filter(Boolean).length;
+    document.getElementById('h-port-count').textContent=pu+' / '+Object.keys(ports).length;
+    document.getElementById('h-port-count').className='stat-val '+(pu===Object.keys(ports).length?'g':'a');
+    const SL={socket_server:{label:'Socket Server (ESL)',icon:'🔌',detail:'Port 9000 · FreeSWITCH ESL controller'},ws_audio_receiver:{label:'WS Audio Receiver',icon:'🎙',detail:'Port 9001 · WebSocket media bridge + AI pipeline'}};
+    const body=document.getElementById('health-svc-body');
+    body.innerHTML=Object.keys(svcs).length
+      ?Object.entries(svcs).map(([n,s])=>{const i=SL[n]||{label:n,icon:'⚙',detail:'PID: '+s.pid},up=s.running;return`<div class="svc-row"><div class="svc-ic ${up?'up':'dn'}">${i.icon}</div><div><div class="svc-nm">${i.label}</div><div class="svc-dt">${i.detail}</div><div class="svc-dt" style="margin-top:3px">PID: <span class="mono">${s.pid}</span></div></div><div class="svc-st">${up?'<span class="badge bg">● Running</span>':'<span class="badge br">✕ Stopped</span>'}</div></div>`}).join('')
+      :'<div style="padding:24px;color:var(--text-d);text-align:center">No service data — runtime may not be started.</div>';
+    const PI={'9000':'socket_server.py (ESL)','9001':'ws_audio_receiver.py (Media WS)'};
+    document.getElementById('health-ports').innerHTML=Object.entries(PI).map(([p,s])=>`<tr><td class="tm">${p}</td><td>${s}</td><td>${ports[p]?'<span class="badge bg">● Listening</span>':'<span class="badge br">✕ Not listening</span>'}</td></tr>`).join('');
+    document.getElementById('h-logdir').textContent=d.logs_dir||'—';stamp();
+  }catch(e){console.error(e)}
+}
+
+// ── bootstrap ──────────────────────────────────────────────────────────────
+function refreshAll(){onActivate(curTab)}
+setInterval(()=>{
+  pollHealth();
+  if(['overview','live-calls','health','control'].includes(curTab))onActivate(curTab);
+  // Auto-refresh conversations every 15s when on that tab (so new calls appear)
+  if(curTab==='conversations')loadConversations();
+},15000);
+pollHealth();loadOverview();
+</script>
+</body>
+</html>

@@ -1,0 +1,646 @@
+{
+  "greeting_en": {
+    "key": "greeting",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/greeting_en.wav",
+    "duration_s": 5.717,
+    "chars": 105
+  },
+  "greeting_hi": {
+    "key": "greeting",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/greeting_hi.wav",
+    "duration_s": 5.632,
+    "chars": 95
+  },
+  "greeting_gu": {
+    "key": "greeting",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/greeting_gu.wav",
+    "duration_s": 6.827,
+    "chars": 97
+  },
+  "mid_call_greeting_en": {
+    "key": "mid_call_greeting",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/mid_call_greeting_en.wav",
+    "duration_s": 1.451,
+    "chars": 23
+  },
+  "mid_call_greeting_hi": {
+    "key": "mid_call_greeting",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/mid_call_greeting_hi.wav",
+    "duration_s": 2.389,
+    "chars": 36
+  },
+  "mid_call_greeting_gu": {
+    "key": "mid_call_greeting",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/mid_call_greeting_gu.wav",
+    "duration_s": 2.816,
+    "chars": 35
+  },
+  "shortcut_hello_en": {
+    "key": "shortcut_hello",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_hello_en.wav",
+    "duration_s": 2.048,
+    "chars": 41
+  },
+  "shortcut_hello_hi": {
+    "key": "shortcut_hello",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_hello_hi.wav",
+    "duration_s": 2.816,
+    "chars": 53
+  },
+  "shortcut_hello_gu": {
+    "key": "shortcut_hello",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_hello_gu.wav",
+    "duration_s": 3.584,
+    "chars": 50
+  },
+  "shortcut_bye_en": {
+    "key": "shortcut_bye",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_bye_en.wav",
+    "duration_s": 3.328,
+    "chars": 67
+  },
+  "shortcut_bye_hi": {
+    "key": "shortcut_bye",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_bye_hi.wav",
+    "duration_s": 4.437,
+    "chars": 72
+  },
+  "shortcut_bye_gu": {
+    "key": "shortcut_bye",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_bye_gu.wav",
+    "duration_s": 5.376,
+    "chars": 79
+  },
+  "shortcut_thanks_en": {
+    "key": "shortcut_thanks",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_thanks_en.wav",
+    "duration_s": 2.731,
+    "chars": 64
+  },
+  "shortcut_thanks_hi": {
+    "key": "shortcut_thanks",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_thanks_hi.wav",
+    "duration_s": 2.56,
+    "chars": 40
+  },
+  "shortcut_thanks_gu": {
+    "key": "shortcut_thanks",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_thanks_gu.wav",
+    "duration_s": 3.499,
+    "chars": 43
+  },
+  "shortcut_not_interested_en": {
+    "key": "shortcut_not_interested",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_not_interested_en.wav",
+    "duration_s": 4.437,
+    "chars": 89
+  },
+  "shortcut_not_interested_hi": {
+    "key": "shortcut_not_interested",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_not_interested_hi.wav",
+    "duration_s": 4.267,
+    "chars": 69
+  },
+  "shortcut_not_interested_gu": {
+    "key": "shortcut_not_interested",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_not_interested_gu.wav",
+    "duration_s": 4.949,
+    "chars": 75
+  },
+  "shortcut_busy_en": {
+    "key": "shortcut_busy",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_busy_en.wav",
+    "duration_s": 3.157,
+    "chars": 66
+  },
+  "shortcut_busy_hi": {
+    "key": "shortcut_busy",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_busy_hi.wav",
+    "duration_s": 3.755,
+    "chars": 50
+  },
+  "shortcut_busy_gu": {
+    "key": "shortcut_busy",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/shortcut_busy_gu.wav",
+    "duration_s": 3.328,
+    "chars": 53
+  },
+  "stt_fallback_en": {
+    "key": "stt_fallback",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/stt_fallback_en.wav",
+    "duration_s": 2.475,
+    "chars": 62
+  },
+  "stt_fallback_hi": {
+    "key": "stt_fallback",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/stt_fallback_hi.wav",
+    "duration_s": 3.157,
+    "chars": 58
+  },
+  "stt_fallback_gu": {
+    "key": "stt_fallback",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/stt_fallback_gu.wav",
+    "duration_s": 4.096,
+    "chars": 48
+  },
+  "language_confirm_hi_hi": {
+    "key": "language_confirm_hi",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/language_confirm_hi_hi.wav",
+    "duration_s": 3.328,
+    "chars": 58
+  },
+  "language_confirm_gu_gu": {
+    "key": "language_confirm_gu",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/language_confirm_gu_gu.wav",
+    "duration_s": 4.352,
+    "chars": 60
+  },
+  "faq_about_company_en": {
+    "key": "faq_about_company",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_about_company_en.wav",
+    "duration_s": 12.203,
+    "chars": 247
+  },
+  "faq_about_company_hi": {
+    "key": "faq_about_company",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_about_company_hi.wav",
+    "duration_s": 10.496,
+    "chars": 162
+  },
+  "faq_about_company_gu": {
+    "key": "faq_about_company",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_about_company_gu.wav",
+    "duration_s": 11.179,
+    "chars": 166
+  },
+  "faq_trust_track_record_en": {
+    "key": "faq_trust_track_record",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_trust_track_record_en.wav",
+    "duration_s": 9.472,
+    "chars": 198
+  },
+  "faq_trust_track_record_hi": {
+    "key": "faq_trust_track_record",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_trust_track_record_hi.wav",
+    "duration_s": 9.301,
+    "chars": 154
+  },
+  "faq_trust_track_record_gu": {
+    "key": "faq_trust_track_record",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_trust_track_record_gu.wav",
+    "duration_s": 10.923,
+    "chars": 171
+  },
+  "faq_rera_en": {
+    "key": "faq_rera",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_rera_en.wav",
+    "duration_s": 10.411,
+    "chars": 168
+  },
+  "faq_rera_hi": {
+    "key": "faq_rera",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_rera_hi.wav",
+    "duration_s": 9.557,
+    "chars": 159
+  },
+  "faq_rera_gu": {
+    "key": "faq_rera",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_rera_gu.wav",
+    "duration_s": 9.387,
+    "chars": 149
+  },
+  "faq_projects_overview_en": {
+    "key": "faq_projects_overview",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_projects_overview_en.wav",
+    "duration_s": 12.032,
+    "chars": 226
+  },
+  "faq_projects_overview_hi": {
+    "key": "faq_projects_overview",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_projects_overview_hi.wav",
+    "duration_s": 10.496,
+    "chars": 187
+  },
+  "faq_projects_overview_gu": {
+    "key": "faq_projects_overview",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_projects_overview_gu.wav",
+    "duration_s": 10.496,
+    "chars": 174
+  },
+  "faq_price_range_general_en": {
+    "key": "faq_price_range_general",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_price_range_general_en.wav",
+    "duration_s": 9.899,
+    "chars": 196
+  },
+  "faq_price_range_general_hi": {
+    "key": "faq_price_range_general",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_price_range_general_hi.wav",
+    "duration_s": 8.619,
+    "chars": 160
+  },
+  "faq_price_range_general_gu": {
+    "key": "faq_price_range_general",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_price_range_general_gu.wav",
+    "duration_s": 10.24,
+    "chars": 165
+  },
+  "faq_payment_plan_en": {
+    "key": "faq_payment_plan",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_payment_plan_en.wav",
+    "duration_s": 10.752,
+    "chars": 187
+  },
+  "faq_payment_plan_hi": {
+    "key": "faq_payment_plan",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_payment_plan_hi.wav",
+    "duration_s": 10.752,
+    "chars": 160
+  },
+  "faq_payment_plan_gu": {
+    "key": "faq_payment_plan",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_payment_plan_gu.wav",
+    "duration_s": 9.899,
+    "chars": 143
+  },
+  "faq_home_loan_en": {
+    "key": "faq_home_loan",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_home_loan_en.wav",
+    "duration_s": 12.459,
+    "chars": 212
+  },
+  "faq_home_loan_hi": {
+    "key": "faq_home_loan",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_home_loan_hi.wav",
+    "duration_s": 14.165,
+    "chars": 204
+  },
+  "faq_home_loan_gu": {
+    "key": "faq_home_loan",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_home_loan_gu.wav",
+    "duration_s": 13.568,
+    "chars": 193
+  },
+  "faq_booking_amount_en": {
+    "key": "faq_booking_amount",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_booking_amount_en.wav",
+    "duration_s": 8.96,
+    "chars": 186
+  },
+  "faq_booking_amount_hi": {
+    "key": "faq_booking_amount",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_booking_amount_hi.wav",
+    "duration_s": 9.984,
+    "chars": 174
+  },
+  "faq_booking_amount_gu": {
+    "key": "faq_booking_amount",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_booking_amount_gu.wav",
+    "duration_s": 11.008,
+    "chars": 169
+  },
+  "faq_location_connectivity_en": {
+    "key": "faq_location_connectivity",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_location_connectivity_en.wav",
+    "duration_s": 12.8,
+    "chars": 239
+  },
+  "faq_location_connectivity_hi": {
+    "key": "faq_location_connectivity",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_location_connectivity_hi.wav",
+    "duration_s": 10.155,
+    "chars": 182
+  },
+  "faq_location_connectivity_gu": {
+    "key": "faq_location_connectivity",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_location_connectivity_gu.wav",
+    "duration_s": 10.837,
+    "chars": 180
+  },
+  "faq_nearby_amenities_en": {
+    "key": "faq_nearby_amenities",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_nearby_amenities_en.wav",
+    "duration_s": 9.984,
+    "chars": 182
+  },
+  "faq_nearby_amenities_hi": {
+    "key": "faq_nearby_amenities",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_nearby_amenities_hi.wav",
+    "duration_s": 12.459,
+    "chars": 182
+  },
+  "faq_nearby_amenities_gu": {
+    "key": "faq_nearby_amenities",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_nearby_amenities_gu.wav",
+    "duration_s": 12.288,
+    "chars": 179
+  },
+  "faq_construction_quality_en": {
+    "key": "faq_construction_quality",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_construction_quality_en.wav",
+    "duration_s": 12.8,
+    "chars": 193
+  },
+  "faq_construction_quality_hi": {
+    "key": "faq_construction_quality",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_construction_quality_hi.wav",
+    "duration_s": 12.288,
+    "chars": 197
+  },
+  "faq_construction_quality_gu": {
+    "key": "faq_construction_quality",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_construction_quality_gu.wav",
+    "duration_s": 13.056,
+    "chars": 196
+  },
+  "faq_possession_timeline_en": {
+    "key": "faq_possession_timeline",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_possession_timeline_en.wav",
+    "duration_s": 9.301,
+    "chars": 170
+  },
+  "faq_possession_timeline_hi": {
+    "key": "faq_possession_timeline",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_possession_timeline_hi.wav",
+    "duration_s": 8.619,
+    "chars": 148
+  },
+  "faq_possession_timeline_gu": {
+    "key": "faq_possession_timeline",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_possession_timeline_gu.wav",
+    "duration_s": 10.069,
+    "chars": 133
+  },
+  "faq_amenities_general_en": {
+    "key": "faq_amenities_general",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_amenities_general_en.wav",
+    "duration_s": 13.995,
+    "chars": 230
+  },
+  "faq_amenities_general_hi": {
+    "key": "faq_amenities_general",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_amenities_general_hi.wav",
+    "duration_s": 13.653,
+    "chars": 214
+  },
+  "faq_amenities_general_gu": {
+    "key": "faq_amenities_general",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_amenities_general_gu.wav",
+    "duration_s": 12.629,
+    "chars": 217
+  },
+  "faq_site_visit_en": {
+    "key": "faq_site_visit",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_site_visit_en.wav",
+    "duration_s": 8.533,
+    "chars": 192
+  },
+  "faq_site_visit_hi": {
+    "key": "faq_site_visit",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_site_visit_hi.wav",
+    "duration_s": 10.24,
+    "chars": 175
+  },
+  "faq_site_visit_gu": {
+    "key": "faq_site_visit",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/faq_site_visit_gu.wav",
+    "duration_s": 11.776,
+    "chars": 170
+  },
+  "invite_visit_en": {
+    "key": "invite_visit",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/invite_visit_en.wav",
+    "duration_s": 8.192,
+    "chars": 192
+  },
+  "invite_visit_hi": {
+    "key": "invite_visit",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/invite_visit_hi.wav",
+    "duration_s": 10.496,
+    "chars": 195
+  },
+  "invite_visit_gu": {
+    "key": "invite_visit",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/invite_visit_gu.wav",
+    "duration_s": 11.264,
+    "chars": 180
+  },
+  "ask_appointment_date_en": {
+    "key": "ask_appointment_date",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_appointment_date_en.wav",
+    "duration_s": 5.973,
+    "chars": 100
+  },
+  "ask_appointment_date_hi": {
+    "key": "ask_appointment_date",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_appointment_date_hi.wav",
+    "duration_s": 6.741,
+    "chars": 107
+  },
+  "ask_appointment_date_gu": {
+    "key": "ask_appointment_date",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_appointment_date_gu.wav",
+    "duration_s": 7.595,
+    "chars": 103
+  },
+  "appointment_confirmed_en": {
+    "key": "appointment_confirmed",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/appointment_confirmed_en.wav",
+    "duration_s": 8.192,
+    "chars": 157
+  },
+  "appointment_confirmed_hi": {
+    "key": "appointment_confirmed",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/appointment_confirmed_hi.wav",
+    "duration_s": 8.875,
+    "chars": 147
+  },
+  "appointment_confirmed_gu": {
+    "key": "appointment_confirmed",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/appointment_confirmed_gu.wav",
+    "duration_s": 8.96,
+    "chars": 130
+  },
+  "ask_name_en": {
+    "key": "ask_name",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_name_en.wav",
+    "duration_s": 1.451,
+    "chars": 34
+  },
+  "ask_name_hi": {
+    "key": "ask_name",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_name_hi.wav",
+    "duration_s": 1.707,
+    "chars": 31
+  },
+  "ask_name_gu": {
+    "key": "ask_name",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_name_gu.wav",
+    "duration_s": 1.963,
+    "chars": 28
+  },
+  "ask_property_type_en": {
+    "key": "ask_property_type",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_property_type_en.wav",
+    "duration_s": 7.765,
+    "chars": 149
+  },
+  "ask_property_type_hi": {
+    "key": "ask_property_type",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_property_type_hi.wav",
+    "duration_s": 6.315,
+    "chars": 111
+  },
+  "ask_property_type_gu": {
+    "key": "ask_property_type",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_property_type_gu.wav",
+    "duration_s": 7.168,
+    "chars": 114
+  },
+  "ask_budget_en": {
+    "key": "ask_budget",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_budget_en.wav",
+    "duration_s": 6.656,
+    "chars": 134
+  },
+  "ask_budget_hi": {
+    "key": "ask_budget",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_budget_hi.wav",
+    "duration_s": 7.765,
+    "chars": 134
+  },
+  "ask_budget_gu": {
+    "key": "ask_budget",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_budget_gu.wav",
+    "duration_s": 7.851,
+    "chars": 115
+  },
+  "ask_location_preference_en": {
+    "key": "ask_location_preference",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_location_preference_en.wav",
+    "duration_s": 9.131,
+    "chars": 175
+  },
+  "ask_location_preference_hi": {
+    "key": "ask_location_preference",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_location_preference_hi.wav",
+    "duration_s": 9.643,
+    "chars": 157
+  },
+  "ask_location_preference_gu": {
+    "key": "ask_location_preference",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/ask_location_preference_gu.wav",
+    "duration_s": 10.325,
+    "chars": 156
+  },
+  "confirm_interest_en": {
+    "key": "confirm_interest",
+    "lang": "en",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/confirm_interest_en.wav",
+    "duration_s": 6.571,
+    "chars": 143
+  },
+  "confirm_interest_hi": {
+    "key": "confirm_interest",
+    "lang": "hi",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/confirm_interest_hi.wav",
+    "duration_s": 8.277,
+    "chars": 142
+  },
+  "confirm_interest_gu": {
+    "key": "confirm_interest",
+    "lang": "gu",
+    "path": "/home/angelo/lescall/calling-agent/tts_cache/confirm_interest_gu.wav",
+    "duration_s": 8.192,
+    "chars": 119
+  }
+}

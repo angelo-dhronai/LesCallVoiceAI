@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Lescall — Live Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:           #07090f;
+  --surface:      #0c1019;
+  --card:         #101520;
+  --card2:        #141922;
+  --border:       #1c2436;
+  --border2:      #222d42;
+  --text:         #dde3f0;
+  --muted:        #5a6580;
+  --dim:          #374056;
+  --blue:         #3b82f6;
+  --blue-soft:    #60a5fa;
+  --blue-bg:      rgba(59,130,246,.1);
+  --green:        #22c55e;
+  --green-bg:     rgba(34,197,94,.08);
+  --red:          #ef4444;
+  --red-bg:       rgba(239,68,68,.08);
+  --amber:        #f59e0b;
+  --amber-bg:     rgba(245,158,11,.08);
+  --purple:       #a855f7;
+  --mono:         'JetBrains Mono', monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Inter',-apple-system,sans-serif;-webkit-font-smoothing:antialiased;overflow:hidden}
+
+/* ── Layout ── */
+.shell{display:grid;grid-template-columns:220px 1fr;height:100vh}
+
+/* ── Sidebar ── */
+.sidebar{background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:18px 12px 12px}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 20px}
+.brand-logo{width:34px;height:34px;border-radius:9px;background:linear-gradient(160deg,#4d8cff 0%,#1d4ed8 100%);display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(37,99,235,.35)}
+.brand-logo svg{width:16px;height:16px;color:#fff}
+.brand-name{font-weight:800;font-size:14px;letter-spacing:-.2px}
+.brand-sub{font-size:10.5px;color:var(--muted);margin-top:1px}
+.nav-section{margin-top:14px}
+.nav-label{font-size:10px;font-weight:700;letter-spacing:.14em;color:var(--dim);padding:0 8px 6px;text-transform:uppercase}
+.nav-item{display:flex;align-items:center;gap:10px;padding:8px;border-radius:7px;color:var(--muted);font-size:13px;font-weight:500;cursor:pointer;transition:all .12s}
+.nav-item svg{width:15px;height:15px;flex-shrink:0}
+.nav-item:hover{background:rgba(255,255,255,.03);color:var(--text)}
+.nav-item.active{background:var(--blue-bg);color:var(--blue-soft)}
+.sidebar-spacer{flex:1}
+.sidebar-foot{border-top:1px solid var(--border);padding-top:10px}
+.sys-row{display:flex;align-items:center;gap:8px;padding:10px 8px 0;font-size:11.5px;color:var(--muted)}
+.dot-sm{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 6px rgba(34,197,94,.6);flex-shrink:0}
+.dot-sm.dead{background:var(--red);box-shadow:none}
+
+/* ── Main ── */
+.main{overflow-y:auto;display:flex;flex-direction:column}
+
+/* ── Views ── */
+.view{display:none;flex-direction:column;padding:40px 48px;gap:24px;flex:1}
+.view.active{display:flex}
+
+/* page header */
+.pg-eyebrow{font-size:10.5px;font-weight:700;letter-spacing:.18em;color:var(--blue);text-transform:uppercase;margin-bottom:6px}
+.pg-title{font-size:30px;font-weight:900;letter-spacing:-.03em;color:#fff}
+.pg-sub{font-size:13px;color:var(--muted);margin-top:4px}
+
+/* ── Stat cards ── */
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 20px}
+.stat-label{font-size:11px;font-weight:600;letter-spacing:.1em;color:var(--muted);text-transform:uppercase;margin-bottom:10px}
+.stat-value{font-size:28px;font-weight:800;letter-spacing:-.03em;color:#fff}
+.stat-sub{font-size:12px;color:var(--muted);margin-top:4px}
+
+/* ── Chip badges ── */
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;padding:3px 9px;border-radius:99px}
+.chip.green{background:var(--green-bg);color:var(--green)}
+.chip.red  {background:var(--red-bg);color:var(--red)}
+.chip.blue {background:var(--blue-bg);color:var(--blue-soft)}
+.chip.amber{background:var(--amber-bg);color:var(--amber)}
+
+/* ── Table ── */
+.table-wrap{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.table-head{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border)}
+.table-title{font-size:13px;font-weight:700;color:#fff}
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{font-size:10.5px;font-weight:700;letter-spacing:.1em;color:var(--muted);text-transform:uppercase;padding:10px 16px;text-align:left;border-bottom:1px solid var(--border)}
+.tbl td{padding:11px 16px;font-size:13px;color:var(--text);border-bottom:1px solid var(--border)}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tr:hover td{background:rgba(255,255,255,.015);cursor:pointer}
+.tbl .mono{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+.lang-flag{font-size:16px}
+
+/* ── Runtime status cards ── */
+.svc-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.svc-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 20px}
+.svc-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.svc-name{font-size:13px;font-weight:700;color:#fff}
+.svc-row{display:flex;justify-content:space-between;font-size:12.5px;color:var(--muted);margin-bottom:6px}
+.svc-val{color:var(--text);font-family:var(--mono);font-size:12px}
+
+/* ── Log terminal ── */
+.terminal{background:#05070c;border:1px solid var(--border);border-radius:12px;flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.terminal-head{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);font-size:12px;font-weight:600;color:var(--muted)}
+.terminal-dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.terminal-lines{flex:1;overflow-y:auto;padding:12px 16px;font-family:var(--mono);font-size:11.5px;line-height:1.6;color:#a0c0a0}
+.terminal-lines::-webkit-scrollbar{width:4px}
+.terminal-lines::-webkit-scrollbar-thumb{background:#1a2436;border-radius:2px}
+.log-line{white-space:pre-wrap;word-break:break-all}
+.log-line.err{color:#f87171}
+.log-line.warn{color:#fbbf24}
+.log-line.info{color:#60a5fa}
+
+/* ── Transcript panel ── */
+.transcript-wrap{background:var(--card);border:1px solid var(--border);border-radius:12px;flex:1;min-height:0;overflow-y:auto}
+.transcript-wrap::-webkit-scrollbar{width:4px}
+.transcript-wrap::-webkit-scrollbar-thumb{background:#1a2436;border-radius:2px}
+.turn{padding:14px 20px;border-bottom:1px solid var(--border);display:grid;grid-template-columns:60px 1fr;gap:12px}
+.turn:last-child{border-bottom:none}
+.turn-ts{font-size:11px;font-family:var(--mono);color:var(--dim);padding-top:2px}
+.turn-body{}
+.turn-who{font-size:10.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;margin-bottom:4px}
+.turn-who.Agent{color:var(--blue-soft)}
+.turn-who.Caller{color:var(--green)}
+.turn-text{font-size:13.5px;line-height:1.55}
+
+/* ── Empty state ── */
+.empty{color:var(--muted);text-align:center;padding:40px;font-size:13px}
+
+/* ── Back btn ── */
+.back-btn{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted);cursor:pointer;padding:6px 0;margin-bottom:12px}
+.back-btn:hover{color:var(--text)}
+.back-btn svg{width:14px;height:14px}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<!-- ── SIDEBAR ── -->
+<aside class="sidebar">
+  <div class="brand">
+    <div class="brand-logo">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.37 1.9.72 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.35 1.85.59 2.81.72A2 2 0 0 1 22 16.92z"/></svg>
+    </div>
+    <div>
+      <div class="brand-name">Lescall</div>
+      <div class="brand-sub">Pramukh Group AI</div>
+    </div>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-label">Monitor</div>
+    <div class="nav-item active" data-view="overview" onclick="showView('overview')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      Overview
+    </div>
+    <div class="nav-item" data-view="calls" onclick="showView('calls')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
+      Call History
+    </div>
+    <div class="nav-item" data-view="live" onclick="showView('live')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h2M7 8v8M11 5v14M15 8v8M19 12h2"/></svg>
+      Live Logs
+    </div>
+    <div class="nav-item" data-view="runtime" onclick="showView('runtime')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+      Runtime
+    </div>
+  </div>
+
+  <div class="sidebar-spacer"></div>
+
+  <div class="sidebar-foot">
+    <div class="sys-row">
+      <div class="dot-sm" id="sys-dot"></div>
+      <span id="sys-label">Checking…</span>
+    </div>
+  </div>
+</aside>
+
+<!-- ── MAIN ── -->
+<main class="main">
+
+  <!-- OVERVIEW -->
+  <section class="view active" id="view-overview">
+    <div>
+      <div class="pg-eyebrow">Pramukh Group</div>
+      <div class="pg-title">Dashboard</div>
+      <div class="pg-sub">Real-time call intelligence</div>
+    </div>
+
+    <div class="stats-row" id="stats-row">
+      <div class="stat-card"><div class="stat-label">Total Calls</div><div class="stat-value" id="st-total">—</div><div class="stat-sub">all time</div></div>
+      <div class="stat-card"><div class="stat-label">Today</div><div class="stat-value" id="st-today">—</div><div class="stat-sub" id="st-today-date">—</div></div>
+      <div class="stat-card"><div class="stat-label">Avg Duration</div><div class="stat-value" id="st-dur">—</div><div class="stat-sub">seconds per call</div></div>
+      <div class="stat-card"><div class="stat-label">Languages</div><div class="stat-value" id="st-lang">—</div><div class="stat-sub" id="st-lang-detail">—</div></div>
+    </div>
+
+    <div class="table-wrap">
+      <div class="table-head">
+        <div class="table-title">Recent Calls</div>
+        <span class="chip blue" onclick="showView('calls')" style="cursor:pointer">View all →</span>
+      </div>
+      <table class="tbl">
+        <thead><tr>
+          <th>Time</th><th>Duration</th><th>Lang</th><th>STT</th><th>Turns</th><th>Status</th>
+        </tr></thead>
+        <tbody id="recent-tbody"><tr><td colspan="6"><div class="empty">Loading…</div></td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- CALL HISTORY -->
+  <section class="view" id="view-calls">
+    <div>
+      <div class="pg-eyebrow">All Recordings</div>
+      <div class="pg-title">Call History</div>
+    </div>
+    <div class="table-wrap">
+      <table class="tbl">
+        <thead><tr>
+          <th>Time</th><th>Duration</th><th>Lang</th><th>STT Provider</th><th>Turns</th><th>Fallback</th>
+        </tr></thead>
+        <tbody id="history-tbody"><tr><td colspan="6"><div class="empty">Loading…</div></td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- TRANSCRIPT DETAIL -->
+  <section class="view" id="view-transcript">
+    <div>
+      <div class="back-btn" onclick="showView('calls')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        Back to Call History
+      </div>
+      <div class="pg-eyebrow">Transcript</div>
+      <div class="pg-title" id="tx-title">—</div>
+      <div class="pg-sub" id="tx-sub">—</div>
+    </div>
+    <div class="transcript-wrap" id="transcript-wrap">
+      <div class="empty">Select a call to view transcript.</div>
+    </div>
+  </section>
+
+  <!-- LIVE LOGS -->
+  <section class="view" id="view-live" style="height:100%">
+    <div>
+      <div class="pg-eyebrow">Streaming</div>
+      <div class="pg-title">Live Logs</div>
+      <div class="pg-sub">ws_audio_receiver.log — last 60 lines + live tail</div>
+    </div>
+    <div class="terminal">
+      <div class="terminal-head">
+        <div class="terminal-dot" id="log-dot"></div>
+        <span id="log-status">Connecting…</span>
+      </div>
+      <div class="terminal-lines" id="log-lines"></div>
+    </div>
+  </section>
+
+  <!-- RUNTIME STATUS -->
+  <section class="view" id="view-runtime">
+    <div>
+      <div class="pg-eyebrow">Infrastructure</div>
+      <div class="pg-title">Runtime Status</div>
+    </div>
+    <div class="svc-grid" id="svc-grid">
+      <div class="stat-card"><div class="empty">Loading…</div></div>
+    </div>
+    <div style="display:flex;gap:12px;align-items:center">
+      <button onclick="loadRuntime()" style="background:var(--blue-bg);color:var(--blue-soft);border:1px solid var(--border2);border-radius:8px;padding:8px 18px;font-size:13px;font-weight:600;cursor:pointer">Refresh</button>
+      <span style="font-size:12px;color:var(--muted)" id="runtime-ts"></span>
+    </div>
+
+    <div class="table-wrap">
+      <div class="table-head"><div class="table-title">Log Directory</div></div>
+      <div style="padding:14px 18px;font-family:var(--mono);font-size:12px;color:var(--muted)" id="runtime-logdir">—</div>
+    </div>
+  </section>
+
+</main>
+</div>
+
+<script>
+// ── View router ──────────────────────────────────────────────────────────
+const views = ['overview','calls','transcript','live','runtime'];
+let liveWs = null;
+let liveActive = false;
+
+function showView(id) {
+  views.forEach(v => {
+    document.getElementById('view-'+v).classList.toggle('active', v === id);
+    const nav = document.querySelector(`[data-view="${v}"]`);
+    if (nav) nav.classList.toggle('active', v === id);
+  });
+  if (id === 'live') startLiveLogs();
+  else stopLiveLogs();
+  if (id === 'calls') loadHistory();
+  if (id === 'overview') loadOverview();
+  if (id === 'runtime') loadRuntime();
+}
+
+// ── Utilities ────────────────────────────────────────────────────────────
+function fmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString('en-IN', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+}
+function fmtDur(sec) {
+  if (!sec) return '—';
+  sec = Math.round(sec);
+  if (sec < 60) return sec + 's';
+  return Math.floor(sec/60) + 'm ' + (sec%60) + 's';
+}
+const LANG_MAP = {hi:'🇮🇳 Hindi', en:'🇬🇧 English', gu:'🇮🇳 Gujarati', '?':'?'};
+function fmtLang(l){ return LANG_MAP[l] || l; }
+
+function chipHtml(label, cls){ return `<span class="chip ${cls}">${label}</span>`; }
+
+// ── Overview ─────────────────────────────────────────────────────────────
+async function loadOverview() {
+  const data = await fetch('/api/overview').then(r=>r.json()).catch(()=>null);
+  if (!data) return;
+  const {stats, recent} = data;
+  document.getElementById('st-total').textContent = stats.total;
+  document.getElementById('st-today').textContent = stats.today;
+  document.getElementById('st-today-date').textContent = new Date().toLocaleDateString('en-IN',{weekday:'long'});
+  document.getElementById('st-dur').textContent = stats.avg_duration ? stats.avg_duration + 's' : '—';
+  const langs = stats.languages || {};
+  const topLang = Object.entries(langs).sort((a,b)=>b[1]-a[1])[0];
+  document.getElementById('st-lang').textContent = topLang ? topLang[1] : '—';
+  document.getElementById('st-lang-detail').textContent = topLang ? fmtLang(topLang[0]) : '—';
+  renderCallRows('recent-tbody', recent, 5);
+}
+
+function renderCallRows(tbodyId, calls, limit) {
+  const tbody = document.getElementById(tbodyId);
+  if (!calls || !calls.length) {
+    tbody.innerHTML = '<tr><td colspan="6"><div class="empty">No calls recorded yet.</div></td></tr>';
+    return;
+  }
+  const rows = (limit ? calls.slice(0,limit) : calls).map(c => `
+    <tr onclick="loadTranscript('${c.folder}','${c.start}')">
+      <td>${fmtTime(c.start)}</td>
+      <td>${fmtDur(c.duration)}</td>
+      <td>${fmtLang(c.language)}</td>
+      <td class="mono">${c.stt || '?'}</td>
+      <td>${c.turns}</td>
+      <td>${c.fallback ? chipHtml('fallback','amber') : chipHtml('ok','green')}</td>
+    </tr>`).join('');
+  tbody.innerHTML = rows;
+}
+
+// ── Call History ──────────────────────────────────────────────────────────
+async function loadHistory() {
+  const data = await fetch('/api/calls').then(r=>r.json()).catch(()=>null);
+  if (!data) return;
+  renderCallRows('history-tbody', data.calls);
+}
+
+// ── Transcript ────────────────────────────────────────────────────────────
+async function loadTranscript(folder, startTime) {
+  showView('transcript');
+  document.getElementById('tx-title').textContent = folder;
+  document.getElementById('tx-sub').textContent = fmtTime(startTime);
+  document.getElementById('transcript-wrap').innerHTML = '<div class="empty">Loading…</div>';
+  const data = await fetch('/api/calls/' + folder).then(r=>r.json()).catch(()=>null);
+  if (!data) { document.getElementById('transcript-wrap').innerHTML = '<div class="empty">Failed to load.</div>'; return; }
+  const meta = data.meta || {};
+  document.getElementById('tx-sub').textContent =
+    `${fmtTime(meta.start_time)} · ${fmtDur(meta.duration_seconds)} · ${fmtLang(meta.language_detected)}`;
+  const turns = data.transcript || [];
+  if (!turns.length) {
+    document.getElementById('transcript-wrap').innerHTML = '<div class="empty">No transcript available.</div>';
+    return;
+  }
+  document.getElementById('transcript-wrap').innerHTML = turns.map(t => `
+    <div class="turn">
+      <div class="turn-ts">${t.ts || ''}</div>
+      <div class="turn-body">
+        <div class="turn-who ${t.speaker}">${t.speaker}</div>
+        <div class="turn-text">${escHtml(t.text)}</div>
+      </div>
+    </div>`).join('');
+}
+
+function escHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ── Live Logs ─────────────────────────────────────────────────────────────
+function startLiveLogs() {
+  if (liveActive) return;
+  liveActive = true;
+  const logLines = document.getElementById('log-lines');
+  const logStatus = document.getElementById('log-status');
+  const logDot = document.getElementById('log-dot');
+
+  logLines.innerHTML = '';
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  liveWs = new WebSocket(`${proto}://${location.host}/ws/live`);
+
+  liveWs.onopen = () => {
+    logStatus.textContent = 'Connected — tailing ws_audio_receiver.log';
+    logDot.style.background = 'var(--green)';
+  };
+  liveWs.onclose = () => {
+    logStatus.textContent = 'Disconnected';
+    logDot.style.background = 'var(--red)';
+    logDot.style.animation = 'none';
+    liveActive = false;
+  };
+  liveWs.onerror = () => {
+    logStatus.textContent = 'Connection error';
+  };
+  liveWs.onmessage = (ev) => {
+    let data; try { data = JSON.parse(ev.data); } catch { return; }
+    const line = data.line || '';
+    const div = document.createElement('div');
+    div.className = 'log-line' +
+      (line.includes('ERROR') || line.includes('error') ? ' err' :
+       line.includes('WARN') || line.includes('warn')   ? ' warn' :
+       line.includes('INFO') || line.includes('info')   ? ' info' : '');
+    div.textContent = line;
+    logLines.appendChild(div);
+    // keep last 300 lines
+    while (logLines.children.length > 300) logLines.removeChild(logLines.firstChild);
+    logLines.scrollTop = logLines.scrollHeight;
+  };
+}
+
+function stopLiveLogs() {
+  if (liveWs) { liveWs.close(); liveWs = null; }
+  liveActive = false;
+}
+
+// ── Runtime Status ────────────────────────────────────────────────────────
+async function loadRuntime() {
+  const data = await fetch('/api/runtime/status').then(r=>r.json()).catch(()=>null);
+  document.getElementById('runtime-ts').textContent = 'Last checked: ' + new Date().toLocaleTimeString();
+  if (!data) { document.getElementById('svc-grid').innerHTML = '<div class="stat-card"><div class="empty">Failed to load.</div></div>'; return; }
+  const svcs = data.services || {};
+  document.getElementById('runtime-logdir').textContent = data.log_dir || 'Not running';
+  document.getElementById('svc-grid').innerHTML = Object.entries(svcs).map(([name, s]) => `
+    <div class="svc-card">
+      <div class="svc-head">
+        <div class="svc-name">${name.replace(/_/g,' ')}</div>
+        ${s.alive ? chipHtml('● running','green') : chipHtml('● stopped','red')}
+      </div>
+      <div class="svc-row"><span>Port</span><span class="svc-val">:${s.port}</span></div>
+      <div class="svc-row"><span>PID</span><span class="svc-val">${s.pid || '—'}</span></div>
+      <div class="svc-row"><span>Status</span><span class="svc-val">${s.alive ? 'alive' : 'not running'}</span></div>
+    </div>`).join('');
+
+  // Update sidebar dot
+  const allAlive = Object.values(svcs).every(s => s.alive);
+  const sysDot = document.getElementById('sys-dot');
+  const sysLabel = document.getElementById('sys-label');
+  if (allAlive) {
+    sysDot.classList.remove('dead');
+    sysLabel.textContent = 'All services up';
+  } else {
+    sysDot.classList.add('dead');
+    sysLabel.textContent = 'Service down';
+  }
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+loadOverview();
+loadRuntime();
+setInterval(loadRuntime, 15000);
+setInterval(() => {
+  if (document.getElementById('view-overview').classList.contains('active')) loadOverview();
+}, 30000);
+</script>
+</body>
+</html>

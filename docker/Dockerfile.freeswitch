@@ -1,0 +1,44 @@
+# lescall FreeSWITCH image.
+#
+# ⚠️ VERIFY BEFORE PRODUCTION: this builds the third-party mod_audio_stream
+# (the live system streams call audio to ws://127.0.0.1:9001 via this module).
+# The base FreeSWITCH image must match the host's working setup (1.11.x).
+# Run with network_mode: host so RTP/SIP + the Plivo trunk behave exactly as today.
+#
+# If the build is not yet verified, keep FreeSWITCH on the host (compose profile
+# "fs-host" omits this service) until this image is validated against a real call.
+
+FROM debian:bookworm-slim AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git build-essential cmake automake autoconf libtool pkg-config \
+        libssl-dev libspeexdsp-dev libspeex-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# mod_audio_stream (https://github.com/amigniter/mod_audio_stream).
+# Requires FreeSWITCH headers — install freeswitch-dev from the base image's repo,
+# or build against a mounted FS source tree. Left as an explicit build step so it
+# is verified intentionally rather than assumed.
+WORKDIR /src
+RUN git clone --depth 1 https://github.com/amigniter/mod_audio_stream.git
+# NOTE: `cmake .. && make` here needs FreeSWITCH dev headers present (see base image).
+
+# ---- runtime ----
+FROM debian:bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gnupg2 wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install FreeSWITCH 1.11.x to match the host. (SignalWire repo or distro packages.)
+# The exact install lines depend on your repo access; documented in docker/README.md.
+
+# Our checked-in configuration (dialplan + SIP profiles + autoload).
+COPY freeswitch/etc/ /etc/freeswitch/
+
+# mod_audio_stream.so produced by the build stage (path depends on FS layout):
+# COPY --from=build /usr/lib/freeswitch/mod/mod_audio_stream.so /usr/lib/freeswitch/mod/
+
+EXPOSE 5060/udp 5060/tcp 5080/udp 16384-32768/udp
+CMD ["freeswitch", "-u", "freeswitch", "-g", "freeswitch", "-nonat", "-nc"]

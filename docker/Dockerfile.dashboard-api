@@ -1,0 +1,16 @@
+# lescall dashboard API — FastAPI backend (agents, campaigns, transcripts,
+# summaries, analytics, Plivo numbers/trunks + FreeSWITCH config generation).
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app
+
+COPY dashboard/api/requirements.txt /app/dashboard/api/requirements.txt
+RUN pip install -r /app/dashboard/api/requirements.txt
+
+COPY shared/ /app/shared/
+COPY dashboard/api/ /app/dashboard/api/
+
+ENV PYTHONPATH=/app
+EXPOSE 8080
+CMD ["uvicorn", "dashboard.api.main:app", "--host", "0.0.0.0", "--port", "8080"]

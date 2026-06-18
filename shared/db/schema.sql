@@ -86,3 +86,39 @@ CREATE TABLE IF NOT EXISTS calls (
 );
 CREATE INDEX IF NOT EXISTS idx_calls_direction ON calls(direction, started_at);
 CREATE INDEX IF NOT EXISTS idx_calls_campaign  ON calls(campaign_id);
+
+-- ---------------------------------------------------------------------------
+-- trunks: a SIP trunk / gateway (e.g. Plivo). Drives FreeSWITCH gateway config.
+-- The dashboard renders the "what SIP trunk to create" instructions from this.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS trunks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT    NOT NULL UNIQUE,          -- FS gateway name e.g. "plivo"
+    provider        TEXT    DEFAULT 'plivo',
+    sip_domain      TEXT    NOT NULL,                 -- e.g. "xxxx.zt.plivo.com"
+    proxy           TEXT,                             -- outbound proxy if different
+    username        TEXT,
+    password        TEXT,
+    register        INTEGER DEFAULT 0,                -- 1 = REGISTER, 0 = IP auth
+    caller_id       TEXT,
+    config_status   TEXT    DEFAULT 'pending',        -- pending | applied | error
+    last_applied_at TEXT,
+    created_at      TEXT    DEFAULT (datetime('now'))
+);
+
+-- ---------------------------------------------------------------------------
+-- phone_numbers: a DID (e.g. a Plivo number) bound to a trunk and an agent.
+-- Adding one here triggers automatic FreeSWITCH dialplan/gateway generation.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS phone_numbers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    number          TEXT    NOT NULL UNIQUE,          -- E.164 DID e.g. "+918031339140"
+    trunk_id        INTEGER REFERENCES trunks(id) ON DELETE SET NULL,
+    inbound_agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL,  -- agent for inbound calls
+    direction       TEXT    DEFAULT 'both',           -- inbound | outbound | both
+    label           TEXT,
+    config_status   TEXT    DEFAULT 'pending',        -- pending | applied | error
+    last_applied_at TEXT,
+    created_at      TEXT    DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_numbers_trunk ON phone_numbers(trunk_id);

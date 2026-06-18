@@ -1,0 +1,17 @@
+**/venv/
+**/.venv/
+**/__pycache__/
+**/*.pyc
+recordings/
+archive/
+phase12-state/
+*.log
+**/*.wav
+**/*.mp3
+data/*.db
+data/*.db-*
+.git/
+.vscode/
+.idea/
+dashboard/web/node_modules/
+dashboard/web/dist/

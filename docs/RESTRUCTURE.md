@@ -36,6 +36,10 @@ lescall/
       image (host networking); docker-compose.yml; .dockerignore.
 - [ ] **Phase 3 — Dashboard backend:** agent CRUD, pitch maker, campaigns/leads, transcripts,
       AI summaries (LLM over recordings), analytics endpoints.
+- [ ] **Phase 3b — Plivo numbers & trunks (NEW):** add/register Plivo DIDs + SIP trunks in the
+      dashboard; auto-generate FreeSWITCH gateway + dialplan XML from the `trunks`/`phone_numbers`
+      tables and reload FS (`fs_cli -x "sofia profile external rescan"`); UI shows the exact SIP
+      trunk config required (domain, IP auth vs REGISTER, allowed IP ranges).
 - [ ] **Phase 4 — Dashboard frontend:** dialer, transcripts, summaries, analytics, agent
       builder, pitch maker, live call panel.
 - [ ] **Phase 5 — Outbound engine:** dialer loop -> FS originate -> agent core; campaign-driven.

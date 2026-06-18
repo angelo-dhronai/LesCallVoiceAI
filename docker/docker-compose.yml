@@ -1,0 +1,68 @@
+# lescall — full stack.
+#
+# Backend services use network_mode: host so the existing hardcoded localhost
+# wiring (FreeSWITCH ESL :9000, media WS :9001, playback :9004, API :8080) works
+# unchanged. The web container is bridge-networked and published on :8088.
+#
+# Profiles:
+#   default      -> app + dashboard (FreeSWITCH stays on the host)
+#   fs-container -> also run FreeSWITCH in a container (verify Dockerfile.freeswitch first)
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yml up -d
+#   docker compose -f docker/docker-compose.yml --profile fs-container up -d
+
+services:
+  socket_server:
+    build: { context: .., dockerfile: docker/Dockerfile.app }
+    image: lescall/app
+    command: ["python", "socket_server.py"]
+    network_mode: host
+    env_file: ../calling-agent/.env
+    volumes:
+      - ../recordings:/app/recordings
+      - ../data:/app/data
+      - ../credit_log:/app/credit_log
+    restart: unless-stopped
+
+  ws_audio_receiver:
+    image: lescall/app
+    build: { context: .., dockerfile: docker/Dockerfile.app }
+    command: ["python", "ws_audio_receiver.py", "--sample-rate", "8000"]
+    network_mode: host
+    env_file: ../calling-agent/.env
+    volumes:
+      - ../recordings:/app/recordings
+      - ../data:/app/data
+      - ../credit_log:/app/credit_log
+    depends_on: [socket_server]
+    restart: unless-stopped
+
+  dashboard_api:
+    build: { context: .., dockerfile: docker/Dockerfile.dashboard-api }
+    image: lescall/dashboard-api
+    network_mode: host          # needs localhost access to FS (fs_cli) + services
+    env_file: ../calling-agent/.env
+    volumes:
+      - ../recordings:/app/recordings
+      - ../data:/app/data
+      - ../credit_log:/app/credit_log
+    restart: unless-stopped
+
+  web:
+    build: { context: .., dockerfile: docker/Dockerfile.web }
+    image: lescall/web
+    ports:
+      - "8088:80"
+    depends_on: [dashboard_api]
+    restart: unless-stopped
+
+  freeswitch:
+    profiles: ["fs-container"]
+    build: { context: .., dockerfile: docker/Dockerfile.freeswitch }
+    image: lescall/freeswitch
+    network_mode: host
+    volumes:
+      - ../recordings:/recordings
+      - /tmp/ai_telephony_playback:/tmp/ai_telephony_playback
+    restart: unless-stopped

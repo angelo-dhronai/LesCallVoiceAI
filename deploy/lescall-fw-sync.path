@@ -1,0 +1,7 @@
+[Unit]
+Description=lescall: watch carrier allow-list change -> reconcile GCP firewall
+[Path]
+PathModified=/home/angelo/lescall/data/kamailio_reload
+Unit=lescall-fw-sync.service
+[Install]
+WantedBy=multi-user.target

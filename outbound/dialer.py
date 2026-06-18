@@ -122,7 +122,7 @@ def _record(lead_id: int, call_status: str) -> None:
             disp = _DISPOSITION.get(call_status, disp)
         db.execute(
             "UPDATE leads SET status=?, disposition=?, attempts=attempts+1, "
-            "last_called_at=datetime('now') WHERE id=?", (status, disp, lead_id))
+            "last_called_at=CURRENT_TIMESTAMP WHERE id=?", (status, disp, lead_id))
 
 
 def main() -> None:

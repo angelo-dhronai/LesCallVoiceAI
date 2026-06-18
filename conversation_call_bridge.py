@@ -82,6 +82,7 @@ class TelephonySession:
         self.event_task = asyncio.create_task(self._event_loop())
         await audit_manager.create(self.conn_id, caller_number=self.caller_number)
         logger.info(f"[{self.conn_id}] Session started (Phase 14)")
+        self._publish_live("started")
         
     async def stop(self):
         """Stops and cleans up the session."""
@@ -150,13 +151,24 @@ class TelephonySession:
                         self.stats["first_transcript_t"] = time.time()
                         logger.info(f"[{self.conn_id}] First transcript received")
                     audit_manager.add_event(self.conn_id, "Caller", event.get("text", ""))
+                    self._publish_live("transcript", role="caller", text=event.get("text", ""))
                 elif etype == "agent":
                     audit_manager.add_event(self.conn_id, "Agent", event.get("text", ""))
+                    self._publish_live("transcript", role="agent", text=event.get("text", ""))
         except asyncio.CancelledError:
             pass
         finally:
             self.hub.unsubscribe(queue)
-        
+
+    def _publish_live(self, kind: str, **fields):
+        """Best-effort publish of a live call event to Redis (no-op if unconfigured)."""
+        try:
+            from shared.events import publish_call_event
+            publish_call_event(self.conn_id, kind, caller=self.caller_number,
+                               did=self.did, campaign_id=self.campaign_id, **fields)
+        except Exception:
+            pass
+
     def push_audio(self, pcm: bytes):
         """Called by ws_audio_receiver when a PCM frame arrives."""
         if not self._running:

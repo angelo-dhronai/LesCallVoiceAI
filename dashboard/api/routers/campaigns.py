@@ -48,8 +48,8 @@ def create_campaign(c: CampaignIn) -> dict:
     fields = c.model_dump()
     cols = ", ".join(fields); qs = ", ".join("?" for _ in fields)
     with get_db() as db:
-        cur = db.execute(f"INSERT INTO campaigns ({cols}) VALUES ({qs})", tuple(fields.values()))
-        cid = cur.lastrowid
+        cur = db.execute(f"INSERT INTO campaigns ({cols}) VALUES ({qs}) RETURNING id", tuple(fields.values()))
+        cid = cur.fetchone()["id"]
         row = db.execute("SELECT * FROM campaigns WHERE id=?", (cid,)).fetchone()
     return dict(row)
 
@@ -60,7 +60,7 @@ def set_status(campaign_id: int, status: str) -> dict:
         raise HTTPException(400, "invalid status")
     with get_db() as db:
         cur = db.execute(
-            "UPDATE campaigns SET status=?, updated_at=datetime('now') WHERE id=?",
+            "UPDATE campaigns SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (status, campaign_id))
         if cur.rowcount == 0:
             raise HTTPException(404, "campaign not found")

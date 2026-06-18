@@ -46,8 +46,8 @@ def create_agent(agent: AgentIn) -> dict:
     cols = ", ".join(fields)
     qs = ", ".join("?" for _ in fields)
     with get_db() as db:
-        cur = db.execute(f"INSERT INTO agents ({cols}) VALUES ({qs})", tuple(fields.values()))
-        agent_id = cur.lastrowid
+        cur = db.execute(f"INSERT INTO agents ({cols}) VALUES ({qs}) RETURNING id", tuple(fields.values()))
+        agent_id = cur.fetchone()["id"]
     return get_agent(agent_id)
 
 
@@ -57,7 +57,7 @@ def update_agent(agent_id: int, agent: AgentIn) -> dict:
     sets = ", ".join(f"{k}=?" for k in fields)
     with get_db() as db:
         cur = db.execute(
-            f"UPDATE agents SET {sets}, updated_at=datetime('now') WHERE id=?",
+            f"UPDATE agents SET {sets}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (*fields.values(), agent_id),
         )
         if cur.rowcount == 0:

@@ -27,6 +27,21 @@ LOG_PATH = Path(os.environ.get(
 @router.websocket("/live/ws")
 async def live_ws(ws: WebSocket) -> None:
     await ws.accept()
+    # Preferred path: Redis pub/sub (multi-node — sees every call). Falls back to
+    # tailing the local runtime log when Redis isn't configured/reachable.
+    try:
+        from shared.events import subscribe, REDIS_URL, CHANNEL
+        if REDIS_URL:
+            await ws.send_json({"type": "status", "message": "connected",
+                                "source": "redis", "channel": CHANNEL})
+            async for event in subscribe():
+                await ws.send_json({"type": "event", **event})
+            return
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        # Redis unavailable -> fall through to log tailing below.
+        pass
     try:
         # Seek to end; stream new lines as they are appended.
         f = None

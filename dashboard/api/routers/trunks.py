@@ -42,8 +42,8 @@ def create_trunk(trunk: TrunkIn) -> dict:
     cols = ", ".join(fields)
     qs = ", ".join("?" for _ in fields)
     with get_db() as db:
-        cur = db.execute(f"INSERT INTO trunks ({cols}) VALUES ({qs})", tuple(fields.values()))
-        tid = cur.lastrowid
+        cur = db.execute(f"INSERT INTO trunks ({cols}) VALUES ({qs}) RETURNING id", tuple(fields.values()))
+        tid = cur.fetchone()["id"]
         row = db.execute("SELECT * FROM trunks WHERE id=?", (tid,)).fetchone()
     return dict(row)
 
@@ -65,10 +65,10 @@ def apply_trunk(trunk_id: int) -> dict:
     status = "applied" if result.get("reloaded") else "error"
     with get_db() as db:
         db.execute(
-            "UPDATE trunks SET config_status=?, last_applied_at=datetime('now') WHERE id=?",
+            "UPDATE trunks SET config_status=?, last_applied_at=CURRENT_TIMESTAMP WHERE id=?",
             (status, trunk_id))
         db.execute(
-            "UPDATE phone_numbers SET config_status=?, last_applied_at=datetime('now') "
+            "UPDATE phone_numbers SET config_status=?, last_applied_at=CURRENT_TIMESTAMP "
             "WHERE trunk_id=?", (status, trunk_id))
     return {"status": status, **result}
 
@@ -95,8 +95,8 @@ def create_number(num: NumberIn) -> dict:
     qs = ", ".join("?" for _ in fields)
     with get_db() as db:
         cur = db.execute(
-            f"INSERT INTO phone_numbers ({cols}) VALUES ({qs})", tuple(fields.values()))
-        nid = cur.lastrowid
+            f"INSERT INTO phone_numbers ({cols}) VALUES ({qs}) RETURNING id", tuple(fields.values()))
+        nid = cur.fetchone()["id"]
         row = db.execute("SELECT * FROM phone_numbers WHERE id=?", (nid,)).fetchone()
     return dict(row)
 

@@ -5,16 +5,26 @@
 # Run host-networked (docker-compose `freeswitch` service, profile fs-container)
 # so RTP/SIP behave exactly like the native install — lowest latency, no NAT.
 
+# NOTE: the SignalWire release repo is token-gated. Provide a free SignalWire
+# Personal Access Token at build time:
+#   docker build --build-arg SIGNALWIRE_TOKEN=pat_xxx -f docker/Dockerfile.freeswitch -t lescall/freeswitch .
+# (or `docker compose --profile fs-container build` after exporting SIGNALWIRE_TOKEN).
+
 # ---------- build stage: compile mod_audio_stream ----------
 FROM debian:bookworm-slim AS build
+ARG SIGNALWIRE_TOKEN
 ENV DEBIAN_FRONTEND=noninteractive
 COPY docker/signalwire-freeswitch-repo.gpg /usr/share/keyrings/signalwire-freeswitch-repo.gpg
-RUN echo "deb [signed-by=/usr/share/keyrings/signalwire-freeswitch-repo.gpg] \
+# ca-certificates FIRST (slim base has none) so the HTTPS SignalWire repo verifies.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gnupg \
+ && printf 'machine freeswitch.signalwire.com login signalwire password %s\n' "$SIGNALWIRE_TOKEN" \
+      > /etc/apt/auth.conf.d/freeswitch.conf \
+ && echo "deb [signed-by=/usr/share/keyrings/signalwire-freeswitch-repo.gpg] \
 https://freeswitch.signalwire.com/repo/deb/debian-release/ bookworm main" \
       > /etc/apt/sources.list.d/freeswitch.list \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
-        git cmake build-essential pkg-config ca-certificates \
+        git cmake build-essential pkg-config \
         libfreeswitch-dev libwebsockets-dev libssl-dev libspeexdsp-dev libspeex-dev \
  && rm -rf /var/lib/apt/lists/*
 RUN git clone --depth 1 https://github.com/amigniter/mod_audio_stream.git /src/mod_audio_stream \
@@ -24,14 +34,19 @@ RUN git clone --depth 1 https://github.com/amigniter/mod_audio_stream.git /src/m
 
 # ---------- runtime stage ----------
 FROM debian:bookworm-slim
+ARG SIGNALWIRE_TOKEN
 ENV DEBIAN_FRONTEND=noninteractive
 COPY docker/signalwire-freeswitch-repo.gpg /usr/share/keyrings/signalwire-freeswitch-repo.gpg
-RUN echo "deb [signed-by=/usr/share/keyrings/signalwire-freeswitch-repo.gpg] \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gnupg \
+ && printf 'machine freeswitch.signalwire.com login signalwire password %s\n' "$SIGNALWIRE_TOKEN" \
+      > /etc/apt/auth.conf.d/freeswitch.conf \
+ && echo "deb [signed-by=/usr/share/keyrings/signalwire-freeswitch-repo.gpg] \
 https://freeswitch.signalwire.com/repo/deb/debian-release/ bookworm main" \
       > /etc/apt/sources.list.d/freeswitch.list \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
-        freeswitch freeswitch-meta-all libwebsockets18 libspeexdsp1 ca-certificates \
+        freeswitch freeswitch-meta-all libwebsockets18 libspeexdsp1 \
+ && rm -f /etc/apt/auth.conf.d/freeswitch.conf \
  && rm -rf /var/lib/apt/lists/*
 
 # Our checked-in configuration + the freshly built module.

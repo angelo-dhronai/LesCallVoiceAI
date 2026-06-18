@@ -16,8 +16,12 @@ export default function Layout() {
   const logout = async () => { try { await api.logout() } catch {} ; location.reload() }
   return (
     <div className="min-h-screen flex">
-      <aside className="w-60 bg-slate-900 text-slate-200 flex flex-col">
-        <div className="px-5 py-5 text-xl font-bold text-white">lescall</div>
+      <aside className="w-60 bg-brand-dark text-slate-200 flex flex-col">
+        <div className="px-4 py-5">
+          <div className="bg-white rounded-xl px-3 py-3 flex items-center justify-center">
+            <img src="/brand/logo.png" alt="LesCall" className="h-9 w-auto" />
+          </div>
+        </div>
         <nav className="flex-1 px-3 space-y-1">
           {nav.map((n) => (
             <NavLink
@@ -26,7 +30,7 @@ export default function Layout() {
               end={n.end}
               className={({ isActive }) =>
                 `block px-3 py-2 rounded-lg text-sm ${
-                  isActive ? 'bg-brand text-white' : 'hover:bg-slate-800'
+                  isActive ? 'bg-accent text-white' : 'hover:bg-brand-light/40'
                 }`
               }
             >
@@ -34,7 +38,7 @@ export default function Layout() {
             </NavLink>
           ))}
         </nav>
-        <div className="px-4 py-4 border-t border-slate-800">
+        <div className="px-4 py-4 border-t border-brand-light/30">
           {user && (
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">

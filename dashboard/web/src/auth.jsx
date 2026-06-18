@@ -26,9 +26,9 @@ export function AuthGate({ children }) {
 
   if (state.authEnabled && !state.user) {
     return (
-      <div className="min-h-screen grid place-items-center bg-slate-900">
+      <div className="min-h-screen grid place-items-center bg-brand-dark">
         <div className="card text-center max-w-sm w-full">
-          <div className="text-2xl font-bold mb-1">lescall</div>
+          <img src="/brand/logo.png" alt="LesCall" className="h-12 w-auto mx-auto mb-3" />
           <div className="text-sm text-slate-500 mb-6">Voice AI Dashboard</div>
           <a className="btn btn-primary w-full inline-block" href="/api/auth/login">
             Sign in with Google

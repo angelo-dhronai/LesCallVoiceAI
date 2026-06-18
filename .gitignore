@@ -30,3 +30,7 @@ recordings/
 # DB (generated)
 data/*.db
 data/*.db-*
+
+# frontend build
+dashboard/web/node_modules/
+dashboard/web/dist/

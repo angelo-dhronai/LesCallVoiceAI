@@ -43,6 +43,7 @@ export const api = {
   summary: (connId) => req('POST', `/calls/${connId}/summary`),
   analytics: () => req('GET', '/analytics'),
 
+  serverInfo: () => req('GET', '/telephony/server-info'),
   trunks: () => req('GET', '/trunks'),
   createTrunk: (t) => req('POST', '/trunks', t),
   trunkInstructions: (id) => req('GET', `/trunks/${id}/instructions`),

@@ -29,6 +29,16 @@ class TrunkIn(BaseModel):
     password: Optional[str] = None
     register: int = 0
     caller_id: Optional[str] = None
+    provider_ips: Optional[str] = None   # comma-separated CIDRs to allow (ACL)
+    transport: str = "udp"
+
+
+@router.get("/telephony/server-info")
+def telephony_server_info(owner: str = Depends(current_owner)) -> dict:
+    """Our SIP endpoint + ACL the user must configure on their provider (Plivo)."""
+    with get_db() as db:
+        cidrs = _all_provider_cidrs(db)
+    return fsc.server_sip_info(cidrs)
 
 
 @router.get("/trunks")
@@ -65,7 +75,8 @@ def apply_trunk(trunk_id: int, owner: str = Depends(current_owner)) -> dict:
     with get_db() as db:
         numbers = [dict(r) for r in db.execute(
             "SELECT * FROM phone_numbers WHERE trunk_id=? AND owner=?", (trunk_id, owner))]
-    result = fsc.apply_config(trunk, numbers, reload=True)
+        all_cidrs = _all_provider_cidrs(db)
+    result = fsc.apply_config(trunk, numbers, reload=True, all_provider_cidrs=all_cidrs)
     status = "applied" if result.get("reloaded") else "error"
     with get_db() as db:
         db.execute(
@@ -128,3 +139,11 @@ def _trunk(trunk_id: int, owner: str) -> dict:
 
 def _slug(email: str) -> str:
     return "".join(ch if ch.isalnum() else "_" for ch in email.split("@")[0])[:24]
+
+
+def _all_provider_cidrs(db) -> list[str]:
+    """Aggregate provider CIDRs across ALL trunks (the FS ACL is one global list)."""
+    cidrs: list[str] = []
+    for r in db.execute("SELECT provider_ips FROM trunks WHERE provider_ips IS NOT NULL"):
+        cidrs += [c.strip() for c in (dict(r)["provider_ips"] or "").split(",") if c.strip()]
+    return sorted(set(cidrs))

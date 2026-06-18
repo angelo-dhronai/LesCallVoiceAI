@@ -103,6 +103,8 @@ CREATE TABLE IF NOT EXISTS trunks (
     password        TEXT,
     register        INTEGER DEFAULT 0,
     caller_id       TEXT,
+    provider_ips    TEXT,                 -- comma-separated CIDRs to allow inbound (ACL)
+    transport       TEXT    DEFAULT 'udp',
     config_status   TEXT    DEFAULT 'pending',
     last_applied_at TIMESTAMP,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP

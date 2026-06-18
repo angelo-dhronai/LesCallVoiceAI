@@ -29,10 +29,14 @@ DP_CTX = os.environ.get("OUTBOUND_DP_CTX", "default")
 FS_CLI = os.environ.get("FS_CLI", "fs_cli")
 
 
-def _originate_cmd(phone: str, caller_id: str, gateway: str) -> str:
+def _originate_cmd(phone: str, caller_id: str, gateway: str,
+                   campaign_id: int | None = None) -> str:
+    # lescall_campaign_id rides along as a channel variable so socket_server can
+    # forward it to the AI bridge for per-campaign agent selection.
+    camp = f",lescall_campaign_id={campaign_id}" if campaign_id else ""
     return (
         f"originate {{origination_caller_id_number={caller_id},"
-        f"originate_timeout=45,ignore_early_media=true}}"
+        f"originate_timeout=45,ignore_early_media=true{camp}}}"
         f"sofia/external/{phone}@{gateway} {DP_EXT} XML {DP_CTX}"
     )
 
@@ -64,7 +68,7 @@ async def dial_lead(lead: dict, caller_id: str, gateway: str, dry_run: bool = Fa
         _record(lead["id"], "answered")
         return "answered (dry-run)"
 
-    cmd = _originate_cmd(phone, caller_id, gateway)
+    cmd = _originate_cmd(phone, caller_id, gateway, lead.get("campaign_id"))
     try:
         proc = await asyncio.create_subprocess_exec(
             FS_CLI, "-x", cmd,

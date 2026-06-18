@@ -551,10 +551,17 @@ def extract_rtp_info(headers: dict) -> dict:
 
     caller_number = re.sub(r"[^\d]", "", unquote(raw_caller)) if raw_caller else ""
 
+    # Dialed DID (destination number) — used downstream to select the inbound
+    # DB agent. Digits-only; harmless/ignored for outbound calls.
+    raw_did = g("Caller-Destination-Number", "") or g("Channel-Destination-Number", "")
+    did_number = re.sub(r"[^\d]", "", unquote(raw_did)) if raw_did else ""
+
     return {
         "uuid":             g("Channel-Call-UUID") or g("Unique-ID", "unknown"),
         "channel_name":     g("Channel-Name", ""),
         "caller_number":    caller_number,
+        "did":              did_number,
+        "campaign_id":      re.sub(r"[^\d]", "", g("variable_lescall_campaign_id", "")),
         "call_direction":   direction or "inbound",
         "local_ip":         g("variable_local_media_ip", ""),
         "local_port":       g("variable_local_media_port", ""),
@@ -723,7 +730,9 @@ def build_record_payload(wav_path: str) -> bytes:
 
 def build_audio_stream_payload(channel_uuid: str, ws_url: str,
                                sample_rate: int = 8000,
-                               caller_number: str = "") -> bytes:
+                               caller_number: str = "",
+                               did: str = "",
+                               campaign_id: str = "") -> bytes:
     """P9-A: bgapi uuid_audio_stream <uuid> start <ws_url> mono <sr>.
 
     mod_audio_stream is registered as an FS API command (NOT a
@@ -768,8 +777,17 @@ def build_audio_stream_payload(channel_uuid: str, ws_url: str,
         if "/" not in rest:
             url = f"{url}/{cu}"
             cn = caller_number.strip()
-            if cn:
-                url = f"{url}/{cn}"
+            dd = did.strip()
+            camp = (campaign_id or "").strip()
+            # Positional path segments: /<uuid>/<caller>/<did>/<campaign>.
+            # A non-digit placeholder ('x') keeps later segments aligned when an
+            # earlier one is empty; ws_audio_receiver treats 'x' as empty.
+            if cn or dd or camp:
+                url = f"{url}/{cn if cn else 'x'}"
+            if dd or camp:
+                url = f"{url}/{dd if dd else 'x'}"
+            if camp:
+                url = f"{url}/{camp}"
     line = (
         "bgapi uuid_audio_stream "
         + cu + " start " + url
@@ -1872,7 +1890,9 @@ def handle(conn: socket.socket, addr) -> None:
                 payload = build_audio_stream_payload(
                     uuid_for_record, AUDIO_STREAM_WS_URL,
                     AUDIO_STREAM_SAMPLE_RATE,
-                    rtp.get("caller_number", ""))
+                    rtp.get("caller_number", ""),
+                    rtp.get("did", ""),
+                    rtp.get("campaign_id", ""))
                 send_raw(conn, payload, "AUDIO_STREAM_START", t0)
                 _t = time.monotonic() - t0
                 cp["T3c_audio_stream_sent"] = _t

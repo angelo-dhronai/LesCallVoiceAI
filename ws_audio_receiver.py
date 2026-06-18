@@ -369,6 +369,8 @@ async def handle_connection(websocket, path: str, args):
 
     fs_uuid = ""
     caller_number = ""
+    dialed_did = ""
+    campaign_id = None
 
     try:
 
@@ -395,10 +397,22 @@ async def handle_connection(websocket, path: str, args):
         if len(parts) > 1 and parts[1].strip().isdigit():
             caller_number = parts[1].strip()
 
+        # Third segment carries the dialed DID (digits only) — used to select
+        # the inbound DB agent. Optional + backward compatible.
+        if len(parts) > 2 and parts[2].strip().isdigit():
+            dialed_did = parts[2].strip()
+
+        # Fourth segment carries the outbound campaign id (digits only) — used
+        # to select the campaign's DB agent. Optional + backward compatible.
+        if len(parts) > 3 and parts[3].strip().isdigit():
+            campaign_id = int(parts[3].strip())
+
     except Exception:
 
         fs_uuid = ""
         caller_number = ""
+        dialed_did = ""
+        campaign_id = None
 
     conn_id = fs_uuid if fs_uuid else uuidlib.uuid4().hex[:8]
 
@@ -431,6 +445,8 @@ async def handle_connection(websocket, path: str, args):
             conn_id,
             TARGET_SR,
             caller_number=caller_number,
+            did=dialed_did,
+            campaign_id=campaign_id,
         )
 
         log.info(

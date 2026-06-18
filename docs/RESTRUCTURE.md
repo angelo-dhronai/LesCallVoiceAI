@@ -46,9 +46,15 @@ lescall/
       Builds clean; live WS verified.
 - [x] **Phase 5 — Outbound engine:** `outbound/dialer.py` — DB-backed, reuses the proven fs_cli
       originate cmd, status/disposition writeback, concurrency + retry. API `/campaigns/{id}/dial`,
-      `/leads/{id}/dial`. Dry-run verified end-to-end. FOLLOW-UP: wire per-campaign agent selection
-      into the live pipeline (outbound_ai_connect still uses the single hardcoded agent; full
-      DB-agent loading lands with the cutover/agent-config refactor).
+      `/leads/{id}/dial`. Dry-run verified end-to-end.
+- [x] **Phase 5b — DB agents wired into the live pipeline:** `agent_config.load_agent()` resolves
+      the per-call agent (inbound by DID via `phone_numbers.inbound_agent_id`, outbound by
+      `campaigns.agent_id`), loaded from the DB and injected into `ConversationRouter`
+      (identity/brand block, greeting, default language). Plumbing: `socket_server` forwards DID +
+      `lescall_campaign_id` as WS path segments → `ws_audio_receiver` → `conversation_call_bridge`
+      → `VoicePipeline` → `ConversationRouter`. Hard fallback to the legacy hardcoded persona when
+      no DB/agent match; `DISABLE_DB_AGENTS=1` kill switch. 112 existing tests still pass; selection
+      verified end-to-end. NOTE: takes effect on the next service restart (Phase 6 window).
 - [ ] **Phase 6 — Cutover (maintenance window, your go-ahead):** `git mv` live telephony files into
       `shared/`, repoint start scripts, restart, verify a real call. NOT done — needs your window.
 

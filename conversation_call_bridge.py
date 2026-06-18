@@ -28,13 +28,26 @@ PLAYBACK_PORT = 9004
 class TelephonySession:
     """Manages one AI pipeline per phone call."""
     def __init__(self, conn_id: str, sample_rate: int, caller_number: str = "",
-                 skip_greeting: bool = False):
+                 skip_greeting: bool = False, did: str = "", campaign_id: int | None = None):
         self.conn_id = conn_id
         self.sample_rate = sample_rate
         self.caller_number = caller_number
+        self.did = did
+        self.campaign_id = campaign_id
         self.source = TelephonySource(sample_rate=sample_rate)
         self.sink = TelephonySink(sample_rate=sample_rate, conn_id=conn_id)
         self.hub = EventHub()
+
+        # Resolve the DB-backed agent for this call (inbound by DID, outbound by
+        # campaign). Best-effort: falls back to the default hardcoded persona.
+        try:
+            from backend.app.voice.agent_config import load_agent
+            agent_config = load_agent(did=did, campaign_id=campaign_id)
+            logger.info("[%s] agent=%r (did=%s campaign=%s)",
+                        conn_id, getattr(agent_config, "name", "?"), did, campaign_id)
+        except Exception as e:
+            logger.warning("[%s] agent load failed (%r); using default", conn_id, e)
+            agent_config = None
 
         # Initialize VoicePipeline with telephony endpoints
         self.pipeline = VoicePipeline(
@@ -44,6 +57,7 @@ class TelephonySession:
             mic_enabled=True,
             skip_greeting=skip_greeting,
             call_id=conn_id,
+            agent_config=agent_config,
         )
         self.pipeline_task = None
         self.playback_task = None
@@ -268,7 +282,8 @@ class SessionManager:
     def __init__(self):
         self.sessions: Dict[str, TelephonySession] = {}
 
-    async def get_or_create(self, conn_id: str, sample_rate: int, caller_number: str = "") -> TelephonySession:
+    async def get_or_create(self, conn_id: str, sample_rate: int, caller_number: str = "",
+                            did: str = "", campaign_id: int | None = None) -> TelephonySession:
         if conn_id not in self.sessions:
             now = time.time()
             # Prune stale greeted entries to avoid unbounded growth
@@ -286,7 +301,8 @@ class SessionManager:
                 logger.info("[BRIDGE] Reconnect detected for conn_id=%s — greeting suppressed", conn_id)
 
             session = TelephonySession(conn_id, sample_rate, caller_number=caller_number,
-                                       skip_greeting=skip_greeting)
+                                       skip_greeting=skip_greeting, did=did,
+                                       campaign_id=campaign_id)
             self.sessions[conn_id] = session
 
             # Mark as greeted on first creation (before start so no race)

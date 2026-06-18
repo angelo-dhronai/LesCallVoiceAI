@@ -799,14 +799,21 @@ class ConversationRouter:
         model: str = "gpt-4o-mini",
         timeout: float = LLM_TIMEOUT,
         default_language: str = "hi",
+        agent_config=None,
     ) -> None:
+        # DB-backed agent persona (name/company/prompt/pitch/greeting/language).
+        # Falls back to the legacy hardcoded identity when not provided.
+        from .agent_config import DEFAULT_AGENT
+        self.agent = agent_config or DEFAULT_AGENT
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self._model = model
         self._timeout = timeout
         self._client: AsyncOpenAI | None = None
         self.memory = ConversationMemory()
         self.state = ConversationState()
-        self.state.language = default_language
+        # Agent's configured language wins over the caller default (still
+        # overridden live once the caller's language is detected).
+        self.state.language = self.agent.language or default_language
         self._response_counter = 0
         self._lang_cache: dict[str, tuple[str, float, str]] = {}
         self._filler_counter = 0
@@ -839,7 +846,7 @@ class ConversationRouter:
     async def generate_opening(self) -> EngineResult:
         """Inbound warm welcome — agent answers the call.
         Bilingual so caller can respond in their preferred language."""
-        greeting = _OPENING_GREETING
+        greeting = self.agent.greeting or _OPENING_GREETING
         self.memory.add_assistant(greeting, language=self.state.language)
         self.state.stage = STAGE_GREETING
         # Store for last-response memory (feature 3)
@@ -2088,6 +2095,39 @@ class ConversationRouter:
     # System prompt — Pramukh Group domain
     # ------------------------------------------------------------------
 
+    def _agent_identity_block(self) -> list[str]:
+        """Identity + brand lines for the system prompt.
+
+        Default agent keeps the hand-tuned Pramukh block verbatim. A DB-defined
+        agent uses its own name/company/persona/pitch + custom system prompt.
+        """
+        a = self.agent
+        if a.is_default:
+            return [
+                "━━ AGENT IDENTITY ━━",
+                "You are Vishal Patel — a warm, genuine, experienced inbound sales agent for Pramukh Group.",
+                "You are NOT reading a script. You are a real person having a real conversation.",
+                "Your job: make every caller feel genuinely heard and understood.",
+                "",
+                "━━ BRAND ━━",
+                "Pramukh Group · 30 years · 60+ completed projects · ZERO stalled projects · RERA compliant",
+                "Surat · Vapi · Silvassa · Contact: +91 87583 70000",
+            ]
+        block = [
+            "━━ AGENT IDENTITY ━━",
+            f"You are {a.name} — a warm, genuine sales agent"
+            + (f" for {a.company}." if a.company else "."),
+            "You are NOT reading a script. You are a real person having a real conversation.",
+            "Your job: make every caller feel genuinely heard and understood.",
+        ]
+        if a.persona:
+            block.append(a.persona)
+        if a.system_prompt:
+            block += ["", "━━ BRIEF ━━", a.system_prompt]
+        if a.pitch:
+            block += ["", "━━ PITCH ━━", a.pitch]
+        return block
+
     def _build_system_prompt(self) -> str:  # noqa: C901
         b = self.memory.booking
         cs = self.memory.call_state
@@ -2283,14 +2323,7 @@ class ConversationRouter:
             lang_header.get(lang, lang_header["en"]),
             *name_confirm_block,
             "",
-            "━━ AGENT IDENTITY ━━",
-            "You are Vishal Patel — a warm, genuine, experienced inbound sales agent for Pramukh Group.",
-            "You are NOT reading a script. You are a real person having a real conversation.",
-            "Your job: make every caller feel genuinely heard and understood.",
-            "",
-            "━━ BRAND ━━",
-            "Pramukh Group · 30 years · 60+ completed projects · ZERO stalled projects · RERA compliant",
-            "Surat · Vapi · Silvassa · Contact: +91 87583 70000",
+            *self._agent_identity_block(),
             "",
             "━━ CALL STATE ━━",
             f"Stage: {self.state.stage}  |  Language: {lang_name}  |  Turn: {self.state.turn_count}",

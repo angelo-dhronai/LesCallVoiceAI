@@ -165,8 +165,10 @@ class VoicePipeline:
         mic_enabled: bool = True,
         skip_greeting: bool = False,
         call_id: str | None = None,
+        agent_config=None,
     ) -> None:
         self._call_id = call_id
+        self._agent_config = agent_config
         self.audio = audio_source or LocalMicSource(sample_rate=SAMPLE_RATE)
         self.sink = audio_sink or LocalSpeakerSink(sample_rate=SAMPLE_RATE)
 
@@ -189,7 +191,7 @@ class VoicePipeline:
         else:
             self.stt = stt
 
-        self.conversation = conversation or ConversationRouter()
+        self.conversation = conversation or ConversationRouter(agent_config=agent_config)
         self._hub = event_hub
 
         if tts is None:

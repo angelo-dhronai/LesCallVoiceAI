@@ -1,18 +1,19 @@
 """Plivo trunks + phone numbers, with automatic FreeSWITCH config generation.
 
-Add a trunk and a DID here; POST .../apply writes the FreeSWITCH gateway + inbound
-dialplan and reloads FS. GET .../instructions shows the SIP trunk config the operator
-must create on the provider side.
+Self-service per user: a user registers their own trunk + DID; POST .../apply
+writes the FreeSWITCH gateway + inbound dialplan and reloads FS. All rows are
+scoped to the logged-in user via `owner`.
 """
 from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 from shared.db.database import get_db
 from shared import freeswitch_config as fsc
+from dashboard.api.auth import current_owner
 
 router = APIRouter()
 
@@ -31,36 +32,39 @@ class TrunkIn(BaseModel):
 
 
 @router.get("/trunks")
-def list_trunks() -> list[dict]:
+def list_trunks(owner: str = Depends(current_owner)) -> list[dict]:
     with get_db() as db:
-        return [dict(r) for r in db.execute("SELECT * FROM trunks ORDER BY id DESC")]
+        return [dict(r) for r in db.execute(
+            "SELECT * FROM trunks WHERE owner=? ORDER BY id DESC", (owner,))]
 
 
 @router.post("/trunks")
-def create_trunk(trunk: TrunkIn) -> dict:
-    fields = trunk.model_dump()
+def create_trunk(trunk: TrunkIn, owner: str = Depends(current_owner)) -> dict:
+    # Trunk name is globally unique (FS gateway name); namespace by owner to avoid clashes.
+    fields = {"owner": owner, **trunk.model_dump()}
+    fields["name"] = f"{_slug(owner)}_{fields['name']}"
     cols = ", ".join(fields)
     qs = ", ".join("?" for _ in fields)
     with get_db() as db:
-        cur = db.execute(f"INSERT INTO trunks ({cols}) VALUES ({qs}) RETURNING id", tuple(fields.values()))
+        cur = db.execute(f"INSERT INTO trunks ({cols}) VALUES ({qs}) RETURNING id",
+                         tuple(fields.values()))
         tid = cur.fetchone()["id"]
         row = db.execute("SELECT * FROM trunks WHERE id=?", (tid,)).fetchone()
     return dict(row)
 
 
 @router.get("/trunks/{trunk_id}/instructions")
-def trunk_instructions(trunk_id: int) -> dict:
-    trunk = _trunk(trunk_id)
-    return fsc.sip_trunk_instructions(trunk)
+def trunk_instructions(trunk_id: int, owner: str = Depends(current_owner)) -> dict:
+    return fsc.sip_trunk_instructions(_trunk(trunk_id, owner))
 
 
 @router.post("/trunks/{trunk_id}/apply")
-def apply_trunk(trunk_id: int) -> dict:
+def apply_trunk(trunk_id: int, owner: str = Depends(current_owner)) -> dict:
     """Generate + write FreeSWITCH gateway and inbound dialplan, then reload FS."""
-    trunk = _trunk(trunk_id)
+    trunk = _trunk(trunk_id, owner)
     with get_db() as db:
         numbers = [dict(r) for r in db.execute(
-            "SELECT * FROM phone_numbers WHERE trunk_id=?", (trunk_id,))]
+            "SELECT * FROM phone_numbers WHERE trunk_id=? AND owner=?", (trunk_id, owner))]
     result = fsc.apply_config(trunk, numbers, reload=True)
     status = "applied" if result.get("reloaded") else "error"
     with get_db() as db:
@@ -83,34 +87,44 @@ class NumberIn(BaseModel):
 
 
 @router.get("/numbers")
-def list_numbers() -> list[dict]:
+def list_numbers(owner: str = Depends(current_owner)) -> list[dict]:
     with get_db() as db:
-        return [dict(r) for r in db.execute("SELECT * FROM phone_numbers ORDER BY id DESC")]
+        return [dict(r) for r in db.execute(
+            "SELECT * FROM phone_numbers WHERE owner=? ORDER BY id DESC", (owner,))]
 
 
 @router.post("/numbers")
-def create_number(num: NumberIn) -> dict:
-    fields = num.model_dump()
+def create_number(num: NumberIn, owner: str = Depends(current_owner)) -> dict:
+    # Validate the referenced trunk/agent belong to this user.
+    if num.trunk_id is not None:
+        _trunk(num.trunk_id, owner)
+    fields = {"owner": owner, **num.model_dump()}
     cols = ", ".join(fields)
     qs = ", ".join("?" for _ in fields)
     with get_db() as db:
         cur = db.execute(
-            f"INSERT INTO phone_numbers ({cols}) VALUES ({qs}) RETURNING id", tuple(fields.values()))
+            f"INSERT INTO phone_numbers ({cols}) VALUES ({qs}) RETURNING id",
+            tuple(fields.values()))
         nid = cur.fetchone()["id"]
         row = db.execute("SELECT * FROM phone_numbers WHERE id=?", (nid,)).fetchone()
     return dict(row)
 
 
 @router.delete("/numbers/{number_id}")
-def delete_number(number_id: int) -> dict:
+def delete_number(number_id: int, owner: str = Depends(current_owner)) -> dict:
     with get_db() as db:
-        db.execute("DELETE FROM phone_numbers WHERE id=?", (number_id,))
+        db.execute("DELETE FROM phone_numbers WHERE id=? AND owner=?", (number_id, owner))
     return {"deleted": number_id}
 
 
-def _trunk(trunk_id: int) -> dict:
+def _trunk(trunk_id: int, owner: str) -> dict:
     with get_db() as db:
-        row = db.execute("SELECT * FROM trunks WHERE id=?", (trunk_id,)).fetchone()
+        row = db.execute("SELECT * FROM trunks WHERE id=? AND owner=?",
+                         (trunk_id, owner)).fetchone()
     if not row:
         raise HTTPException(404, "trunk not found")
     return dict(row)
+
+
+def _slug(email: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in email.split("@")[0])[:24]

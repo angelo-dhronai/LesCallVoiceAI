@@ -21,6 +21,11 @@ export const api = {
   put: (p, b) => req('PUT', p, b),
   del: (p) => req('DELETE', p),
 
+  // auth
+  authConfig: () => req('GET', '/auth/config'),
+  me: () => req('GET', '/auth/me'),
+  logout: () => req('POST', '/auth/logout'),
+
   // domain helpers
   agents: () => req('GET', '/agents'),
   createAgent: (a) => req('POST', '/agents', a),

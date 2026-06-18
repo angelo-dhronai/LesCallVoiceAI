@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import './index.css'
+import { AuthGate } from './auth.jsx'
 import Layout from './components/Layout.jsx'
 import Overview from './pages/Overview.jsx'
 import Agents from './pages/Agents.jsx'
@@ -12,6 +13,7 @@ import Live from './pages/Live.jsx'
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
+    <AuthGate>
     <BrowserRouter>
       <Routes>
         <Route element={<Layout />}>
@@ -25,5 +27,6 @@ ReactDOM.createRoot(document.getElementById('root')).render(
         </Route>
       </Routes>
     </BrowserRouter>
+    </AuthGate>
   </React.StrictMode>
 )

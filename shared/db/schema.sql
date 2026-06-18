@@ -5,9 +5,22 @@
 -- Timestamps use CURRENT_TIMESTAMP (supported by both). No engine-specific PRAGMAs
 -- here — SQLite WAL/foreign_keys are set on connect; Postgres needs neither.
 
+-- users: dashboard accounts (Google OAuth SSO). `owner` columns elsewhere store
+-- the user's email, scoping every resource to its tenant.
+CREATE TABLE IF NOT EXISTS users (
+    id          {PK},
+    email       TEXT    NOT NULL UNIQUE,
+    name        TEXT,
+    google_sub  TEXT    UNIQUE,
+    picture     TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login  TIMESTAMP
+);
+
 -- agents: a configurable AI persona (replaces hardcoded Vishal Patel / Pramukh).
 CREATE TABLE IF NOT EXISTS agents (
     id              {PK},
+    owner           TEXT,
     name            TEXT    NOT NULL,
     company         TEXT,
     persona         TEXT,
@@ -26,6 +39,7 @@ CREATE TABLE IF NOT EXISTS agents (
 -- campaigns: an outbound dialing campaign bound to one agent.
 CREATE TABLE IF NOT EXISTS campaigns (
     id              {PK},
+    owner           TEXT,
     name            TEXT    NOT NULL,
     agent_id        INTEGER REFERENCES agents(id) ON DELETE SET NULL,
     caller_id       TEXT,

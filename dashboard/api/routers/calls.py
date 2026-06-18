@@ -8,11 +8,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from shared.db.database import get_db, _REPO_ROOT
 from shared.transcript import parse_transcript_file
 from shared.summarizer import summarize_turns
+from dashboard.api.auth import current_owner
 
 router = APIRouter()
 RECORDINGS = _REPO_ROOT / "recordings"
@@ -26,7 +27,7 @@ def _list_recording_dirs() -> list[Path]:
 
 
 @router.get("/calls")
-def list_calls(limit: int = 100) -> list[dict]:
+def list_calls(limit: int = 100, owner: str = Depends(current_owner)) -> list[dict]:
     out = []
     for d in _list_recording_dirs()[:limit]:
         meta = {}
@@ -53,7 +54,7 @@ def list_calls(limit: int = 100) -> list[dict]:
 
 
 @router.get("/calls/{conn_id}/transcript")
-def get_transcript(conn_id: str) -> dict:
+def get_transcript(conn_id: str, owner: str = Depends(current_owner)) -> dict:
     d = RECORDINGS / conn_id
     tp = d / "transcript.txt"
     if not tp.exists():
@@ -62,7 +63,7 @@ def get_transcript(conn_id: str) -> dict:
 
 
 @router.post("/calls/{conn_id}/summary")
-def make_summary(conn_id: str) -> dict:
+def make_summary(conn_id: str, owner: str = Depends(current_owner)) -> dict:
     """Generate (or regenerate) the AI summary and cache it in the calls table."""
     d = RECORDINGS / conn_id
     tp = d / "transcript.txt"
@@ -89,8 +90,13 @@ def make_summary(conn_id: str) -> dict:
 
 
 @router.get("/analytics")
-def analytics() -> dict:
-    """Headline numbers for the dashboard overview."""
+def analytics(owner: str = Depends(current_owner)) -> dict:
+    """Headline numbers for the dashboard overview, scoped to the logged-in user.
+
+    NOTE: total_recordings counts the legacy on-disk recordings, which predate
+    per-user ownership and are therefore a global/system metric. Per-call owner
+    scoping requires the pipeline to persist owner-tagged call rows (follow-up).
+    """
     dirs = _list_recording_dirs()
     total = len(dirs)
     with_transcript = sum(1 for d in dirs if (d / "transcript.txt").exists())
@@ -99,9 +105,13 @@ def analytics() -> dict:
             "SELECT outcome, COUNT(*) n FROM calls GROUP BY outcome")}
         by_sentiment = {r["sentiment"] or "unknown": r["n"] for r in db.execute(
             "SELECT sentiment, COUNT(*) n FROM calls GROUP BY sentiment")}
-        leads = db.execute("SELECT COUNT(*) n FROM leads").fetchone()["n"]
-        campaigns = db.execute("SELECT COUNT(*) n FROM campaigns").fetchone()["n"]
-        agents = db.execute("SELECT COUNT(*) n FROM agents").fetchone()["n"]
+        leads = db.execute(
+            "SELECT COUNT(*) n FROM leads l JOIN campaigns c ON c.id=l.campaign_id "
+            "WHERE c.owner=?", (owner,)).fetchone()["n"]
+        campaigns = db.execute(
+            "SELECT COUNT(*) n FROM campaigns WHERE owner=?", (owner,)).fetchone()["n"]
+        agents = db.execute(
+            "SELECT COUNT(*) n FROM agents WHERE owner=?", (owner,)).fetchone()["n"]
     return {
         "total_recordings": total,
         "with_transcript": with_transcript,

@@ -30,10 +30,11 @@ def seed_default_agent() -> int:
         if row:
             return row["id"]
         cur = db.execute(
-            """INSERT INTO agents (name, company, persona, system_prompt, pitch,
+            """INSERT INTO agents (owner, name, company, persona, system_prompt, pitch,
                                    language, tts_speaker, greeting)
-               VALUES (?,?,?,?,?,?,?,?) RETURNING id""",
+               VALUES (?,?,?,?,?,?,?,?,?) RETURNING id""",
             (
+                "default@local",
                 "Vishal Patel",
                 "Pramukh Group",
                 "Warm bilingual real-estate sales agent.",
@@ -59,8 +60,8 @@ def import_legacy_contacts(agent_id: int) -> int:
             campaign_id = row["id"]
         else:
             cur = db.execute(
-                "INSERT INTO campaigns (name, agent_id, status) VALUES (?,?,?) RETURNING id",
-                ("Legacy Outbound", agent_id, "paused"),
+                "INSERT INTO campaigns (owner, name, agent_id, status) VALUES (?,?,?,?) RETURNING id",
+                ("default@local", "Legacy Outbound", agent_id, "paused"),
             )
             campaign_id = cur.fetchone()["id"]
 

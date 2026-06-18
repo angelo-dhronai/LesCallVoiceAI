@@ -1,0 +1,13 @@
+<include>
+  <extension name="outbound_ai_connect">
+    <condition field="destination_number" expression="^outbound_ai_connect$">
+
+      <!-- Brief pause to let RTP paths stabilize after remote party answers -->
+      <action application="sleep" data="500"/>
+
+      <!-- Hand the call to the AI socket server (same path as inbound) -->
+      <action application="socket" data="127.0.0.1:9000 async full"/>
+
+    </condition>
+  </extension>
+</include>

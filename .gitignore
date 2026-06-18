@@ -26,3 +26,7 @@ recordings/
 
 # OS
 .DS_Store
+
+# DB (generated)
+data/*.db
+data/*.db-*

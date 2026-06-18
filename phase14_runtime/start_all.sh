@@ -73,14 +73,8 @@ if ! wait_for_port 9001 "ws_audio_receiver"; then
     exit 1
 fi
 
-# 4. Optional: Start stt_stream_worker.py
-if [ "$ENABLE_STT_WORKER" == "1" ]; then
-    echo "[OPTIONAL] Starting STT Stream Worker..."
-    nohup python3 /home/angelo/lescall/stt_stream_worker.py >> "$RUN_DIR/stt_worker.log" 2>&1 &
-    STT_PID=$!
-    echo $STT_PID > "$RUN_DIR/stt_worker.pid"
-    wait_for_port 9002 "stt_stream_worker"
-fi
+# 4. Optional STT stream worker: REMOVED. stt_stream_worker.py was archived to
+#    archive/ (STT now runs inline inside pipeline.py). Block intentionally left out.
 
 # 5. Create a filtered view for call_bridge logs (they go to ws_audio_receiver.log)
 nohup tail -f "$RUN_DIR/ws_audio_receiver.log" | grep --line-buffered "call_bridge" >> "$RUN_DIR/call_bridge.log" 2>&1 &

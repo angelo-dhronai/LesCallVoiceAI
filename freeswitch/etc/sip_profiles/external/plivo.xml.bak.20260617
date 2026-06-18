@@ -1,0 +1,9 @@
+<include>
+  <gateway name="plivo-outbound">
+    <param name="proxy" value="16584853209835561.zt.plivo.com"/>
+    <param name="from-domain" value="16584853209835561.zt.plivo.com"/>
+    <param name="register" value="false"/>
+    <param name="caller-id-in-from" value="true"/>
+    <param name="extension-in-contact" value="true"/>
+  </gateway>
+</include>

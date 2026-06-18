@@ -1,0 +1,55 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html { font-family: 'Inter', system-ui, sans-serif; }
+
+body {
+  @apply bg-gray-50 text-gray-900 antialiased;
+}
+.dark body {
+  @apply bg-[#0b0d12] text-gray-100;
+}
+
+/* ── Reusable design-system component classes ───────────────────────────── */
+@layer components {
+  /* Surfaces */
+  .card {
+    @apply bg-white dark:bg-[#13161d] border border-gray-200 dark:border-white/10 rounded-xl;
+  }
+  .section-label {
+    @apply text-[11px] font-semibold uppercase tracking-wider text-gray-400 dark:text-gray-500;
+  }
+  .page-title {
+    @apply text-xl font-bold text-gray-900 dark:text-white;
+  }
+  .metric-number {
+    @apply text-3xl font-bold tracking-tight text-gray-900 dark:text-white;
+  }
+
+  /* Buttons */
+  .btn { @apply inline-flex items-center gap-2 rounded-lg text-sm font-medium transition-colors; }
+  .btn-primary { @apply btn px-3.5 py-2 bg-accent text-white hover:bg-accent-hover; }
+  .btn-ghost { @apply btn px-3 py-2 text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-white/5; }
+  .btn-outline { @apply btn px-3 py-2 border border-gray-200 dark:border-white/10 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-white/5; }
+
+  /* Inputs */
+  .input {
+    @apply w-full rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-[#0f1218]
+           px-3 py-2 text-sm text-gray-900 dark:text-gray-100 placeholder-gray-400
+           focus:outline-none focus:ring-2 focus:ring-accent/40 focus:border-accent;
+  }
+
+  /* Badges */
+  .badge { @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium; }
+  .badge-green { @apply badge bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400; }
+  .badge-gray  { @apply badge bg-gray-100 text-gray-600 dark:bg-white/5 dark:text-gray-400; }
+  .badge-red   { @apply badge bg-red-50 text-red-700 dark:bg-red-500/10 dark:text-red-400; }
+  .badge-blue  { @apply badge bg-accent-soft text-accent dark:bg-accent/15 dark:text-blue-300; }
+  .badge-amber { @apply badge bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400; }
+}
+
+/* Thin, unobtrusive scrollbars */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { @apply bg-gray-300 dark:bg-white/10 rounded-full; }
+::-webkit-scrollbar-track { background: transparent; }

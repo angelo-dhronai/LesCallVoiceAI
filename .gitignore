@@ -40,3 +40,5 @@ docker/fs-rootfs.tar.gz
 
 # local rollback backups (not committed)
 backups/
+bolna-dashboard/node_modules/
+bolna-dashboard/dist/

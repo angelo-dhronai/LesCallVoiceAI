@@ -39,9 +39,20 @@ needed. When FreeSWITCH nodes run on OTHER hosts or endpoints are NAT'd: install
 and call `rtpengine_manage()` at the marked spots in `request_route` (offer) and
 `onreply_route` (answer).
 
-## Firewall
-Open inbound **UDP 5060** (SIP to Kamailio) in the GCP firewall, plus the existing
-**UDP 16384–32768** (RTP to FreeSWITCH). Carriers no longer need UDP 5080 open.
+## Firewall (carrier-aware, auto-reconciled)
+Inbound **UDP 5060** (SIP to Kamailio) + **UDP 16384–32768** (RTP) are open in the GCP
+firewall, scoped to registered carriers' IPs. When a client registers a trunk, the
+dashboard touches `data/kamailio_reload`, and `deploy/lescall-fw-sync.{path,service}`
+runs `deploy/fw_sync.py` on the host to reconcile `allow-sip-5060-kamailio`'s
+`--source-ranges` to `FW_BASE_RANGES ∪ <registered carrier CIDRs>` (from the Kamailio
+`address` table). So onboarding any carrier opens BOTH the Kamailio ACL and the cloud
+firewall automatically — no manual `gcloud`.
+
+Cloud creds stay on the host (the reconciler runs as user `angelo` using the host's
+gcloud auth), never in the dashboard container. **Prod hardening:** swap to a dedicated
+service account with only `compute.firewalls.{get,list,update}` (set
+`FW_SYNC_GCLOUD_ACCOUNT` + `CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE` in the service) so it
+doesn't depend on a human OAuth token.
 
 ## Verify
 ```

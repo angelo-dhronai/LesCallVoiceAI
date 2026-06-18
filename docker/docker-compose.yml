@@ -41,12 +41,19 @@ services:
   dashboard_api:
     build: { context: .., dockerfile: docker/Dockerfile.dashboard-api }
     image: lescall/dashboard-api
-    network_mode: host          # needs localhost access to FS (fs_cli) + services
+    network_mode: host          # localhost access to Postgres/Redis + FreeSWITCH ESL :8021
+    user: "1000:994"            # angelo:freeswitch — write mounted data/ AND /etc/freeswitch config
     env_file: ../calling-agent/.env
+    environment:
+      # Live events over Redis; FS control over ESL (no fs_cli binary in the image).
+      REDIS_URL: redis://127.0.0.1:6379/0
+      FS_ESL_HOST: 127.0.0.1
+      FS_ESL_PASSWORD: ClueCon
     volumes:
       - ../recordings:/app/recordings
       - ../data:/app/data
       - ../credit_log:/app/credit_log
+      - /etc/freeswitch:/etc/freeswitch   # write generated gateway/dialplan, then ESL reload
     restart: unless-stopped
 
   web:

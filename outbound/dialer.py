@@ -75,6 +75,11 @@ async def dial_lead(lead: dict, caller_id: str, gateway: str, dry_run: bool = Fa
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=55)
         status = _parse_result(stdout.decode() + " " + stderr.decode())
+    except (FileNotFoundError, OSError):
+        # fs_cli not installed (e.g. inside a container) -> originate over ESL TCP.
+        from shared.esl import esl_api
+        ok, out = await asyncio.to_thread(esl_api, cmd, 55.0)
+        status = _parse_result(out) if ok else "failed"
     except Exception:
         status = "failed"
     _record(lead["id"], status)

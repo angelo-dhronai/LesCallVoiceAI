@@ -96,12 +96,25 @@ def apply_config(trunk: dict, numbers: list[dict], reload: bool = True) -> dict:
 
     reloaded = False
     if reload:
-        try:
-            subprocess.run([FS_CLI, "-x", "reloadxml"], check=True, timeout=10,
-                           capture_output=True)
-            subprocess.run([FS_CLI, "-x", "sofia profile external rescan"],
-                           check=True, timeout=10, capture_output=True)
-            reloaded = True
-        except Exception as e:  # fs_cli not reachable from this context
-            return {"written": written, "reloaded": False, "error": str(e)}
+        ok1, out1 = _fs("reloadxml")
+        ok2, out2 = _fs("sofia profile external rescan")
+        reloaded = ok1 and ok2
+        if not reloaded:
+            return {"written": written, "reloaded": False, "error": out1 or out2}
     return {"written": written, "reloaded": reloaded}
+
+
+def _fs(command: str) -> tuple[bool, str]:
+    """Run a FreeSWITCH API command: prefer the fs_cli binary, fall back to ESL
+    over TCP (works from inside a container where fs_cli isn't installed)."""
+    try:
+        r = subprocess.run([FS_CLI, "-x", command], timeout=10, capture_output=True, text=True)
+        if r.returncode == 0:
+            return True, r.stdout
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        pass
+    try:
+        from shared.esl import esl_api
+        return esl_api(command)
+    except Exception as e:
+        return False, repr(e)

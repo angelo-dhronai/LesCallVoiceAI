@@ -1,0 +1,9 @@
+[Unit]
+Description=lescall: reload Kamailio permissions address table (carrier allow-list)
+After=kamailio.service
+
+[Service]
+Type=oneshot
+# small debounce so a burst of dashboard writes collapses into one reload
+ExecStartPre=/bin/sleep 1
+ExecStart=/usr/sbin/kamcmd permissions.addressReload

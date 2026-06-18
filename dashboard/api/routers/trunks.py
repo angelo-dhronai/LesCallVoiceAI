@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict
 
 from shared.db.database import get_db
 from shared import freeswitch_config as fsc
+from shared import kamailio_acl
 from dashboard.api.auth import current_owner
 
 router = APIRouter()
@@ -22,7 +23,7 @@ router = APIRouter()
 class TrunkIn(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     name: str
-    provider: str = "plivo"
+    provider: Optional[str] = None   # any SIP carrier (Plivo, Twilio, Telnyx, …) — label only
     sip_domain: str
     proxy: Optional[str] = None
     username: Optional[str] = None
@@ -35,7 +36,7 @@ class TrunkIn(BaseModel):
 
 @router.get("/telephony/server-info")
 def telephony_server_info(owner: str = Depends(current_owner)) -> dict:
-    """Our SIP endpoint + ACL the user must configure on their provider (Plivo)."""
+    """Our SIP endpoint + ACL the user configures on their carrier (any SIP provider)."""
     with get_db() as db:
         cidrs = _all_provider_cidrs(db)
     return fsc.server_sip_info(cidrs)
@@ -60,6 +61,9 @@ def create_trunk(trunk: TrunkIn, owner: str = Depends(current_owner)) -> dict:
                          tuple(fields.values()))
         tid = cur.fetchone()["id"]
         row = db.execute("SELECT * FROM trunks WHERE id=?", (tid,)).fetchone()
+        all_cidrs = _all_provider_cidrs(db)
+    # Allow this carrier's IPs at the Kamailio edge (provider-agnostic).
+    kamailio_acl.sync_carrier_acl(all_cidrs)
     return dict(row)
 
 
@@ -77,6 +81,9 @@ def apply_trunk(trunk_id: int, owner: str = Depends(current_owner)) -> dict:
             "SELECT * FROM phone_numbers WHERE trunk_id=? AND owner=?", (trunk_id, owner))]
         all_cidrs = _all_provider_cidrs(db)
     result = fsc.apply_config(trunk, numbers, reload=True, all_provider_cidrs=all_cidrs)
+    # Propagate carrier IPs to the Kamailio edge allow-list (runtime reload, no restart).
+    kam = kamailio_acl.sync_carrier_acl(all_cidrs)
+    result["kamailio_acl"] = kam
     status = "applied" if result.get("reloaded") else "error"
     with get_db() as db:
         db.execute(

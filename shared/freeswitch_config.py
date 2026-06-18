@@ -144,18 +144,25 @@ def render_inbound_dialplan(number: dict) -> str:
 
 
 def sip_trunk_instructions(trunk: dict) -> dict:
-    """What the operator must configure on the provider side (shown in the UI)."""
+    """What the operator must configure on their carrier side (shown in the UI).
+
+    Provider-agnostic: works for any SIP carrier (Plivo, Twilio, Telnyx, Vonage,
+    a local PSTN gateway, …). Carriers point at the Kamailio proxy on UDP 5060.
+    """
+    ip = _public_ip()
     return {
-        "provider": trunk.get("provider", "plivo"),
+        "provider": trunk.get("provider") or "carrier",
         "sip_domain": trunk["sip_domain"],
         "auth_mode": "REGISTER (username/password)" if trunk.get("register")
                      else "IP authentication (allowlist this server's public IP)",
-        "freeswitch_signaling_port": "5080 (external profile)",
-        "rtp_port_range": "16384-32768/udp",
+        "signaling_endpoint": f"{ip}:{SIP_INBOUND_PORT}/udp (Kamailio SIP proxy)",
+        "rtp_port_range": f"{RTP_PORT_RANGE}/udp",
         "notes": [
-            "Point the Plivo outbound trunk / app at this server's public IP on UDP 5080.",
-            "For inbound, set the Plivo number's app to deliver SIP to sip:<did>@<server-ip>:5080.",
-            "Open SIP (5080/udp) and the RTP range (16384-32768/udp) in the firewall.",
+            f"Point your carrier's outbound/origination trunk at {ip}:{SIP_INBOUND_PORT} (UDP).",
+            f"For inbound, deliver the DID via SIP to sip:<did>@{ip}:{SIP_INBOUND_PORT}.",
+            f"Whitelist this server IP ({ip}) on your carrier; we allow your carrier's "
+            "signaling IPs at our edge automatically when you save the trunk.",
+            f"Firewall: SIP {SIP_INBOUND_PORT}/udp + RTP {RTP_PORT_RANGE}/udp.",
         ],
     }
 

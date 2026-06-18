@@ -1,0 +1,9 @@
+[Unit]
+Description=lescall: watch for carrier allow-list change -> reload Kamailio
+[Path]
+# The dashboard (container, via its data/ mount) touches this file after syncing
+# the Postgres `address` table; that triggers permissions.addressReload on the host.
+PathModified=/home/angelo/lescall/data/kamailio_reload
+Unit=lescall-kamailio-reload.service
+[Install]
+WantedBy=multi-user.target

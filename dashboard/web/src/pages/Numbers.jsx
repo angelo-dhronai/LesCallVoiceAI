@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '../api.js'
 
 // Self-service number registration:
-//  1) Server SIP settings panel — what to configure on the provider (Plivo).
+//  1) Server SIP settings panel — what to configure on the carrier (any SIP provider).
 //  2) Create a trunk (provider domain + IPs to allow + outbound caller ID).
 //  3) Add DID(s) + pick the inbound agent, then Apply (generates FS gateway +
 //     inbound dialplan + ACL and reloads FreeSWITCH).
@@ -12,7 +12,7 @@ export default function Numbers() {
   const [numbers, setNumbers] = useState([])
   const [agents, setAgents] = useState([])
   const [trunkForm, setTrunkForm] = useState({
-    name: '', provider: 'plivo', sip_domain: '', caller_id: '', provider_ips: '', register: 0,
+    name: '', provider: '', sip_domain: '', caller_id: '', provider_ips: '', register: 0,
   })
   const [numForm, setNumForm] = useState({ number: '', trunk_id: '', inbound_agent_id: '', direction: 'both' })
   const [msg, setMsg] = useState(null)
@@ -25,7 +25,7 @@ export default function Numbers() {
 
   const copy = (t) => navigator.clipboard?.writeText(t)
   const addTrunk = async () => {
-    try { await api.createTrunk(trunkForm); setTrunkForm({ name: '', provider: 'plivo', sip_domain: '', caller_id: '', provider_ips: '', register: 0 }); load(); setMsg('Trunk added') }
+    try { await api.createTrunk(trunkForm); setTrunkForm({ name: '', provider: '', sip_domain: '', caller_id: '', provider_ips: '', register: 0 }); load(); setMsg('Trunk added') }
     catch (e) { setMsg(e.message) }
   }
   const addNumber = async () => {
@@ -60,7 +60,7 @@ export default function Numbers() {
 
       {/* Step 0: our SIP settings to configure on the provider */}
       <div className="card mb-6 bg-brand-dark text-slate-100">
-        <h3 className="font-semibold mb-1">① Configure these on your provider (Plivo)</h3>
+        <h3 className="font-semibold mb-1">① Configure these on your SIP carrier (Plivo, Twilio, Telnyx, …)</h3>
         <p className="text-xs text-slate-400 mb-3">Use this server's details to set up your inbound + outbound SIP trunk, then whitelist our IP.</p>
         {info ? (
           <div className="grid md:grid-cols-2 gap-x-8">
@@ -91,8 +91,8 @@ export default function Numbers() {
         <div className="card">
           <h3 className="font-semibold mb-3">② Add your SIP trunk</h3>
           <div className="space-y-2">
-            <input className="input" placeholder="Trunk name (e.g. plivo)" value={trunkForm.name} onChange={(e) => setTrunkForm({ ...trunkForm, name: e.target.value })} />
-            <input className="input" placeholder="Provider SIP domain (xxx.zt.plivo.com)" value={trunkForm.sip_domain} onChange={(e) => setTrunkForm({ ...trunkForm, sip_domain: e.target.value })} />
+            <input className="input" placeholder="Trunk name (e.g. my-carrier)" value={trunkForm.name} onChange={(e) => setTrunkForm({ ...trunkForm, name: e.target.value })} />
+            <input className="input" placeholder="Provider SIP domain (e.g. sip.telnyx.com, xxx.zt.plivo.com)" value={trunkForm.sip_domain} onChange={(e) => setTrunkForm({ ...trunkForm, sip_domain: e.target.value })} />
             <input className="input" placeholder="Outbound caller ID (your DID/number)" value={trunkForm.caller_id} onChange={(e) => setTrunkForm({ ...trunkForm, caller_id: e.target.value })} />
             <input className="input" placeholder="Provider IPs to allow, comma-separated CIDRs" value={trunkForm.provider_ips} onChange={(e) => setTrunkForm({ ...trunkForm, provider_ips: e.target.value })} />
             <label className="flex items-center gap-2 text-sm text-slate-600">

@@ -22,8 +22,11 @@ import re
 
 from shared.db.database import get_db
 
-CALLER_ID = os.environ.get("OUTBOUND_CALLER_ID", "912264231897")
-GATEWAY = os.environ.get("OUTBOUND_GATEWAY", "16584853209835561.zt.plivo.com")
+# Provider-agnostic: no hardcoded carrier. Each campaign supplies its own
+# gateway (the trunk name / SIP domain) + caller_id; these env vars are only
+# optional fallbacks for single-tenant/dev use.
+CALLER_ID = os.environ.get("OUTBOUND_CALLER_ID", "")
+GATEWAY = os.environ.get("OUTBOUND_GATEWAY", "")
 DP_EXT = os.environ.get("OUTBOUND_DP_EXT", "outbound_ai_connect")
 DP_CTX = os.environ.get("OUTBOUND_DP_CTX", "default")
 FS_CLI = os.environ.get("FS_CLI", "fs_cli")
@@ -62,6 +65,10 @@ async def dial_lead(lead: dict, caller_id: str, gateway: str, dry_run: bool = Fa
     if len(phone) < 7:
         _record(lead["id"], "failed")
         return "failed"
+    if not gateway:
+        # No carrier gateway configured on the campaign — can't originate.
+        _record(lead["id"], "failed")
+        return "failed (no gateway)"
 
     _set_status(lead["id"], "dialing")
     if dry_run:

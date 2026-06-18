@@ -48,11 +48,19 @@ runs `deploy/fw_sync.py` on the host to reconcile `allow-sip-5060-kamailio`'s
 `address` table). So onboarding any carrier opens BOTH the Kamailio ACL and the cloud
 firewall automatically — no manual `gcloud`.
 
-Cloud creds stay on the host (the reconciler runs as user `angelo` using the host's
-gcloud auth), never in the dashboard container. **Prod hardening:** swap to a dedicated
-service account with only `compute.firewalls.{get,list,update}` (set
-`FW_SYNC_GCLOUD_ACCOUNT` + `CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE` in the service) so it
-doesn't depend on a human OAuth token.
+Cloud creds stay on the host (the reconciler runs as user `angelo`), never in the
+dashboard container. The firewall change executes as a **dedicated least-privilege
+service account** `lescall-fw@lescall.iam.gserviceaccount.com` (custom role
+`lescallFwManager`: only `compute.firewalls.{get,list,update}` + `compute.networks.updatePolicy`)
+via **impersonation** — `lescall-fw-sync.service` sets
+`FW_SYNC_IMPERSONATE_SA=lescall-fw@…`. The org policy blocks SA *keys*
+(`constraints/iam.disableServiceAccountKeyCreation`), so we impersonate instead of using
+a key file; the host's active account holds `roles/iam.serviceAccountTokenCreator` on the SA.
+
+So the firewall mutation is constrained to the SA's least privilege regardless of the
+bootstrap account. Residual: impersonation is bootstrapped by the host's gcloud login,
+so a fully login-independent setup would attach the SA to the VM (needs a stop/start) or
+use Workload Identity Federation.
 
 ## Verify
 ```

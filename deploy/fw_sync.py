@@ -31,6 +31,19 @@ import sys
 FW_RULE = os.environ.get("FW_RULE", "allow-sip-5060-kamailio")
 DB_URL = os.environ.get("KAMAILIO_DB_URL", "postgresql://lescall:lescall_dev@127.0.0.1:5432/lescall")
 GCLOUD_ACCOUNT = os.environ.get("FW_SYNC_GCLOUD_ACCOUNT", "")
+# Run the firewall change AS this least-privilege SA via impersonation (no key needed;
+# the org blocks SA keys). The host's active gcloud account must hold
+# roles/iam.serviceAccountTokenCreator on this SA.
+IMPERSONATE_SA = os.environ.get("FW_SYNC_IMPERSONATE_SA", "")
+
+
+def _auth_flags() -> list[str]:
+    flags = []
+    if GCLOUD_ACCOUNT:
+        flags.append(f"--account={GCLOUD_ACCOUNT}")
+    if IMPERSONATE_SA:
+        flags.append(f"--impersonate-service-account={IMPERSONATE_SA}")
+    return flags
 # Default base = the Plivo ranges originally configured, so nothing pre-existing breaks.
 BASE_RANGES = os.environ.get(
     "FW_BASE_RANGES",
@@ -63,10 +76,8 @@ def _registered_cidrs() -> list[str]:
 
 
 def _gcloud(args: list[str]) -> subprocess.CompletedProcess:
-    cmd = ["gcloud"] + args + ["--format=value(sourceRanges.list())"]
-    if GCLOUD_ACCOUNT:
-        cmd += [f"--account={GCLOUD_ACCOUNT}"]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    cmd = ["gcloud"] + args + ["--format=value(sourceRanges.list())"] + _auth_flags()
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=90)
 
 
 def main() -> int:
@@ -89,9 +100,8 @@ def main() -> int:
 
     upd = subprocess.run(
         ["gcloud", "compute", "firewall-rules", "update", FW_RULE,
-         f"--source-ranges={','.join(desired)}"]
-        + ([f"--account={GCLOUD_ACCOUNT}"] if GCLOUD_ACCOUNT else []),
-        capture_output=True, text=True, timeout=120)
+         f"--source-ranges={','.join(desired)}"] + _auth_flags(),
+        capture_output=True, text=True, timeout=150)
     if upd.returncode != 0:
         print(f"fw_sync: update failed: {upd.stderr.strip()}", file=sys.stderr)
         return 3

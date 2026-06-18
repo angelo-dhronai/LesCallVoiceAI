@@ -8,7 +8,6 @@ Type=oneshot
 User=angelo
 Environment=KAMAILIO_DB_URL=postgresql://lescall:lescall_dev@127.0.0.1:5432/lescall
 # For prod robustness set a dedicated service account instead of user auth:
-#   Environment=FW_SYNC_GCLOUD_ACCOUNT=lescall-fw@lescall.iam.gserviceaccount.com
-#   Environment=CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=/etc/lescall/fw-sa.json
+Environment=FW_SYNC_IMPERSONATE_SA=lescall-fw@lescall.iam.gserviceaccount.com
 ExecStartPre=/bin/sleep 2
 ExecStart=/home/angelo/lescall/calling-agent/venv/bin/python /home/angelo/lescall/deploy/fw_sync.py

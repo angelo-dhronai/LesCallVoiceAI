@@ -58,6 +58,16 @@ lescall/
 - [ ] **Phase 6 — Cutover (maintenance window, your go-ahead):** `git mv` live telephony files into
       `shared/`, repoint start scripts, restart, verify a real call. NOT done — needs your window.
 
+## Hosting
+Dashboard is live at **https://platform.lescall.dhronai.com** (DNS A → 35.207.206.252).
+- `deploy/lescall-dashboard-api.service` — FastAPI on 127.0.0.1:8080 (systemd, enabled, auto-restart).
+- `deploy/nginx-platform.conf` — nginx vhost: serves `dashboard/web/dist` SPA + proxies `/api`
+  (incl. WSS). New server block; the legacy `lescall` default_server is untouched.
+- TLS via Let's Encrypt (certbot --nginx), HTTP→HTTPS redirect, auto-renew timer.
+- `deploy/deploy_dashboard.sh <FQDN>` reproduces the whole setup.
+- NOTE: ensure the cloud firewall allows inbound 443 (80 is already open).
+- Frontend is served from the repo `dist/`; after a rebuild, nginx picks it up (no copy needed).
+
 ## Data model
 `agents`, `campaigns`, `leads`, `calls` — see `shared/db/schema.sql`.
 Default agent (Vishal Patel / Pramukh) seeded from the legacy hardcoded config;

@@ -41,11 +41,16 @@ lescall/
       dashboard; auto-generate FreeSWITCH gateway + dialplan XML from the `trunks`/`phone_numbers`
       tables and reload FS (`fs_cli -x "sofia profile external rescan"`); UI shows the exact SIP
       trunk config required (domain, IP auth vs REGISTER, allowed IP ranges).
-- [ ] **Phase 4 — Dashboard frontend:** dialer, transcripts, summaries, analytics, agent
-      builder, pitch maker, live call panel.
-- [ ] **Phase 5 — Outbound engine:** dialer loop -> FS originate -> agent core; campaign-driven.
-- [ ] **Phase 6 — Cutover (maintenance window):** `git mv` live telephony files into `shared/`,
-      update start scripts, restart, verify a real call.
+- [x] **Phase 4 — Dashboard frontend:** React+Vite+Tailwind SPA (Overview/analytics, Agents+pitch
+      maker, Outbound dialer, Calls+transcripts+AI summaries, Numbers/trunks, Live monitor).
+      Builds clean; live WS verified.
+- [x] **Phase 5 — Outbound engine:** `outbound/dialer.py` — DB-backed, reuses the proven fs_cli
+      originate cmd, status/disposition writeback, concurrency + retry. API `/campaigns/{id}/dial`,
+      `/leads/{id}/dial`. Dry-run verified end-to-end. FOLLOW-UP: wire per-campaign agent selection
+      into the live pipeline (outbound_ai_connect still uses the single hardcoded agent; full
+      DB-agent loading lands with the cutover/agent-config refactor).
+- [ ] **Phase 6 — Cutover (maintenance window, your go-ahead):** `git mv` live telephony files into
+      `shared/`, repoint start scripts, restart, verify a real call. NOT done — needs your window.
 
 ## Data model
 `agents`, `campaigns`, `leads`, `calls` — see `shared/db/schema.sql`.

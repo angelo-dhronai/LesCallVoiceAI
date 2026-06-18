@@ -88,6 +88,24 @@ def add_leads(campaign_id: int, leads: list[LeadIn]) -> dict:
     return {"campaign_id": campaign_id, "added": added}
 
 
+@router.post("/campaigns/{campaign_id}/dial")
+async def dial_campaign(campaign_id: int, dry_run: bool = False) -> dict:
+    """Run one dialing pass over the campaign's pending leads via the outbound engine."""
+    from outbound.dialer import run_campaign
+    return await run_campaign(campaign_id, dry_run=dry_run)
+
+
+@router.post("/leads/{lead_id}/dial")
+async def dial_lead_now(lead_id: int, dry_run: bool = False) -> dict:
+    from outbound.dialer import dial_lead, CALLER_ID, GATEWAY
+    with get_db() as db:
+        row = db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "lead not found")
+    status = await dial_lead(dict(row), CALLER_ID, GATEWAY, dry_run=dry_run)
+    return {"lead_id": lead_id, "status": status}
+
+
 @router.post("/leads/{lead_id}/dispose")
 def dispose_lead(lead_id: int, disposition: str, notes: Optional[str] = None) -> dict:
     with get_db() as db:

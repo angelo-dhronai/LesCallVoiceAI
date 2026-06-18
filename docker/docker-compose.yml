@@ -17,24 +17,30 @@ services:
     build: { context: .., dockerfile: docker/Dockerfile.app }
     image: lescall/app
     command: ["python", "socket_server.py"]
-    network_mode: host
+    network_mode: host          # FreeSWITCH reaches it on 127.0.0.1:9000 (no NAT)
+    user: "1000:994"            # angelo:freeswitch — playback WAVs readable by FS
     env_file: ../calling-agent/.env
     volumes:
       - ../recordings:/app/recordings
       - ../data:/app/data
       - ../credit_log:/app/credit_log
+      - /tmp/ai_telephony_playback:/tmp/ai_telephony_playback   # shared with FreeSWITCH
+      - /tmp/esl_recordings:/tmp/esl_recordings
     restart: unless-stopped
 
   ws_audio_receiver:
     image: lescall/app
     build: { context: .., dockerfile: docker/Dockerfile.app }
     command: ["python", "ws_audio_receiver.py", "--sample-rate", "8000"]
-    network_mode: host
+    network_mode: host          # receives media on :9001; talks to socket_server :9004
+    user: "1000:994"
     env_file: ../calling-agent/.env
     volumes:
       - ../recordings:/app/recordings
       - ../data:/app/data
       - ../credit_log:/app/credit_log
+      - ../calling-agent/tts_cache:/app/calling-agent/tts_cache
+      - /tmp/ai_telephony_playback:/tmp/ai_telephony_playback   # writes WAVs FS plays
     depends_on: [socket_server]
     restart: unless-stopped
 

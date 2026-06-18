@@ -305,6 +305,7 @@ ESL framing rules (unchanged from Phase 1)
 """
 
 import re
+import sys
 import socket
 import threading
 import time
@@ -2499,7 +2500,17 @@ def main() -> None:
     # not fail on the first call before an operator has SSH'd in.
     ensure_recording_dir()
     import subprocess
-    subprocess.run(["fs_cli", "-x", "reloadxml"], capture_output=True)
+    # Best-effort FreeSWITCH reload at startup. fs_cli may be absent (e.g. inside a
+    # container) — fall back to ESL over TCP, and never let this abort startup.
+    try:
+        subprocess.run(["fs_cli", "-x", "reloadxml"], capture_output=True, timeout=10)
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from shared.esl import esl_api
+            esl_api("reloadxml")
+        except Exception as e:
+            log.warning("startup reloadxml skipped (no fs_cli / ESL): %r", e)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST, PORT))

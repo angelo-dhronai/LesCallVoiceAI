@@ -71,11 +71,12 @@ services:
     restart: unless-stopped
 
   freeswitch:
-    profiles: ["fs-container"]
+    profiles: ["fs-container"]   # opt-in: stop native FS first, then `--profile fs-container up`
     build: { context: .., dockerfile: docker/Dockerfile.freeswitch }
     image: lescall/freeswitch
-    network_mode: host
+    network_mode: host           # RTP/SIP like native — no NAT, lowest latency
     volumes:
       - ../recordings:/recordings
-      - /tmp/ai_telephony_playback:/tmp/ai_telephony_playback
+      - /tmp/ai_telephony_playback:/tmp/ai_telephony_playback   # WAVs from ws_audio_receiver
+      - /tmp/esl_recordings:/tmp/esl_recordings
     restart: unless-stopped

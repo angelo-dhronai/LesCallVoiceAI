@@ -1,44 +1,42 @@
-# lescall FreeSWITCH image.
+# lescall FreeSWITCH image — FreeSWITCH (SignalWire repo) + mod_audio_stream built
+# from source against THIS image's FS headers (the repo rolled past the host's
+# 1.11.0, so the host .so can't be reused — it must be recompiled).
 #
-# ⚠️ VERIFY BEFORE PRODUCTION: this builds the third-party mod_audio_stream
-# (the live system streams call audio to ws://127.0.0.1:9001 via this module).
-# The base FreeSWITCH image must match the host's working setup (1.11.x).
-# Run with network_mode: host so RTP/SIP + the Plivo trunk behave exactly as today.
-#
-# If the build is not yet verified, keep FreeSWITCH on the host (compose profile
-# "fs-host" omits this service) until this image is validated against a real call.
+# Run host-networked (docker-compose `freeswitch` service, profile fs-container)
+# so RTP/SIP behave exactly like the native install — lowest latency, no NAT.
 
+# ---------- build stage: compile mod_audio_stream ----------
 FROM debian:bookworm-slim AS build
-
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git build-essential cmake automake autoconf libtool pkg-config \
-        libssl-dev libspeexdsp-dev libspeex-dev ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+COPY docker/signalwire-freeswitch-repo.gpg /usr/share/keyrings/signalwire-freeswitch-repo.gpg
+RUN echo "deb [signed-by=/usr/share/keyrings/signalwire-freeswitch-repo.gpg] \
+https://freeswitch.signalwire.com/repo/deb/debian-release/ bookworm main" \
+      > /etc/apt/sources.list.d/freeswitch.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        git cmake build-essential pkg-config ca-certificates \
+        libfreeswitch-dev libwebsockets-dev libssl-dev libspeexdsp-dev libspeex-dev \
+ && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 https://github.com/amigniter/mod_audio_stream.git /src/mod_audio_stream \
+ && cmake -S /src/mod_audio_stream -B /src/mod_audio_stream/build \
+ && cmake --build /src/mod_audio_stream/build --config Release \
+ && cp /src/mod_audio_stream/build/mod_audio_stream.so /tmp/mod_audio_stream.so
 
-# mod_audio_stream (https://github.com/amigniter/mod_audio_stream).
-# Requires FreeSWITCH headers — install freeswitch-dev from the base image's repo,
-# or build against a mounted FS source tree. Left as an explicit build step so it
-# is verified intentionally rather than assumed.
-WORKDIR /src
-RUN git clone --depth 1 https://github.com/amigniter/mod_audio_stream.git
-# NOTE: `cmake .. && make` here needs FreeSWITCH dev headers present (see base image).
-
-# ---- runtime ----
+# ---------- runtime stage ----------
 FROM debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        gnupg2 wget ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+COPY docker/signalwire-freeswitch-repo.gpg /usr/share/keyrings/signalwire-freeswitch-repo.gpg
+RUN echo "deb [signed-by=/usr/share/keyrings/signalwire-freeswitch-repo.gpg] \
+https://freeswitch.signalwire.com/repo/deb/debian-release/ bookworm main" \
+      > /etc/apt/sources.list.d/freeswitch.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        freeswitch freeswitch-meta-all libwebsockets18 libspeexdsp1 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
-# Install FreeSWITCH 1.11.x to match the host. (SignalWire repo or distro packages.)
-# The exact install lines depend on your repo access; documented in docker/README.md.
-
-# Our checked-in configuration (dialplan + SIP profiles + autoload).
+# Our checked-in configuration + the freshly built module.
 COPY freeswitch/etc/ /etc/freeswitch/
+COPY --from=build /tmp/mod_audio_stream.so /usr/lib/freeswitch/mod/mod_audio_stream.so
 
-# mod_audio_stream.so produced by the build stage (path depends on FS layout):
-# COPY --from=build /usr/lib/freeswitch/mod/mod_audio_stream.so /usr/lib/freeswitch/mod/
-
-EXPOSE 5060/udp 5060/tcp 5080/udp 16384-32768/udp
-CMD ["freeswitch", "-u", "freeswitch", "-g", "freeswitch", "-nonat", "-nc"]
+EXPOSE 5060/udp 5080/udp 8021/tcp 16384-32768/udp
+CMD ["freeswitch", "-u", "freeswitch", "-g", "freeswitch", "-nonat", "-nc", "-nf"]

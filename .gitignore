@@ -37,3 +37,6 @@ dashboard/web/dist/
 
 # FS image staging blob (not committed)
 docker/fs-rootfs.tar.gz
+
+# local rollback backups (not committed)
+backups/

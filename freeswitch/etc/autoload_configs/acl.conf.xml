@@ -27,6 +27,13 @@
       <!-- <node type="allow" cidr="192.168.0.0/24"/> -->
     </list>
 
+    <!-- lescall: ONLY the Kamailio SIP proxy (10.160.0.6) may send inbound to FS.
+         Carriers must traverse Kamailio (public IP:5060). Loopback kept for tools. -->
+    <list name="trusted_kamailio" default="deny">
+      <node type="allow" cidr="127.0.0.1/32"/>
+      <node type="allow" cidr="10.160.0.6/32"/>
+    </list>
+
   </network-lists>
 </configuration>
 

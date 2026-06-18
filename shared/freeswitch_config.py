@@ -23,7 +23,7 @@ AI_SOCKET = os.environ.get("AI_SOCKET", "127.0.0.1:9000")
 
 # Public SIP endpoint advertised to providers (shown in the dashboard).
 PUBLIC_SIP_IP = os.environ.get("PUBLIC_SIP_IP", "")          # resolved lazily if empty
-SIP_INBOUND_PORT = os.environ.get("SIP_INBOUND_PORT", "5080")  # FS external profile
+SIP_INBOUND_PORT = os.environ.get("SIP_INBOUND_PORT", "5060")  # Kamailio SIP proxy (public)
 RTP_PORT_RANGE = os.environ.get("RTP_PORT_RANGE", "16384-32768")
 PROVIDER_ACL = "lescall_providers"
 
@@ -73,8 +73,18 @@ def server_sip_info(provider_cidrs: list[str] | None = None) -> dict:
     }
 
 
+KAMAILIO_IP = os.environ.get("KAMAILIO_IP", "10.160.0.6")
+
+
 def render_acl(cidrs: list[str]) -> str:
-    """Full acl.conf.xml: keep the stock lan/domains lists + our provider list."""
+    """Full acl.conf.xml: stock lan/domains + provider list + trusted_kamailio.
+
+    IMPORTANT: the FreeSWITCH external profile enforces apply-inbound-acl=trusted_kamailio
+    (carriers reach us only via the Kamailio proxy). This list MUST always be present,
+    so the dashboard regenerates it here too — otherwise an "apply" would drop it and
+    break inbound. The carrier IP allow-list lives at Kamailio now; `lescall_providers`
+    is kept for reference/back-compat but is not what the external profile trusts.
+    """
     nodes = "\n".join(f'      <node type="allow" cidr="{c.strip()}"/>'
                       for c in cidrs if c.strip()) or "      <!-- no provider IPs yet -->"
     return (
@@ -83,6 +93,11 @@ def render_acl(cidrs: list[str]) -> str:
         '    <list name="lan" default="allow"/>\n'
         '    <list name="domains" default="deny">\n'
         '      <node type="allow" domain="$${domain}"/>\n'
+        '    </list>\n'
+        '    <!-- Only the Kamailio SIP proxy may send inbound to FreeSWITCH. -->\n'
+        '    <list name="trusted_kamailio" default="deny">\n'
+        '      <node type="allow" cidr="127.0.0.1/32"/>\n'
+        f'      <node type="allow" cidr="{KAMAILIO_IP}/32"/>\n'
         '    </list>\n'
         f'    <list name="{PROVIDER_ACL}" default="deny">\n'
         f'{nodes}\n'

@@ -1,0 +1,18 @@
+# lescall — Kamailio dispatcher backends (SIP signaling -> FreeSWITCH)
+#
+# Format:  setid  destination_uri  [flags] [priority] [attrs]
+#
+# setid 1 = "freeswitch media nodes". Today there is exactly ONE backend: the
+# FreeSWITCH external profile on this same VM (private NIC 10.160.0.6:5080).
+#
+# >>> TO ADD A SECOND FREESWITCH NODE LATER (zero redesign): <<<
+#   1. Append another line with the SAME setid (1) and the new node's IP:5080, e.g.
+#        1 sip:10.160.0.7:5080
+#   2. Run:  kamcmd dispatcher.reload
+#   Dispatcher will load-balance/failover across all setid-1 nodes automatically
+#   (algorithm set in kamailio.cfg). No restart, no config redesign.
+#
+# NOTE: when nodes live on OTHER hosts behind NAT, media relay (rtpengine) becomes
+# necessary — see the rtpengine notes in kamailio.cfg.
+
+1 sip:10.160.0.6:5080 0 0

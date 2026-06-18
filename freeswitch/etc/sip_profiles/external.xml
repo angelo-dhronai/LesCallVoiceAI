@@ -56,6 +56,8 @@
     <param name="inbound-codec-negotiation" value="generous"/>
     <param name="nonce-ttl" value="60"/>
     <param name="auth-calls" value="false"/>
+    <!-- lescall: accept inbound ONLY from Kamailio (see acl.conf.xml) -->
+    <param name="apply-inbound-acl" value="trusted_kamailio"/>
     <param name="inbound-late-negotiation" value="true"/>
     <!--
         DO NOT USE HOSTNAMES, ONLY IP ADDRESSES IN THESE SETTINGS!

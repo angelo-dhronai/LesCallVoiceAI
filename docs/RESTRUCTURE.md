@@ -32,11 +32,12 @@ lescall/
 ## Phases
 - [x] **Phase 1 — Foundation:** branch; archive dead code; scaffold dirs; pull FS configs;
       DB schema + data-access layer + seed (default agent + legacy leads imported).
-- [ ] **Phase 2 — Dockerize:** Dockerfiles (agent-core, dashboard-api, web); FreeSWITCH
-      image (host networking); docker-compose.yml; .dockerignore.
-- [ ] **Phase 3 — Dashboard backend:** agent CRUD, pitch maker, campaigns/leads, transcripts,
-      AI summaries (LLM over recordings), analytics endpoints.
-- [ ] **Phase 3b — Plivo numbers & trunks (NEW):** add/register Plivo DIDs + SIP trunks in the
+- [x] **Phase 2 — Dockerize:** Dockerfiles (app, dashboard-api, web, freeswitch); compose with
+      host networking + fs-container profile; .dockerignore; README. FS image flagged for
+      mod_audio_stream verification before production use.
+- [~] **Phase 3 — Dashboard backend:** DONE: agent CRUD + pitch fields. TODO: campaigns/leads
+      endpoints, transcripts, AI summaries (LLM over recordings), analytics.
+- [x] **Phase 3b — Plivo numbers & trunks (NEW):** add/register Plivo DIDs + SIP trunks in the
       dashboard; auto-generate FreeSWITCH gateway + dialplan XML from the `trunks`/`phone_numbers`
       tables and reload FS (`fs_cli -x "sofia profile external rescan"`); UI shows the exact SIP
       trunk config required (domain, IP auth vs REGISTER, allowed IP ranges).

@@ -32,6 +32,7 @@ class AgentConfig:
     language: str = "hi"          # default spoken language code (hi/gu/en or BCP-47)
     tts_speaker: str = "shubh"
     greeting: str = ""            # empty -> pipeline uses its built-in _OPENING_GREETING
+    stages: str = ""              # JSON overrides for the stage machine (goals/conditions)
 
     @property
     def is_default(self) -> bool:
@@ -68,6 +69,7 @@ def _row_to_config(row: dict) -> AgentConfig:
         language=_short_lang(row.get("language")),
         tts_speaker=row.get("tts_speaker") or DEFAULT_AGENT.tts_speaker,
         greeting=row.get("greeting") or "",
+        stages=row.get("stages") or "",
     )
 
 

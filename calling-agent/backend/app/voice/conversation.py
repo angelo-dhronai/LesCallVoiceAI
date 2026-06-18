@@ -804,7 +804,11 @@ class ConversationRouter:
         # DB-backed agent persona (name/company/prompt/pitch/greeting/language).
         # Falls back to the legacy hardcoded identity when not provided.
         from .agent_config import DEFAULT_AGENT
+        from .stage_machine import build_stage_spec
         self.agent = agent_config or DEFAULT_AGENT
+        # Data-driven stage machine: per-stage goal text + advancement conditions,
+        # overridable via the agent's `stages` JSON, else the legacy defaults.
+        self._stage_spec = build_stage_spec(self.agent)
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self._model = model
         self._timeout = timeout
@@ -1365,45 +1369,44 @@ class ConversationRouter:
         self.state.discovery_turns += 1
 
     def _maybe_advance_stage(self) -> None:
-        """Soft stage advancement — let collected data drive progression."""
+        """Soft stage advancement — data-driven, condition evaluated from the spec.
+
+        Conditions come from self._stage_spec[stage]["advance_when"] (overridable
+        per agent). The default conditions reproduce the legacy hardcoded logic
+        exactly. Stage keys/order stay canonical; we move to the next stage in
+        STAGE_ORDER when the current stage's condition is met.
+        """
+        from .stage_machine import should_advance, next_stage
+
         b = self.memory.booking
         dt = self.state.discovery_turns
 
-        if self.state.stage == STAGE_DISCOVERY:
-            _has_name = bool(b.user_name or self.memory.call_state.customer_name)
-            _has_location = bool(b.location or self.memory.call_state.selected_location)
-            # Advance once BOTH name + location are known (3+ turns), so the agent
-            # doesn't pitch projects before knowing who the caller is and where they
-            # want to buy. Fallback at 12 turns ensures the flow never stalls.
-            if (_has_name and _has_location and dt >= 3) or dt >= 12:
-                self.state.stage = STAGE_PROJECT_MATCH
-                logger.info("[STAGE] DISCOVERY → PROJECT_MATCH (name=%s, loc=%s, turns=%d)",
-                            b.user_name, b.location, dt)
+        # booking_valid is only meaningful at CONFIRMATION; compute lazily.
+        valid, missing = (False, [])
+        if self.state.stage == STAGE_CONFIRMATION:
+            valid, missing = self._validate_booking_for_closing()
 
-        elif self.state.stage == STAGE_PROJECT_MATCH:
-            # Advance to visit invitation after sufficient project discussion.
-            # Reduced from 14 to 9 turns — keep momentum.
-            if dt >= 9:
-                self.state.stage = STAGE_INVITE_VISIT
-                logger.info("[STAGE] PROJECT_MATCH → INVITE_VISIT")
+        ctx = {
+            "name": bool(b.user_name or self.memory.call_state.customer_name),
+            "location": bool(b.location or self.memory.call_state.selected_location),
+            "appointment": bool(b.appointment_time),
+            "turns": dt,
+            "confirmed": bool(b.confirmed),
+            "booking_valid": valid,
+        }
 
-        elif self.state.stage == STAGE_INVITE_VISIT:
-            if b.appointment_time:
-                self.state.stage = STAGE_CONFIRMATION
-                logger.info("[STAGE] INVITE_VISIT → CONFIRMATION")
-
-        elif self.state.stage == STAGE_CONFIRMATION:
-            if b.confirmed:
-                valid, missing = self._validate_booking_for_closing()
-                if valid:
-                    self.state.stage = STAGE_CLOSING
+        cond = (self._stage_spec.get(self.state.stage) or {}).get("advance_when", {})
+        if should_advance(cond, ctx):
+            nxt = next_stage(self.state.stage)
+            if nxt:
+                logger.info("[STAGE] %s → %s (name=%s loc=%s appt=%s turns=%d confirmed=%s)",
+                            self.state.stage, nxt, ctx["name"], ctx["location"],
+                            ctx["appointment"], dt, ctx["confirmed"])
+                self.state.stage = nxt
+                if nxt == STAGE_CLOSING:
                     self.state.is_closing = True
-                    logger.info("[STAGE] CONFIRMATION → CLOSING (booking validated)")
-                else:
-                    logger.info(
-                        "[STAGE] CLOSING blocked — missing: %s",
-                        ", ".join(missing),
-                    )
+        elif self.state.stage == STAGE_CONFIRMATION and b.confirmed and not valid:
+            logger.info("[STAGE] CLOSING blocked — missing: %s", ", ".join(missing))
 
         logger.info(
             "[STAGE-STATE] stage=%s turns=%d | loc=%s bhk=%s purpose=%s appt=%s confirmed=%s",
@@ -2184,56 +2187,10 @@ class ConversationRouter:
         }
 
         # ── Stage-specific goal ──────────────────────────────────────────────
-        _stage_goals = {
-            STAGE_GREETING: (
-                "Caller just responded to your introduction. "
-                "Warmly acknowledge what they said in their language. "
-                "Ask for their name — ONE question only."
-            ),
-            STAGE_DISCOVERY: (
-                "You are a proactive property sales consultant. Your mission: qualify this caller "
-                "and build enough rapport to earn a site visit.\n"
-                "\n"
-                "MANDATORY FLOW — after EVERY caller response:\n"
-                "  1. Acknowledge what they just said (1 sentence, genuinely).\n"
-                "  2. Check QUALIFICATION STATUS below — ask the NEXT MISSING FIELD in priority order.\n"
-                "  3. If all core fields are captured, pivot to a project recommendation naturally.\n"
-                "\n"
-                "COLLECTION PRIORITY (one question per turn, skip if already known):\n"
-                "  1. Name  2. City (Surat / Vapi / Silvassa)  3. Configuration (1/2/3 BHK)\n"
-                "  4. Budget (comfortable range — ask softly)  5. Purpose (self-use or investment)\n"
-                "  6. Timeline (when planning to buy)  7. Phone / WhatsApp\n"
-                "\n"
-                "Do NOT wait for the caller to volunteer information — ask for it warmly.\n"
-                "Do NOT skip fields — every answer helps you match the right property.\n"
-                "If the caller volunteers a field before you ask, capture it and move to the next one."
-            ),
-            STAGE_PROJECT_MATCH: (
-                "You have enough information. Now be the expert.\n"
-                "Pick EXACTLY ONE project that fits what this caller described — budget, location, purpose.\n"
-                "Name the project. Give 2 specific reasons why it fits THEM personally.\n"
-                "Never list the whole portfolio — make it feel like a personal recommendation.\n"
-                "End your recommendation with a natural bridge toward a site visit:\n"
-                "'Photos don't do it justice — would you like to see it in person?'"
-            ),
-            STAGE_INVITE_VISIT: (
-                "The caller is interested. Your only goal now: book the site visit.\n"
-                "Give EXACTLY TWO specific time options (from the available slots).\n"
-                "When they pick a slot, confirm: date, time, and their name for the register.\n"
-                "Ask for WhatsApp to send the site address and directions.\n"
-                "Do NOT give more options — scarcity creates urgency."
-            ),
-            STAGE_CONFIRMATION: (
-                "Confirm the visit details: day, time, property, and caller's name.\n"
-                "Ask if any family member is joining (great buying decisions involve family).\n"
-                "Offer to WhatsApp the exact site address and parking instructions."
-            ),
-            STAGE_CLOSING: (
-                "Warm, genuine close using caller's name. Express real excitement about meeting them. "
-                "Keep the door open — any question, just call or WhatsApp."
-            ),
-        }
-        stage_goal = _stage_goals.get(self.state.stage, _stage_goals[STAGE_DISCOVERY])
+        # Data-driven: goal text comes from the per-agent stage spec (overridable
+        # via agents.stages JSON), falling back to DISCOVERY for unknown stages.
+        _spec = self._stage_spec
+        stage_goal = (_spec.get(self.state.stage) or _spec[STAGE_DISCOVERY])["goal"]
 
         # ── Collected info ───────────────────────────────────────────────────
         # Use confirmed name only; pending name gets its own confirmation block above

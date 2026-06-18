@@ -21,7 +21,7 @@ class AgentIn(BaseModel):
     tts_speaker: str = "shubh"
     greeting: Optional[str] = None
     knowledge: Optional[str] = None
-    stages: Optional[str] = None
+    stages: Optional[str] = None     # JSON: per-stage goal/advance_when overrides
     is_active: int = 1
 
 

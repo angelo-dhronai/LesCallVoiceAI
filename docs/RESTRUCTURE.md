@@ -68,6 +68,17 @@ Dashboard is live at **https://platform.lescall.dhronai.com** (DNS A → 35.207.
 - NOTE: ensure the cloud firewall allows inbound 443 (80 is already open).
 - Frontend is served from the repo `dist/`; after a rebuild, nginx picks it up (no copy needed).
 
+## Scaling prerequisites (done)
+- **Postgres-capable data layer:** `shared/db/database.py` is dual-driver (sqlite3 /
+  psycopg3), backend chosen by `DATABASE_URL`. Portable schema; verified identical on
+  both. Single-node stays on SQLite; multi-node sets `DATABASE_URL=postgresql://…`.
+- **Redis live events:** `shared/events.py` publishes per-call events; the pipeline
+  publishes transcript/started events; the dashboard live WS subscribes (falls back to
+  log tail when `REDIS_URL` unset). Enables the live view to see calls across all nodes.
+- Activate in prod by setting `DATABASE_URL` + `REDIS_URL` in `calling-agent/.env`
+  (read by the systemd unit). `owner` columns added to trunks/phone_numbers for
+  per-user (self-service) number registration.
+
 ## Data model
 `agents`, `campaigns`, `leads`, `calls` — see `shared/db/schema.sql`.
 Default agent (Vishal Patel / Pramukh) seeded from the legacy hardcoded config;

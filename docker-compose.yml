@@ -1,0 +1,118 @@
+# ─────────────────────────────────────────────────────────────────────────
+# lescall — full application + web + data plane in ONE command:
+#     docker compose up -d --build
+#
+# Brings up: Postgres, Redis, the dashboard API, the telephony app tier
+# (socket_server + ws_audio_receiver), and the TLS web frontend.
+#
+# FreeSWITCH and Kamailio remain NATIVE host services (the SIP/media edge):
+#   - FreeSWITCH packages are token-gated (can't be imaged here) and host
+#     networking is the correct, lowest-latency setup for RTP/SIP anyway.
+#   - Kamailio's carrier-ACL reload + GCP firewall sync are host systemd bridges.
+# The containers reach them over localhost via `network_mode: host`.
+#
+# Backend services use host networking so the existing 127.0.0.1 wiring
+# (FreeSWITCH ESL :9000, media WS :9001, playback :9004, Postgres :5432,
+# Redis :6379, dashboard API :8080) all works unchanged.
+# ─────────────────────────────────────────────────────────────────────────
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lescall
+      POSTGRES_PASSWORD: lescall_dev
+      POSTGRES_DB: lescall
+    # Published on loopback so native Kamailio + the host fw_sync reach it too.
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lescall -d lescall"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    restart: unless-stopped
+
+  dashboard_api:
+    build: { context: ., dockerfile: docker/Dockerfile.dashboard-api }
+    image: lescall/dashboard-api
+    network_mode: host                    # localhost access to PG/Redis + FreeSWITCH ESL
+    user: "1000:994"                      # angelo:freeswitch (write data/ + /etc/freeswitch)
+    env_file: ./calling-agent/.env
+    environment:
+      DATABASE_URL: postgresql://lescall:lescall_dev@127.0.0.1:5432/lescall
+      REDIS_URL: redis://127.0.0.1:6379/0
+      FS_ESL_HOST: 127.0.0.1
+      FS_ESL_PASSWORD: ClueCon
+    # Seed the DB (idempotent) on first boot, then serve the API.
+    command: ["sh", "-c", "python -m shared.db.seed || true; exec uvicorn dashboard.api.main:app --host 0.0.0.0 --port 8080"]
+    volumes:
+      - ./recordings:/app/recordings
+      - ./data:/app/data
+      - ./credit_log:/app/credit_log
+      - /etc/freeswitch:/etc/freeswitch
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+    restart: unless-stopped
+
+  socket_server:
+    build: { context: ., dockerfile: docker/Dockerfile.app }
+    image: lescall/app
+    command: ["python", "socket_server.py"]
+    network_mode: host
+    user: "1000:994"
+    env_file: ./calling-agent/.env
+    environment:
+      DATABASE_URL: postgresql://lescall:lescall_dev@127.0.0.1:5432/lescall
+      REDIS_URL: redis://127.0.0.1:6379/0
+    volumes:
+      - ./recordings:/app/recordings
+      - ./data:/app/data
+      - ./credit_log:/app/credit_log
+      - /tmp/ai_telephony_playback:/tmp/ai_telephony_playback
+      - /tmp/esl_recordings:/tmp/esl_recordings
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  ws_audio_receiver:
+    image: lescall/app
+    command: ["python", "ws_audio_receiver.py", "--sample-rate", "8000"]
+    network_mode: host
+    user: "1000:994"
+    env_file: ./calling-agent/.env
+    environment:
+      DATABASE_URL: postgresql://lescall:lescall_dev@127.0.0.1:5432/lescall
+      REDIS_URL: redis://127.0.0.1:6379/0
+    volumes:
+      - ./recordings:/app/recordings
+      - ./data:/app/data
+      - ./credit_log:/app/credit_log
+      - ./calling-agent/tts_cache:/app/calling-agent/tts_cache
+      - /tmp/ai_telephony_playback:/tmp/ai_telephony_playback
+    depends_on:
+      - socket_server
+    restart: unless-stopped
+
+  web:
+    build: { context: ., dockerfile: docker/Dockerfile.web }
+    image: lescall/web
+    network_mode: host                    # binds 80/443, proxies to API on :8080
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      - dashboard_api
+    restart: unless-stopped
+
+volumes:
+  pgdata:

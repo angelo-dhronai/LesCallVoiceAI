@@ -125,3 +125,10 @@ def me(user: dict = Depends(current_user)) -> dict:
 def logout(request: Request) -> dict:
     request.session.clear()
     return {"ok": True}
+
+
+@router.get("/logout")
+def logout_redirect(request: Request):
+    """GET logout for plain <a href> links — clear the session, send to login."""
+    request.session.clear()
+    return RedirectResponse(url=PUBLIC_BASE_URL or "/")

@@ -36,16 +36,11 @@ export default function Sidebar({ view, onNavigate, collapsed }) {
         dark:bg-slate-900 dark:border-slate-800 transition-[width] duration-200`}
     >
       {/* Brand logo (white chip so the wordmark reads in dark mode too) */}
-      <div className="h-16 flex items-center gap-2 px-3 border-b border-slate-100 dark:border-slate-800">
-        <div className="bg-white rounded-lg px-2 py-1.5 flex items-center">
+      <div className="h-16 flex items-center px-2 border-b border-slate-100 dark:border-slate-800">
+        <div className="bg-white rounded-lg px-2 py-1 flex items-center">
           <img src="/brand/logo.png" alt="LesCall"
-            className={collapsed ? 'h-6 w-auto' : 'h-7 w-auto'} />
+            className={collapsed ? 'h-8 w-auto' : 'h-11 w-auto'} />
         </div>
-        {!collapsed && (
-          <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-600">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" /> live
-          </span>
-        )}
       </div>
 
       {/* Nav */}

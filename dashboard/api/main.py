@@ -13,7 +13,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from shared.db.database import init_db
 from dashboard.api import auth
-from dashboard.api.routers import agents, trunks, calls, campaigns, live
+from dashboard.api.routers import agents, trunks, calls, campaigns, live, knowledge
 
 app = FastAPI(title="lescall dashboard API", version="0.1.0")
 
@@ -49,3 +49,4 @@ app.include_router(trunks.router, prefix="/api", tags=["telephony"])
 app.include_router(calls.router, prefix="/api", tags=["calls"])
 app.include_router(campaigns.router, prefix="/api", tags=["campaigns"])
 app.include_router(live.router, prefix="/api", tags=["live"])
+app.include_router(knowledge.router, prefix="/api", tags=["knowledge"])

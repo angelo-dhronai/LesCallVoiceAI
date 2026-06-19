@@ -6,6 +6,9 @@ import FlowCanvas from './components/flow/FlowCanvas.jsx'
 import CallHistoryTable from './components/tables/CallHistoryTable.jsx'
 import KnowledgeBaseGrid from './components/tables/KnowledgeBaseGrid.jsx'
 import CallDetailView from './components/calls/CallDetailView.jsx'
+import NumbersView from './components/numbers/NumbersView.jsx'
+import CampaignsView from './components/campaigns/CampaignsView.jsx'
+import AnalyticsView from './components/analytics/AnalyticsView.jsx'
 import { Construction } from 'lucide-react'
 
 // Dark-mode context — toggled from the header, applied to <html class="dark">.
@@ -20,7 +23,7 @@ export const VIEWS = {
   calls: { crumbs: ['Call History'] },
   numbers: { crumbs: ['My Numbers'] },
   knowledge: { crumbs: ['Knowledge Base'] },
-  batches: { crumbs: ['Batches'] },
+  batches: { crumbs: ['Campaigns'] },
   reports: { crumbs: ['Reports'] },
   analytics: { crumbs: ['Analytics'] },
 }
@@ -66,6 +69,12 @@ export default function App() {
     body = <CallHistoryTable onOpenCall={setOpenCall} />
   } else if (view === 'knowledge') {
     body = <KnowledgeBaseGrid />
+  } else if (view === 'numbers') {
+    body = <NumbersView />
+  } else if (view === 'batches') {
+    body = <CampaignsView />
+  } else if (view === 'analytics') {
+    body = <AnalyticsView />
   } else {
     body = <ComingSoon title={VIEWS[view]?.crumbs.at(-1) || 'Section'} />
   }

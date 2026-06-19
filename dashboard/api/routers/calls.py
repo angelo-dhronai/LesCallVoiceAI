@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 
 from shared.db.database import get_db, _REPO_ROOT
 from shared.transcript import parse_transcript_file
@@ -57,8 +58,16 @@ def _can_view(meta: dict, owner: str) -> bool:
 
 
 def _owned_dir(conn_id: str, owner: str) -> Path:
-    """Resolve a recording dir, enforcing tenant ownership (404 if not visible)."""
-    d = RECORDINGS / conn_id
+    """Resolve a recording dir, enforcing tenant ownership (404 if not visible).
+
+    conn_id arrives from the URL path, so reject any traversal/separator first and
+    confirm the resolved path stays inside RECORDINGS before touching the disk.
+    """
+    if "/" in conn_id or "\\" in conn_id or conn_id in ("", ".", ".."):
+        raise HTTPException(404, "call not found")
+    d = (RECORDINGS / conn_id).resolve()
+    if RECORDINGS.resolve() not in d.parents:
+        raise HTTPException(404, "call not found")
     if not d.exists() or not _can_view(_read_meta(d), owner):
         raise HTTPException(404, "call not found")
     return d
@@ -96,6 +105,24 @@ def get_transcript(conn_id: str, owner: str = Depends(current_owner)) -> dict:
     if not tp.exists():
         raise HTTPException(404, "transcript not found")
     return {"conn_id": conn_id, "turns": parse_transcript_file(tp)}
+
+
+@router.get("/calls/{conn_id}/audio")
+def get_audio(conn_id: str, download: bool = False, owner: str = Depends(current_owner)):
+    """Serve the call's recorded WAV (owner-checked).
+
+    FileResponse streams the file and honors HTTP Range requests, so the browser
+    <audio> element can seek without downloading the whole file. ?download=1
+    forces a save dialog instead of inline playback.
+    """
+    d = _owned_dir(conn_id, owner)
+    wav = d / "caller_audio.wav"
+    if not wav.exists():
+        raise HTTPException(404, "audio not found")
+    headers = None
+    if download:
+        headers = {"Content-Disposition": f'attachment; filename="{conn_id}.wav"'}
+    return FileResponse(wav, media_type="audio/wav", headers=headers)
 
 
 @router.post("/calls/{conn_id}/summary")

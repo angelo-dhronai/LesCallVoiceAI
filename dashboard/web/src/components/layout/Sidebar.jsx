@@ -12,7 +12,7 @@ const NAV = [
   { id: 'calls', label: 'Call History', icon: PhoneCall },
   { id: 'numbers', label: 'My Numbers', icon: Hash },
   { id: 'knowledge', label: 'Knowledge Base', icon: BookOpen },
-  { id: 'batches', label: 'Batches', icon: Layers },
+  { id: 'batches', label: 'Campaigns', icon: Layers },
   { id: 'reports', label: 'Reports', icon: FileBarChart },
   { id: 'analytics', label: 'Analytics', icon: BarChart3 },
 ]

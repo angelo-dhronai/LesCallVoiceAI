@@ -124,3 +124,22 @@ CREATE TABLE IF NOT EXISTS phone_numbers (
     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_numbers_trunk ON phone_numbers(trunk_id);
+
+-- documents: knowledge-base files a tenant uploads for RAG grounding. The blob is
+-- stored on disk under data/knowledge/<owner-slug>/<stored_name>; the row is the
+-- index. `status` tracks indexing (pending -> indexed); `agent_id` optionally
+-- scopes a doc to one agent (NULL = available to all of the tenant's agents).
+CREATE TABLE IF NOT EXISTS documents (
+    id              {PK},
+    owner           TEXT,
+    agent_id        INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+    name            TEXT    NOT NULL,
+    doc_type        TEXT    DEFAULT 'pdf',     -- pdf | csv | docx | txt | url
+    stored_name     TEXT,                      -- filename on disk (NULL for url type)
+    source_url      TEXT,                      -- set when doc_type='url'
+    size_bytes      INTEGER DEFAULT 0,
+    status          TEXT    DEFAULT 'pending', -- pending | indexed | error
+    progress        INTEGER DEFAULT 0,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents(owner);

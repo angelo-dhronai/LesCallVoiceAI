@@ -4,7 +4,7 @@ import { agentFromApi, agentToApi } from '../../data/adapters.js'
 import AgentList from './AgentList.jsx'
 import CostBreakdownBar from './CostBreakdownBar.jsx'
 import PromptCanvas from './PromptCanvas.jsx'
-import { Save, Trash2, Bot, Loader2 } from 'lucide-react'
+import { Save, Trash2, Bot, Loader2, AlertTriangle } from 'lucide-react'
 
 const TABS = ['Agent', 'LLM', 'Audio', 'Engine', 'Call', 'Tools', 'Analytics', 'Inbound']
 
@@ -53,15 +53,16 @@ export default function AgentConfigView() {
   const [tab, setTab] = useState('Agent')
   const [saving, setSaving] = useState(false)
   const [savedTick, setSavedTick] = useState(false)
+  const [error, setError] = useState('')
 
   const load = useCallback(async (selectFirst = false) => {
-    setLoading(true)
+    setLoading(true); setError('')
     try {
       const rows = (await api.agents()).map(agentFromApi)
       setAgents(rows)
       if (selectFirst && rows.length) { setSelectedId(rows[0].id); setDraft(rows[0]) }
     } catch (e) {
-      setAgents([])
+      setAgents([]); setError(e.message)
     } finally {
       setLoading(false)
     }
@@ -113,19 +114,21 @@ export default function AgentConfigView() {
     return <div className="h-full grid place-items-center text-slate-400"><Loader2 className="h-6 w-6 animate-spin" /></div>
   }
 
-  // Empty playground for a fresh tenant.
+  // Empty playground for a fresh tenant (or a load error — surface it, don't hide it).
   if (!draft && agents.length === 0) {
     return (
       <div className="h-full grid place-items-center p-10">
         <div className="text-center max-w-sm">
-          <div className="mx-auto mb-4 h-14 w-14 rounded-2xl bg-accent-soft dark:bg-accent/10 grid place-items-center">
-            <Bot className="h-7 w-7 text-accent" />
+          <div className={`mx-auto mb-4 h-14 w-14 rounded-2xl grid place-items-center ${error ? 'bg-rose-100 dark:bg-rose-500/10' : 'bg-accent-soft dark:bg-accent/10'}`}>
+            {error ? <AlertTriangle className="h-7 w-7 text-rose-500" /> : <Bot className="h-7 w-7 text-accent" />}
           </div>
-          <h2 className="text-lg font-semibold text-slate-800 dark:text-slate-100">No agents yet</h2>
+          <h2 className="text-lg font-semibold text-slate-800 dark:text-slate-100">{error ? "Couldn't load agents" : 'No agents yet'}</h2>
           <p className="mt-1.5 text-sm text-slate-500 dark:text-slate-400">
-            This is your private workspace. Create your first voice agent to get started.
+            {error || 'This is your private workspace. Create your first voice agent to get started.'}
           </p>
-          <button className="btn btn-primary mt-5" onClick={startNew}>Create your first agent</button>
+          {error
+            ? <button className="btn btn-outline mt-5" onClick={() => load(true)}>Retry</button>
+            : <button className="btn btn-primary mt-5" onClick={startNew}>Create your first agent</button>}
         </div>
       </div>
     )

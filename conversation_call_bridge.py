@@ -82,7 +82,8 @@ class TelephonySession:
         self.playback_task = asyncio.create_task(self._playback_loop())
         self.event_task = asyncio.create_task(self._event_loop())
         await audit_manager.create(self.conn_id, caller_number=self.caller_number,
-                                   owner=getattr(self.agent_config, "owner", None))
+                                   owner=getattr(self.agent_config, "owner", None),
+                                   direction="outbound" if self.campaign_id else "inbound")
         logger.info(f"[{self.conn_id}] Session started (Phase 14)")
         self._publish_live("started")
         

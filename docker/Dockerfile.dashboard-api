@@ -9,6 +9,7 @@ COPY dashboard/api/requirements.txt /app/dashboard/api/requirements.txt
 RUN pip install -r /app/dashboard/api/requirements.txt
 
 COPY shared/ /app/shared/
+COPY outbound/ /app/outbound/
 COPY dashboard/api/ /app/dashboard/api/
 
 ENV PYTHONPATH=/app

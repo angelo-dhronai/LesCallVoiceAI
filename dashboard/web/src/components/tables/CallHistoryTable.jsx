@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect } from 'react'
-import { Search, ChevronLeft, ChevronRight, FileText, Repeat, Loader2, PhoneOff, RefreshCw } from 'lucide-react'
+import { Search, ChevronLeft, ChevronRight, FileText, Repeat, Loader2, PhoneOff, RefreshCw, AlertTriangle } from 'lucide-react'
 import { api } from '../../api.js'
 import { callFromApi } from '../../data/adapters.js'
 
@@ -26,14 +26,15 @@ function StatusBadge({ status }) {
 export default function CallHistoryTable({ onOpenCall }) {
   const [calls, setCalls] = useState([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
   const [q, setQ] = useState('')
   const [statusFilter, setStatusFilter] = useState('All')
   const [page, setPage] = useState(0)
 
   const load = async () => {
-    setLoading(true)
+    setLoading(true); setError('')
     try { setCalls((await api.calls(200)).map(callFromApi)) }
-    catch { setCalls([]) }
+    catch (e) { setCalls([]); setError(e.message) }
     finally { setLoading(false) }
   }
   useEffect(() => { load() }, [])
@@ -57,6 +58,13 @@ export default function CallHistoryTable({ onOpenCall }) {
         </div>
         <button className="btn btn-outline" onClick={load}><RefreshCw className="h-4 w-4" /> Refresh</button>
       </div>
+
+      {error && (
+        <div className="flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 dark:border-rose-500/30 dark:bg-rose-500/10 px-4 py-3 text-sm text-rose-700 dark:text-rose-300">
+          <AlertTriangle className="h-4 w-4" /> Couldn't load calls: {error}
+          <button onClick={load} className="ml-auto font-semibold hover:underline">Retry</button>
+        </div>
+      )}
 
       <div className="card-flat p-3 flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2 rounded-xl border border-slate-200 dark:border-slate-700 px-2.5 py-1.5 flex-1 min-w-48">

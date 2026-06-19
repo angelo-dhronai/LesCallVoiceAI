@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import {
-  Bot, Megaphone, Users, PhoneCall, ArrowUpRight, FileText, Loader2, RefreshCw, Plus,
+  Bot, Megaphone, Users, PhoneCall, ArrowUpRight, FileText, Loader2, RefreshCw, Plus, AlertTriangle,
 } from 'lucide-react'
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, Tooltip, Cell,
@@ -49,14 +49,15 @@ export default function Overview({ onNavigate, onOpenCall }) {
   const [stats, setStats] = useState(null)
   const [calls, setCalls] = useState([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
   const load = async () => {
-    setLoading(true)
+    setLoading(true); setError('')
     try {
       const [a, c] = await Promise.all([api.analytics(), api.calls(8)])
       setStats(a)
       setCalls(c.map(callFromApi))
-    } catch { setStats(null); setCalls([]) }
+    } catch (e) { setStats(null); setCalls([]); setError(e.message) }
     finally { setLoading(false) }
   }
   useEffect(() => { load() }, [])
@@ -77,6 +78,13 @@ export default function Overview({ onNavigate, onOpenCall }) {
           <button className="btn btn-primary" onClick={() => onNavigate('agents')}><Plus className="h-4 w-4" /> New agent</button>
         </div>
       </div>
+
+      {error && (
+        <div className="flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 dark:border-rose-500/30 dark:bg-rose-500/10 px-4 py-3 text-sm text-rose-700 dark:text-rose-300">
+          <AlertTriangle className="h-4 w-4" /> Couldn't load your dashboard: {error}
+          <button onClick={load} className="ml-auto font-semibold hover:underline">Retry</button>
+        </div>
+      )}
 
       {loading ? (
         <div className="grid place-items-center py-24 text-slate-400"><Loader2 className="h-6 w-6 animate-spin" /></div>

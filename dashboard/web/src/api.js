@@ -42,6 +42,23 @@ export const api = {
   transcript: (connId) => req('GET', `/calls/${connId}/transcript`),
   summary: (connId) => req('POST', `/calls/${connId}/summary`),
   analytics: () => req('GET', '/analytics'),
+  // Same-origin URL for the recorded WAV (used as <audio src> / download link).
+  audioUrl: (connId, download = false) =>
+    `/api/calls/${encodeURIComponent(connId)}/audio${download ? '?download=1' : ''}`,
+
+  // knowledge base
+  knowledge: () => req('GET', '/knowledge'),
+  deleteDocument: (id) => req('DELETE', `/knowledge/${id}`),
+  documentUrl: (id) => `/api/knowledge/${id}/download`,
+  uploadDocument: (formData) =>
+    fetch('/api/knowledge/upload', { method: 'POST', body: formData }).then(async (r) => {
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}: ${await r.text().catch(() => '')}`)
+      return r.json()
+    }),
+
+  dialCampaign: (id) => req('POST', `/campaigns/${id}/dial`),
+  dialLead: (id) => req('POST', `/leads/${id}/dial`),
+  disposeLead: (id, disposition) => req('POST', `/leads/${id}/dispose?disposition=${encodeURIComponent(disposition)}`),
 
   serverInfo: () => req('GET', '/telephony/server-info'),
   trunks: () => req('GET', '/trunks'),

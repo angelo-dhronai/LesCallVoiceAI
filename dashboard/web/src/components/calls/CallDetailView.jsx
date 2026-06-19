@@ -48,7 +48,13 @@ export default function CallDetailView({ call, onBack }) {
             : <TranscriptPanel bubbles={bubbles} />}
         </div>
         <div className="flex flex-col gap-5 h-[640px] min-h-0">
-          <AudioPlayer durationSeconds={call.duration || 60} waveform={waveform} hasAudio />
+          <AudioPlayer
+            src={api.audioUrl(call.id)}
+            downloadUrl={api.audioUrl(call.id, true)}
+            durationSeconds={call.duration || 60}
+            waveform={waveform}
+            hasAudio={call.status !== 'Failed'}
+          />
           <div className="flex-1 min-h-0">
             <NotesPanel connId={call.id} summary={summary} onSummary={setSummary} />
           </div>

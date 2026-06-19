@@ -42,3 +42,6 @@ docker/fs-rootfs.tar.gz
 backups/
 bolna-dashboard/node_modules/
 bolna-dashboard/dist/
+
+# ACME http-01 challenge webroot (ephemeral)
+data/acme-webroot/

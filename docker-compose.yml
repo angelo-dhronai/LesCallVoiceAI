@@ -110,6 +110,7 @@ services:
     network_mode: host                    # binds 80/443, proxies to API on :8080
     volumes:
       - /etc/letsencrypt:/etc/letsencrypt:ro
+      - ./data/acme-webroot:/var/www/acme:ro   # http-01 challenge files for cert renewal
     depends_on:
       - dashboard_api
     restart: unless-stopped

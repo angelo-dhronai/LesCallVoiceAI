@@ -45,9 +45,10 @@ _AUDIO_QUEUE_MAXSIZE = 200  # ~4s of 20ms frames at 16kHz; excess frames dropped
 class CallAuditSession:
     """Per-call recording session. All writes are non-blocking."""
 
-    def __init__(self, call_id: str, caller_number: str = "") -> None:
+    def __init__(self, call_id: str, caller_number: str = "", owner: Optional[str] = None) -> None:
         self.call_id = call_id
         self.caller_number = caller_number or "unknown"
+        self.owner = owner  # tenant (user email) this call belongs to; tags the recording for privacy
         self._start_time = time.time()
         self._start_dt = datetime.now(timezone.utc)
 
@@ -157,6 +158,7 @@ class CallAuditSession:
         duration = end_time - self._start_time
         metadata = {
             "call_id": self.call_id,
+            "owner": self.owner,
             "start_time": self._start_dt.isoformat(),
             "end_time": datetime.now(timezone.utc).isoformat(),
             "duration_seconds": round(duration, 3),
@@ -204,12 +206,13 @@ class CallAuditManager:
     def enabled(self) -> bool:
         return ENABLE_CALL_AUDIT
 
-    async def create(self, call_id: str, caller_number: str = "") -> Optional[CallAuditSession]:
+    async def create(self, call_id: str, caller_number: str = "",
+                     owner: Optional[str] = None) -> Optional[CallAuditSession]:
         if not ENABLE_CALL_AUDIT:
             return None
         if call_id in self._sessions:
             return self._sessions[call_id]
-        session = CallAuditSession(call_id, caller_number=caller_number)
+        session = CallAuditSession(call_id, caller_number=caller_number, owner=owner)
         self._sessions[call_id] = session
         await session.start()
         return session

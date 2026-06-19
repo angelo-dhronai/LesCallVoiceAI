@@ -33,6 +33,7 @@ class AgentConfig:
     tts_speaker: str = "shubh"
     greeting: str = ""            # empty -> pipeline uses its built-in _OPENING_GREETING
     stages: str = ""              # JSON overrides for the stage machine (goals/conditions)
+    owner: str | None = None      # tenant (user email) this agent belongs to; tags recordings
 
     @property
     def is_default(self) -> bool:
@@ -70,6 +71,7 @@ def _row_to_config(row: dict) -> AgentConfig:
         tts_speaker=row.get("tts_speaker") or DEFAULT_AGENT.tts_speaker,
         greeting=row.get("greeting") or "",
         stages=row.get("stages") or "",
+        owner=row.get("owner"),
     )
 
 

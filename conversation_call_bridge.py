@@ -48,6 +48,7 @@ class TelephonySession:
         except Exception as e:
             logger.warning("[%s] agent load failed (%r); using default", conn_id, e)
             agent_config = None
+        self.agent_config = agent_config
 
         # Initialize VoicePipeline with telephony endpoints
         self.pipeline = VoicePipeline(
@@ -80,7 +81,8 @@ class TelephonySession:
         self.pipeline_task = asyncio.create_task(self.pipeline.run_until_shutdown())
         self.playback_task = asyncio.create_task(self._playback_loop())
         self.event_task = asyncio.create_task(self._event_loop())
-        await audit_manager.create(self.conn_id, caller_number=self.caller_number)
+        await audit_manager.create(self.conn_id, caller_number=self.caller_number,
+                                   owner=getattr(self.agent_config, "owner", None))
         logger.info(f"[{self.conn_id}] Session started (Phase 14)")
         self._publish_live("started")
         

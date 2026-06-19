@@ -104,6 +104,23 @@ services:
       - socket_server
     restart: unless-stopped
 
+  # Sarvam API key rotator: keeps a healthy key active so STT/TTS never go dark
+  # when one key runs out of credits. Shares the key pool (./data) and .env with
+  # the telephony services; the clients also rotate reactively on 401/402/403.
+  sarvam_rotator:
+    image: lescall/app
+    command: ["python", "deploy/sarvam_rotator.py"]
+    network_mode: host
+    user: "1000:994"
+    env_file: ./calling-agent/.env
+    environment:
+      SARVAM_ROTATOR_INTERVAL_S: "30"
+    volumes:
+      - ./data:/app/data
+      - ./deploy:/app/deploy
+      - ./calling-agent/.env:/app/calling-agent/.env
+    restart: unless-stopped
+
   web:
     build: { context: ., dockerfile: docker/Dockerfile.web }
     image: lescall/web

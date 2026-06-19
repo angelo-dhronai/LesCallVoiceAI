@@ -1,0 +1,18 @@
+[Unit]
+Description=LesCall Sarvam API key rotator (auto-rotate keys on credit exhaustion)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=angelo
+WorkingDirectory=/home/angelo/lescall
+# Load the key pool (SARVAM_API_KEYS) and other env from the app .env.
+EnvironmentFile=/home/angelo/lescall/calling-agent/.env
+Environment=SARVAM_ROTATOR_INTERVAL_S=30
+ExecStart=/usr/bin/python3 /home/angelo/lescall/deploy/sarvam_rotator.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

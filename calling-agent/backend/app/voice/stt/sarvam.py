@@ -8,7 +8,9 @@ Requires SARVAM_API_KEY environment variable.
 from __future__ import annotations
 
 import os
+import sys
 import logging
+from pathlib import Path
 
 import httpx
 
@@ -18,6 +20,22 @@ logger = logging.getLogger(__name__)
 
 SARVAM_API_URL = "https://api.sarvam.ai/speech-to-text"
 SARVAM_TIMEOUT = 10.0
+
+
+def _keypool():
+    """Lazily import the shared Sarvam key pool (repo-root module).
+
+    Returns the module, or None when it isn't importable (then we fall back to
+    the plain SARVAM_API_KEY env var — single-key behaviour, unchanged).
+    """
+    try:
+        repo_root = Path(__file__).resolve().parents[5]  # sarvam.py -> stt -> voice -> app -> backend -> calling-agent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from shared import sarvam_keys
+        return sarvam_keys
+    except Exception:
+        return None
 
 
 class SarvamRateLimitError(Exception):
@@ -53,7 +71,8 @@ class SarvamSTT(STTProvider):
         model: str = "saaras:v3",
         mode: str = "codemix",
     ) -> None:
-        self._api_key = api_key or os.environ.get("SARVAM_API_KEY", "")
+        pool = _keypool()
+        self._api_key = api_key or (pool.active_key() if pool else os.environ.get("SARVAM_API_KEY", ""))
         self._api_url = api_url
         self._timeout = timeout
         self._model = model
@@ -76,6 +95,21 @@ class SarvamSTT(STTProvider):
                 limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=60),
             )
         return self._client
+
+    def _rotate_key(self, reason: str) -> bool:
+        """Report the current key exhausted to the pool and adopt the next one.
+
+        Returns True only when a *different* key becomes active.
+        """
+        pool = _keypool()
+        if not pool:
+            return False
+        old = self._api_key
+        new = pool.report_exhausted(old, reason=reason)
+        if new and new != old:
+            self._api_key = new
+            return True
+        return False
 
     async def transcribe(
         self,
@@ -106,43 +140,52 @@ class SarvamSTT(STTProvider):
 
         client = self._get_client()
 
-        try:
-            response = await client.post(
-                self._api_url,
-                headers={"api-subscription-key": self._api_key},
-                data={
-                    "language_code": lang_code,
-                    "model": self._model,
-                    "mode": self._mode,
-                },
-                files={"file": ("audio.wav", wav_data, "audio/wav")},
-            )
-        except httpx.TimeoutException as exc:
-            logger.warning("[STT:Sarvam] Request timed out: %s", exc)
-            raise
-        except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError) as exc:
-            # Stale or closed connection — discard the client so the next
-            # attempt (STT router retry or next turn) opens a fresh one.
-            logger.warning(
-                "[STT:Sarvam] Stale connection error: %s — resetting client for retry", exc
-            )
-            await self.close()
-            raise
+        # Up to 2 attempts so a credit-exhausted key (HTTP 401/402/403) can be
+        # rotated out of the pool and the request retried with a fresh key.
+        for attempt in range(2):
+            try:
+                response = await client.post(
+                    self._api_url,
+                    headers={"api-subscription-key": self._api_key},
+                    data={
+                        "language_code": lang_code,
+                        "model": self._model,
+                        "mode": self._mode,
+                    },
+                    files={"file": ("audio.wav", wav_data, "audio/wav")},
+                )
+            except httpx.TimeoutException as exc:
+                logger.warning("[STT:Sarvam] Request timed out: %s", exc)
+                raise
+            except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError) as exc:
+                # Stale or closed connection — discard the client so the next
+                # attempt (STT router retry or next turn) opens a fresh one.
+                logger.warning(
+                    "[STT:Sarvam] Stale connection error: %s — resetting client for retry", exc
+                )
+                await self.close()
+                raise
 
-        if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After")
-            logger.warning(
-                "[STT:Sarvam] Rate limited (HTTP 429) Retry-After=%s", retry_after
-            )
-            raise SarvamRateLimitError(retry_after=retry_after)
+            if response.status_code in (401, 402, 403) and attempt == 0 and self._rotate_key(f"http_{response.status_code}"):
+                logger.warning("[STT:Sarvam] HTTP %d (credits/auth) — rotated key, retrying",
+                               response.status_code)
+                continue
 
-        if response.status_code != 200:
-            logger.error(
-                "[STT:Sarvam] HTTP %d — body: %s",
-                response.status_code,
-                response.text[:500],
-            )
-            response.raise_for_status()
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                logger.warning(
+                    "[STT:Sarvam] Rate limited (HTTP 429) Retry-After=%s", retry_after
+                )
+                raise SarvamRateLimitError(retry_after=retry_after)
+
+            if response.status_code != 200:
+                logger.error(
+                    "[STT:Sarvam] HTTP %d — body: %s",
+                    response.status_code,
+                    response.text[:500],
+                )
+                response.raise_for_status()
+            break
 
         data = response.json()
         transcript = data.get("transcript", "").strip()

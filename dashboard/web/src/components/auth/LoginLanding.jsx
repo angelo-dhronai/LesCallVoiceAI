@@ -30,11 +30,10 @@ export default function LoginLanding() {
         <div className="absolute -bottom-32 -left-16 h-80 w-80 rounded-full bg-emerald-400/15 blur-3xl" />
 
         <div className="relative flex items-center gap-3">
-          <div className="h-11 w-11 rounded-2xl bg-white/10 backdrop-blur grid place-items-center text-2xl font-extrabold">L</div>
-          <div>
-            <div className="text-xl font-extrabold tracking-tight">LesCall</div>
-            <div className="text-xs text-white/60">by Dhron AI</div>
+          <div className="bg-white rounded-xl px-3 py-2">
+            <img src="/brand/logo.png" alt="LesCall" className="h-8 w-auto" />
           </div>
+          <div className="text-xs text-white/60">by Dhron AI</div>
         </div>
 
         <div className="relative max-w-md">
@@ -69,9 +68,8 @@ export default function LoginLanding() {
       <div className="flex items-center justify-center p-6 sm:p-12">
         <div className="w-full max-w-sm">
           {/* compact brand for mobile */}
-          <div className="lg:hidden flex items-center gap-2.5 mb-8">
-            <div className="h-10 w-10 rounded-2xl bg-brand grid place-items-center text-white text-xl font-extrabold">L</div>
-            <div className="text-lg font-extrabold text-slate-900">LesCall</div>
+          <div className="lg:hidden mb-8">
+            <img src="/brand/logo.png" alt="LesCall" className="h-9 w-auto" />
           </div>
 
           <h2 className="text-2xl font-bold text-slate-900">Welcome back</h2>

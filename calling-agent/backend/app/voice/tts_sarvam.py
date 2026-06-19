@@ -12,8 +12,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import queue as _queue
 import threading
+from pathlib import Path
 
 import httpx
 import numpy as np
@@ -24,6 +26,18 @@ from ..audio_transport.base import AudioSink
 from ..audio_transport.local_speaker_sink import LocalSpeakerSink
 
 logger = logging.getLogger(__name__)
+
+
+def _keypool():
+    """Lazily import the shared Sarvam key pool (repo-root module), or None."""
+    try:
+        repo_root = Path(__file__).resolve().parents[4]  # tts_sarvam.py -> voice -> app -> backend -> calling-agent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from shared import sarvam_keys
+        return sarvam_keys
+    except Exception:
+        return None
 
 SARVAM_TTS_STREAM_URL = "https://api.sarvam.ai/text-to-speech/stream"
 DEFAULT_MODEL = "bulbul:v3"
@@ -59,7 +73,8 @@ class SarvamTTS(StreamingTTS):
             sample_rate=sample_rate,
             output_device=output_device
         ))
-        self._api_key = api_key or os.environ.get("SARVAM_API_KEY", "")
+        _pool = _keypool()
+        self._api_key = api_key or (_pool.active_key() if _pool else os.environ.get("SARVAM_API_KEY", ""))
         self._model = model
         self._speaker = speaker
         self._sample_rate = sample_rate
@@ -124,6 +139,18 @@ class SarvamTTS(StreamingTTS):
                 logger.info("[TTS:Sarvam] Playback complete (%d chunks)", chunk_count)
             self._reset()
 
+    def _rotate_key(self, reason: str) -> bool:
+        """Report the active key exhausted to the pool and adopt the next one."""
+        pool = _keypool()
+        if not pool:
+            return False
+        old = self._api_key
+        new = pool.report_exhausted(old, reason=reason)
+        if new and new != old:
+            self._api_key = new
+            return True
+        return False
+
     async def _stream_audio(self, text: str):
         lang_code = _LANG_CODE_MAP.get(self._language, "en-IN")
 
@@ -159,6 +186,13 @@ class SarvamTTS(StreamingTTS):
                             "[TTS:Sarvam] HTTP %d — %s",
                             response.status_code, body[:500],
                         )
+                        # Credit-exhausted / invalid key: rotate to the next pool
+                        # key and retry (don't fail the call while keys remain).
+                        if response.status_code in (401, 402, 403) and self._rotate_key(f"http_{response.status_code}"):
+                            logger.warning("[TTS:Sarvam] HTTP %d (credits/auth) — rotated key, retrying",
+                                           response.status_code)
+                            self._client = None
+                            continue
                         return
 
                     logger.info("[TTS:Sarvam] Streaming started for %r (%s, %s)",

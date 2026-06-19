@@ -45,3 +45,6 @@ bolna-dashboard/dist/
 
 # ACME http-01 challenge webroot (ephemeral)
 data/acme-webroot/
+
+# Sarvam key pool (secrets)
+data/sarvam_keys.json

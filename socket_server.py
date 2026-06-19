@@ -528,28 +528,17 @@ def extract_rtp_info(headers: dict) -> dict:
     — guessing here would produce subtly wrong tcpdump filters."""
     g = headers.get
 
+    # Caller-Caller-ID-Number is URL-encoded (e.g. %2B919599761331 → +919...).
+    # Strip leading + and any non-digit chars so the value is safe as a URL
+    # path segment forwarded to ws_audio_receiver.py.
     from urllib.parse import unquote
-
-    # For outbound calls (Channel-Direction=outbound), the channel was
-    # originated by us so Caller-Caller-ID-Number is our own number.
-    # Use Caller-Destination-Number instead so ws_audio_receiver.py
-    # records the called party's number in the audit folder.
-    direction = (g("Channel-Direction", "") or g("Caller-Direction", "")).lower()
-    if direction == "outbound":
-        raw_caller = (g("Caller-Destination-Number", "")
-                      or g("Channel-Destination-Number", ""))
-        log.info("OUTBOUND call detected — using destination number as "
-                 "caller_number: %r", raw_caller)
-    else:
-        raw_caller = g("Caller-Caller-ID-Number", "") or g("Channel-Caller-ID-Number", "")
-
+    raw_caller = g("Caller-Caller-ID-Number", "") or g("Channel-Caller-ID-Number", "")
     caller_number = re.sub(r"[^\d]", "", unquote(raw_caller)) if raw_caller else ""
 
     return {
         "uuid":             g("Channel-Call-UUID") or g("Unique-ID", "unknown"),
         "channel_name":     g("Channel-Name", ""),
         "caller_number":    caller_number,
-        "call_direction":   direction or "inbound",
         "local_ip":         g("variable_local_media_ip", ""),
         "local_port":       g("variable_local_media_port", ""),
         "remote_ip":        g("variable_remote_media_ip", ""),
@@ -1886,20 +1875,15 @@ def handle(conn: socket.socket, addr) -> None:
                 log.info("AUDIO_STREAM disabled (AUDIO_STREAM_WS_URL "
                          "is empty). Playback path unaffected.")
 
-        # ------------- Phase 2: single playback execute ---------------
-        # PLAYBACK_PAYLOAD bytes are byte-for-byte identical from
-        # Phase 2 through Phase 5. The only Phase-5 change is that the
-        # record_session sendmsg above now precedes this on the wire.
-        send_raw(conn, PLAYBACK_PAYLOAD, "PLAYBACK_EXECUTE", t0)
-        # P5-B: dual-write NEW (T5_playback_sent) and LEGACY
-        # (T3_playback_sent) checkpoint keys.
-        _t = time.monotonic() - t0
-        cp["T5_playback_sent"] = _t
-        cp["T3_playback_sent"] = _t
-        state = "SENT_PLAYBACK"
-        log.info("STATE -> %s (T5 +%.3fs) — awaiting sendmsg ack, then "
-                 "CHANNEL_EXECUTE / CHANNEL_EXECUTE_COMPLETE for "
-                 "Application=playback", state, _t)
+        # ------------- Phase 2 diagnostic tone: REMOVED ----------------
+        # This used to unconditionally fire a 6s tone_stream://%(2000,
+        # 4000,440) probe beep (PLAYBACK_PAYLOAD) on every call, left
+        # over from the Phase-2..9 RTP forensic investigation. It blocked
+        # the channel for ~6s and was audible to callers as a beep
+        # before the AI greeting could start. Removed for production —
+        # it was never a real call-flow requirement, only a diagnostic.
+        state = "SKIPPED_DIAGNOSTIC_PLAYBACK"
+        log.info("STATE -> %s (diagnostic tone probe disabled)", state)
 
         # ------------- WAITING with execution-aware classification ----
         state = "WAITING"
@@ -1974,11 +1958,24 @@ def handle(conn: socket.socket, addr) -> None:
                     cp.setdefault("T4_playback_execute", now)
                     cp.setdefault("T6_playback_execute", now)  # P5-B
                     counters["playback_execute"] += 1
-                    log.info("EXEC START: Application=%s  "
-                             "Application-Data=%r  (T6 +%.3fs, "
-                             "+%.1fms after T5)",
-                             app, app_data, now,
-                             (now - cp["T5_playback_sent"]) * 1000)
+                    t5_sent = cp.get("T5_playback_sent")
+                    # T5_playback_sent is only set by the (now-removed)
+                    # diagnostic tone probe — every other playback (e.g.
+                    # the AI agent's TTS injected via the Phase-12
+                    # listener) has no T5, so this must not be a direct
+                    # dict lookup or it raises KeyError and crashes this
+                    # call's handler thread, which makes FreeSWITCH treat
+                    # the dead ESL control connection as a reason to hang
+                    # up the channel.
+                    if t5_sent is not None:
+                        log.info("EXEC START: Application=%s  "
+                                 "Application-Data=%r  (T6 +%.3fs, "
+                                 "+%.1fms after T5)",
+                                 app, app_data, now, (now - t5_sent) * 1000)
+                    else:
+                        log.info("EXEC START: Application=%s  "
+                                 "Application-Data=%r  (T6 +%.3fs)",
+                                 app, app_data, now)
                 elif ev == "CHANNEL_EXECUTE_COMPLETE" and app == "playback":
                     cp.setdefault("T5_playback_execute_complete", now)
                     cp.setdefault("T7_playback_complete", now)  # P5-B

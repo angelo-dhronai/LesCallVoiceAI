@@ -37,12 +37,6 @@ MIN_CONFIDENCE = 0.4
 _RL_INITIAL_BACKOFF_S = 60.0
 _RL_MAX_BACKOFF_S = 300.0
 
-# Global (process-wide) Sarvam rate-limit state shared across all STTRouter
-# instances. When any call hits a 429, all concurrent calls immediately route
-# to Whisper instead of pile-driving the same rate-limited endpoint.
-_global_rl_until: float = 0.0
-_global_rl_count: int = 0
-
 _FILLER_WORDS = {"um", "uh", "like", "you know"}
 _FILLER_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(w) for w in _FILLER_WORDS) + r")\b",
@@ -341,61 +335,53 @@ class STTRouter:
         sample_rate: int = 16_000,
         language: str = "en",
     ) -> STTResult:
-        global _global_rl_until, _global_rl_count
-
         duration_ms = len(audio_bytes) / (sample_rate * 2) * 1000
         logger.info("[STT] Audio segment: %.0f ms, %d bytes", duration_ms, len(audio_bytes))
 
         now = time.monotonic()
 
-        # ── Sarvam rate-limited (global or per-instance): route to fallback ──
-        rl_until = max(self._sarvam_rl_until, _global_rl_until)
-        if now < rl_until:
-            remaining = rl_until - now
+        # ── Sarvam rate-limited: route directly to fallback ──────────────
+        if now < self._sarvam_rl_until:
+            remaining = self._sarvam_rl_until - now
             logger.warning(
-                "[STT] Sarvam rate-limited (%.0fs remaining, global=%s) — routing to fallback",
+                "[STT] Sarvam rate-limited (%.0fs remaining) — routing to fallback",
                 remaining,
-                now < _global_rl_until,
             )
-            text, _, _, _ = await self._try_provider(
+            text, _, _ = await self._try_provider(
                 self._fallback, "fallback", audio_bytes, sample_rate, language
             )
             return STTResult(text=text)
 
         # ── Try primary (Sarvam) ─────────────────────────────────────────
         try:
-            text, had_error, detected_lang, lang_prob = await self._try_provider(
+            text, had_error, detected_lang = await self._try_provider(
                 self._primary, "primary", audio_bytes, sample_rate, language
             )
         except SarvamRateLimitError as exc:
-            # Apply exponential backoff on both per-instance and global state
-            # so all concurrent calls immediately know Sarvam is rate-limiting.
-            _global_rl_count += 1
-            self._sarvam_rl_count = _global_rl_count
+            # Apply exponential backoff; reset on the next successful call
+            self._sarvam_rl_count += 1
             backoff = min(
-                _RL_INITIAL_BACKOFF_S * (2 ** (_global_rl_count - 1)),
+                _RL_INITIAL_BACKOFF_S * (2 ** (self._sarvam_rl_count - 1)),
                 _RL_MAX_BACKOFF_S,
             )
-            _global_rl_until = time.monotonic() + backoff
-            self._sarvam_rl_until = _global_rl_until
+            self._sarvam_rl_until = time.monotonic() + backoff
             logger.warning(
-                "[STT] Sarvam rate-limited (strike %d, GLOBAL) — backoff %.0fs, "
+                "[STT] Sarvam rate-limited (strike %d) — backoff %.0fs, "
                 "retry-after=%s — routing to fallback",
-                _global_rl_count,
+                self._sarvam_rl_count,
                 backoff,
                 exc.retry_after,
             )
-            text, _, _, _ = await self._try_provider(
+            text, _, _ = await self._try_provider(
                 self._fallback, "fallback", audio_bytes, sample_rate, language
             )
             return STTResult(text=text)
 
         if text:
-            # Successful Sarvam call → reset both per-instance and global counters
+            # Successful Sarvam call → reset rate-limit strike counter
             self._sarvam_rl_count = 0
-            _global_rl_count = 0
             logger.info("[STT] Primary succeeded: %r", text)
-            return STTResult(text=text, detected_language=detected_lang, language_probability=lang_prob)
+            return STTResult(text=text, detected_language=detected_lang)
 
         if not had_error:
             # Sarvam processed the audio cleanly but found no speech.
@@ -408,7 +394,7 @@ class STTRouter:
 
         # ── Primary had a genuine API/network error → try fallback ───────
         logger.info("[STT] Primary errored — routing to fallback provider")
-        text, _, _, _ = await self._try_provider(
+        text, _, _ = await self._try_provider(
             self._fallback, "fallback", audio_bytes, sample_rate, language
         )
         if text:
@@ -433,13 +419,13 @@ class STTRouter:
         audio_bytes: bytes,
         sample_rate: int,
         language: str,
-    ) -> tuple[str, bool, str | None, float | None]:
+    ) -> tuple[str, bool, str | None]:
         """
         Attempt transcription with up to (max_retries + 1) attempts.
 
         Returns
         -------
-        (transcript, had_error, detected_language, language_probability)
+        (transcript, had_error, detected_language)
             transcript : str
                 Clean, post-processed text; empty string if nothing usable.
             had_error : bool
@@ -449,8 +435,6 @@ class STTRouter:
             detected_language : str | None
                 BCP-47 language code returned by the provider (e.g. "gu-IN"),
                 or None if the provider did not report one.
-            language_probability : float | None
-                Confidence in the detected language (0.0–1.0), or None.
         """
         had_error = False
 
@@ -462,7 +446,6 @@ class STTRouter:
                 text = result.text
                 confidence = result.confidence
                 detected_lang = result.detected_language
-                lang_prob = result.language_probability
 
                 if confidence < self._min_confidence:
                     logger.info(
@@ -470,31 +453,29 @@ class STTRouter:
                         "provider=%s attempt=%d",
                         confidence, text, label, attempt,
                     )
-                    return "", False, None, None
+                    return "", False, None
 
                 if len(text) < self._min_length:
                     logger.info(
                         "[STT] %s short/empty transcript %r (attempt %d) — no speech",
                         label, text, attempt,
                     )
-                    return "", False, None, None
+                    return "", False, None
 
                 validated = validate_transcript(text)
                 if validated:
                     processed = self._post_process(validated, language)
                     logger.info(
-                        "[STT] %s attempt %d: RAW=%r -> validated=%r -> POST=%r lang=%s prob=%s",
+                        "[STT] %s attempt %d: %r -> validated %r -> processed %r",
                         label, attempt, text, validated, processed,
-                        detected_lang,
-                        f"{lang_prob:.2f}" if lang_prob is not None else "n/a",
                     )
-                    return processed, False, detected_lang, lang_prob
+                    return processed, False, detected_lang
 
                 logger.info(
                     "[STT] %s transcript %r rejected by validation (attempt %d)",
                     label, text, attempt,
                 )
-                return "", False, None, None
+                return "", False, None
 
             except SarvamRateLimitError:
                 raise
@@ -512,4 +493,4 @@ class STTRouter:
                     label, attempt + 1, self._max_retries + 1,
                 )
 
-        return "", had_error, None, None
+        return "", had_error, None

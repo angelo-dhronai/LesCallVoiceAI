@@ -83,7 +83,12 @@ if [ "$ENABLE_STT_WORKER" == "1" ]; then
 fi
 
 # 5. Create a filtered view for call_bridge logs (they go to ws_audio_receiver.log)
-nohup tail -f "$RUN_DIR/ws_audio_receiver.log" | grep --line-buffered "call_bridge" >> "$RUN_DIR/call_bridge.log" 2>&1 &
+# Wrapped in `bash -c` so the redirect below applies to tail's stderr too —
+# otherwise tail -f's stderr inherits the caller's stdout/stderr pipe (e.g. the
+# dashboard's subprocess pipe) and, since tail -f never exits, that pipe never
+# reaches EOF, which makes the dashboard think a start/stop command is stuck
+# running forever.
+nohup bash -c 'tail -f "'"$RUN_DIR"'/ws_audio_receiver.log" | grep --line-buffered "call_bridge"' >> "$RUN_DIR/call_bridge.log" 2>&1 &
 FILTER_PID=$!
 echo $FILTER_PID > "$RUN_DIR/call_bridge_filter.pid"
 

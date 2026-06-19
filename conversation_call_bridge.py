@@ -4,6 +4,7 @@ import json
 import struct
 import time
 import wave
+from collections import deque
 from typing import Dict
 
 import sys
@@ -43,13 +44,17 @@ class TelephonySession:
             event_hub=self.hub,
             mic_enabled=True,
             skip_greeting=skip_greeting,
-            call_id=conn_id,
         )
         self.pipeline_task = None
         self.playback_task = None
         self.event_task = None
         self._running = False
-        
+
+        # Rolling tail of recent transcript turns, for the dashboard's live
+        # snapshot writer (see ws_audio_receiver.py). Purely additive — fed
+        # from the same hub events already consumed for call-audit logging.
+        self.transcript_tail: deque = deque(maxlen=6)
+
         # Diagnostics
         self.stats = {
             "first_audio_t": None,
@@ -136,8 +141,10 @@ class TelephonySession:
                         self.stats["first_transcript_t"] = time.time()
                         logger.info(f"[{self.conn_id}] First transcript received")
                     audit_manager.add_event(self.conn_id, "Caller", event.get("text", ""))
+                    self.transcript_tail.append({"speaker": "Caller", "text": event.get("text", "")})
                 elif etype == "agent":
                     audit_manager.add_event(self.conn_id, "Agent", event.get("text", ""))
+                    self.transcript_tail.append({"speaker": "Agent", "text": event.get("text", "")})
         except asyncio.CancelledError:
             pass
         finally:

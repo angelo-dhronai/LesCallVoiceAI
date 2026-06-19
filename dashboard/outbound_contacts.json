@@ -1,78 +1,40 @@
 [
   {
-    "id": "1781605550028_2864",
-    "phone": "+918076562864",
-    "name": "Angelo  P Chery",
-    "notes": "angelo",
-    "added_at": "2026-06-16T10:25:50.028606Z",
-    "call_status": "busy",
-    "disposition": "not_classified",
-    "call_count": 3,
-    "last_called_at": "2026-06-16T10:39:08.264579Z",
-    "call_notes": "",
-    "call_history": [
-      {
-        "ts": "2026-06-16T10:26:00.634512Z",
-        "call_status": "answered"
-      },
-      {
-        "ts": "2026-06-16T10:31:17.636779Z",
-        "call_status": "answered"
-      },
-      {
-        "ts": "2026-06-16T10:39:08.264579Z",
-        "call_status": "busy"
-      }
-    ]
-  },
-  {
-    "id": "1781605818929_0227",
-    "phone": "+917042340227",
-    "name": "alwyn",
-    "notes": "ben",
-    "added_at": "2026-06-16T10:30:18.929227Z",
-    "call_status": "answered",
-    "disposition": "not_classified",
-    "call_count": 4,
-    "last_called_at": "2026-06-16T10:52:33.857218Z",
-    "call_notes": "",
-    "call_history": [
-      {
-        "ts": "2026-06-16T10:31:53.891892Z",
-        "call_status": "busy"
-      },
-      {
-        "ts": "2026-06-16T10:39:35.738140Z",
-        "call_status": "busy"
-      },
-      {
-        "ts": "2026-06-16T10:52:20.023055Z",
-        "call_status": "answered"
-      },
-      {
-        "ts": "2026-06-16T10:52:33.857218Z",
-        "call_status": "answered"
-      }
-    ]
-  },
-  {
-    "id": "1781606281435_2520",
-    "phone": "+919930852520",
-    "name": "Vrushi",
+    "id": "1781854054155_1331",
+    "phone": "+919599761331",
+    "name": "angelo main",
     "notes": "",
-    "added_at": "2026-06-16T10:38:01.435722Z",
+    "added_at": "2026-06-19T07:27:34.155738Z",
     "call_status": "answered",
-    "disposition": "to_contact_later",
-    "call_count": 2,
-    "last_called_at": "2026-06-16T10:39:46.365716Z",
+    "disposition": "not_classified",
+    "call_count": 1,
+    "last_called_at": "2026-06-19T07:27:44.346053Z",
     "call_notes": "",
     "call_history": [
       {
-        "ts": "2026-06-16T10:38:50.032829Z",
-        "call_status": "no_answer"
+        "ts": "2026-06-19T07:27:44.346053Z",
+        "call_status": "answered"
+      }
+    ]
+  },
+  {
+    "id": "1781854161006_5737",
+    "phone": "+918628835737",
+    "name": "moksh",
+    "notes": "",
+    "added_at": "2026-06-19T07:29:21.006200Z",
+    "call_status": "answered",
+    "disposition": "not_classified",
+    "call_count": 2,
+    "last_called_at": "2026-06-19T07:29:57.757637Z",
+    "call_notes": "",
+    "call_history": [
+      {
+        "ts": "2026-06-19T07:29:40.615479Z",
+        "call_status": "busy"
       },
       {
-        "ts": "2026-06-16T10:39:46.365716Z",
+        "ts": "2026-06-19T07:29:57.757637Z",
         "call_status": "answered"
       }
     ]

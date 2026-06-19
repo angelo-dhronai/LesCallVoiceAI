@@ -108,7 +108,6 @@ class EngineResult:
     text: str
     is_shortcut: bool
     intent: str
-    cache_key: str | None = None
 
 
 class ConversationState:
@@ -662,93 +661,6 @@ _GRACEFUL_CLOSE: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Greeting-only detection
-# ---------------------------------------------------------------------------
-
-_GREETING_WORDS = frozenset({
-    "hello", "helo", "hellow", "halo", "hallo",
-    "hi", "hey",
-    "namaste", "namaskar",
-    "kem", "cho", "kemcho",
-    "हेलो", "हैलो", "नमस्ते", "हाय",
-    "હેલો", "નમસ્તે",
-})
-
-_GREETING_ONLY_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
-
-
-def _is_greeting_only(text: str) -> bool:
-    """Return True if text contains only greeting words and punctuation — no substantive content."""
-    cleaned = _GREETING_ONLY_PUNCT_RE.sub("", text).strip().lower()
-    if not cleaned:
-        return False
-    words = cleaned.split()
-    return all(w in _GREETING_WORDS for w in words)
-
-
-# Mid-conversation greeting response (connectivity check)
-_MID_CALL_GREETING_RESPONSE = "Hello, kya aapko meri awaaz aa rahi hai?"
-
-# ---------------------------------------------------------------------------
-# TTS cache routing — LLM outputs CACHE:<key> instead of live text when a
-# pre-generated WAV is the correct response.  The pipeline intercepts this
-# token and plays the cached file instead of calling Sarvam TTS.
-# ---------------------------------------------------------------------------
-
-_CACHE_ROUTER_INSTRUCTIONS = """
-━━ CACHE ROUTING — READ CAREFULLY ━━
-When the situation below matches EXACTLY, output ONLY the bare token shown.
-NO greeting. NO prefix. NO suffix. NO punctuation. NOTHING else.
-If you add even one extra character, the routing breaks and a live API call fires.
-
-STAGE_DISCOVERY — gathering caller info:
-  CACHE:ask_name                → need caller's name (not yet in CallState)
-  CACHE:ask_property_type       → need to ask 1BHK / 2BHK / 3BHK / villa
-  CACHE:ask_budget              → need to ask budget
-  CACHE:ask_location_preference → need to ask Surat / Vapi / Silvassa
-
-STAGE_PROJECT_MATCH — presenting options:
-  CACHE:faq_projects_overview   → "what projects do you have?" — no location/type given
-  CACHE:faq_price_range_general → general price/rate question — no specific project named
-  CACHE:confirm_interest        → you are confirming one project matches their criteria
-
-FAQ — any stage (caller asks general questions):
-  CACHE:faq_about_company       → who is Pramukh Group / background / how old
-  CACHE:faq_trust_track_record  → reliability / past projects / builder reputation
-  CACHE:faq_rera                → RERA / legal compliance / government approved
-  CACHE:faq_payment_plan        → payment plans / installments / EMI
-  CACHE:faq_home_loan           → home loan / bank financing / which banks
-  CACHE:faq_booking_amount      → booking / token / advance amount to reserve
-  CACHE:faq_construction_quality → materials / build quality / vastu / earthquake
-  CACHE:faq_possession_timeline → ready by when / handover / possession date
-  CACHE:faq_amenities_general   → amenities / facilities / what is included
-  CACHE:faq_site_visit          → visiting site / show flat / office timings
-  CACHE:faq_nearby_amenities    → schools / hospitals / transport / shopping
-  CACHE:faq_location_connectivity → connectivity / highway / metro / distance
-
-STAGE_INVITE_VISIT+:
-  CACHE:invite_visit            → right moment to invite to site visit (interest confirmed)
-  CACHE:ask_appointment_date    → caller agreed to visit, need preferred date and time
-  CACHE:appointment_confirmed   → you have just confirmed their appointment date+time
-
-USE LIVE TEXT (write your own response) when:
-- The answer must include the caller's name, chosen project, price, or appointment
-- The caller is raising an objection and needs a personalised response
-- The answer combines information from multiple topics
-- You are responding to social chat ("how are you?", "are you busy?")
-- No cache key above exactly matches the situation
-"""
-
-
-def _parse_llm_response(raw: str) -> tuple[str | None, str | None]:
-    """Return (cache_key, live_text). Exactly one will be non-None."""
-    m = re.match(r'^CACHE:([a-zA-Z_]+)\s*$', raw.strip())
-    if m:
-        return m.group(1), None
-    return None, raw.strip()
-
-
-# ---------------------------------------------------------------------------
 # Response validation
 # ---------------------------------------------------------------------------
 
@@ -847,7 +759,7 @@ class ConversationRouter:
         self.last_agent_language = self.state.language
         self.memory.qa_tracker.observe_agent_turn(greeting, self.memory.turn_index)
         logger.info("[OPENING] Inbound welcome delivered")
-        return EngineResult(text=greeting, cache_key="greeting", is_shortcut=True, intent="greeting")
+        return EngineResult(text=greeting, is_shortcut=True, intent="greeting")
 
     # ------------------------------------------------------------------
     # Public API
@@ -1100,7 +1012,7 @@ class ConversationRouter:
             self.memory.add_assistant(resp, language=self.state.language)
             self._store_last_response(resp)
             self.state.stage = STAGE_CLOSING
-            yield EngineResult(text=resp, cache_key="shortcut_bye", is_shortcut=True, intent="farewell")
+            yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
             return
 
         # --- Objection at any stage (except GREETING, which has its own handler) ---
@@ -1118,13 +1030,13 @@ class ConversationRouter:
                 )
                 self.memory.add_assistant(resp, language=self.state.language)
                 self._store_last_response(resp)
-                yield EngineResult(text=resp, cache_key="shortcut_bye", is_shortcut=True, intent="farewell")
+                yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
                 return
 
             resp = self._pick_objection_response()
             self.memory.add_assistant(resp, language=self.state.language)
             self._store_last_response(resp)
-            yield EngineResult(text=resp, cache_key="shortcut_not_interested", is_shortcut=True, intent="objection")
+            yield EngineResult(text=resp, is_shortcut=True, intent="objection")
             return
 
         # --- Gratitude at any stage ---
@@ -1133,7 +1045,7 @@ class ConversationRouter:
             resp = self._localized_list("gratitude", ["You're welcome!", "Happy to help!"])
             self.memory.add_assistant(resp, language=self.state.language)
             self._store_last_response(resp)
-            yield EngineResult(text=resp, cache_key="shortcut_thanks", is_shortcut=True, intent="gratitude")
+            yield EngineResult(text=resp, is_shortcut=True, intent="gratitude")
             return
 
         # --- Identity question at any stage — fast deterministic response ---
@@ -1168,24 +1080,6 @@ class ConversationRouter:
             logger.info("[LANG-LOCK] explicit_switch lang=%s lock_turns=%d (persists ~17 turns)",
                         new_lang, self.state.language_lock_turns)
             yield EngineResult(text=resp, is_shortcut=True, intent="language_switch")
-            return
-
-        # --- Pure greeting mid-conversation — connectivity check ---
-        # If the caller says only "Hello" / "Hi" / "Hello hello" after the
-        # opening exchange, they are likely checking if the line is live.
-        # Return an immediate fixed response instead of routing to the LLM,
-        # which can silently produce nothing for a single-word input.
-        # At the GREETING stage (very first caller turn) we let the LLM
-        # continue naturally so the agent greets and advances the script.
-        # "Hello?" → intent="question" due to trailing "?", but _is_greeting_only
-        # strips punctuation so it correctly identifies it as greeting-only.
-        if intent in ("greeting", "question") and _is_greeting_only(text) and self.state.stage != STAGE_GREETING:
-            _cancel_llm()
-            resp = _MID_CALL_GREETING_RESPONSE
-            self.memory.add_assistant(resp, language=self.state.language)
-            self._store_last_response(resp)
-            logger.info("[GREETING] Mid-call greeting-only → connectivity check response")
-            yield EngineResult(text=resp, cache_key="shortcut_hello", is_shortcut=True, intent="greeting")
             return
 
         # =============================================================
@@ -1929,24 +1823,6 @@ class ConversationRouter:
             first_chunk = await llm_queue.get()
 
         if first_chunk is not None:
-            cache_key, live_text = _parse_llm_response(first_chunk)
-
-            if cache_key:
-                # LLM returned a cache token — drain the queue, then yield a
-                # single EngineResult with cache_key set and text="" so the
-                # pipeline plays the pre-generated WAV instead of calling TTS.
-                while True:
-                    _rem = await llm_queue.get()
-                    if _rem is None:
-                        break
-                _label = f"[CACHE:{cache_key}]"
-                self.memory.add_assistant(_label, language=self.state.language)
-                self._store_last_response(_label)
-                logger.info("[CACHE-ROUTE] LLM routed to cache key=%s", cache_key)
-                yield EngineResult(text="", cache_key=cache_key, is_shortcut=False, intent=intent)
-                return
-
-            # Normal live-TTS streaming path
             full_parts.append(first_chunk)
             yield EngineResult(text=first_chunk, is_shortcut=False, intent=intent)
 
@@ -2407,10 +2283,6 @@ class ConversationRouter:
         context_str = self.memory.context.to_prompt_string()
         if context_str:
             parts.append(f"\nKnown context:\n{context_str}")
-
-        # Cache router instructions — always last so the LLM sees them immediately
-        # before generating a response
-        parts.append(_CACHE_ROUTER_INSTRUCTIONS)
 
         return "\n".join(parts)
 

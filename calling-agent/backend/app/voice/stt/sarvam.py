@@ -50,14 +50,12 @@ class SarvamSTT(STTProvider):
         api_key: str | None = None,
         api_url: str = SARVAM_API_URL,
         timeout: float = SARVAM_TIMEOUT,
-        model: str = "saaras:v3",
-        mode: str = "codemix",
+        model: str = "saarika:v2.5",
     ) -> None:
         self._api_key = api_key or os.environ.get("SARVAM_API_KEY", "")
         self._api_url = api_url
         self._timeout = timeout
         self._model = model
-        self._mode = mode
         self._client: httpx.AsyncClient | None = None
 
         if not self._api_key:
@@ -89,8 +87,8 @@ class SarvamSTT(STTProvider):
         wav_data = pcm_to_wav(audio_bytes, sample_rate=sample_rate)
         duration_ms = len(audio_bytes) // (sample_rate * 2) * 1000
         logger.info(
-            "[STT:Sarvam] Sending %d bytes (%.0fms) lang=%s mode=%s model=%s",
-            len(wav_data), duration_ms, language, self._mode, self._model,
+            "[STT:Sarvam] Sending %d bytes (%.0fms) lang=%s",
+            len(wav_data), duration_ms, language,
         )
 
         # Language mapping:
@@ -113,7 +111,6 @@ class SarvamSTT(STTProvider):
                 data={
                     "language_code": lang_code,
                     "model": self._model,
-                    "mode": self._mode,
                 },
                 files={"file": ("audio.wav", wav_data, "audio/wav")},
             )
@@ -148,19 +145,8 @@ class SarvamSTT(STTProvider):
         transcript = data.get("transcript", "").strip()
         confidence = float(data.get("confidence", 1.0))
         detected_lang = data.get("language_code") or None
-        lang_prob = data.get("language_probability")
-        lang_prob = float(lang_prob) if lang_prob is not None else None
-        logger.info(
-            "[STT:Sarvam] RAW=%r (confidence=%.2f lang=%s lang_prob=%s)",
-            transcript, confidence, detected_lang,
-            f"{lang_prob:.2f}" if lang_prob is not None else "n/a",
-        )
-        return STTResult(
-            text=transcript,
-            confidence=confidence,
-            detected_language=detected_lang,
-            language_probability=lang_prob,
-        )
+        logger.info("[STT:Sarvam] Transcript: %r (confidence=%.2f, lang=%s)", transcript, confidence, detected_lang)
+        return STTResult(text=transcript, confidence=confidence, detected_language=detected_lang)
 
     async def warmup(self) -> None:
         """Pre-open a TLS connection to the Sarvam host so the first real

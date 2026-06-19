@@ -1,0 +1,119 @@
+{
+  "919599761331_20260619_061410": {
+    "summary": "The call was between Vishal, a sales agent from Pramukh Group, and a prospect named Vrishti who is looking for real estate options. Vrishti expressed interest in properties in Surat and Vapi, specifically a 3 BHK, and discussed her budget and intentions for living and investment.",
+    "customer_intent": "looking for real estate options",
+    "key_points": [
+      "Vrishti is interested in 3 BHK properties",
+      "She is considering both living and investment purposes"
+    ],
+    "suggested_next_action": "Provide more information about properties in Vapi and schedule a site visit",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "real estate options",
+      "property budget",
+      "site visit scheduling"
+    ],
+    "products_mentioned": [
+      "Aranya II",
+      "Revanta",
+      "Satwa",
+      "Aara project"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "Vrishti expressed interest but needs more information and a site visit scheduled",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-10-30",
+    "_analyzed_at": "2026-06-19T06:38:27.190Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918628835737_20260619_072958": {
+    "summary": "The sales agent, Vishal Patel, called the prospect, Mr. X, to discuss potential property options. Mr. X was skeptical about the call, questioning how the agent obtained his number and expressing frustration with the agent's responses.",
+    "customer_intent": "inquire about property options",
+    "key_points": [
+      "Customer was skeptical about the call and the agent's intentions.",
+      "Agent repeatedly asked for the customer's city of interest."
+    ],
+    "customer_questions": [
+      "how did you get my number?",
+      "\u0906\u092a \u092c\u093e\u0930-\u092c\u093e\u0930 \u091a\u0941\u092a \u0915\u094d\u092f\u094b\u0902 \u0939\u094b \u091c\u093e \u0930\u0939\u0947 \u0939\u0948\u0902? \u0915\u094d\u092f\u093e \u0906\u092a \u090f\u0906\u0908 \u0939\u0948\u0902?",
+      "\u0915\u094d\u092f\u093e \u092c\u0915\u0935\u093e\u0938 \u0915\u0930 \u0930\u0939\u093e \u0939\u0948?"
+    ],
+    "suggested_next_action": "The agent should provide clear information about property options and address the customer's concerns directly.",
+    "sentiment": "negative",
+    "lead_quality": "cold",
+    "objections": [
+      "Customer questioned the legitimacy of the call."
+    ],
+    "topics": [
+      "property inquiry",
+      "customer skepticism"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": true,
+    "follow_up_reason": "The customer showed some interest but needs reassurance and clarity.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-10-30",
+    "_analyzed_at": "2026-06-19T07:56:44.395Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918628835737_20260619_081316": {
+    "summary": "The call involved a sales agent trying to assist a customer named Meaning with property options in Vapi. The customer expressed interest in a 2.5 BHK apartment and a budget of 40 to 60 lakhs but became frustrated with the agent's questions and language barriers.",
+    "customer_intent": "inquire about property options",
+    "key_points": [
+      "Customer interested in 2.5 BHK in Vapi",
+      "Budget is between 40 to 60 lakhs"
+    ],
+    "customer_questions": [
+      "why did you call?",
+      "how can i come for the visit?"
+    ],
+    "suggested_next_action": "Send the site address and parking instructions via WhatsApp",
+    "sentiment": "negative",
+    "lead_quality": "warm",
+    "objections": [
+      "Confusion about visiting Vapi from Delhi",
+      "Frustration with language and communication"
+    ],
+    "topics": [
+      "Property options in Vapi",
+      "Budget for property"
+    ],
+    "products_mentioned": [
+      "2 BHK apartments"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide the site address and parking information",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-10-06",
+    "_analyzed_at": "2026-06-19T08:25:46.239Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919599761331_20260619_083508": {
+    "summary": "The call was between Vishal Patel from Pramukh Group and a prospect named Vrishee, who is looking for a 3 BHK property in Vapi with a budget of 2 to 3 crores. They scheduled a site visit for the next day at 12:00 PM and agreed on a reminder call for later that day.",
+    "customer_intent": "Schedule a property site visit",
+    "key_points": [
+      "Customer is looking for a 3 BHK property in Vapi",
+      "Budget is between 2 to 3 crores"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Make the reminder call at 4:00 PM as requested",
+    "sentiment": "positive",
+    "lead_quality": "hot",
+    "objections": [],
+    "topics": [
+      "property search",
+      "site visit scheduling"
+    ],
+    "products_mentioned": [
+      "3 BHK property"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "Customer requested a reminder call",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-10-06",
+    "_analyzed_at": "2026-06-19T08:39:04.546Z",
+    "_model": "gpt-4o-mini"
+  }
+}

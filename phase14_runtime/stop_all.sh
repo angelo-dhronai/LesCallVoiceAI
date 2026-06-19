@@ -30,4 +30,9 @@ pkill -f "stt_stream_worker.py"
 pkill -f "ws_audio_receiver.py"
 pkill -f "socket_server.py"
 
+# The call_bridge_filter pid file only holds the wrapper bash -c PID; killing
+# it leaves the tail/grep children orphaned. Clean those up explicitly too.
+pkill -f "tail -f .*ws_audio_receiver.log"
+pkill -f "grep --line-buffered \"call_bridge\""
+
 echo "All services stopped."

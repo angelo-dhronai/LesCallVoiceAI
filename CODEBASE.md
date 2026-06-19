@@ -1,90 +1,91 @@
-# Codebase Reference — Lescall / Pramukh Group Voice Agent
+# Codebase Reference — LesCall Voice AI Platform
 
-Last updated: 2026-06-11 (branch `apicostreduction` — hybrid TTS cache complete, 3 known cache bugs unfixed)
+Last updated: 2026-06-19 (dashboard fully redesigned; manual follow-up, Follow-Up Automation, AI Call Analysis, Conversation Analytics, Agent Settings, Recordings, and all prior features complete)
 
 ---
 
 ## System Overview
 
-Inbound real-time voice AI for **Pramukh Group** real estate. Phone calls arrive via FreeSWITCH → WebSocket → AI pipeline. The agent (Vishal Patel) greets callers bilingually, detects language (English / Hindi / Gujarati), and drives through a 6-stage sales flow:
+Real-time inbound/outbound voice AI platform. Phone calls arrive via FreeSWITCH → WebSocket → AI pipeline. The agent greets callers bilingually (English / Hindi / Gujarati) and drives a configurable sales flow. A separate dashboard server (`dashboard/server.py`) provides operational visibility, runtime control, and intelligence features — it is a pure read-only observer of the calling pipeline, with the exception of placing outbound calls via FreeSWITCH ESL (`fs_cli`).
+
+---
+
+## Repository Layout
 
 ```
-GREETING → DISCOVERY → PROJECT_MATCH → INVITE_VISIT → CONFIRMATION → CLOSING
+/home/angelo/lescall/
+├── calling-agent/                    ← AI pipeline (venv Python)
+│   ├── backend/
+│   │   ├── run.py                    ← CLI entrypoint (--web, --test)
+│   │   └── app/voice/
+│   │       ├── conversation.py       ← ConversationRouter (LLM agent + stage machine)
+│   │       ├── pipeline.py           ← 5-task async pipeline
+│   │       ├── memory.py             ← CallState, ConversationMemory, ContextMemory
+│   │       ├── shortcuts.py          ← deterministic canned-response shortcuts
+│   │       ├── call_audit.py         ← WAV + transcript recording
+│   │       ├── stt/                  ← SarvamSTT + WhisperSTT + STTRouter
+│   │       └── tts_sarvam.py         ← SarvamTTS streaming
+│   └── .env                          ← SARVAM_API_KEY, OPENAI_API_KEY, etc.
+├── phase14_runtime/
+│   ├── start_all.sh / stop_all.sh    ← start/stop socket_server + ws_audio_receiver
+│   ├── check_runtime.sh / tail_logs.sh
+│   ├── logs/latest/                  ← live log files (SSE streamed by dashboard)
+│   └── live_calls_state.json         ← written by pipeline; read by dashboard
+├── recordings/                       ← root:root 755; subdirs 755 world-readable
+│   └── <folder>/                     ← one dir per call session
+│       ├── metadata.json             ← call_id, caller, start_time, end_time, etc.
+│       ├── transcript.txt            ← full dialogue (read by AI analysis)
+│       └── recording.wav             ← PCM16 16kHz mono (root:root 644)
+├── credit_log/                       ← CSV files written by pipeline per call
+│   └── YYYY-MM-DD.csv                ← rows: call_id, event, cost, timestamp, ...
+├── socket_server.py                  ← ESL controller (system Python, port 9000)
+├── ws_audio_receiver.py              ← media WebSocket + AI bridge (venv, port 9001)
+├── dashboard/                        ← dashboard server (system Python)
+│   ├── server.py                     ← FastAPI app (port 8080)
+│   ├── start.sh                      ← `bash start.sh --bg` to launch
+│   ├── dashboard.log                 ← dashboard process log
+│   ├── static/                       ← SPA frontend
+│   │   ├── index.html
+│   │   ├── css/
+│   │   └── js/                       ← one JS file per dashboard tab/feature
+│   └── *.json                        ← dashboard-owned data stores (see below)
+└── CODEBASE.md                       ← this file
 ```
 
 ---
 
-## Process Topology
+## Process Topology (telephony mode)
 
 ```
 Caller (PSTN)
     │ SIP/RTP PCMU 8kHz
     ▼
 FreeSWITCH
-    │ ESL (port 9000)               ← socket_server.py (system Python)
-    │ mod_audio_stream (port 9001)  — binary PCMU frames via WebSocket
+    │ ESL (port 9000)
     ▼
-ws_audio_receiver.py                ← WebSocket server (venv Python)
-    │  PCMU decode: audioop.ulaw2lin (any frame size — fixed 2026-06-05)
-    │  Upsample: audioop.ratecv 8kHz → 16kHz
-    │  conversation_call_bridge.call_bridge() → TelephonySession
+socket_server.py            ← ESL controller; handles CHANNEL_* events, triggers
+    │                          playback via validated `bgapi originate` / `execute`
+    │ WebSocket (port 9001)
     ▼
-calling-agent/backend/app/voice/pipeline.py   ← AI pipeline (5 async tasks)
+ws_audio_receiver.py        ← receives PCMU audio, decodes to PCM16, upsamples
+    │                          8kHz→16kHz, calls conversation_call_bridge
+    ▼
+conversation_call_bridge.py ← creates TelephonySession per call; wires
+    │                          TelephonySource/Sink + VoicePipeline
+    ▼
+pipeline.py                 ← 5-task async pipeline (VAD→STT→Router→TTS→Sink)
     │
-    └── TTS audio → TelephonySink
-            → writes PCM to /tmp/ai_telephony_playback/<uuid>.wav
-            → conversation_call_bridge._playback_loop() polls sink
-            → injects WAV path into FreeSWITCH via ESL uuid_broadcast
-            → FreeSWITCH plays WAV to caller
+    └── TTS audio → TelephonySink → TCP port 9004 → socket_server.py → FreeSWITCH
 ```
 
-**Critical**: `socket_server.py` runs under system Python. Everything under `calling-agent/` runs under `calling-agent/venv`. Never mix them.
+### Port Map
 
----
-
-## Services and Startup
-
-### Start All
-```bash
-cd /home/angelo/lescall
-bash phase14_runtime/start_all.sh
-```
-Starts in order:
-1. `socket_server.py` (port 9000 — FreeSWITCH ESL controller)
-2. `ws_audio_receiver.py` (port 9001 — media WebSocket + AI bridge, `--sample-rate 8000`)
-
-Logs: `phase14_runtime/logs/latest/`
-
-### Stop / Monitor
-```bash
-bash phase14_runtime/stop_all.sh
-bash phase14_runtime/tail_logs.sh
-bash phase14_runtime/tail_logs_filtered.sh   # errors + transcripts + AI responses only
-bash phase14_runtime/check_runtime.sh        # service health check
-```
-
-### AI Pipeline Only (CLI mic, no telephony)
-```bash
-cd calling-agent && source venv/bin/activate && cd backend
-python run.py              # mic input → speaker output
-python run.py --web        # + local web console http://127.0.0.1:8000
-python run.py --test       # single-turn VAD/mic sanity test (needs audio device)
-```
-
-### Environment
-File: `calling-agent/.env`
-
-```
-SARVAM_API_KEY=sk_...          # STT + TTS (required — validated at startup; exact name matters)
-OPENAI_API_KEY=sk-...          # Whisper fallback STT only (not used for LLM)
-ENABLE_BARGE_IN=true           # allow caller to interrupt TTS playback
-TELEPHONY_MODE=false           # set true when running via FreeSWITCH
-ENABLE_CALL_AUDIT=true         # record WAV + transcripts to ./recordings/
-```
-
-**CRITICAL**: Env var name is `SARVAM_API_KEY` (NOT `SARVAMAI_API_KEY` — this recurring mistake causes silent startup failure).
-
-LLM uses `OPENAI_API_KEY` via an `AsyncOpenAI` client (OpenAI-compatible). Default model: `gpt-4o-mini` (set in `ConversationRouter.__init__`). The model can be overridden by passing `model=` at construction.
+| Port | Service | Notes |
+|------|---------|-------|
+| 9000 | socket_server.py | FreeSWITCH ESL |
+| 9001 | ws_audio_receiver.py | media WebSocket |
+| 9004 | TelephonySink TCP | TTS audio back to FS |
+| 8080 | dashboard/server.py | operational dashboard |
 
 ---
 
@@ -94,586 +95,382 @@ Five independent async tasks connected by bounded queues:
 
 ```
 [AudioSource]
-    ↓ raw PCM frames (16kHz)
-[_vad_task]          — energy VAD, accumulates speech, flushes segments
-    ↓ AudioSegment
-[_stt_worker]        — sends to Sarvam WS STT, validates, locks language
-    ↓ Transcript
-[_conversation_layer] — deterministic shortcuts first, then LLM via ConversationRouter
-    ↓ Response (with optional cache_key)
-[_tts_layer]         — cache-first routing: speak_cached() or live Sarvam TTS
-    ↓ PCM audio chunks
-[AudioSink]          — LocalSpeakerSink (CLI) or TelephonySink (telephony)
+  → vad_queue   → [VAD task]            energy-based, self-calibrating
+  → stt_queue   → [STT worker]          SarvamSTT primary / WhisperSTT fallback
+  → transcript_queue → [ConversationRouter]  deterministic shortcuts → LLM
+  → tts_queue   → [TTS player]          SarvamTTS HTTP streaming
+  → [AudioSink]                         LocalSpeakerSink (CLI) or TelephonySink
 ```
 
-Queue bounds prevent backpressure from propagating upward — a slow TTS never blocks audio capture.
+Queue bounds prevent backpressure from propagating upstream (slow TTS never blocks audio capture).
 
-### Key Constants (pipeline.py)
+### STT Layer
 
-| Constant | Value | Rationale |
-|---|---|---|
-| `SAMPLE_RATE` | 16000 | Internal pipeline rate |
-| `MIN_SPEECH_MS` | 300.0ms | Minimum speech to pass to STT |
-| `HARD_FLUSH_SILENCE_FRAMES` | 50 (1000ms) | Silence frames before VAD flush. Raised from 30 (600ms) — Hindi/Gujarati callers pause 400–700ms within sentences; 600ms split single utterances into fragments |
-| `MAX_SPEECH_SECONDS` | 4 | Hard cap on segment length |
-| `_STT_FALLBACK_MIN_SPEECH_MS` | 800ms | Min segment duration to trigger "please repeat" fallback phrase |
-| `TTS_ECHO_COOLDOWN_MS` | 400ms (telephony) / 1500ms (local) | Post-TTS mute window to suppress echo |
-| `BARGE_IN_COOLDOWN_MS` | 400ms | Min time after barge-in trigger |
-| `BARGE_IN_MIN_FRAMES` | 3 (60ms) | Sustained speech needed to trigger barge-in |
+- `STTRouter`: always tries Sarvam first; exponential backoff (60→300s) on HTTP 429, falls back to Whisper. Empty transcripts (no speech) do NOT trigger fallback.
+- `SarvamSTT`: multipart WAV POST to `api.sarvam.ai/speech-to-text`, model `saaras:v3`, mode `codemix`. PCM amplitude-normalized before upload.
+- `validate_transcript()`: rejects hallucinations (YouTube phrases + Devanagari equivalents), unsupported scripts, Marathi markers, filler words, repetition, and function-word-only fragments (quality score < 0.3).
+- Language locking: after `language_probability ≥ 0.75` the BCP-47 code is stored in `_stt_locked_language` and used for all subsequent STT/TTS calls.
 
-### Dataclasses (pipeline.py)
+### Conversation Engine (conversation.py)
 
-```python
-@dataclass
-class AudioSegment:
-    audio: bytes          # PCM16 @ 16kHz
-    duration_ms: float
-    timestamp: float
+- `ConversationRouter`: stage machine + LLM agent. Stages: `GREETING → DISCOVERY → PROJECT_MATCH → INVITE_VISIT → CONFIRMATION → CLOSING`.
+- `CallState` (memory.py): canonical session object — `customer_name`, `customer_phone`, `selected_project`, `selected_location`, `appointment_date/time`, `language`, `conversation_stage`. Injected into every LLM system prompt.
+- Deterministic shortcuts (shortcuts.py): common phrases bypass the LLM entirely.
+- Project lock: first confirmed project is stored and never overridden.
+- **INVARIANT**: `conversation.py` is NEVER imported by the dashboard. Agent Settings reads it via regex on the raw source text only.
 
-@dataclass
-class Transcript:
-    text: str
-    duration_ms: float
-    timestamp: float
-    stt_latency_ms: float = 0.0
+### Memory (memory.py)
 
-@dataclass
-class Response:           # queue item from _conversation_layer to _tts_layer
-    text: str             # live TTS text (or fallback if cache misses)
-    is_shortcut: bool
-    timestamp: float
-    cache_key: str | None = None   # if set, _tts_layer tries speak_cached() first
-```
-
-### Greeting Gate
-
-Greeting fires only after `_greeting_done = False → True` transition, which happens after the first audio frame arrives from the caller. This prevents TTS credit burn on abandoned WebSocket connections that never establish a real call.
-
----
-
-## Audio Path: FreeSWITCH → Pipeline
-
-### What FreeSWITCH sends
-`socket_server.py` starts the media stream with:
-```
-bgapi uuid_audio_stream <uuid> start ws://127.0.0.1:9001 mono 8000
-```
-mod_audio_stream streams raw PCMU (G.711 µ-law) at 8 kHz. TCP batching produces variable frame sizes (160B, 320B, 480B+).
-
-### PCMU Decode (fixed 2026-06-05)
-```python
-# Previous BUG: only 20ms (160B) frames decoded; larger frames passed as raw µ-law → garbled
-if len(norm_msg) == 160:
-    norm_msg = audioop.ulaw2lin(norm_msg, 2)
-
-# Fixed: decode all non-empty frames
-if INPUT_CODEC == "pcmu" and len(norm_msg) > 0:
-    norm_msg = audioop.ulaw2lin(norm_msg, 2)
-```
-
-### Resampling
-```python
-norm_msg, resample_state = audioop.ratecv(norm_msg, 2, 1, 8000, 16000, resample_state)
-```
-Result: PCM16 at 16kHz → `TelephonySource.push_frame()` → pipeline VAD task.
-
----
-
-## Audio Path: Pipeline → FreeSWITCH (TTS return)
-
-```
-_tts_layer
-    → CachedTTS.speak_cached()  or  SarvamTTS.speak()
-    → TelephonySink.write_frame(pcm_chunk)   [streams PCM as it arrives]
-    → TelephonySink.flush()
-        → writes PCM to /tmp/ai_telephony_playback/<uuid>_<ts>.wav
-        → downsamples 16kHz → 8kHz (audioop.ratecv)
-        → validates WAV (size > 0, duration > 100ms)
-        → queues path in self._pending_wavs
-    ← conversation_call_bridge._playback_loop() polls TelephonySink._pending_wavs
-    → ESL: uuid_broadcast <uuid> 'playback /tmp/...' aleg
-    → FreeSWITCH plays WAV to caller
-```
-
-**PLAYBACK ERROR verdict**: If FreeSWITCH returns `Application-Response=PLAYBACK ERROR` (not `FILE PLAYED`), the WAV file failed to play. Root cause is usually a missing or zero-byte WAV. Logged as `CRITICAL PHASE-5 REGRESSION SUSPECTED` in `socket_server.py`.
-
----
-
-## VAD Layer (vad.py)
-
-Energy-based (RMS), self-calibrating over first 25 frames (500ms).
-
-| Parameter | TELEPHONY_MODE=True | Local mode |
-|---|---|---|
-| `onset_frames` | 2 (40ms) | 2 |
-| `hold_frames` | 10 (200ms) | 10 |
-| `minimum_threshold` | 260.0 | lower |
-| `calibration_frames` | 25 (500ms) | 25 |
-
-**Known issue — calibration on greeting echo**: The VAD calibrates during the first 500ms of the call. If TTS greeting audio echoes back during calibration, the threshold is set too high → VAD temporarily deaf. Partially mitigated by `TTS_ECHO_COOLDOWN_MS`.
-
-### VAD flow in `_vad_task`
-
-```
-audio frame → VAD.is_speech()
-    if speech:   accumulate in _audio_buffer, advance _speech_duration_ms
-    if silence:  increment _silence_frames
-                 if _silence_frames >= HARD_FLUSH_SILENCE_FRAMES (1000ms)
-                    AND _speech_duration_ms >= MIN_SPEECH_MS (300ms):
-                        flush → AudioSegment → stt_queue
-```
-
-Frames during `_vad_mute_until` (TTS echo cooldown) are silently dropped.
-
----
-
-## STT Layer (stt/)
-
-### Provider Hierarchy
-
-1. **SarvamWSSTT** (`stt/sarvam_ws.py`) — primary, Sarvam saaras:v3 WebSocket
-2. **SarvamSTT** (`stt/sarvam.py`) — HTTP fallback if WebSocket fails
-3. **WhisperSTT** (`stt/openai_whisper.py`) — fallback on Sarvam HTTP 429
-
-### SarvamWSSTT (`stt/sarvam_ws.py`)
-
-- Model: `saaras:v3` (telephony-tuned)
-- One persistent WebSocket connection per language code
-- `flush_signal="true"` — clean segment boundaries
-- `high_vad_sensitivity="true"` — Sarvam's internal VAD active
-
-**Connection pool**: `_pool: dict[str, (ws, ctx)]` — one connection per active `lang_code`. `warmup()` pre-opens the `"unknown"` connection.
-
-**Language detection**:
-- Before language lock: `language_code="unknown"` → Sarvam detects natively, returns BCP-47 in `message.data.language_code`
-- After lock: explicit code (`hi-IN`, `gu-IN`, `en-IN`) on a single connection
-
-**Timeouts**: `TRANSCRIBE_TIMEOUT=10s`, `WARMUP_TIMEOUT=5s`. On timeout/error, connection closed and recreated on next call.
-
-### STTResult dataclass (`stt/base.py`)
-
-```python
-@dataclass
-class STTResult:
-    text: str
-    confidence: float = 1.0
-    detected_language: str | None = None   # BCP-47, e.g. "hi-IN" — from Sarvam
-```
-
-### STTRouter (`stt/router.py`)
-
-- Always returns `STTResult` (not `str`) — `detected_language` propagates upstream
-- Exponential backoff on Sarvam 429: 60s → 300s max, routes to Whisper
-- Empty transcript (no speech) does NOT trigger Whisper fallback
-- `validate_transcript()` post-processor: rejects hallucinations, unsupported scripts (Korean, Tamil, Malayalam, Punjabi), filler words, repetition, noise tokens
-
-### Language Lock (`_stt_worker` in pipeline.py)
-
-```python
-if stt_result.detected_language and not state.language_locked and transcript_text:
-    short = {"en-IN": "en", "hi-IN": "hi", "gu-IN": "gu"}.get(detected)
-    if short:
-        state.language = short
-        state.language_locked = True
-```
-
-Once locked, `language_locked=True` is permanent for the session (unless the caller explicitly switches language, in which case `language_locked` is reset). The locked code is passed on every subsequent STT call.
-
-### STT Quality Gates (`_stt_worker`)
-
-1. **Hallucination check**: `word_count > max(4, segment_ms/250) * 2` → discard
-2. **Min length**: `len(transcript.strip()) < 2` → trigger fallback phrase
-3. **STT fallback phrase**: If segment ≥ 800ms but transcript is empty/rejected → enqueue `Response(text=fallback, cache_key="stt_fallback")` ← **BUG: `cache_key` not yet set here; fixed in next session**
-
----
-
-## Conversation Engine (conversation.py)
-
-`ConversationRouter` is the production agent.
-
-### Stage Machine
-
-```
-GREETING → DISCOVERY → PROJECT_MATCH → INVITE_VISIT → CONFIRMATION → CLOSING
-```
-
-Defined as module-level constants. Current stage is injected into every LLM system prompt as part of the stage goal.
-
-### EngineResult dataclass
-
-```python
-@dataclass
-class EngineResult:
-    text: str                          # LLM or shortcut response text
-    is_shortcut: bool                  # True = bypass LLM buffering, enqueue immediately
-    intent: str                        # classified intent (farewell, gratitude, etc.)
-    cache_key: str | None = None       # set to route _tts_layer to pre-cached WAV
-```
-
-### CallState (memory.py)
-
-Canonical session object, ground truth for all confirmed fields:
-
-| Field | Type | Description |
-|---|---|---|
-| `language` | `str` | Short code: `en`, `hi`, `gu` |
-| `language_locked` | `bool` | Prevents re-detection after first substantive turn |
-| `language_lock_turns` | `int` | Decay counter; explicit switch sets to -7 |
-| `conversation_stage` | `str` | Current STAGE_* constant |
-| `customer_name` | `str` | Captured name |
-| `customer_phone` | `str` | Captured phone (never read back to caller) |
-| `selected_project` | `str` | First confirmed project — never overridden |
-| `selected_location` | `str` | City (Surat, Vapi, Silvassa) |
-| `appointment_date` | `str` | Confirmed visit date |
-| `appointment_time` | `str` | Confirmed visit time |
-| `is_closing` | `bool` | Set True on farewell/second decline |
-| `decline_count` | `int` | Objection counter; at 2, close gracefully |
-
-Injected into every LLM call as "CONFIRMED LEAD PROFILE" — prevents the agent from re-asking confirmed fields.
-
-### LLM Client
-
-`AsyncOpenAI` with `OPENAI_API_KEY`. Default model `gpt-4o-mini`. Max response: `MAX_RESPONSE_LENGTH` chars, 1-2 sentences for spoken delivery.
-
-### Deterministic Shortcuts
-
-Shortcut intents are detected in `process_stream()` by `detect_intent()` before the LLM is called. Each shortcut `EngineResult` now carries a `cache_key` that routes the response to a pre-cached WAV:
-
-| Intent / trigger | cache_key |
-|---|---|
-| Mid-call greeting ("hello?" after opening) | `shortcut_hello` |
-| Farewell (any stage) | `shortcut_bye` |
-| Second decline / closing farewell | `shortcut_bye` |
-| Objection / not interested (1st decline) | `shortcut_not_interested` |
-| Gratitude / thanks | `shortcut_thanks` |
-
-`text=resp` is kept on the `EngineResult` as a live TTS fallback if the WAV is missing.
-
-### Cache Router (LLM path)
-
-`_CACHE_ROUTER_INSTRUCTIONS` (module-level string, appended to every system prompt) lists 22 cache keys with trigger conditions. The LLM outputs `CACHE:<key>` as its entire response when a generic cached answer fits.
-
-`_parse_llm_response(raw)` in `_consume_llm_with_filler()` intercepts the first chunk:
-```python
-def _parse_llm_response(raw: str) -> tuple[str | None, str | None]:
-    m = re.match(r'^CACHE:([a-zA-Z_]+)\s*$', raw.strip())
-    if m:
-        return m.group(1), None   # cache routing
-    return None, raw.strip()      # live TTS
-```
-
-If a CACHE token is detected, the LLM queue is drained and a single `EngineResult(text="", cache_key=key)` is yielded. **Known issue: LLM rarely/never outputs CACHE tokens in practice — the instructions need to be stronger. Fix pending.**
-
-### Opening Greeting
-
-`generate_opening()` returns `EngineResult(text=_OPENING_GREETING, is_shortcut=True, intent="greeting")`. **Known bug: `cache_key="greeting"` is not set, so the opening greeting always fires a live Sarvam TTS call (106 chars, ~₹0.32/call). Fix: add `cache_key="greeting"` to the return statement.**
-
-The greeting text (`_OPENING_GREETING`):
-```
-"Hello! Namaste — this is Vishal Patel calling from Pramukh Group. Hope I haven't caught you at a bad time."
-```
-
----
-
-## TTS Layer (pipeline.py `_tts_layer`)
-
-### Cache-First Routing
-
-```
-Response dequeued
-    ↓
-if response.cache_key and tts has speak_cached():
-    try CachedTTS.speak_cached(cache_key, lang_short)
-    if success → done
-    if miss    → fall through to live TTS
-↓
-Silence protection: if text is empty AND no cache_key → substitute fallback phrase
-↓
-Preprocess text: normalize em-dashes, ellipsis, bullets
-↓
-Apply _PRONUNCIATION_MAP corrections
-↓
-await tts.speak(tts_text)   ← live Sarvam TTS
-```
-
-`lang_short` = first part of `self.conversation.state.language` (e.g. `"en"`, `"hi"`, `"gu"`).
-
-### TTS Providers
-
-| Class | File | Usage |
-|---|---|---|
-| `CachedTTS` | `tts_cached.py` | **Default** — serves pre-generated WAVs; inherits `TrackingSarvamTTS` |
-| `TrackingSarvamTTS` | `tracking_tts.py` | SarvamTTS + credit tracking; base class for CachedTTS |
-| `SarvamTTS` | `tts_sarvam.py` | HTTP streaming to Sarvam API; `bulbul:v3`, speaker `shubh` |
-| `SarvamWSTTS` | `tts_sarvam_ws.py` | WebSocket TTS; same model/speaker |
-
-`VoicePipeline` instantiates `CachedTTS` by default (as of branch `apicostreduction`).
-
-### Echo-Mute Window
-
-After TTS completes (`flush()` / `speak()` returns), `_vad_mute_until` is set to suppress echo for `TTS_ECHO_COOLDOWN_MS` (400ms telephony / 1500ms local). For cached WAV playback, `CachedTTS.speak_cached()` calls `sink.flush()` which sets `sink.last_flush_duration` — the pipeline uses this to size the mute window correctly.
-
----
-
-## Hybrid TTS Cache System (branch: apicostreduction)
-
-Pre-generated WAV files for 92 common responses. Cache hit = **~5ms latency, ₹0.00 cost**. Cache miss = **live Sarvam TTS, ~800ms, normal credit cost**.
-
-### Architecture
-
-```
-LLM system prompt lists 22 CACHE keys
-    ↓
-LLM outputs "CACHE:faq_home_loan" (entire response)
-    ↓
-_parse_llm_response() detects CACHE token
-    ↓
-EngineResult(text="", cache_key="faq_home_loan") → _tts_layer
-    ↓
-CachedTTS.speak_cached("faq_home_loan", "hi")
-    → reads tts_cache/faq_home_loan_hi.wav
-    → streams PCM chunks to sink
-    → sink.flush() → WAV injection → FreeSWITCH plays to caller
-```
-
-### Files
-
-| File | Purpose |
-|---|---|
-| `calling-agent/tts_cache/` | 92 WAV files (30.9MB, ~735s total audio) |
-| `calling-agent/tts_cache/manifest.json` | Index: `{key_lang: {key, lang, path, duration_s, chars}}` |
-| `calling-agent/backend/generate_tts_cache.py` | Generator script (see below) |
-| `calling-agent/backend/app/voice/tts_cached.py` | `CachedTTS` class |
-
-### Cache Catalogue (32 keys × 3 languages = 92 WAVs)
-
-**Shortcuts** (6 keys): `shortcut_hello`, `shortcut_bye`, `shortcut_thanks`, `shortcut_not_interested`, `shortcut_busy`, `stt_fallback`
-
-**Stage transitions** (8 keys): `greeting`, `mid_call_greeting`, `ask_name`, `ask_property_type`, `ask_budget`, `ask_location_preference`, `invite_visit`, `confirm_interest`, `ask_appointment_date`, `appointment_confirmed`
-
-**FAQs** (13 keys): `faq_about_company`, `faq_trust_track_record`, `faq_rera`, `faq_projects_overview`, `faq_price_range_general`, `faq_payment_plan`, `faq_home_loan`, `faq_booking_amount`, `faq_construction_quality`, `faq_possession_timeline`, `faq_amenities_general`, `faq_site_visit`, `faq_nearby_amenities`, `faq_location_connectivity`
-
-**Language confirmations** (2 keys): `language_confirm_hi`, `language_confirm_gu`
-
-All WAVs use voice `shubh`, model `bulbul:v3`. Language `en` is the fallback when a caller's language (`hi`, `gu`) key is missing.
-
-### CachedTTS (`tts_cached.py`)
-
-```python
-class CachedTTS(TrackingSarvamTTS):
-    def cache_has(self, key: str, lang: str) -> bool
-    async def speak_cached(self, cache_key: str, lang: str, sink=None) -> bool
-    # speak() inherited unchanged — live Sarvam TTS
-```
-
-`speak_cached()`:
-1. Looks up manifest: exact `lang` match, then `"en"` fallback
-2. Opens WAV, reads PCM in 4096-byte chunks → `sink.write_frame()`
-3. Calls `sink.flush()` after all frames (sets `last_flush_duration` for echo-mute)
-4. Checks `self._cancelled` before each chunk (respects barge-in)
-5. Returns `True` on success, `False` on miss or I/O error
-
-### WAV Generator (`backend/generate_tts_cache.py`)
-
-```bash
-cd calling-agent && source venv/bin/activate && cd backend
-
-python generate_tts_cache.py              # generate all missing WAVs
-python generate_tts_cache.py --dry-run    # preview only
-python generate_tts_cache.py --validate   # check all WAVs on disk
-python generate_tts_cache.py --force      # overwrite existing WAVs
-python generate_tts_cache.py --key greeting   # regenerate one key only
-```
-
-Calls `POST https://api.sarvam.ai/text-to-speech` (not the streaming endpoint), base64-decodes `audios[0]`, writes WAV. Reads `SARVAM_API_KEY` from environment. 1s sleep between calls.
-
----
-
-## Credit Tracking (credit_tracker.py)
-
-`SarvamCreditTracker` (singleton) records every STT and TTS API call to JSONL files in `/home/angelo/lescall/credit_log/YYYY-MM-DD.jsonl`.
-
-Each call end logs:
-```
-[CREDITS] Call ended: <uuid> | STT: Xs billed=Ys (N calls Sarvam / M Whisper) | TTS: C chars (N calls, B barge-in) | est ₹X.XXXX
-```
-
-`TrackingSarvamTTS.speak()` records TTS credit (chars + completion status) after each utterance. `barge-in=N` counts calls cancelled mid-stream.
-
-**Credit cost reference** (approximate at current Sarvam rates):
-- Greeting (106 chars, 1 TTS call) ≈ ₹0.32 per call
-- Full conversation (1478 chars, 9 TTS calls) ≈ ₹4.59
-- STT: 19 billed-seconds Sarvam ≈ included above
-
----
-
-## Known Bugs (as of 2026-06-11, unfixed)
-
-### Bug 1 — Greeting never served from cache (HIGH PRIORITY)
-
-**Cost**: ₹0.32 per call wasted — every call fires a live TTS for the greeting even though `greeting_en.wav` exists.
-
-**Root cause**: Two missing lines:
-- `conversation.py:840` — `generate_opening()` returns `EngineResult(text=greeting, is_shortcut=True, intent="greeting")` with no `cache_key`.
-- `pipeline.py:354` — the `Response` built from `opening` does not pass `cache_key=opening.cache_key`.
-
-**Fix**:
-```python
-# conversation.py generate_opening(), line ~840
-return EngineResult(text=greeting, cache_key="greeting", is_shortcut=True, intent="greeting")
-
-# pipeline.py, line ~354
-self._tts_queue.put_nowait(Response(
-    text=opening.text,
-    is_shortcut=True,
-    cache_key=opening.cache_key,   # ADD THIS
-    timestamp=time.monotonic(),
-))
-```
-
-### Bug 2 — STT fallback phrase never served from cache
-
-**Root cause**: `pipeline.py:864` creates `Response(text=fallback, is_shortcut=True, ...)` without `cache_key="stt_fallback"`. The `stt_fallback_en/hi/gu.wav` files are never used.
-
-**Fix**: Add `cache_key="stt_fallback"` to the `Response` at line ~864.
-
-### Bug 3 — LLM never outputs `CACHE:` tokens
-
-**Root cause**: `_CACHE_ROUTER_INSTRUCTIONS` lists 22 keys with trigger conditions but the model prefers natural conversation over cache routing. In production logs, zero `[CACHE-ROUTE]` entries appear.
-
-**Fix**: Rewrite instructions to be stage-aware and more forceful. Add: "OUTPUT ONLY 'CACHE:<key>' — nothing else, no greeting, no prefix." Organize keys by stage group with explicit negative examples.
-
-### Bug 4 — Agent too social at GREETING stage
-
-**Symptom**: Caller says "No, not at all. How are you?" → agent responds "I'm doing well, thank you! I appreciate you asking. How about you?" instead of advancing to name capture. Burns extra TTS credits on social chat.
-
-**Fix**: Add to GREETING stage goal: "Do not engage in social chat or answer 'how are you?' questions. After the caller confirms it's a good time, immediately ask for their name."
-
----
-
-## Memory System (memory.py)
-
-Three-layer memory injected into each LLM call:
-
-1. **`ConversationMemory`** — sliding window, last 5 turns (configurable)
-2. **`ContextMemory`** — extracted `user_name`, `intent`, `topic`, `sentiment`
-3. **`CallState`** — structured booking fields (ground truth, see above)
-
-`QATracker` within `ConversationMemory` tracks agent turn quality to prevent repetition.
-
----
-
-## Web Console (app/web/)
-
-Optional `--web` flag adds FastAPI server (port 8000). `EventHub` (`event_hub.py`) is an async pub/sub broadcaster — `emit_nowait()` is non-blocking. Each WebSocket client has its own bounded queue. Slow client drops messages, never blocks pipeline.
+Three layers injected into each LLM call:
+1. `ConversationMemory` — sliding window of last 5 turns.
+2. `ContextMemory` — extracted `user_name`, `intent`, `topic`, `sentiment`.
+3. `CallState` — structured booking fields (ground truth for what has been confirmed).
 
 ---
 
 ## Call Audit (call_audit.py)
 
-`ENABLE_CALL_AUDIT=true` → WAV recording + transcript in `./recordings/<conn_id>/`. Managed by `audit_manager` singleton imported by `ws_audio_receiver.py`.
+When `ENABLE_CALL_AUDIT=true`, each call produces:
+- `recordings/<folder>/recording.wav` — PCM16 16kHz mono, root:root 644 (world-readable)
+- `recordings/<folder>/metadata.json` — call_id, caller, start_time, end_time, duration
+- `recordings/<folder>/transcript.txt` — full dialogue
+
+Recording folders are root:root 755 (world-readable, not writable by dashboard process). Dashboard never writes into recording folders — all its own data goes to `dashboard/*.json`.
 
 ---
 
-## Directory Structure
+## Dashboard Server (dashboard/server.py)
 
+**Framework**: FastAPI + Starlette (port 8080)
+**Auth**: none (single-tenant, internal)
+**Pattern**: stateless read-mostly; writes only to dashboard-owned JSON files
+**Frontend**: vanilla JS SPA served from `static/index.html`
+
+### Critical design rules
+
+1. Never import or execute `conversation.py`, `socket_server.py`, `ws_audio_receiver.py`, or `call_audit.py`.
+2. Never write into the `recordings/` tree or `credit_log/` directory.
+3. Never modify live calling pipeline config.
+4. Outbound calls (and follow-up automation calls) use `fs_cli -x "originate ..."` — the same mechanism as manual Outbound Calls. The live conversation engine is untouched.
+
+### Environment variables (dashboard)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OUTBOUND_CALLER_ID` | `912264231897` | Outbound caller ID sent to FreeSWITCH |
+| `OUTBOUND_GATEWAY` | `16584853209835561.zt.plivo.com` | SIP gateway |
+| `DASHBOARD_ANALYSIS_MODEL` | `gpt-4o-mini` | LLM model for on-demand AI Call Analysis |
+
+---
+
+## Dashboard Data Stores (JSON files)
+
+All files live in `/home/angelo/lescall/dashboard/`. Never written by the calling pipeline.
+
+| File | Schema | Purpose |
+|------|--------|---------|
+| `outbound_contacts.json` | `[{id, name, phone, disposition, notes, call_notes, last_called_at, ...}]` | Outbound contact list |
+| `sarvam_credits.json` | `{credit_balance, updated_at, ...}` | Cached Sarvam API credit balance |
+| `api_key_pool.json` | `[{key, label, ...}]` | Sarvam API key pool |
+| `api_key_state.json` | `{active_key, ...}` | Which key is currently active |
+| `call_link.json` | `[{phone, contact_id, name, dialed_at}]` | Ring-buffer (max 5000) of dial events; used for inbound/outbound classification heuristic |
+| `call_analysis.json` | `{folder: analysis_object}` | On-demand AI Call Analysis results keyed by recording folder |
+| `follow_ups.json` | `{entry_id: {status, updated_at}}` | Status overrides for outbound/AI-analysis follow-up entries |
+| `manual_followups.json` | `[{id, contact_name, contact_phone, reason, follow_up_date, priority, call_id, status, created_at, updated_at}]` | Manually created follow-ups from Call Activity |
+| `follow_up_automation.json` | `[{id, source_id, contact_name, contact_phone, past_call_context, call_aim, script_notes, scheduled_time, linked_contact_id, status, created_at, called_at, call_outcome}]` | Follow-Up Automation schedule |
+| `minutes_quota.json` | `{total_minutes, updated_at}` | Operator-set minutes quota (created on first save) |
+
+---
+
+## API Endpoints
+
+### Runtime
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/runtime/status` | Start/stop/PID status of socket_server + ws_audio_receiver |
+| POST | `/api/runtime/start` | Start all services via `start_all.sh` |
+| POST | `/api/runtime/stop` | Stop all services via `stop_all.sh` |
+| POST | `/api/runtime/restart` | Stop then start |
+| GET | `/api/runtime/output/stream` | SSE stream of command output |
+
+### Health
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/health` | Process liveness, log file freshness |
+
+### Overview / KPIs
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/overview?period=today\|week\|month` | KPIs (total/answered/missed/inbound/outbound/appointments/followups/minutes), minutes_quota, charts (calls_over_time, call_type_distribution, call_status_distribution) |
+| GET | `/api/minutes/quota` | Current quota setting |
+| POST | `/api/minutes/quota` | Set `{total_minutes}` |
+
+### Live Calls
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/calls/active` | Active calls from `live_calls_state.json` (stale if no call_end within 20 min) |
+| GET | `/api/calls/live-state` | Full JSON of `live_calls_state.json` |
+| GET | `/api/calls/live-state/stream` | SSE stream, polls every 3s |
+
+### Call Activity / History
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/calls/history?page&limit&search&days&call_type&status` | Paginated call log from credit_log CSV files; merged with call_link.json for direction, outbound_contacts.json for contact name. Fields: all original credit_log columns + call_type, status, contact_name, contact_phone, duration_seconds |
+
+### Recordings
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/calls/recordings?page&limit&search` | List recording folders with metadata |
+| GET | `/api/calls/recordings/{folder}/transcript` | Metadata + full transcript messages |
+| GET | `/api/calls/recordings/{folder}/audio` | FileResponse with HTTP 206 Range support for browser audio player; `?download=1` for download |
+| GET | `/api/calls/transcripts/search?q=` | Server-side full-text search across all transcript.txt files |
+
+### AI Call Analysis (on-demand)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/analysis/eligible` | Folders with a completed transcript but not yet analyzed |
+| GET | `/api/calls/recordings/{folder}/analysis` | Cached analysis result from `call_analysis.json` |
+| POST | `/api/analysis/run` | `{folders: [...]}` — runs LLM analysis for each; model=gpt-4o-mini; JSON mode. Results cached in `call_analysis.json`. Never re-analyzed unless explicitly re-run. |
+
+Analysis schema (stored in `call_analysis.json[folder]`):
+```json
+{
+  "summary": "", "customer_intent": "", "sentiment": "",
+  "outcome": "", "objections": [], "topics": [], "products_mentioned": [],
+  "customer_questions": [], "appointments_scheduled": false,
+  "follow_up_needed": false, "follow_up_reason": "", "follow_up_priority": "",
+  "recommended_follow_up_date": "", "suggested_next_action": "",
+  "ai_recommendations": [], "_analyzed_at": ""
+}
 ```
-/home/angelo/lescall/
-├── socket_server.py                      ESL controller (system Python)
-├── ws_audio_receiver.py                  WebSocket media bridge (venv)
-├── conversation_call_bridge.py           Per-call session: wires TelephonySource/Sink
-│                                         + VoicePipeline + playback injection loop
-├── phase14_runtime/
-│   ├── start_all.sh                      Service startup (order matters)
-│   ├── stop_all.sh
-│   ├── tail_logs.sh                      All logs
-│   ├── tail_logs_filtered.sh             Errors + AI responses only
-│   ├── check_runtime.sh                  Health check
-│   └── logs/latest/                      Current run logs (ws_audio.log, socket.log)
-├── credit_log/
-│   └── YYYY-MM-DD.jsonl                  Per-call credit records
-├── calling-agent/
-│   ├── .env                              API keys + feature flags
-│   ├── requirements.txt
-│   ├── venv/                             Isolated Python env (MUST use for all backend)
-│   ├── tts_cache/                        Pre-generated WAV files (30.9MB, 92 files)
-│   │   └── manifest.json                 Index of all cached WAVs
-│   └── backend/
-│       ├── run.py                        CLI entrypoint (mic mode + --test + --web)
-│       ├── generate_tts_cache.py         WAV cache generator script
-│       └── app/
-│           ├── audio_transport/
-│           │   ├── base.py               AudioSource/AudioSink ABCs
-│           │   ├── telephony_source.py   Receives PCM from ws_audio_receiver
-│           │   ├── telephony_sink.py     Buffers PCM → WAV → queues for injection
-│           │   └── local_*.py            Mic/speaker for CLI mode
-│           └── voice/
-│               ├── pipeline.py           Pipeline orchestrator (5 async tasks)
-│               ├── vad.py                Energy VAD with auto-calibration
-│               ├── turn_manager.py       Semantic turn completion heuristic
-│               ├── conversation.py       ConversationRouter: stage machine + LLM + shortcuts
-│               │                         Contains: EngineResult, CallState, _CACHE_ROUTER_INSTRUCTIONS,
-│               │                                   _parse_llm_response(), detect_intent()
-│               ├── memory.py             ConversationMemory + ContextMemory + CallState
-│               ├── shortcuts.py          SHORTCUTS dict (trigger → response text)
-│               │                         Note: inline shortcut dispatch is in conversation.py,
-│               │                               not here — shortcuts.py is not called directly
-│               ├── tts_cached.py         CachedTTS: speak_cached() + manifest loader
-│               ├── tracking_tts.py       TrackingSarvamTTS: credit recording wrapper
-│               ├── tts_sarvam.py         SarvamTTS HTTP streaming (DEFAULT_SPEAKER="shubh")
-│               ├── tts_sarvam_ws.py      SarvamWSTTS WebSocket (DEFAULT_SPEAKER="shubh")
-│               ├── tracking_stt.py       TrackingSarvamSTT: credit recording wrapper
-│               ├── credit_tracker.py     SarvamCreditTracker singleton + JSONL logging
-│               ├── event_hub.py          Async pub/sub for web console events
-│               ├── call_audit.py         WAV + transcript recording
-│               ├── main_loop.py          run.py bootstrap: mic test, pipeline init
-│               └── stt/
-│                   ├── base.py           STTProvider ABC + STTResult dataclass
-│                   ├── router.py         STTRouter: Sarvam WS → HTTP → Whisper cascade
-│                   │                     Contains: validate_transcript(), backoff logic
-│                   ├── sarvam_ws.py      SarvamWSSTT: saaras:v3 WebSocket STT (primary)
-│                   ├── sarvam.py         SarvamSTT: HTTP fallback STT
-│                   ├── openai_whisper.py OpenAI Whisper fallback
-│                   └── post_processor.py validate_transcript() helper functions
-└── recordings/                           Call audit output (one dir per call)
+
+### Conversation Analytics
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/analytics/conversation` | Aggregates all `call_analysis.json` entries; returns lead_intelligence, sentiment distribution, objections, topics, products, customer_questions, ai_recommendations, trends table |
+
+### Agent Settings (read-only)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/agent/config` | Regex-extracted sections from `conversation.py` source text (never imported). Returns: name, tone, greeting, identity, guidelines, rules, portfolio, objections. Read-only — pipeline is never modified. |
+
+### Analytics
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/analytics` | Legacy analytics: calls_today, avg_duration, conversion rate, disposition breakdown, recent recordings |
+
+### Follow-Up Tracker
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/followups?status=all\|pending\|completed\|missed` | Merged list from three sources: outbound contacts with disposition `to_contact_later`/`in_doubt`, AI-analyzed calls flagged `follow_up_needed`, and manual entries from `manual_followups.json`. Status overrides from `follow_ups.json` (for outbound/ai sources) or direct field (for manual). |
+| PATCH | `/api/followups/{entry_id}` | Update status (`pending`/`completed`/`missed`). For `manual:` IDs updates `manual_followups.json` directly; for others updates `follow_ups.json` override map. |
+| POST | `/api/followups/manual` | Create manual follow-up: `{contact_name?, contact_phone*, reason?, follow_up_date?, priority?, call_id?}` |
+| PATCH | `/api/followups/manual/{id}` | Edit manual entry fields |
+| DELETE | `/api/followups/manual/{id}` | Remove manual entry |
+
+**Entry ID format**:
+- `contact:{outbound_contact_id}` — from outbound disposition
+- `call:{recording_folder}` — from AI Call Analysis
+- `manual:{uuid12}` — manually created from Call Activity
+
+### Follow-Up Automation
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/followup-automation` | List all automation entries sorted by scheduled_time |
+| POST | `/api/followup-automation` | `{followup_id}` — create entry; resolves context from follow-up source; deduplicates (409 if already scheduled for same ID) |
+| PATCH | `/api/followup-automation/{id}` | Update `scheduled_time`, `call_aim`, `script_notes`, or `status` |
+| DELETE | `/api/followup-automation/{id}` | Remove entry |
+| POST | `/api/followup-automation/{id}/call-now` | Place real outbound call immediately via FreeSWITCH `fs_cli`; updates status/outcome |
+
+Automation scheduler: `asyncio` background loop (started on app startup, polls every 30s). Places calls for entries where `status=scheduled` and `scheduled_time ≤ now`. Dialing: `fs_cli -x "originate sofia/gateway/{gateway}/{phone} &transfer({ext} {ctx})"`. Result parsing detects `+OK UUID` vs error strings.
+
+### Outbound Calls & Campaign
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/outbound/contacts?page&limit&search&disposition` | Paginated outbound contact list |
+| POST | `/api/outbound/contacts` | Add single contact |
+| POST | `/api/outbound/contacts/upload` | CSV bulk import |
+| DELETE | `/api/outbound/contacts/all` | Clear all contacts |
+| DELETE | `/api/outbound/contacts/{id}` | Delete one contact |
+| PATCH | `/api/outbound/contacts/{id}` | Update contact fields |
+| GET | `/api/outbound/stats` | Disposition breakdown counts |
+| POST | `/api/outbound/dial/{contact_id}` | Dial immediately; updates disposition; appends to `call_link.json` |
+| GET | `/api/outbound/campaign/status` | Campaign running status, progress, current contact |
+| POST | `/api/outbound/campaign/start` | Start sequential auto-dialer with configurable delay |
+| POST | `/api/outbound/campaign/stop` | Stop campaign |
+
+### Sarvam API Credits (Finance)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/sarvam/credits` | Cached credit balance + threshold alert |
+| POST | `/api/sarvam/credits` | `{credit_balance}` — manual override |
+| GET | `/api/sarvam/keys` | List API key pool |
+| POST | `/api/sarvam/keys/replace` | Replace active key |
+| POST | `/api/sarvam/keys/bulk` | Add multiple keys |
+| DELETE | `/api/sarvam/keys/pool` | Clear key pool |
+| POST | `/api/sarvam/keys/ack-restart` | Acknowledge pending restart |
+| GET | `/api/sarvam/usage` | Recent credit_log aggregated by day |
+| GET | `/api/sarvam/usage/history` | Historical usage series |
+
+### Logs
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/logs/stream` | SSE stream of live log file tail (both socket_server + ws_audio_receiver) |
+| GET | `/api/logs/tail?lines=N` | Last N lines of log files |
+
+---
+
+## Frontend (static/index.html + static/js/)
+
+Single-page application. All tabs are rendered in `static/index.html`; each tab has a corresponding JS file. Navigation is handled by `app.js`.
+
+### Navigation Structure
+
+**Monitoring**
+- Overview (`overview.js`) — KPI cards (9 metrics with ptabs today/week/month) + 3 bar charts + runtime health
+- Live Calls (`live-calls.js`) — SSE-driven active call list
+- Call Activity (`history.js`) — paginated call log with filters + "⏰ Follow-Up" action per row
+- Recordings (`recordings.js`) — audio player + download link per row
+- Follow-Up Tracker (`followups.js`) — merged follow-up list; status dropdown + ⚡ Automate + 🗑 delete (manual entries only)
+- Live Logs (`logs.js`) — SSE-driven log tail
+
+**Intelligence**
+- Call Transcripts (`conversations.js`) — searchable transcript list; inline slide panel
+- AI Call Analysis (`ai-analysis.js`) — checkbox selection, on-demand analysis run, full results display
+- Conversation Analytics (`conv-analytics.js`) — aggregated insights from all analyses
+- Analytics (`analytics.js`) — legacy per-day stats
+- Follow-Up Automation (`followup-automation.js`) — editable automation schedule; Call Now / cancel / delete
+
+**Campaigns**
+- Outbound Calls (`outbound.js`) — contact list, dial, campaign runner
+
+**Finance**
+- API Usage (`sarvam.js`) — credit balance, key pool, usage history
+
+**System**
+- Runtime Control (`control.js`) — start/stop/restart buttons + live output stream
+- Health (`health.js`) — process liveness indicators
+- Agent Settings (`agent-settings.js`) — read-only extracted agent config from `conversation.py`
+
+### Shared JS utilities (app.js)
+
+- `api(path)` — fetch wrapper, returns JSON, throws on non-2xx
+- `esc(s)` — HTML-escape
+- `fmtTs(iso)` — format ISO timestamp
+- `fmtDur(seconds)` — format duration as mm:ss or Xm Ys
+- `R(n, decimals)` — round to decimals
+- `shortId(id)` — truncate call ID for display
+- `sortRows(rows, key, dir)` — in-memory sort
+- `bindSortableHeaders(thead, cb)` — click-to-sort
+- `pushNotification(msg, type)` — top-right toast
+- `switchTab(tabId)` — navigate to tab programmatically
+- `renderHbarList(data, elId)` — horizontal bar list for analytics
+
+### Add to Follow-Up modal
+
+Defined inline in `index.html` (`#addfu-backdrop`). Functions `openAddFuModal(call)`, `closeAddFuModal()`, `submitAddFuModal()` live in `history.js`. Pre-fills contact name/phone from the Call Activity row. Posts to `POST /api/followups/manual`.
+
+---
+
+## Key Design Decisions and Limitations
+
+### Inbound/Outbound Direction Classification
+
+`credit_log` CSVs have no `direction` field. The dashboard infers direction using a timestamp-based heuristic:
+
+1. When a manual dial or campaign dial fires, `_record_dial()` appends `{phone, dialed_at}` to `call_link.json` (ring-buffer, max 5000 entries).
+2. `_classify_direction(call_start_time)` searches `call_link.json` for the closest entry whose `dialed_at` is within ±90 seconds of the call start. If found → `outbound`; otherwise → `inbound`.
+
+**Limitation**: calls placed before the dashboard was deployed (or before `call_link.json` had entries) are classified as `inbound` by default. This is a forward-looking heuristic only — historical calls cannot be retroactively classified.
+
+### On-Demand AI Call Analysis
+
+- Analysis is triggered only when the user selects a recording in the AI Call Analysis tab and clicks "Run Analysis" — it is never automatic.
+- The dashboard reads `transcript.txt` from disk and sends it to an OpenAI-compatible API (model: `gpt-4o-mini`, JSON mode).
+- Results are cached in `call_analysis.json` (keyed by folder name). Re-running the same folder re-bills and overwrites the cached result.
+- Recording folders are root:root — the dashboard cannot create files inside them. Analysis results are stored in the dashboard-owned `call_analysis.json` instead.
+
+### Follow-Up Tracker — Three Sources
+
+1. **Outbound disposition** (`contact:` prefix): contacts in `outbound_contacts.json` with `disposition in ("to_contact_later", "in_doubt")`. Status overrides in `follow_ups.json`.
+2. **AI Call Analysis** (`call:` prefix): analyzed calls with `follow_up_needed: true`. Status overrides in `follow_ups.json`.
+3. **Manual** (`manual:` prefix): entries in `manual_followups.json` created by operator from Call Activity. Status stored directly on the entry (not in the override map).
+
+### Follow-Up Automation
+
+- Creating an automation entry resolves context from the source (`_build_followup_context`): outbound disposition → contact notes; AI analysis → call summary/reason; manual → stored reason/date/call_id.
+- Automation only places the call — it does NOT alter what the agent says. Script notes and call aim are for the operator's reference only (shown in the dashboard, not injected into the live conversation engine).
+- Scheduler polls every 30s via asyncio background loop started on app `startup` event.
+- Dialing reuses the exact same FreeSWITCH `originate` command as manual outbound dials.
+
+### Agent Settings (Read-Only)
+
+The dashboard extracts agent name, tone, greeting, and prompt sections from `conversation.py` using regex over the raw source text. The module is **never imported**. There is no write path — editing agent settings via the dashboard is intentionally out of scope (changes to the live agent require direct code edits and a pipeline restart).
+
+### Known Data Gaps
+
+- **Inbound missed calls**: not tracked — `credit_log` only records calls that reached the AI pipeline. Abandoned calls before connection appear in FreeSWITCH CDR but not here.
+- **Caller phone number**: `metadata.json` does not store the caller's PSTN number. For recent calls, the recording folder name often IS the phone number (e.g., `919599761331_20260619_061410`), but this is not guaranteed for older calls.
+- **CallState not persisted**: session state (`CallState`) lives in memory during a call and is not written to disk after the call ends. Post-call data available: transcript, metadata, credit_log row.
+- **Minutes accounting**: minutes used is estimated from recording durations (if available) or credit_log timestamps. The quota is set manually by the operator — there is no automatic sync with the telephony provider's billing.
+
+---
+
+## Running the System
+
+### Start All Services
+```bash
+cd /home/angelo/lescall
+bash phase14_runtime/start_all.sh
+```
+
+### Dashboard Only
+```bash
+cd /home/angelo/lescall/dashboard
+bash start.sh --bg          # starts in background, logs to dashboard.log
+bash start.sh               # foreground
+```
+
+### Stop / Monitor
+```bash
+bash phase14_runtime/stop_all.sh
+bash phase14_runtime/tail_logs.sh
+bash phase14_runtime/check_runtime.sh
+```
+
+### AI Pipeline Only (CLI test, no telephony)
+```bash
+cd /home/angelo/lescall/calling-agent
+source venv/bin/activate
+cd backend
+python run.py               # mic → speaker
+python run.py --web         # + local web console at http://127.0.0.1:8000
+python run.py --test        # single-turn test, no mic
 ```
 
 ---
 
-## Key Invariants
+## Invariants — Never Violate
 
-- `SARVAM_API_KEY` is the correct env var name (not `SARVAMAI_API_KEY`)
-- `socket_server.py` runs under system Python; everything else under `calling-agent/venv`
-- All audio inside the AI pipeline is PCM16 at 16kHz
-- FreeSWITCH delivers PCMU at 8kHz; `ws_audio_receiver.py` decodes (any frame size) and upsamples
-- Greeting fires only after first audio frame from caller (`_greeting_done` gate)
-- `selected_project` in `CallState` is never overridden after first confirmation
-- `language_locked=True` is permanent per session unless caller explicitly switches language
-- TTS echo cooldown applies in both telephony and local mode (different durations)
-- Both TTS files (`tts_sarvam.py`, `tts_sarvam_ws.py`) use `DEFAULT_SPEAKER = "shubh"` (bulbul:v3)
-- `VoicePipeline` instantiates `CachedTTS` (not `TrackingSarvamTTS`) by default
-- `_parse_llm_response()` requires CACHE token to be the ENTIRE LLM response — even one extra word causes cache routing to fail
-- WAV files injected to FreeSWITCH go via `/tmp/ai_telephony_playback/` and are played via ESL `uuid_broadcast`
-
----
-
-## Historical Fixes
-
-| Date | File | Fix |
-|---|---|---|
-| 2026-06-05 | `ws_audio_receiver.py` | PCMU decode: removed 160B size guard — now decodes all non-empty PCMU frames |
-| 2026-06-05 | `pipeline.py` | `HARD_FLUSH_SILENCE_FRAMES` 30→50 (600ms→1000ms) to prevent Hindi/Gu sentence fragmentation |
-| 2026-06-05 | `stt/sarvam_ws.py` | Full rewrite: single `unknown` connection, native language detection, removed 120 lines of heuristic dual-connection code |
-| 2026-06-05 | `phase14_runtime/start_all.sh` | Added explicit `--sample-rate 8000` |
-| 2026-06-02 | `pipeline.py` | Greeting gate: greeting fires after first audio frame, not at WebSocket open |
-| 2026-06-02 | `stt/router.py` | Added unsupported-script fallback; ffmpeg normalization failure now drops WAV |
-| 2026-06-11 | `tts_sarvam.py`, `tts_sarvam_ws.py` | `DEFAULT_SPEAKER` changed from `"priya"` to `"shubh"` |
-| 2026-06-11 | `pipeline.py` | `Response` dataclass: added `cache_key: str \| None = None` |
-| 2026-06-11 | `pipeline.py` | `VoicePipeline`: uses `CachedTTS` instead of `TrackingSarvamTTS` |
-| 2026-06-11 | `pipeline.py` | `_tts_layer`: cache-first routing block; silence protection skips cache responses |
-| 2026-06-11 | `pipeline.py` | `_conversation_layer`: propagates `cache_key` for both shortcut and LLM paths |
-| 2026-06-11 | `conversation.py` | `EngineResult`: added `cache_key: str \| None = None` |
-| 2026-06-11 | `conversation.py` | `_parse_llm_response()`, `_CACHE_ROUTER_INSTRUCTIONS`, `_consume_llm_with_filler()` — CACHE token interception |
-| 2026-06-11 | `conversation.py` | Shortcut yields: `shortcut_bye`, `shortcut_thanks`, `shortcut_not_interested`, `shortcut_hello` wired to cache_key |
-| 2026-06-11 | `tts_cached.py` | NEW: `CachedTTS` class with `speak_cached()` |
-| 2026-06-11 | `generate_tts_cache.py` | NEW: WAV cache generator, 92 files generated and validated |
+1. `socket_server.py`, `ws_audio_receiver.py`, `conversation.py`, `call_audit.py` are NEVER imported or modified by the dashboard.
+2. The dashboard never writes into `recordings/` or `credit_log/`.
+3. `socket_server.py` runs under **system Python**; `ws_audio_receiver.py` and all `calling-agent/` code runs under `calling-agent/venv`. Do not mix.
+4. All audio in the AI pipeline is 16-bit PCM at 16 kHz. FreeSWITCH delivers PCMU at 8 kHz; `ws_audio_receiver.py` handles decode and upsample.
+5. `SARVAM_API_KEY` is the correct env var name (not `SARVAMAI_API_KEY`).
+6. The greeting fires only after the first audio frame is received (`signal_call_active()` gate) — not at WebSocket open — to avoid burning TTS credits on abandoned connections.
+7. Follow-Up Automation places real calls via FreeSWITCH — always confirm before using "Call Now" on a production system.

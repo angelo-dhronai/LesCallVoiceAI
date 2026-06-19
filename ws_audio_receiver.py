@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import audioop
 import base64
+import datetime
 import json
 import logging
 import os
@@ -22,6 +23,19 @@ import wave
 
 from conversation_call_bridge import call_bridge
 from call_audit import audit_manager
+
+# ---------------------------------------------------------------------
+# Live-call state snapshot (additive, dashboard-only consumer).
+#
+# Periodically dumps a small JSON snapshot of every active call's
+# coarse state (stage, language, who's-speaking, last transcript lines)
+# to disk so the separate dashboard process (port 8080) can poll/stream
+# it. Pure read-and-snapshot — never mutates pipeline/session state.
+# ---------------------------------------------------------------------
+LIVE_STATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "phase14_runtime", "live_calls_state.json"
+)
+LIVE_STATE_INTERVAL_S = 1.5
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -808,9 +822,63 @@ async def handle_connection(websocket, path: str, args):
 # ---------------------------------------------------------------------
 
 
+def _snapshot_live_calls() -> dict:
+    """Build the live-call snapshot dict from in-memory session state.
+
+    Read-only: only ever reads attributes off existing session/pipeline
+    objects, never sets anything. If any expected attribute is missing
+    (e.g. a session mid-teardown), that call is skipped rather than
+    raising — this must never be able to affect call handling.
+    """
+    calls = []
+    for conn_id, session in list(call_bridge.sessions.items()):
+        try:
+            pipeline = session.pipeline
+            conv_state = getattr(getattr(pipeline, "conversation", None), "state", None)
+            stage = getattr(conv_state, "stage", None)
+            language = getattr(conv_state, "language", None)
+            tts_playing = bool(getattr(pipeline, "_tts_playing", False))
+            user_speaking = bool(getattr(pipeline, "_user_speaking", False))
+            speaking = "ai" if tts_playing else ("user" if user_speaking else "listening")
+            start_time_epoch = session.stats.get("start_time")
+            start_time_iso = (
+                datetime.datetime.fromtimestamp(start_time_epoch, tz=datetime.timezone.utc).isoformat()
+                if start_time_epoch else None
+            )
+            calls.append({
+                "conn_id": conn_id,
+                "caller_number": getattr(session, "caller_number", "") or "",
+                "start_time": start_time_iso,
+                "language": language,
+                "stage": stage,
+                "speaking": speaking,
+                "transcript_tail": list(getattr(session, "transcript_tail", []) or []),
+            })
+        except Exception as exc:
+            log.warning("[LIVE-STATE] Skipped snapshot for %s: %r", conn_id, exc, exc_info=True)
+    return {"updated_at": time.time(), "calls": calls}
+
+
+async def _live_state_writer_loop():
+    """Background task: snapshot active calls to disk every ~1.5s."""
+    tmp_path = LIVE_STATE_PATH + ".tmp"
+    while True:
+        try:
+            snapshot = _snapshot_live_calls()
+            os.makedirs(os.path.dirname(LIVE_STATE_PATH), exist_ok=True)
+            with open(tmp_path, "w") as f:
+                json.dump(snapshot, f)
+            os.replace(tmp_path, LIVE_STATE_PATH)
+        except Exception:
+            log.warning("[LIVE-STATE] Snapshot write failed", exc_info=True)
+        await asyncio.sleep(LIVE_STATE_INTERVAL_S)
+
+
 async def main_async(args):
 
     import websockets
+
+    asyncio.create_task(_live_state_writer_loop())
 
     log.info(
         "ws_audio_receiver listening on ws://%s:%d",

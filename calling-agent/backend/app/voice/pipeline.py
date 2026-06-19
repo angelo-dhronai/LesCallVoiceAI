@@ -28,13 +28,9 @@ from .stt.router import STTRouter
 from .tts_stream import StreamingTTS, MockStreamingTTS
 from .tts_sarvam import SarvamTTS
 from .turn_manager import TurnManager, TurnManagerConfig
-from .conversation import ConversationRouter, detect_language as _detect_script_language
+from .conversation import ConversationRouter
 from .memory import ConversationMemory
 from .event_hub import EventHub
-from .tracking_stt import TrackingSarvamSTT, TrackingWhisperSTT
-from .tracking_tts import TrackingSarvamTTS
-from .tts_cached import CachedTTS
-from .credit_tracker import SarvamCreditTracker
 
 from ..audio_transport.base import AudioSource, AudioSink
 from ..audio_transport.local_mic_source import LocalMicSource
@@ -70,28 +66,9 @@ class Response:
     text: str
     is_shortcut: bool
     timestamp: float
-    cache_key: str | None = None
 
 
 QUEUE_SIZE_AUDIO = 40
-
-# ---------------------------------------------------------------------------
-# TTS pronunciation normalisation
-# Add entries here for any word the model mispronounces.  The replacement is
-# passed verbatim to Sarvam so phonetic spelling works ("Pramukh" → "Prahmukh").
-# Keys are matched case-insensitively; longest match wins because dict iteration
-# is insertion-ordered and we sort by length below.
-# ---------------------------------------------------------------------------
-_PRONUNCIATION_MAP: dict[str, str] = {
-    # Add mispronounced words/phrases below, e.g.:
-    # "Pramukh": "Prahmukh",
-    # "Vishal": "Vishal",
-}
-_PRONUNCIATION_PATTERNS = [
-    (re.compile(r'\b' + re.escape(src) + r'\b', re.IGNORECASE), dst)
-    for src, dst in sorted(_PRONUNCIATION_MAP.items(), key=lambda x: -len(x[0]))
-]
-
 QUEUE_SIZE_STT = 3
 QUEUE_SIZE_TRANSCRIPT = 3
 # Raised from 3 to 8: streamed LLM responses produce multiple sentence-level
@@ -125,14 +102,12 @@ SPEECH_ONSET_MIN_FRAMES = 2
 SPEECH_HOLD_MIN_FRAMES = 10
 
 # Hard-flush silence gate (frames of consecutive silence after hold expires).
-# Lowered 50→35 frames (1000→700 ms): reduces end-of-turn latency while still
-# tolerating most Hindi/Gujarati intra-utterance pauses (typically 300–500 ms).
-HARD_FLUSH_SILENCE_FRAMES = 35
-
-# Minimum Sarvam language_probability to lock language for subsequent STT calls.
-# Below this threshold we keep auto-detecting so noisy first turns don't
-# permanently mis-lock (e.g. background music detected as Tamil).
-_LANG_LOCK_PROB_THRESHOLD = 0.75
+# Raised 30→50 frames (600→1000 ms): callers speaking Hindi/Gujarati regularly
+# pause 400–700 ms between clause groups within a single utterance.  600 ms
+# was splitting those utterances, sending 2 short fragments to STT instead of
+# one complete sentence.  1000 ms still catches end-of-turn pauses (>1s) while
+# tolerating normal intra-utterance breathing pauses.
+HARD_FLUSH_SILENCE_FRAMES = 50
 
 # Fallback phrases played when STT returns empty on substantial speech,
 # or when TTS receives an empty string or fails to play (feature 2 & 5).
@@ -164,12 +139,10 @@ class VoicePipeline:
         event_hub: EventHub | None = None,
         mic_enabled: bool = True,
         skip_greeting: bool = False,
-        call_id: str | None = None,
     ) -> None:
-        self._call_id = call_id
         self.audio = audio_source or LocalMicSource(sample_rate=SAMPLE_RATE)
         self.sink = audio_sink or LocalSpeakerSink(sample_rate=SAMPLE_RATE)
-
+        
         # Phase 17: Adjust VAD for telephony mode
         if vad is None:
             vad = VoiceActivityDetector(
@@ -179,26 +152,15 @@ class VoicePipeline:
                 maximum_threshold=3000.0 if TELEPHONY_MODE else 1500.0,
             )
         self.vad = vad
-
-        if stt is None:
-            _get_cid = lambda: self._call_id
-            self.stt = STTRouter(
-                primary=TrackingSarvamSTT(call_id_provider=_get_cid),
-                fallback=TrackingWhisperSTT(call_id_provider=_get_cid),
-            )
-        else:
-            self.stt = stt
-
+        
+        self.stt = stt or STTRouter()
         self.conversation = conversation or ConversationRouter()
         self._hub = event_hub
 
-        if tts is None:
-            _get_cid = lambda: self._call_id
-            self.tts = CachedTTS(call_id_provider=_get_cid, audio_sink=self.sink)
-        else:
-            self.tts = tts
-            if hasattr(tts, 'set_sink'):
-                tts.set_sink(self.sink)
+        # TTS uses the sink
+        self.tts = tts or SarvamTTS(audio_sink=self.sink)
+        if tts and hasattr(tts, 'set_sink'):
+            tts.set_sink(self.sink)
 
         # Inter-layer queues
         self._stt_queue: asyncio.Queue[AudioSegment] = asyncio.Queue(maxsize=QUEUE_SIZE_STT)
@@ -210,6 +172,10 @@ class VoicePipeline:
         self._tasks: list[asyncio.Task] = []
         self._current_generation_task: asyncio.Task | None = None
         self._tts_playing = False
+        # Live "is the caller currently speaking" flag — read-only signal for
+        # external monitoring (dashboard live-call snapshot); never consulted
+        # by any pipeline control-flow branch.
+        self._user_speaking: bool = False
         self._tts_start_time = 0.0
         self._tts_end_time = 0.0
         self._vad_mute_until = 0.0
@@ -236,11 +202,6 @@ class VoicePipeline:
         self._silence_frames = 0       # debounce: frames since last speech
         self._pre_speech_buffer: list[bytes] = []  # look-back to recover onset clip
 
-        # STT language lock — set to BCP-47 code (e.g. "hi-IN") after Sarvam
-        # returns a confident detection (language_probability >= threshold).
-        # "unknown" is only used pre-lock to allow free language detection.
-        self._stt_locked_language: str | None = None
-
         # Diagnostic counters — logged at session end to trace audio path
         self._vad_frames_seen: int = 0
         self._vad_speech_frames: int = 0
@@ -266,21 +227,19 @@ class VoicePipeline:
             )
 
         # Turn manager — tuned for phone call cadence.
-        # silence_threshold_ms 1400→950: reduces perceived latency while still
-        # giving callers enough time to finish short pauses mid-thought.
-        # grace_window_ms 300→150: keeps trailing-syllable protection without
-        # adding unnecessary dead time at every turn end.
+        # Longer silence threshold (1400 ms) gives callers time to finish their
+        # thought before the agent jumps in.  Grace window 300 ms absorbs
+        # trailing syllables.  min_words raised so single-frame noise doesn't
+        # trigger a turn.
         self._turn = TurnManager(TurnManagerConfig(
-            silence_threshold_ms=950.0,
-            grace_window_ms=150.0,
+            silence_threshold_ms=1400.0,
+            grace_window_ms=300.0,
             min_words_short=2,
             min_words_long=3,
         ))
 
     async def start(self) -> None:
         self._running = True
-        if self._call_id:
-            SarvamCreditTracker.get().start_call(self._call_id)
         logger.info("=" * 60)
         logger.info("[PIPELINE] Starting voice pipeline")
         logger.info("=" * 60)
@@ -351,7 +310,6 @@ class VoicePipeline:
             self._tts_queue.put_nowait(Response(
                 text=opening.text,
                 is_shortcut=True,
-                cache_key=opening.cache_key,
                 timestamp=time.monotonic(),
             ))
             logger.info("[PIPELINE] Agent opening: %r", opening.text)
@@ -368,8 +326,6 @@ class VoicePipeline:
 
     async def stop(self) -> None:
         self._running = False
-        if self._call_id:
-            SarvamCreditTracker.get().end_call(self._call_id)
         await self.audio.stop()
         for task in self._tasks:
             task.cancel()
@@ -457,12 +413,14 @@ class VoicePipeline:
         if not self._mic_enabled:
             if not self.vad.calibrated:
                 self.vad.is_speech(frame)
+            self._user_speaking = False
             return
 
         self._vad_frames_seen += 1
         raw_speech = self.vad.is_speech(frame)
         if raw_speech:
             self._vad_speech_frames += 1
+        self._user_speaking = bool(raw_speech) and not self._tts_playing
 
         # === FULL MUTE while TTS is playing — only allow barge-in ===
         # Barge-in uses a stricter threshold than turn-detection so TTS
@@ -611,6 +569,8 @@ class VoicePipeline:
 
         # Hard flush: after enough accumulated speech, a long consecutive
         # silence window triggers a flush even if TurnManager hasn't fired.
+        # Using HARD_FLUSH_SILENCE_FRAMES (1000 ms) to tolerate natural
+        # intra-utterance pauses common in Hindi/Gujarati speech.
         if (
             not speech
             and self._speech_duration_ms >= MIN_SPEECH_MS
@@ -714,14 +674,13 @@ class VoicePipeline:
                 # English is also passed explicitly when locked — Sarvam handles
                 # English-IN well and it prevents misclassification on accented
                 # English with Indian words.
-                # Use locked language if we have a confident detection from a
-                # prior turn; otherwise let Sarvam auto-detect.
-                _stt_lang = self._stt_locked_language or "unknown"
-                logger.debug(
-                    "[STT-WORKER] stt_lang=%s (%s)",
-                    _stt_lang,
-                    "locked" if self._stt_locked_language else "auto-detect",
-                )
+                _stt_lang = "unknown"
+                # Always use unknown for auto-detection — prevents the feedback loop
+                # where language_locked forces STT to a specific language, causing
+                # cross-language transcripts to be mis-detected and keeping the lock
+                # active. Sarvam's auto-detection on each turn enables true dynamic
+                # language switching as required.
+                logger.debug("[STT-WORKER] stt_lang=unknown (auto-detect every turn)")
                 _seg_samples = np.frombuffer(segment.audio, dtype=np.int16).astype(np.float32)
                 _seg_rms = float(np.sqrt(np.mean(_seg_samples ** 2))) if len(_seg_samples) else 0.0
                 logger.info(
@@ -740,8 +699,7 @@ class VoicePipeline:
                 stt_latency = (time.monotonic() - latency_start) * 1000
 
                 # Update conversation language from Sarvam's native detection result.
-                # Also lock the STT language when detection confidence is high enough
-                # so subsequent chunks don't bounce between languages mid-call.
+                # Applied on every turn — no lock. Enables truly dynamic language switching.
                 if (
                     stt_result.detected_language
                     and self.conversation
@@ -750,44 +708,12 @@ class VoicePipeline:
                     _bcp47_to_short = {"en-IN": "en", "hi-IN": "hi", "gu-IN": "gu"}
                     short = _bcp47_to_short.get(stt_result.detected_language)
                     if short:
+                        logger.info(
+                            "[STT] Language auto-detected by Sarvam: %s → %s",
+                            stt_result.detected_language, short,
+                        )
                         self.conversation.state.language = short
-
-                        lang_prob = stt_result.language_probability
-                        if (
-                            lang_prob is not None
-                            and lang_prob >= _LANG_LOCK_PROB_THRESHOLD
-                            and self._stt_locked_language != stt_result.detected_language
-                        ):
-                            self._stt_locked_language = stt_result.detected_language
-                            logger.info(
-                                "[STT] Language locked: %s → %s (prob=%.2f)",
-                                stt_result.detected_language, short, lang_prob,
-                            )
-                        else:
-                            logger.info(
-                                "[STT] Language detected: %s → %s (prob=%s, lock=%s)",
-                                stt_result.detected_language, short,
-                                f"{lang_prob:.2f}" if lang_prob is not None else "n/a",
-                                self._stt_locked_language or "none",
-                            )
-
-                # Script-based language override: if the transcript contains Devanagari or
-                # Gujarati script but the STT lock is en-IN, the lock was set from an
-                # early codemix word (e.g. "hello", "cash") and is now forcing Sarvam to
-                # transliterate or translate Hindi/Gujarati into English. Reset the lock
-                # so the next STT call uses the caller's actual language.
-                if transcript_text and self._stt_locked_language == "en-IN":
-                    _script_lang = _detect_script_language(transcript_text)
-                    if _script_lang != "en":
-                        _new_bcp47 = {"hi": "hi-IN", "gu": "gu-IN"}.get(_script_lang)
-                        if _new_bcp47:
-                            logger.info(
-                                "[STT] Script override: transcript=%s lock=en-IN → resetting lock to %s",
-                                _script_lang, _new_bcp47,
-                            )
-                            self._stt_locked_language = _new_bcp47
-                            if self.conversation:
-                                self.conversation.state.language = _script_lang
+                        # Do NOT lock — allow every utterance to update language dynamically
 
                 # Duration-aware plausibility: natural speech maxes at ~4 words/sec.
                 # A transcript with far more words than the audio can contain is a
@@ -829,13 +755,6 @@ class VoicePipeline:
                         "nope", "theek", "barobar", "aavjo",
                         "हां", "हाँ", "जी", "ठीक", "हा", "ना", "नहीं",
                         "હા", "જી", "ઠીક", "ના", "નહીં",
-                        # Greeting/farewell single-words — valid shortcut triggers
-                        "hello", "hi", "hey", "helo", "hellow", "halo",
-                        "bye", "goodbye",
-                        "thanks",
-                        "namaste", "namaskar",
-                        "हेलो", "नमस्ते",
-                        "હેલો", "નમસ્તે",
                     }
                     if _single not in _affirmation_negation:
                         logger.info(
@@ -885,7 +804,6 @@ class VoicePipeline:
                                 self._tts_queue.put_nowait(Response(
                                     text=fallback,
                                     is_shortcut=True,
-                                    cache_key="stt_fallback",
                                     timestamp=time.monotonic(),
                                 ))
                             except asyncio.QueueFull:
@@ -992,7 +910,6 @@ class VoicePipeline:
                                     Response(
                                         text=result.text,
                                         is_shortcut=True,
-                                        cache_key=result.cache_key,
                                         timestamp=time.monotonic(),
                                     )
                                 )
@@ -1001,24 +918,8 @@ class VoicePipeline:
                                     "[ENGINE] TTS queue full -- dropping shortcut chunk"
                                 )
                         else:
-                            if result.cache_key:
-                                # Cache-routed response: enqueue directly, bypassing llm_parts
-                                try:
-                                    self._tts_queue.put_nowait(
-                                        Response(
-                                            text="",
-                                            is_shortcut=False,
-                                            cache_key=result.cache_key,
-                                            timestamp=time.monotonic(),
-                                        )
-                                    )
-                                except asyncio.QueueFull:
-                                    logger.warning(
-                                        "[ENGINE] TTS queue full -- dropping cache response"
-                                    )
-                            else:
-                                # Buffer LLM sentence chunks; sent combined below.
-                                llm_parts.append(result.text)
+                            # Buffer LLM sentence chunks; sent combined below.
+                            llm_parts.append(result.text)
 
                     # Send all LLM sentences as ONE TTS request to produce a
                     # single coherent utterance instead of fragmented pieces.
@@ -1139,9 +1040,8 @@ class VoicePipeline:
                 await asyncio.sleep(0.05)
 
             try:
-                # Silence protection (feature 5): never send blank text to TTS.
-                # Skip for cache-routed responses — text="" is intentional there.
-                if not response.text.strip() and not response.cache_key:
+                # Silence protection (feature 5): never send blank text to TTS
+                if not response.text.strip():
                     lang = self.conversation.state.language if self.conversation else "en"
                     fallback = _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
                     logger.warning("[TTS] Empty response text — substituting fallback phrase (lang=%s)", lang)
@@ -1151,48 +1051,24 @@ class VoicePipeline:
                         timestamp=response.timestamp,
                     )
 
-                # Cache routing: serve from pre-generated WAV when available
-                cache_key = response.cache_key
-                lang = self.conversation.state.language if self.conversation else "en"
-                lang_short = lang.split('-')[0] if '-' in lang else lang
+                # Preprocess text to avoid gibberish: normalize punctuation that
+                # can confuse Sarvam TTS (em-dashes produce audio glitches).
+                tts_text = response.text
+                tts_text = tts_text.replace("—", ", ").replace("–", ", ")
+                tts_text = tts_text.replace("…", ".").replace("…", ".")
+                tts_text = tts_text.replace("•", "").replace("·", "")
+                # Collapse multiple spaces/newlines that may appear in LLM output
+                tts_text = re.sub(r'\s+', ' ', tts_text).strip()
 
-                served_from_cache = False
-                if cache_key and hasattr(self.tts, 'speak_cached'):
-                    logger.info("[TTS] Cache route: key=%s lang=%s", cache_key, lang_short)
-                    self._tts_playing = True
-                    self._tts_start_time = time.monotonic()
-                    served_from_cache = await self.tts.speak_cached(cache_key, lang_short)
-                    if not served_from_cache:
-                        logger.warning("[TTS] Cache miss: key=%s — falling back to live TTS", cache_key)
+                logger.info("[TTS] Playing: %r (queued %.0fms ago)", tts_text, age_ms)
 
-                if not served_from_cache:
-                    tts_text = response.text or ''
-                    if tts_text.strip():
-                        # Preprocess text to avoid gibberish: normalize punctuation that
-                        # can confuse Sarvam TTS (em-dashes produce audio glitches).
-                        tts_text = tts_text.replace("—", ", ").replace("–", ", ")
-                        tts_text = tts_text.replace("…", ".").replace("…", ".")
-                        tts_text = tts_text.replace("•", "").replace("·", "")
-                        # Collapse multiple spaces/newlines that may appear in LLM output
-                        tts_text = re.sub(r'\s+', ' ', tts_text).strip()
-                        # Apply pronunciation corrections (edit _PRONUNCIATION_MAP at top of file)
-                        for pattern, replacement in _PRONUNCIATION_PATTERNS:
-                            tts_text = pattern.sub(replacement, tts_text)
+                self._tts_playing = True
+                self._tts_start_time = time.monotonic()
 
-                        logger.info("[TTS] Playing: %r (queued %.0fms ago)", tts_text, age_ms)
+                if hasattr(self.tts, 'set_language') and self.conversation:
+                    self.tts.set_language(self.conversation.state.language)
 
-                        self._tts_playing = True
-                        self._tts_start_time = time.monotonic()
-
-                        if hasattr(self.tts, 'set_language') and self.conversation:
-                            self.tts.set_language(self.conversation.state.language)
-
-                        await self.tts.speak(tts_text)
-                    else:
-                        logger.warning(
-                            "[TTS] Cache miss key=%s with no live fallback text — skipping turn",
-                            cache_key,
-                        )
+                await self.tts.speak(tts_text)
 
             except asyncio.CancelledError:
                 logger.info("[TTS] Interrupted")

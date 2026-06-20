@@ -1,41 +1,56 @@
 [
   {
-    "id": "1781854054155_1331",
-    "phone": "+919599761331",
-    "name": "angelo main",
-    "notes": "",
-    "added_at": "2026-06-19T07:27:34.155738Z",
-    "call_status": "answered",
+    "id": "1781872607014_5050",
+    "phone": "+918767865050",
+    "name": "shubhangi Vijay pawar",
+    "notes": "project manager",
+    "added_at": "2026-06-19T12:36:47.014827Z",
+    "call_status": "not_called",
     "disposition": "not_classified",
-    "call_count": 1,
-    "last_called_at": "2026-06-19T07:27:44.346053Z",
+    "call_count": 0,
+    "last_called_at": null,
     "call_notes": "",
-    "call_history": [
-      {
-        "ts": "2026-06-19T07:27:44.346053Z",
-        "call_status": "answered"
-      }
-    ]
+    "call_history": []
   },
   {
-    "id": "1781854161006_5737",
-    "phone": "+918628835737",
-    "name": "moksh",
+    "id": "1781872607016_2864",
+    "phone": "+918076562864",
+    "name": "angelo p chery hottest man alive",
     "notes": "",
-    "added_at": "2026-06-19T07:29:21.006200Z",
-    "call_status": "answered",
+    "added_at": "2026-06-19T12:36:47.016054Z",
+    "call_status": "failed",
     "disposition": "not_classified",
-    "call_count": 2,
-    "last_called_at": "2026-06-19T07:29:57.757637Z",
+    "call_count": 7,
+    "last_called_at": "2026-06-19T12:39:56.484940Z",
     "call_notes": "",
     "call_history": [
       {
-        "ts": "2026-06-19T07:29:40.615479Z",
-        "call_status": "busy"
+        "ts": "2026-06-19T12:37:06.667447Z",
+        "call_status": "failed"
       },
       {
-        "ts": "2026-06-19T07:29:57.757637Z",
-        "call_status": "answered"
+        "ts": "2026-06-19T12:37:19.674440Z",
+        "call_status": "failed"
+      },
+      {
+        "ts": "2026-06-19T12:37:49.637123Z",
+        "call_status": "failed"
+      },
+      {
+        "ts": "2026-06-19T12:38:00.458413Z",
+        "call_status": "failed"
+      },
+      {
+        "ts": "2026-06-19T12:39:09.051766Z",
+        "call_status": "failed"
+      },
+      {
+        "ts": "2026-06-19T12:39:47.752564Z",
+        "call_status": "failed"
+      },
+      {
+        "ts": "2026-06-19T12:39:56.484940Z",
+        "call_status": "failed"
       }
     ]
   }

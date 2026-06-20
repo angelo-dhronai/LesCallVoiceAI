@@ -102,12 +102,10 @@ SPEECH_ONSET_MIN_FRAMES = 2
 SPEECH_HOLD_MIN_FRAMES = 10
 
 # Hard-flush silence gate (frames of consecutive silence after hold expires).
-# Raised 30→50 frames (600→1000 ms): callers speaking Hindi/Gujarati regularly
-# pause 400–700 ms between clause groups within a single utterance.  600 ms
-# was splitting those utterances, sending 2 short fragments to STT instead of
-# one complete sentence.  1000 ms still catches end-of-turn pauses (>1s) while
-# tolerating normal intra-utterance breathing pauses.
-HARD_FLUSH_SILENCE_FRAMES = 50
+# 30 frames = 600 ms: matches reference system tuning. Flushes the STT buffer
+# faster after the caller stops speaking, reducing per-turn latency by up to
+# 400 ms vs the previous 50-frame (1000 ms) setting.
+HARD_FLUSH_SILENCE_FRAMES = 30
 
 # Fallback phrases played when STT returns empty on substantial speech,
 # or when TTS receives an empty string or fails to play (feature 2 & 5).
@@ -569,8 +567,8 @@ class VoicePipeline:
 
         # Hard flush: after enough accumulated speech, a long consecutive
         # silence window triggers a flush even if TurnManager hasn't fired.
-        # Using HARD_FLUSH_SILENCE_FRAMES (1000 ms) to tolerate natural
-        # intra-utterance pauses common in Hindi/Gujarati speech.
+        # Using HARD_FLUSH_SILENCE_FRAMES (600 ms) to flush STT buffer promptly
+        # after caller stops speaking.
         if (
             not speech
             and self._speech_duration_ms >= MIN_SPEECH_MS
@@ -1064,6 +1062,14 @@ class VoicePipeline:
 
                 self._tts_playing = True
                 self._tts_start_time = time.monotonic()
+                # Reset the barge-in streak at every utterance boundary so loud
+                # frames accumulated from the PREVIOUS utterance's echo cannot
+                # trip barge-in on this one.  This is what was cutting off the
+                # real response right after a filler ("एक सेकंड…"): the filler's
+                # echo built the streak to ~10, then the response started and
+                # tripped barge-in the instant it passed the 250ms guard.  A
+                # genuine interrupter simply rebuilds the streak (~60ms).
+                self._speech_frame_streak = 0
 
                 if hasattr(self.tts, 'set_language') and self.conversation:
                     self.tts.set_language(self.conversation.state.language)

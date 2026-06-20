@@ -311,6 +311,24 @@ class ConversationMemory:
             "good", "fine", "okay", "sure", "ready", "happy", "sorry",
             "glad", "trying", "going", "coming", "waiting", "talking",
             "asking", "wondering", "thinking", "planning", "searching",
+            # Feeling/state/condition words — caller answering "how are you?"
+            # with "i'm <state>" must never be read as a name. These are the
+            # words that follow "i'm"/"i am" in small talk, not introductions.
+            "even", "better", "best", "well", "doing", "great", "alright",
+            "blessed", "grateful", "thankful", "tired", "bored", "stressed",
+            "exhausted", "sleepy", "hungry", "sick", "ill", "unwell",
+            "nervous", "anxious", "worried", "scared", "afraid", "confused",
+            "fantastic", "wonderful", "excellent", "perfect", "amazing",
+            "awesome", "fabulous", "fabulous", "cool", "nice", "bit",
+            # Intensifiers / adverbs that precede a state word
+            "very", "really", "so", "too", "quite", "pretty", "more", "much",
+            "still", "all", "right", "kind", "sort", "of", "feeling",
+            "absolutely", "totally", "super", "completely", "actually",
+            "honestly", "literally", "fine", "good", "okay", "ok",
+            # Courtesy / address words that trail a state reply
+            "thanks", "thank", "thankyou", "thanku", "thx", "welcome",
+            "please", "yaar", "bhai", "sir", "madam", "you", "yourself",
+            "today", "now", "also", "anyway", "though",
             "surat", "vapi", "silvassa", "pramukh", "vishal", "patel",
             "mera", "meri", "mere", "naam", "my", "name",
             "maro", "mari", "maru", "apnu", "apna", "aapka",

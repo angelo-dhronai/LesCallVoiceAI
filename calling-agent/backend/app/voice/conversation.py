@@ -80,7 +80,12 @@ _STAGE_ORDER = {
 MAX_RESPONSE_LENGTH = 400
 LLM_TIMEOUT = 5.0
 LLM_MAX_TOKENS = 160
-FILLER_TIMEOUT_S = 2.0
+# Lowered 2.0 → 1.0s: the LLM's first sentence typically lands at ~1.8s, so a
+# 2.0s gate almost never fired and the caller heard dead air. At 1.0s a short
+# acknowledgment ("One moment…") plays ~1s after the caller stops, masking the
+# LLM round-trip and cutting *perceived* turn latency without touching the
+# turn-end wait or the model itself.
+FILLER_TIMEOUT_S = 1.0
 LLM_STREAM_TIMEOUT_S = 7.0
 INTENT_CLASSIFY_TIMEOUT_S = 1.0
 
@@ -1542,6 +1547,23 @@ class ConversationRouter:
         "good", "fine", "okay", "sure", "ready", "happy", "sorry",
         "glad", "trying", "going", "coming", "waiting", "talking",
         "asking", "wondering", "thinking", "planning", "searching",
+        # Feeling/state words — "i'm even better", "i'm doing well" etc. are
+        # small-talk answers to "how are you?", never a name introduction.
+        "even", "better", "best", "well", "doing", "great", "alright",
+        "blessed", "grateful", "thankful", "tired", "bored", "stressed",
+        "exhausted", "sleepy", "hungry", "sick", "ill", "unwell",
+        "nervous", "anxious", "worried", "scared", "afraid", "confused",
+        "fantastic", "wonderful", "excellent", "perfect", "amazing",
+        "awesome", "fabulous", "cool", "nice", "bit",
+        # Intensifiers / adverbs that precede a state word
+        "very", "really", "so", "too", "quite", "pretty", "more", "much",
+        "still", "all", "right", "kind", "sort", "of", "feeling",
+        "absolutely", "totally", "super", "completely", "actually",
+        "honestly", "literally", "ok",
+        # Courtesy / address words that trail a state reply
+        "thanks", "thank", "thankyou", "thanku", "thx", "welcome",
+        "please", "yaar", "bhai", "sir", "madam", "you", "yourself",
+        "today", "now", "also", "anyway", "though",
         "surat", "vapi", "silvassa", "pramukh", "vishal", "patel",
         "yes", "no", "haan", "nahi", "ji", "ha", "na",
         # Greetings — never a name

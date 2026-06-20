@@ -13,5 +13,20 @@
     "created_at": "2026-06-19T08:38:31.818Z",
     "called_at": null,
     "call_outcome": null
+  },
+  {
+    "id": "da8872b00d",
+    "source_id": "call:919599761331_20260619_083508",
+    "contact_name": "",
+    "contact_phone": "919599761331",
+    "past_call_context": "Call summary: The call was between Vishal Patel from Pramukh Group and a prospect named Vrishee, who is looking for a 3 BHK property in Vapi with a budget of 2 to 3 crores. They scheduled a site visit for the next day at 12:00 PM and agreed on a reminder call for later that day. Customer intent: Schedule a property site visit Why follow-up was flagged: Customer requested a reminder call",
+    "call_aim": "Make the reminder call at 4:00 PM as requested",
+    "script_notes": "",
+    "scheduled_time": null,
+    "linked_contact_id": null,
+    "status": "scheduled",
+    "created_at": "2026-06-20T05:45:28.626Z",
+    "called_at": null,
+    "call_outcome": null
   }
 ]

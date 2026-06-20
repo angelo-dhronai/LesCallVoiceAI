@@ -11,47 +11,5 @@
     "last_called_at": null,
     "call_notes": "",
     "call_history": []
-  },
-  {
-    "id": "1781872607016_2864",
-    "phone": "+918076562864",
-    "name": "angelo p chery hottest man alive",
-    "notes": "",
-    "added_at": "2026-06-19T12:36:47.016054Z",
-    "call_status": "failed",
-    "disposition": "not_classified",
-    "call_count": 7,
-    "last_called_at": "2026-06-19T12:39:56.484940Z",
-    "call_notes": "",
-    "call_history": [
-      {
-        "ts": "2026-06-19T12:37:06.667447Z",
-        "call_status": "failed"
-      },
-      {
-        "ts": "2026-06-19T12:37:19.674440Z",
-        "call_status": "failed"
-      },
-      {
-        "ts": "2026-06-19T12:37:49.637123Z",
-        "call_status": "failed"
-      },
-      {
-        "ts": "2026-06-19T12:38:00.458413Z",
-        "call_status": "failed"
-      },
-      {
-        "ts": "2026-06-19T12:39:09.051766Z",
-        "call_status": "failed"
-      },
-      {
-        "ts": "2026-06-19T12:39:47.752564Z",
-        "call_status": "failed"
-      },
-      {
-        "ts": "2026-06-19T12:39:56.484940Z",
-        "call_status": "failed"
-      }
-    ]
   }
 ]

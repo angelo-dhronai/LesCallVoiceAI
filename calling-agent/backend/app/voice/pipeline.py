@@ -66,6 +66,10 @@ class Response:
     text: str
     is_shortcut: bool
     timestamp: float
+    # True only for filler utterances ("एक सेकंड…").  Used by the TTS layer to
+    # grant the filler — and the real response that follows it — a longer
+    # barge-in guard so the filler's own echo can't cancel the real response.
+    is_filler: bool = False
 
 
 QUEUE_SIZE_AUDIO = 40
@@ -87,6 +91,19 @@ BARGE_IN_COOLDOWN_MS = 400.0
 # the agent; requiring 5 sustained frames (100ms) was causing their first
 # syllable to be swallowed before barge-in triggered.
 BARGE_IN_MIN_FRAMES = 3
+
+# Barge-in grace for the utterance that immediately FOLLOWS a filler
+# ("एक सेकंड…", "One moment…").  A filler's own audio echoes back through the
+# telephony round-trip (~700ms injection + the filler's playback duration) and
+# lands *during* the real response that plays right after it.  Those echo frames
+# are loud and fresh, so they trip barge-in and cancel the real response — the
+# caller hears only the filler, then silence.  The normal 250ms guard is far too
+# short to skip that echo.  For the post-filler utterance only (and the filler
+# itself) we require this much elapsed time before barge-in can fire, which
+# covers the filler-echo window.  Every other utterance keeps the 250ms guard,
+# so normal barge-in responsiveness is unchanged.
+BARGE_IN_MIN_ELAPSED_MS = 250.0
+FILLER_ECHO_GRACE_MS = 1500.0
 
 # Echo cooldown after TTS ends naturally: prevents residual TTS audio from
 # being re-captured by the microphone and sent to STT as "user speech".
@@ -195,6 +212,11 @@ class VoicePipeline:
         self._speech_duration_ms = 0.0
         self._prev_speech = False
         self._speech_frame_streak = 0
+        # Tracks whether the previously-started TTS utterance was a filler, so
+        # the real response that immediately follows it gets a longer barge-in
+        # guard (see FILLER_ECHO_GRACE_MS).  Set per-utterance in the TTS layer.
+        self._last_was_filler = False
+        self._barge_in_min_elapsed_ms = BARGE_IN_MIN_ELAPSED_MS
         self._frame_count = 0
         self._speech_onset_frames = 0  # debounce: frames since speech started
         self._silence_frames = 0       # debounce: frames since last speech
@@ -445,7 +467,7 @@ class VoicePipeline:
 
             if (
                 self._speech_frame_streak >= BARGE_IN_MIN_FRAMES
-                and elapsed > 250
+                and elapsed > self._barge_in_min_elapsed_ms
             ):
                 logger.info(
                     "[BARGE-IN] Interrupting TTS "
@@ -909,6 +931,7 @@ class VoicePipeline:
                                         text=result.text,
                                         is_shortcut=True,
                                         timestamp=time.monotonic(),
+                                        is_filler=(result.intent == "filler"),
                                     )
                                 )
                             except asyncio.QueueFull:
@@ -1062,6 +1085,19 @@ class VoicePipeline:
 
                 self._tts_playing = True
                 self._tts_start_time = time.monotonic()
+                # Barge-in guard for THIS utterance.  If this utterance is a
+                # filler, or it is the real response that immediately follows a
+                # filler, use the longer FILLER_ECHO_GRACE_MS so the filler's
+                # own telephony echo (which lands during the next utterance)
+                # cannot trip barge-in and cancel the real response.  Every
+                # other utterance keeps the normal 250ms guard — full barge-in
+                # responsiveness is preserved.
+                prev_was_filler = self._last_was_filler
+                self._last_was_filler = response.is_filler
+                if response.is_filler or prev_was_filler:
+                    self._barge_in_min_elapsed_ms = FILLER_ECHO_GRACE_MS
+                else:
+                    self._barge_in_min_elapsed_ms = BARGE_IN_MIN_ELAPSED_MS
                 # Reset the barge-in streak at every utterance boundary so loud
                 # frames accumulated from the PREVIOUS utterance's echo cannot
                 # trip barge-in on this one.  This is what was cutting off the

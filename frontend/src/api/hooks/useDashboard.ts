@@ -36,7 +36,26 @@ export function useHealth() {
     refetchInterval: 20_000,
   })
   if (!q.data) return demoHealth
-  const services = q.data.services?.map((s: any) => ({ name: s.name ?? s.service, ok: !!s.ok })) ?? demoHealth.services
+  const services = normalizeServices(q.data.services)
   const overall = (q.data.overall as 'healthy' | 'degraded' | 'down') ?? demoHealth.overall
-  return { services, overall, liveCount: q.data.active_calls ?? demoHealth.liveCount }
+  const liveCount = q.data.active_calls ?? q.data.live_count ?? demoHealth.liveCount
+  return { services, overall, liveCount }
+}
+
+/**
+ * Backend /api/health returns `services` as an object keyed by name
+ * ({ ws_audio_receiver: { running: true }, ... }), but older builds expected an
+ * array. Accept either shape so a single unexpected payload can't blank the app.
+ */
+function normalizeServices(raw: any) {
+  if (Array.isArray(raw)) {
+    return raw.map((s: any) => ({ name: s.name ?? s.service, ok: !!(s.ok ?? s.running) }))
+  }
+  if (raw && typeof raw === 'object') {
+    return Object.entries(raw).map(([name, v]: [string, any]) => ({
+      name,
+      ok: !!(v?.ok ?? v?.running),
+    }))
+  }
+  return demoHealth.services
 }

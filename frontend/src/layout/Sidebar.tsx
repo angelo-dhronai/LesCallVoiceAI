@@ -6,16 +6,14 @@ export function Sidebar({ collapsed, liveCount }: { collapsed: boolean; liveCoun
   return (
     <aside className={cx('fixed inset-y-3 left-3 z-40 hidden flex-col lg:flex transition-all duration-300', collapsed ? 'w-[76px]' : 'w-[244px]')}>
       <div className="glass flex h-full flex-col rounded-3xl p-3">
-        <div className={cx('flex items-center gap-2.5 px-2 py-2', collapsed && 'justify-center')}>
-          <div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-mint-400 to-indigo-500 shadow-glow-mint">
-            <span className="font-display text-[15px] font-black text-[#04150d]">L</span>
+        <div className={cx('flex items-center px-1 py-1.5', collapsed ? 'justify-center' : 'px-2')}>
+          <div className={cx('grid place-items-center rounded-2xl bg-white shadow-sm ring-1 ring-black/5', collapsed ? 'h-11 w-11 p-1.5' : 'w-full px-3 py-2.5')}>
+            <img
+              src="/logo.png"
+              alt="LesCall — Call Intelligence"
+              className={cx('w-auto object-contain', collapsed ? 'h-7' : 'h-12')}
+            />
           </div>
-          {!collapsed && (
-            <div className="leading-tight">
-              <div className="font-display text-[15px] font-extrabold tracking-tight">LesCall</div>
-              <div className="text-[10px] font-medium text-dim">Call Intelligence</div>
-            </div>
-          )}
         </div>
         <nav className="mt-2 flex-1 space-y-4 overflow-y-auto px-0.5 py-1">
           {NAV.map((group) => (

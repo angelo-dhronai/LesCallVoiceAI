@@ -40,6 +40,21 @@ done
 
 if [ $STILL_OCCUPIED -ne 0 ]; then
     echo "ERROR: Could not free all ports. Reset failed."
+    # A port we couldn't free almost always means the holder is owned by a
+    # different user (usually a stray root/sudo run) that this script can't
+    # kill. Surface the owner so the operator knows to 'sudo kill' it rather
+    # than guessing. This is the diagnostic that was missing during outages.
+    for port in "${PORTS[@]}"; do
+        holder=$(ss -ltnp 2>/dev/null | grep ":$port ")
+        [ -n "$holder" ] || continue
+        hpid=$(echo "$holder" | grep -oP 'pid=\K[0-9]+' | head -1)
+        howner=$(ps -o user= -p "$hpid" 2>/dev/null | tr -d ' ')
+        echo "  port $port held by pid=$hpid owner=${howner:-unknown}"
+        if [ "$howner" = "root" ]; then
+            echo "    -> owned by root. Stop it with: sudo kill -9 $hpid"
+            echo "    -> then never start the runtime with sudo again (see start_all.sh guard)."
+        fi
+    done
     exit 1
 fi
 

@@ -1,6 +1,19 @@
 #!/bin/bash
 # start_all.sh - Deterministic startup for Phase 14 runtime
 
+# --- Identity guard ---------------------------------------------------------
+# Never start the runtime as root. A root-started service creates root-owned
+# files in the shared runtime dirs (/tmp/phase15_audio_debug, recordings/, ...)
+# which the normal service user then cannot write -> PermissionError on every
+# audio frame -> the agent goes deaf. Root processes also can't be killed by
+# stop_all.sh. This single check prevents that entire failure class.
+if [ "$(id -u)" -eq 0 ]; then
+    echo "FATAL: do not run start_all.sh as root / with sudo." >&2
+    echo "       Run it as the service user (e.g. 'angelo')." >&2
+    exit 1
+fi
+# ---------------------------------------------------------------------------
+
 RUNTIME_DIR="/home/angelo/lescall/phase14_runtime"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 RUN_DIR="$RUNTIME_DIR/logs/run_$TIMESTAMP"

@@ -269,22 +269,24 @@
   <!-- AI CALL ANALYSIS -->
   <div class="tab-panel" id="tab-ai-analysis">
     <div class="sec-head">
-      <div><div class="sec-title">🧠 AI Call Analysis</div><div class="sec-sub">On-demand only — select completed calls below and click Analyze. Nothing is analyzed automatically.</div></div>
+      <div><div class="sec-title">🧠 AI Call Analysis</div><div class="sec-sub">Completed calls are analyzed <strong>automatically</strong> in the background. Click any call to read its analysis, or select calls and re-run on demand.</div></div>
       <div style="display:flex;gap:8px">
         <input class="inp inp-sm" placeholder="Search contact/number…" id="aa-search" oninput="loadAiAnalysisList()">
+        <button class="icon-btn btn-sm" onclick="loadAiAnalysisList(aaPage)">↻ Refresh</button>
         <button class="btn btn-p btn-sm" id="aa-analyze-btn" onclick="runSelectedAnalysis()" disabled>🧠 Analyze Selected (<span id="aa-selected-count">0</span>)</button>
       </div>
     </div>
     <div class="card" style="margin-bottom:14px">
+      <div class="card-head"><span class="card-ht">Completed Calls</span><span class="card-hs" id="aa-summary"></span></div>
       <div class="tw"><table>
-        <thead><tr><th><input type="checkbox" id="aa-select-all" onchange="toggleSelectAllAnalysis(this)"></th><th>Contact</th><th>Date</th><th>Duration</th><th>Status</th></tr></thead>
-        <tbody id="aa-table"><tr><td colspan="5" style="text-align:center;padding:32px;color:var(--text-d)">Loading…</td></tr></tbody>
+        <thead><tr><th style="width:34px"><input type="checkbox" id="aa-select-all" onchange="toggleSelectAllAnalysis(this)"></th><th>Contact</th><th>Date</th><th>Duration</th><th>Status</th><th></th></tr></thead>
+        <tbody id="aa-table"><tr><td colspan="6" style="text-align:center;padding:32px;color:var(--text-d)">Loading…</td></tr></tbody>
       </table></div>
       <div class="pages" id="aa-pages"></div>
     </div>
     <div class="card" id="aa-result-card" style="display:none">
-      <div class="card-head"><span class="card-ht">Analysis Result</span></div>
-      <div class="card-body" id="aa-result-body" style="padding:18px"></div>
+      <div class="card-head"><span class="card-ht">Analysis Result</span><button class="btn btn-gh btn-sm" id="aa-reanalyze-btn" onclick="reanalyzeCurrent()">↻ Re-analyze</button></div>
+      <div class="card-body" id="aa-result-body" style="padding:0"></div>
     </div>
   </div>
 
@@ -346,39 +348,60 @@
   <!-- AGENT SETTINGS -->
   <div class="tab-panel" id="tab-agent-settings">
     <div class="sec-head">
-      <div><div class="sec-title">🤖 Agent Settings</div><div class="sec-sub">Read-only — generated live from the calling agent's source code</div></div>
-      <button class="icon-btn btn-sm" onclick="loadAgentSettings()">↻ Refresh</button>
+      <div><div class="sec-title">🤖 Agents</div><div class="sec-sub">Manage agent personas and per-agent knowledge bases. The active agent answers live calls.</div></div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select class="inp inp-sm" id="as-agent-select" onchange="selectAgent(this.value)"></select>
+        <button class="btn btn-gh btn-sm" onclick="createAgentPrompt()">＋ New Agent</button>
+        <button class="icon-btn btn-sm" onclick="loadAgents()">↻</button>
+      </div>
     </div>
-    <div class="notice mt4" id="as-notice">Editing isn't wired up yet — this view exists so the current configuration is visible from the dashboard. Future work: externalize this into separate prompt/pitch/knowledge-base files the agent loads at runtime, with edit support here.</div>
+    <div class="notice mt4" id="as-restart-note" style="display:none">⚠ You changed the active agent or its knowledge base. <a href="#" onclick="restartFromAgents();return false"><strong>Restart the pipeline</strong></a> for changes to take effect on new calls.</div>
+
     <div class="g3" style="margin-top:14px">
-      <div class="stat"><div class="stat-lbl">Agent Name</div><div class="stat-val" id="as-name">—</div></div>
-      <div class="stat"><div class="stat-lbl">Agent Tone</div><div class="stat-val" id="as-tone" style="font-size:14px">—</div></div>
-      <div class="stat"><div class="stat-lbl">Greeting</div><div class="stat-val" id="as-greeting" style="font-size:12px;font-weight:400">—</div></div>
+      <div class="stat"><div class="stat-lbl">Active Agent</div><div class="stat-val" id="as-active-name" style="font-size:15px">—</div></div>
+      <div class="stat"><div class="stat-lbl">KB Documents</div><div class="stat-val b" id="as-kb-docs">—</div></div>
+      <div class="stat"><div class="stat-lbl">KB Chunks Indexed</div><div class="stat-val b" id="as-kb-chunks">—</div></div>
     </div>
+
     <div class="card" style="margin-top:14px">
-      <div class="card-head"><span class="card-ht">Prompt Configuration</span><span class="card-hs">View only</span></div>
-      <div class="card-body" style="padding:16px">
-        <div class="ob-lbl">Identity</div>
-        <div class="mono dim" id="as-identity" style="font-size:12px;white-space:pre-wrap;margin-bottom:12px"></div>
-        <div class="ob-lbl">Conversation Guidelines</div>
-        <div class="mono dim" id="as-guidelines" style="font-size:12px;white-space:pre-wrap;margin-bottom:12px"></div>
-        <div class="ob-lbl">Firm Rules</div>
-        <div class="mono dim" id="as-rules" style="font-size:12px;white-space:pre-wrap"></div>
+      <div class="card-head">
+        <span class="card-ht">Persona — <span id="as-edit-name">—</span></span>
+        <span style="display:flex;gap:8px">
+          <button class="btn btn-gh btn-sm" id="as-activate-btn" onclick="activateAgent()">Set Active</button>
+          <button class="btn btn-gh btn-sm" onclick="deleteAgentCur()" style="color:var(--error)">Delete</button>
+          <button class="btn btn-p btn-sm" onclick="savePersona()">💾 Save Persona</button>
+        </span>
+      </div>
+      <div class="card-body" style="padding:16px;display:flex;flex-direction:column;gap:12px">
+        <div class="g2">
+          <div><div class="ob-lbl">Agent Display Name</div><input class="inp" id="as-f-name" style="width:100%"></div>
+          <div><div class="ob-lbl">Default Language</div>
+            <select class="inp" id="as-f-lang" style="width:100%"><option value="hi">Hindi</option><option value="gu">Gujarati</option><option value="en">English</option></select>
+          </div>
+        </div>
+        <div><div class="ob-lbl">Agent Name (in prompt)</div><input class="inp" id="as-f-agentname" style="width:100%"></div>
+        <div><div class="ob-lbl">Role line</div><input class="inp" id="as-f-role" style="width:100%"></div>
+        <div><div class="ob-lbl">Identity (one line per rule)</div><textarea class="inp" id="as-f-identity" rows="3" style="width:100%;font-family:var(--mono);font-size:12px"></textarea></div>
+        <div><div class="ob-lbl">Brand (one line each)</div><textarea class="inp" id="as-f-brand" rows="2" style="width:100%;font-family:var(--mono);font-size:12px"></textarea></div>
+        <div><div class="ob-lbl">Project Portfolio (one line each)</div><textarea class="inp" id="as-f-portfolio" rows="5" style="width:100%;font-family:var(--mono);font-size:12px"></textarea></div>
       </div>
     </div>
+
     <div class="card" style="margin-top:14px">
-      <div class="card-head"><span class="card-ht">Pitch Management</span><span class="card-hs">View only</span></div>
+      <div class="card-head"><span class="card-ht">📚 Knowledge Base</span><span class="card-hs">Uploaded docs are chunked + embedded into a fast in-memory vector index the agent searches mid-call</span></div>
       <div class="card-body" style="padding:16px">
-        <div class="ob-lbl">Project Portfolio</div>
-        <div class="mono dim" id="as-portfolio" style="font-size:12px;white-space:pre-wrap;margin-bottom:12px"></div>
-        <div class="ob-lbl">Objection Handling</div>
-        <div class="mono dim" id="as-objections" style="font-size:12px;white-space:pre-wrap"></div>
-      </div>
-    </div>
-    <div class="card" style="margin-top:14px">
-      <div class="card-head"><span class="card-ht">Knowledge Base</span></div>
-      <div class="card-body" style="padding:16px">
-        <div class="dim" style="font-size:12px">No separate knowledge-base store exists yet — brand/project facts above (from Pitch Management) are the agent's only reference material today. Upload/edit support is planned for a future update.</div>
+        <div id="as-kb-drop" class="kb-drop">
+          <input type="file" id="as-kb-file" accept=".pdf,.docx,.txt,.md" style="display:none" onchange="uploadKbFile()">
+          <div style="font-size:26px;opacity:.5">⬆️</div>
+          <div style="font-weight:600;margin-top:6px">Upload a document</div>
+          <div class="dim" style="font-size:12px;margin-top:2px">PDF, DOCX, TXT, or MD — brochures, price lists, FAQs, policies</div>
+          <button class="btn btn-p btn-sm" style="margin-top:10px" onclick="document.getElementById('as-kb-file').click()">Choose File</button>
+          <button class="btn btn-gh btn-sm" style="margin-top:10px" onclick="reindexKb()">↻ Re-index</button>
+        </div>
+        <div class="tw" style="margin-top:14px"><table>
+          <thead><tr><th>Document</th><th>Size</th><th>Chunks</th><th>Status</th><th></th></tr></thead>
+          <tbody id="as-kb-table"><tr><td colspan="5" style="text-align:center;padding:24px;color:var(--text-d)">No documents yet</td></tr></tbody>
+        </table></div>
       </div>
     </div>
   </div>

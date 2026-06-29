@@ -1,4 +1,5 @@
 import { useEffect, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { X } from 'lucide-react'
 import { cx } from './ui'
 
@@ -10,13 +11,38 @@ function useEsc(onClose: () => void) {
   }, [onClose])
 }
 
+/**
+ * Overlays must render at the document root. The app shell's <main> carries
+ * `animate-fade-up` whose `both` fill-mode leaves a persistent
+ * `transform: translateY(0)` on the element — a non-`none` transform makes it
+ * the containing block for any `position: fixed` descendant, which would trap a
+ * modal/slide-over inside the content area instead of covering the viewport.
+ * Portaling to <body> sidesteps that (and any future transformed ancestor).
+ */
+function Portal({ children }: { children: ReactNode }) {
+  if (typeof document === 'undefined') return null
+  return createPortal(children, document.body)
+}
+
+/** Lock background scroll while an overlay is open. */
+function useScrollLock(open: boolean) {
+  useEffect(() => {
+    if (!open) return
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => { document.body.style.overflow = prev }
+  }, [open])
+}
+
 /** Centered modal dialog. */
 export function Modal({
   open, onClose, title, children, footer, wide,
 }: { open: boolean; onClose: () => void; title?: ReactNode; children: ReactNode; footer?: ReactNode; wide?: boolean }) {
   useEsc(onClose)
+  useScrollLock(open)
   if (!open) return null
   return (
+    <Portal>
     <div className="fixed inset-0 z-[80] grid place-items-center p-4">
       <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} />
       <div className={cx('card relative z-10 w-full p-5 animate-fade-up', wide ? 'max-w-2xl' : 'max-w-md')}>
@@ -30,6 +56,7 @@ export function Modal({
         {footer && <div className="mt-4 flex justify-end gap-2">{footer}</div>}
       </div>
     </div>
+    </Portal>
   )
 }
 
@@ -38,8 +65,10 @@ export function SlideOver({
   open, onClose, title, children, headerExtra,
 }: { open: boolean; onClose: () => void; title?: ReactNode; children: ReactNode; headerExtra?: ReactNode }) {
   useEsc(onClose)
+  useScrollLock(open)
   if (!open) return null
   return (
+    <Portal>
     <div className="fixed inset-0 z-[80]">
       <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} />
       <div className="absolute right-0 top-0 flex h-full w-[min(94vw,560px)] flex-col bg-[var(--surface-solid)] shadow-glass-lg animate-fade-up">
@@ -53,5 +82,6 @@ export function SlideOver({
         <div className="flex-1 overflow-y-auto p-5">{children}</div>
       </div>
     </div>
+    </Portal>
   )
 }

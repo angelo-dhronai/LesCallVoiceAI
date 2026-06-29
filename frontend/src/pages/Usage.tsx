@@ -151,7 +151,7 @@ export default function Usage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="API Usage" sub="Sarvam STT/TTS credits & usage" />
+      <PageHeader title="API Usage" sub="STT/TTS credits & usage" />
 
       <div className="grid gap-4 lg:grid-cols-2">
         {/* Credits Card */}

@@ -26,6 +26,14 @@ logger = logging.getLogger("call_bridge")
 PLAYBACK_HOST = "127.0.0.1"
 PLAYBACK_PORT = 9004
 
+# Dashboard (follow-up automation) endpoint for in-call callback requests.
+DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
+DASHBOARD_PORT = os.environ.get("DASHBOARD_PORT", "8080")
+# Append-only spool drained by the dashboard when it was unreachable at call end.
+CALLBACK_SPOOL_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "dashboard", "_callback_spool.jsonl")
+)
+
 class TelephonySession:
     """Manages one AI pipeline per phone call."""
     def __init__(self, conn_id: str, sample_rate: int, caller_number: str = "",
@@ -44,6 +52,7 @@ class TelephonySession:
             event_hub=self.hub,
             mic_enabled=True,
             skip_greeting=skip_greeting,
+            call_id=conn_id,
         )
         self.pipeline_task = None
         self.playback_task = None
@@ -112,6 +121,13 @@ class TelephonySession:
         await self.sink.stop()
         self._print_summary()
 
+        # Capture the transcript path before close() pops the audit session.
+        transcript_path = None
+        try:
+            transcript_path = audit_manager.transcript_path(self.conn_id)
+        except Exception:
+            pass
+
         # Close audit session — collect language from conversation state
         try:
             lang = "unknown"
@@ -127,7 +143,64 @@ class TelephonySession:
         except Exception as exc:
             logger.warning("[%s] Audit close failed: %r", self.conn_id, exc)
 
+        # If the caller asked to be called back, hand the request to the
+        # dashboard's follow-up automation so it auto-dials at the requested
+        # time. Must never break call teardown.
+        try:
+            await self._emit_callback_followup(transcript_path)
+        except Exception as exc:
+            logger.warning("[%s] Callback follow-up emit failed: %r", self.conn_id, exc)
+
         logger.info(f"[{self.conn_id}] Session stopped")
+
+    async def _emit_callback_followup(self, transcript_path) -> None:
+        """If CallState carries a callback request, register it with the
+        dashboard follow-up automation (auto-dial at the requested time). Falls
+        back to an append-only spool file if the dashboard is unreachable."""
+        try:
+            cs = self.pipeline.conversation.memory.call_state
+        except Exception:
+            return
+        if not getattr(cs, "callback_requested", False) or not getattr(cs, "callback_iso", None):
+            return
+
+        # Past-call context = the transcript (truncated, most-recent-kept).
+        context = ""
+        if transcript_path and os.path.exists(transcript_path):
+            try:
+                with open(transcript_path, "r", encoding="utf-8") as f:
+                    context = f.read()[-4000:]
+            except Exception:
+                context = ""
+
+        phone = "".join(ch for ch in (self.caller_number or getattr(cs, "customer_phone", "") or "") if ch.isdigit())
+        payload = {
+            "call_id": self.conn_id,
+            "contact_phone": phone,
+            "contact_name": getattr(cs, "customer_name", "") or "",
+            "scheduled_time": cs.callback_iso,
+            "past_call_context": context,
+            "raw": getattr(cs, "callback_raw", "") or "",
+        }
+
+        url = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}/api/followup-automation/callback"
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(url, json=payload)
+                resp.raise_for_status()
+            logger.info("[%s] Callback follow-up scheduled for %s", self.conn_id, cs.callback_iso)
+            return
+        except Exception as exc:
+            logger.warning("[%s] Callback POST failed (%r) — spooling", self.conn_id, exc)
+
+        # Dashboard unreachable: append to the pipeline-owned spool (append-only
+        # JSONL is safe across processes; the dashboard drains it on its next tick).
+        try:
+            with open(CALLBACK_SPOOL_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload) + "\n")
+        except Exception as exc:
+            logger.warning("[%s] Callback spool write failed: %r", self.conn_id, exc)
 
     async def _event_loop(self):
         """Listens for AI pipeline events to capture first_transcript_t."""
@@ -172,7 +245,15 @@ class TelephonySession:
                     with wave.open(wav_path, 'rb') as wf:
                         frames = wf.getnframes()
                         rate = wf.getframerate()
+                        channels = wf.getnchannels()
                         duration = frames / float(rate)
+                        # Capture the exact audio the caller is about to hear so
+                        # the call recording includes the agent's voice (mixed
+                        # into mixed_audio.wav alongside the caller).
+                        agent_pcm = wf.readframes(frames)
+                    audit_manager.push_agent_audio(
+                        self.conn_id, agent_pcm, src_rate=rate, channels=channels
+                    )
                 except Exception as e:
                     logger.warning(f"[{self.conn_id}] Could not parse WAV info for {wav_path}: {e}")
 

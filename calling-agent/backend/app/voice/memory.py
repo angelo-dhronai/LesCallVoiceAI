@@ -110,6 +110,12 @@ class CallState:
     booking_validated: bool = False         # True once all mandatory fields pass
     timeline: str | None = None             # caller's stated timeline (e.g. "3 months", "immediate")
     preferred_visit_date: str | None = None # caller's stated preferred visit date
+    # Caller-requested callback ("call me in 10 minutes" / "at 12 today"). When
+    # set, a follow-up automation entry is created at call end so the system
+    # auto-dials them back at the requested time.
+    callback_requested: bool = False
+    callback_iso: str | None = None          # UTC ISO8601 — when to dial back
+    callback_raw: str | None = None          # original phrase, for context/debug
 
 
 @dataclass

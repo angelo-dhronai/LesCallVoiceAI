@@ -10,7 +10,13 @@ async function loadConversations(){
     convData=d.recordings||[];
     const lc=document.getElementById('conv-list-count');
     if(lc) lc.textContent=convData.length+' recordings';
+    const hadActive=!!document.querySelector('.conv-item.active');
     renderConvList(convData);
+    // Auto-load newest call on first tab open so the right panel is never blank.
+    if(!hadActive&&convData.length){
+      const firstItem=document.querySelector('.conv-item');
+      if(firstItem)firstItem.click();
+    }
   }catch(e){
     document.getElementById('conv-list-items').innerHTML='<div style="padding:24px;color:var(--error);text-align:center">Error loading</div>';
   }
@@ -81,6 +87,6 @@ async function loadTranscript(itemEl,folder,caller,dt,dur,lang){
         ${m.timestamp?`<div class="msg-ts">${esc(m.timestamp)}</div>`:''}
       </div>`;
     }).join('');
-    msgs.scrollTop=msgs.scrollHeight;
+    msgs.scrollTop=0;
   }catch(e){msgs.innerHTML='<div class="conv-empty" style="color:var(--error)"><span>⚠</span><span>Error loading transcript</span></div>';}
 }

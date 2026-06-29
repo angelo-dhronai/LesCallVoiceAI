@@ -5,11 +5,168 @@
     "name": "shubhangi Vijay pawar",
     "notes": "project manager",
     "added_at": "2026-06-19T12:36:47.014827Z",
-    "call_status": "not_called",
+    "call_status": "answered",
     "disposition": "not_classified",
-    "call_count": 0,
-    "last_called_at": null,
+    "call_count": 2,
+    "last_called_at": "2026-06-29T07:23:00.097028Z",
     "call_notes": "",
-    "call_history": []
+    "call_history": [
+      {
+        "ts": "2026-06-27T08:17:26.339240Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-29T07:23:00.097028Z",
+        "call_status": "answered"
+      }
+    ]
+  },
+  {
+    "id": "1782537836495_0227",
+    "phone": "+917042340227",
+    "name": "Alwyn Ben",
+    "notes": "",
+    "added_at": "2026-06-27T05:23:56.495049Z",
+    "call_status": "answered",
+    "disposition": "not_classified",
+    "call_count": 4,
+    "last_called_at": "2026-06-27T07:22:41.777942Z",
+    "call_notes": "",
+    "call_history": [
+      {
+        "ts": "2026-06-27T05:24:14.644044Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-27T05:35:49.526163Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-27T05:50:09.392018Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-27T07:22:41.777942Z",
+        "call_status": "answered"
+      }
+    ]
+  },
+  {
+    "id": "1782538754462_2864",
+    "phone": "+918076562864",
+    "name": "Angelo  P Chery",
+    "notes": "",
+    "added_at": "2026-06-27T05:39:14.462767Z",
+    "call_status": "answered",
+    "disposition": "not_classified",
+    "call_count": 3,
+    "last_called_at": "2026-06-29T06:47:06.651163Z",
+    "call_notes": "",
+    "call_history": [
+      {
+        "ts": "2026-06-27T05:39:24.563496Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-27T07:44:50.620358Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-29T06:47:06.651163Z",
+        "call_status": "answered"
+      }
+    ]
+  },
+  {
+    "id": "1782548128757_2129",
+    "phone": "+918320522129",
+    "name": "Umang",
+    "notes": "",
+    "added_at": "2026-06-27T08:15:28.757287Z",
+    "call_status": "busy",
+    "disposition": "not_classified",
+    "call_count": 1,
+    "last_called_at": "2026-06-27T08:18:08.811786Z",
+    "call_notes": "",
+    "call_history": [
+      {
+        "ts": "2026-06-27T08:18:08.811786Z",
+        "call_status": "busy"
+      }
+    ]
+  },
+  {
+    "id": "1782715328461_2520",
+    "phone": "+919930852520",
+    "name": "Vrushi",
+    "notes": "",
+    "added_at": "2026-06-29T06:42:08.461217Z",
+    "call_status": "answered",
+    "disposition": "not_classified",
+    "call_count": 5,
+    "last_called_at": "2026-06-29T08:06:18.708634Z",
+    "call_notes": "",
+    "call_history": [
+      {
+        "ts": "2026-06-29T06:42:28.849610Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-29T06:42:37.372855Z",
+        "call_status": "busy"
+      },
+      {
+        "ts": "2026-06-29T06:44:14.113812Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-29T07:09:39.707739Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-29T08:06:18.708634Z",
+        "call_status": "answered"
+      }
+    ]
+  },
+  {
+    "id": "1782718646139_5191",
+    "phone": "+919601755191",
+    "name": "Swastik Shukla",
+    "notes": "",
+    "added_at": "2026-06-29T07:37:26.139960Z",
+    "call_status": "answered",
+    "disposition": "not_classified",
+    "call_count": 1,
+    "last_called_at": "2026-06-29T07:37:46.843742Z",
+    "call_notes": "",
+    "call_history": [
+      {
+        "ts": "2026-06-29T07:37:46.843742Z",
+        "call_status": "answered"
+      }
+    ]
+  },
+  {
+    "id": "1782719781548_6878",
+    "phone": "+918626056878",
+    "name": "Kanika",
+    "notes": "",
+    "added_at": "2026-06-29T07:56:21.548694Z",
+    "call_status": "answered",
+    "disposition": "not_classified",
+    "call_count": 2,
+    "last_called_at": "2026-06-29T07:59:09.688150Z",
+    "call_notes": "",
+    "call_history": [
+      {
+        "ts": "2026-06-29T07:56:39.933700Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-29T07:59:09.688150Z",
+        "call_status": "answered"
+      }
+    ]
   }
 ]

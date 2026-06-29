@@ -1,18 +1,27 @@
 """
 call_audit.py — Call Audit System
 
-Records caller audio, transcripts, and metadata for every phone call.
+Records call audio, transcripts, and metadata for every phone call.
 
 Enabled by:  ENABLE_CALL_AUDIT=true
 Disabled by: ENABLE_CALL_AUDIT=false  (zero overhead — early-exit everywhere)
 
 Directory layout:
     recordings/
-    YYYYMMDD/
-        <call_id>/
-            caller_audio.wav   (PCM16, 16kHz, mono)
+        <caller_number>_<YYYYMMDD_HHMMSS>/
+            caller_audio.wav   (PCM16, 16kHz, mono — caller only, kept for back-compat)
+            mixed_audio.wav    (PCM16, 16kHz, mono — caller + agent, time-aligned)
             transcript.txt
             metadata.json
+
+Audio mixing
+------------
+Caller frames (inbound, from ws_audio_receiver) and agent frames (the TTS the
+caller actually heard, fed from the call bridge's playback loop) are both
+stamped with their wall-clock offset from call start. At close() the two
+timelines are laid onto a common 16kHz grid and summed into mixed_audio.wav so
+*both* voices are audible in playback. Previously only caller audio was
+recorded, so the agent was silent on playback.
 """
 
 from __future__ import annotations
@@ -24,7 +33,9 @@ import os
 import time
 import wave
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 
 logger = logging.getLogger("call_audit")
 
@@ -39,11 +50,26 @@ SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2  # PCM16 = 2 bytes per sample
 CHANNELS = 1
 
-_AUDIO_QUEUE_MAXSIZE = 200  # ~4s of 20ms frames at 16kHz; excess frames dropped
+# Safety cap on buffered audio per channel (~45 min). Frames whose timeline
+# offset would exceed this are dropped, bounding memory for runaway calls.
+_MAX_SAMPLES = 45 * 60 * SAMPLE_RATE
+
+# Mix level balancing. Telephony callers arrive much quieter than full-scale
+# agent TTS, so a naive sum buries the caller. We normalise each channel to a
+# common RMS target (with a peak guard so we never clip the loudest sample) so
+# both voices are clearly audible in mixed_audio.wav and caller_audio.wav.
+MIX_TARGET_RMS = 3000.0   # int16 RMS target per channel before mixing
+MAX_NORM_GAIN = 8.0       # cap so a near-silent channel's noise floor can't explode
+SILENCE_FLOOR_RMS = 50.0  # below this a channel is treated as silent (left as-is)
 
 
 class CallAuditSession:
-    """Per-call recording session. All writes are non-blocking."""
+    """Per-call recording session. All push_* calls are non-blocking.
+
+    Audio is buffered in memory as (offset_samples, pcm_bytes) fragments and
+    rendered to disk once at close(). For normal call lengths this is a few MB
+    per channel and lets us time-align caller and agent onto one timeline.
+    """
 
     def __init__(self, call_id: str, caller_number: str = "") -> None:
         self.call_id = call_id
@@ -58,23 +84,16 @@ class CallAuditSession:
         os.makedirs(self._call_dir, exist_ok=True)
 
         self._wav_path = os.path.join(self._call_dir, "caller_audio.wav")
+        self._mixed_path = os.path.join(self._call_dir, "mixed_audio.wav")
         self._txt_path = os.path.join(self._call_dir, "transcript.txt")
         self._meta_path = os.path.join(self._call_dir, "metadata.json")
 
-        # WAV writer — opened immediately so we can stream frames
-        self._wav_file = wave.open(self._wav_path, "wb")
-        self._wav_file.setnchannels(CHANNELS)
-        self._wav_file.setsampwidth(SAMPLE_WIDTH)
-        self._wav_file.setframerate(SAMPLE_RATE)
-
-        # Transcript file
+        # Transcript file — opened immediately so turns stream as they arrive
         self._txt_file = open(self._txt_path, "a", encoding="utf-8")
 
-        # Non-blocking audio queue → background writer
-        self._audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(
-            maxsize=_AUDIO_QUEUE_MAXSIZE
-        )
-        self._writer_task: Optional[asyncio.Task] = None
+        # Time-stamped audio fragments, rendered at close()
+        self._caller_frags: List[Tuple[int, bytes]] = []
+        self._agent_frags: List[Tuple[int, bytes]] = []
 
         # Transcript counter for elapsed-time calculation
         self._transcript_count = 0
@@ -87,18 +106,47 @@ class CallAuditSession:
         logger.info("[AUDIT] Session created call_id=%s dir=%s", call_id, self._call_dir)
 
     async def start(self) -> None:
-        self._writer_task = asyncio.create_task(
-            self._audio_writer_loop(), name=f"audit_writer_{self.call_id}"
-        )
+        # No background writer needed — audio is rendered at close(). Kept async
+        # for API compatibility with the manager's await session.start().
+        return
+
+    def _elapsed_samples(self) -> int:
+        return int((time.time() - self._start_time) * SAMPLE_RATE)
 
     def push_audio(self, pcm_bytes: bytes) -> None:
-        """Non-blocking: queue PCM frame for background writing."""
+        """Queue an inbound caller PCM16/16kHz frame (non-blocking)."""
+        if not pcm_bytes:
+            return
+        off = self._elapsed_samples()
+        if off + len(pcm_bytes) // 2 > _MAX_SAMPLES:
+            return
+        self._caller_frags.append((off, pcm_bytes))
+
+    def push_agent_audio(
+        self, pcm_bytes: bytes, src_rate: int = SAMPLE_RATE, channels: int = 1
+    ) -> None:
+        """Queue agent (TTS) audio the caller heard. Resampled to 16kHz mono and
+        stamped with the current call-timeline offset (non-blocking)."""
         if not pcm_bytes:
             return
         try:
-            self._audio_queue.put_nowait(pcm_bytes)
-        except asyncio.QueueFull:
-            pass  # Drop oldest-equivalent: just skip this frame
+            samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+            if channels > 1:
+                samples = samples.reshape(-1, channels).mean(axis=1).astype(np.int16)
+            if src_rate != SAMPLE_RATE and samples.size:
+                new_len = int(samples.size * SAMPLE_RATE / src_rate)
+                if new_len <= 0:
+                    return
+                x_old = np.linspace(0.0, 1.0, samples.size, endpoint=False)
+                x_new = np.linspace(0.0, 1.0, new_len, endpoint=False)
+                samples = np.interp(x_new, x_old, samples.astype(np.float32)).astype(np.int16)
+        except Exception as exc:
+            logger.warning("[AUDIT] Agent audio decode failed: %r", exc)
+            return
+        off = self._elapsed_samples()
+        if off + samples.size > _MAX_SAMPLES:
+            return
+        self._agent_frags.append((off, samples.tobytes()))
 
     def add_event(self, speaker: str, text: str) -> None:
         """Record a transcript entry (caller or agent) with elapsed timestamp."""
@@ -116,34 +164,84 @@ class CallAuditSession:
             logger.warning("[AUDIT] Transcript write failed: %r", exc)
         self._transcript_count += 1
 
+    @staticmethod
+    def _normalize_channel(
+        buf: np.ndarray,
+        target_rms: float = MIX_TARGET_RMS,
+        max_gain: float = MAX_NORM_GAIN,
+        silence_floor: float = SILENCE_FLOOR_RMS,
+    ) -> np.ndarray:
+        """Scale an int32 timeline toward ``target_rms`` so quiet callers and
+        loud agent TTS sit at comparable loudness. Robust to silent channels and
+        never clips the loudest sample (peak guard). Returns float64."""
+        if buf.size == 0:
+            return buf.astype(np.float64)
+        x = buf.astype(np.float64)
+        rms = float(np.sqrt(np.mean(x * x)))
+        if rms < silence_floor:
+            # Treat as silent/idle — boosting would just amplify the noise floor.
+            return x
+        gain = min(target_rms / rms, max_gain)
+        # Peak-guard against the 99.5th-percentile sample rather than the
+        # absolute max: telephony audio has rare transient spikes (clicks, DTMF)
+        # with a huge crest factor, and letting those dictate the gain would keep
+        # speech far too quiet. Allowing the top ~0.5% to hard-clip is inaudible.
+        peak = float(np.percentile(np.abs(x), 99.5)) * gain
+        if peak > 32767.0:
+            gain *= 32767.0 / peak
+        return x * gain
+
+    @staticmethod
+    def _render_channel(frags: List[Tuple[int, bytes]]) -> np.ndarray:
+        """Lay time-stamped fragments onto a single int32 timeline (summed on
+        overlap). Returns int32 to avoid intermediate clipping."""
+        if not frags:
+            return np.zeros(0, dtype=np.int32)
+        total = max(off + len(b) // 2 for off, b in frags)
+        buf = np.zeros(total, dtype=np.int32)
+        for off, b in frags:
+            arr = np.frombuffer(b, dtype=np.int16).astype(np.int32)
+            buf[off:off + arr.size] += arr
+        return buf
+
     async def close(
         self,
         language_detected: str = "unknown",
         stt_provider: str = "sarvam",
         fallback_used: bool = False,
     ) -> None:
-        """Flush all buffers, close files, write metadata."""
+        """Render audio, close files, write metadata."""
         self._language_detected = language_detected
         self._stt_provider = stt_provider
         self._fallback_used = fallback_used
 
-        # Signal writer to stop
+        # Render audio timelines
         try:
-            await self._audio_queue.put(None)
-        except Exception:
-            pass
+            left = self._render_channel(self._caller_frags)   # caller
+            right = self._render_channel(self._agent_frags)    # agent
+            n = max(left.size, right.size)
+            if left.size < n:
+                left = np.concatenate([left, np.zeros(n - left.size, dtype=np.int32)])
+            if right.size < n:
+                right = np.concatenate([right, np.zeros(n - right.size, dtype=np.int32)])
 
-        if self._writer_task is not None:
-            try:
-                await asyncio.wait_for(self._writer_task, timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                self._writer_task.cancel()
+            # Balance both channels to a common loudness before mixing so the
+            # quiet caller isn't buried under full-scale agent TTS. Silent
+            # channels (e.g. agent-only or caller-only calls) pass through
+            # untouched via the silence guard in _normalize_channel.
+            left_n = self._normalize_channel(left)
+            right_n = self._normalize_channel(right)
 
-        # Close WAV
-        try:
-            self._wav_file.close()
+            caller_mono = np.clip(left_n, -32768, 32767).astype(np.int16)
+            # Final mix-bus normalisation keeps simultaneous speech from
+            # clipping when both balanced channels sum.
+            mixed = self._normalize_channel(left_n + right_n)
+            mixed_mono = np.clip(mixed, -32768, 32767).astype(np.int16)
+
+            self._write_wav(self._wav_path, caller_mono)
+            self._write_wav(self._mixed_path, mixed_mono)
         except Exception as exc:
-            logger.warning("[AUDIT] WAV close error: %r", exc)
+            logger.error("[AUDIT] Audio render failed: %r", exc)
 
         # Close transcript
         try:
@@ -164,6 +262,7 @@ class CallAuditSession:
             "stt_provider": self._stt_provider,
             "fallback_used": self._fallback_used,
             "transcript_count": self._transcript_count,
+            "has_agent_audio": bool(self._agent_frags),
         }
         try:
             with open(self._meta_path, "w", encoding="utf-8") as f:
@@ -172,27 +271,20 @@ class CallAuditSession:
             logger.warning("[AUDIT] Metadata write failed: %r", exc)
 
         logger.info(
-            "[AUDIT] Session closed call_id=%s duration=%.1fs transcripts=%d",
+            "[AUDIT] Session closed call_id=%s duration=%.1fs transcripts=%d agent_audio=%s",
             self.call_id,
             duration,
             self._transcript_count,
+            bool(self._agent_frags),
         )
 
-    async def _audio_writer_loop(self) -> None:
-        """Background coroutine: drains audio queue → WAV file."""
-        try:
-            while True:
-                chunk = await self._audio_queue.get()
-                if chunk is None:
-                    break
-                try:
-                    self._wav_file.writeframes(chunk)
-                except Exception as exc:
-                    logger.warning("[AUDIT] WAV write error: %r", exc)
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.error("[AUDIT] Audio writer crashed: %r", exc)
+    @staticmethod
+    def _write_wav(path: str, mono_int16: np.ndarray) -> None:
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(SAMPLE_WIDTH)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(mono_int16.tobytes())
 
 
 class CallAuditManager:
@@ -221,12 +313,27 @@ class CallAuditManager:
         if session is not None:
             session.push_audio(pcm_bytes)
 
+    def push_agent_audio(
+        self, call_id: str, pcm_bytes: bytes, src_rate: int = SAMPLE_RATE, channels: int = 1
+    ) -> None:
+        if not ENABLE_CALL_AUDIT:
+            return
+        session = self._sessions.get(call_id)
+        if session is not None:
+            session.push_agent_audio(pcm_bytes, src_rate=src_rate, channels=channels)
+
     def add_event(self, call_id: str, speaker: str, text: str) -> None:
         if not ENABLE_CALL_AUDIT:
             return
         session = self._sessions.get(call_id)
         if session is not None:
             session.add_event(speaker, text)
+
+    def transcript_path(self, call_id: str) -> Optional[str]:
+        """Path to the (already-flushed) transcript.txt for a live session, or
+        None. Call before close() — close() pops the session."""
+        session = self._sessions.get(call_id)
+        return session._txt_path if session is not None else None
 
     async def close(
         self,

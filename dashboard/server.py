@@ -13,6 +13,7 @@ Start: bash /home/angelo/lescall/dashboard/start.sh --bg
 from __future__ import annotations
 
 import asyncio
+import sys
 import csv
 import datetime
 import io
@@ -56,6 +57,8 @@ MINUTES_QUOTA_FILE = Path(__file__).parent / "minutes_quota.json"
 ANALYSIS_STORE_FILE = Path(__file__).parent / "call_analysis.json"
 FOLLOWUP_AUTOMATION_FILE = Path(__file__).parent / "follow_up_automation.json"
 AUTOMATION_POLL_SECONDS = 30
+ANALYSIS_POLL_SECONDS = 45   # background auto-analysis cadence for new calls
+ANALYSIS_AUTO_BATCH = 10     # max folders analysed per auto-analysis tick
 CONVERSATION_PY  = LESCALL_ROOT / "calling-agent" / "backend" / "app" / "voice" / "conversation.py"
 
 # A dial is considered matched to a subsequent pipeline call if the pipeline
@@ -77,6 +80,25 @@ OUTBOUND_DP_CTX     = "default"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("dashboard")
+
+# ---------------------------------------------------------------------------
+# Multi-agent registry + per-agent knowledge base (RAG).
+# The dashboard runs inside the calling-agent venv (see dashboard/start.sh), so
+# the agent package and its embedding deps are importable here. Ingestion runs
+# in a thread executor to keep the event loop responsive.
+# ---------------------------------------------------------------------------
+_BACKEND_DIR = LESCALL_ROOT / "calling-agent" / "backend"
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+try:
+    from app.agent import registry as agent_registry
+    from app.agent import knowledge as agent_kb
+    AGENTS_AVAILABLE = True
+except Exception as _exc:  # pragma: no cover
+    agent_registry = None
+    agent_kb = None
+    AGENTS_AVAILABLE = False
+    logger.warning("agent registry unavailable: %r", _exc)
 
 # ---------------------------------------------------------------------------
 # App
@@ -473,15 +495,28 @@ def _save_minutes_quota(data: dict) -> None:
 # Recordings helpers
 # ---------------------------------------------------------------------------
 
-_recordings_cache: tuple[float, list[dict]] | None = None
-_RECORDINGS_CACHE_TTL = 15.0  # short TTL so new calls appear quickly
+_recordings_cache: tuple[float, float, list[dict]] | None = None
+_RECORDINGS_CACHE_TTL = 5.0  # short TTL backstop so new calls appear quickly
+
+
+def _recordings_dir_mtime() -> float:
+    """mtime of the recordings root — bumps whenever a new call folder is
+    created, so we can bust the scan cache immediately rather than waiting out
+    the TTL."""
+    try:
+        return os.stat(RECORDINGS_DIR).st_mtime
+    except OSError:
+        return 0.0
 
 
 def _scan_recordings(limit: int = 500) -> list[dict]:
     global _recordings_cache
     now = time.monotonic()
-    if _recordings_cache and (now - _recordings_cache[0]) < _RECORDINGS_CACHE_TTL:
-        return _recordings_cache[1]
+    dir_mtime = _recordings_dir_mtime()
+    if (_recordings_cache
+            and (now - _recordings_cache[0]) < _RECORDINGS_CACHE_TTL
+            and _recordings_cache[1] == dir_mtime):
+        return _recordings_cache[2]
     entries: list[str] = []
     try:
         with os.scandir(RECORDINGS_DIR) as it:
@@ -518,7 +553,7 @@ def _scan_recordings(limit: int = 500) -> list[dict]:
             except Exception:
                 pass
         records.append(rec)
-    _recordings_cache = (now, records)
+    _recordings_cache = (now, dir_mtime, records)
     return records
 
 
@@ -1243,6 +1278,26 @@ async def get_analysis(folder: str) -> JSONResponse:
     return JSONResponse({"analyzed": True, "analysis": store[folder]})
 
 
+async def _ensure_analysis(folder: str, store: dict[str, dict],
+                           force: bool = False) -> dict:
+    """Analyse one recording into `store` (mutated in place). Idempotent: a
+    folder already in the store is skipped unless force=True. Shared by the
+    manual /api/analysis/run endpoint and the background auto-analysis loop."""
+    if "/" in folder or ".." in folder:
+        return {"ok": False, "error": "invalid folder"}
+    if not _is_recording_complete(folder):
+        return {"ok": False, "error": "call not yet complete"}
+    if folder in store and not force:
+        return {"ok": True, "analysis": store[folder], "cached": True}
+    try:
+        analysis = await _analyze_transcript(folder)
+        store[folder] = analysis
+        return {"ok": True, "analysis": analysis, "cached": False}
+    except Exception as exc:
+        logger.error("analysis failed for %s: %r", folder, exc)
+        return {"ok": False, "error": str(exc)}
+
+
 @app.post("/api/analysis/run")
 async def run_analysis(request: Request) -> JSONResponse:
     body = await request.json()
@@ -1254,24 +1309,39 @@ async def run_analysis(request: Request) -> JSONResponse:
     store = _load_analysis_store()
     results: dict[str, Any] = {}
     for folder in folders:
-        if "/" in folder or ".." in folder:
-            results[folder] = {"ok": False, "error": "invalid folder"}
-            continue
-        if not _is_recording_complete(folder):
-            results[folder] = {"ok": False, "error": "call not yet complete"}
-            continue
-        if folder in store and not force:
-            results[folder] = {"ok": True, "analysis": store[folder], "cached": True}
-            continue
-        try:
-            analysis = await _analyze_transcript(folder)
-            store[folder] = analysis
-            results[folder] = {"ok": True, "analysis": analysis, "cached": False}
-        except Exception as exc:
-            logger.error("analysis failed for %s: %r", folder, exc)
-            results[folder] = {"ok": False, "error": str(exc)}
+        results[folder] = await _ensure_analysis(folder, store, force=force)
     _save_analysis_store(store)
     return JSONResponse({"ok": True, "results": results})
+
+
+async def _auto_analysis_loop() -> None:
+    """Background loop: every ANALYSIS_POLL_SECONDS, analyse any completed
+    recording not yet in call_analysis.json. The re-scan also serves as the
+    catch-up pass when the dashboard was offline while calls completed.
+    Idempotent (skips analysed folders) and bounded per tick to avoid bursts."""
+    while True:
+        try:
+            store = _load_analysis_store()
+            pending = [r["folder"] for r in _scan_recordings(limit=2000)
+                       if _is_recording_complete(r["folder"]) and r["folder"] not in store]
+            changed = False
+            for folder in pending[:ANALYSIS_AUTO_BATCH]:
+                res = await _ensure_analysis(folder, store)
+                changed = changed or res.get("ok") and not res.get("cached")
+            if changed:
+                # Re-load immediately before save so a concurrent manual run
+                # isn't clobbered, then merge our new results on top.
+                latest = _load_analysis_store()
+                latest.update(store)
+                _save_analysis_store(latest)
+        except Exception as exc:
+            logger.error("auto-analysis tick failed: %r", exc)
+        await asyncio.sleep(ANALYSIS_POLL_SECONDS)
+
+
+@app.on_event("startup")
+async def _start_auto_analysis() -> None:
+    asyncio.create_task(_auto_analysis_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -1357,6 +1427,173 @@ def _introspect_agent_config() -> dict:
 @app.get("/api/agent/config")
 async def agent_config() -> JSONResponse:
     return JSONResponse(_introspect_agent_config())
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent registry + per-agent knowledge base (RAG)
+# ---------------------------------------------------------------------------
+
+def _agent_kb_summary(agent_id: str) -> dict:
+    docs = agent_kb.list_docs(agent_id)
+    meta = agent_kb.index_meta(agent_id)
+    return {"docs": docs, "n_docs": len(docs),
+            "n_chunks": meta.get("n_chunks", 0),
+            "built_at": meta.get("built_at"), "model": meta.get("model")}
+
+
+def _require_agents() -> JSONResponse | None:
+    if not AGENTS_AVAILABLE:
+        return JSONResponse({"ok": False, "reason": "agent registry unavailable"}, status_code=503)
+    agent_registry.ensure_default_agent()
+    return None
+
+
+async def _reindex_agent(agent_id: str) -> None:
+    """Rebuild an agent's vector index off the event loop (embedding is CPU
+    heavy). Marks docs ready/error via build_index."""
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, agent_kb.build_index, agent_id)
+    except Exception as exc:
+        logger.error("reindex failed for %s: %r", agent_id, exc)
+
+
+@app.get("/api/agents")
+async def agents_list() -> JSONResponse:
+    if (err := _require_agents()):
+        return err
+    agents = []
+    for a in agent_registry.list_agents():
+        docs = agent_kb.list_docs(a["id"])
+        agents.append({**a, "doc_count": len(docs),
+                       "n_chunks": agent_kb.index_meta(a["id"]).get("n_chunks", 0)})
+    return JSONResponse({"agents": agents, "active_agent_id": agent_registry.get_active_agent_id()})
+
+
+@app.post("/api/agents")
+async def agents_create(request: Request) -> JSONResponse:
+    if (err := _require_agents()):
+        return err
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"ok": False, "reason": "name is required"}, status_code=400)
+    overrides = {k: body[k] for k in agent_registry.PERSONA_FIELDS if k in body}
+    entry = agent_registry.create_agent(name, overrides)
+    return JSONResponse({"ok": True, "agent": entry})
+
+
+@app.get("/api/agents/{agent_id}")
+async def agents_get(agent_id: str) -> JSONResponse:
+    if (err := _require_agents()):
+        return err
+    if not agent_registry.get_agent(agent_id):
+        return JSONResponse({"ok": False, "reason": "not found"}, status_code=404)
+    return JSONResponse({"ok": True, "persona": agent_registry.load_persona(agent_id),
+                         "kb": _agent_kb_summary(agent_id),
+                         "active": agent_registry.get_active_agent_id() == agent_id})
+
+
+@app.patch("/api/agents/{agent_id}")
+async def agents_update(agent_id: str, request: Request) -> JSONResponse:
+    if (err := _require_agents()):
+        return err
+    body = await request.json()
+    fields = {k: body[k] for k in (("name",) + agent_registry.PERSONA_FIELDS) if k in body}
+    persona = agent_registry.update_persona(agent_id, fields)
+    if persona is None:
+        return JSONResponse({"ok": False, "reason": "not found"}, status_code=404)
+    return JSONResponse({"ok": True, "persona": persona})
+
+
+@app.post("/api/agents/{agent_id}/activate")
+async def agents_activate(agent_id: str) -> JSONResponse:
+    if (err := _require_agents()):
+        return err
+    if not agent_registry.set_active(agent_id):
+        return JSONResponse({"ok": False, "reason": "not found"}, status_code=404)
+    return JSONResponse({"ok": True, "restart_required": True})
+
+
+@app.delete("/api/agents/{agent_id}")
+async def agents_delete(agent_id: str) -> JSONResponse:
+    if (err := _require_agents()):
+        return err
+    ok, msg = agent_registry.delete_agent(agent_id)
+    return JSONResponse({"ok": ok, "reason": msg}, status_code=200 if ok else 409)
+
+
+@app.get("/api/agents/{agent_id}/kb")
+async def agent_kb_list(agent_id: str) -> JSONResponse:
+    if (err := _require_agents()):
+        return err
+    if not agent_registry.get_agent(agent_id):
+        return JSONResponse({"ok": False, "reason": "not found"}, status_code=404)
+    return JSONResponse({"ok": True, **_agent_kb_summary(agent_id)})
+
+
+@app.post("/api/agents/{agent_id}/kb/upload")
+async def agent_kb_upload(agent_id: str, request: Request) -> JSONResponse:
+    if (err := _require_agents()):
+        return err
+    if not agent_registry.get_agent(agent_id):
+        return JSONResponse({"ok": False, "reason": "not found"}, status_code=404)
+    form = await request.form()
+    upload = form.get("file")
+    # request.form() yields a starlette UploadFile (duck-type on .read/.filename)
+    if upload is None or isinstance(upload, str) or not hasattr(upload, "read"):
+        return JSONResponse({"ok": False, "reason": "file field is required"}, status_code=400)
+    filename = os.path.basename(upload.filename or "")
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in agent_kb.SUPPORTED_EXT:
+        return JSONResponse({"ok": False, "reason": f"unsupported type {ext}; allowed: pdf, docx, txt, md"},
+                            status_code=400)
+    data = await upload.read()
+    if not data:
+        return JSONResponse({"ok": False, "reason": "empty file"}, status_code=400)
+
+    import uuid as _uuid
+    doc_id = _uuid.uuid4().hex[:10]
+    stored_name = f"{doc_id}{ext}"
+    raw = agent_registry.raw_dir(agent_id)
+    os.makedirs(raw, exist_ok=True)
+    with open(os.path.join(raw, stored_name), "wb") as f:
+        f.write(data)
+    docs = agent_kb._load_docs(agent_id)
+    docs.append({"id": doc_id, "filename": filename, "stored_name": stored_name,
+                 "size": len(data), "status": "indexing", "chunk_count": 0,
+                 "uploaded_at": _now_iso()})
+    agent_kb._save_docs(agent_id, docs)
+    # Re-index in the background; the doc list shows status until it flips ready.
+    asyncio.create_task(_reindex_agent(agent_id))
+    return JSONResponse({"ok": True, "doc_id": doc_id, "status": "indexing"})
+
+
+@app.delete("/api/agents/{agent_id}/kb/{doc_id}")
+async def agent_kb_delete(agent_id: str, doc_id: str) -> JSONResponse:
+    if (err := _require_agents()):
+        return err
+    docs = agent_kb._load_docs(agent_id)
+    target = next((d for d in docs if d["id"] == doc_id), None)
+    if not target:
+        return JSONResponse({"ok": False, "reason": "not found"}, status_code=404)
+    try:
+        os.remove(os.path.join(agent_registry.raw_dir(agent_id), target["stored_name"]))
+    except OSError:
+        pass
+    agent_kb._save_docs(agent_id, [d for d in docs if d["id"] != doc_id])
+    asyncio.create_task(_reindex_agent(agent_id))
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/agents/{agent_id}/kb/reindex")
+async def agent_kb_reindex(agent_id: str) -> JSONResponse:
+    if (err := _require_agents()):
+        return err
+    if not agent_registry.get_agent(agent_id):
+        return JSONResponse({"ok": False, "reason": "not found"}, status_code=404)
+    asyncio.create_task(_reindex_agent(agent_id))
+    return JSONResponse({"ok": True, "status": "reindexing"})
 
 
 @app.get("/api/analytics/conversation")
@@ -1455,7 +1692,11 @@ async def transcripts_search(q: str = Query(..., min_length=1), limit: int = Que
 async def recording_audio(folder: str, download: int = Query(0)) -> FileResponse:
     if "/" in folder or ".." in folder:
         return JSONResponse({"error": "invalid folder"}, status_code=400)
-    audio_path = RECORDINGS_DIR / folder / "caller_audio.wav"
+    # Prefer the caller+agent mix (so the agent voice is audible); fall back to
+    # the caller-only track for recordings made before mixing was added.
+    audio_path = RECORDINGS_DIR / folder / "mixed_audio.wav"
+    if not audio_path.exists():
+        audio_path = RECORDINGS_DIR / folder / "caller_audio.wav"
     if not audio_path.exists():
         return JSONResponse({"error": "no audio for this recording"}, status_code=404)
     headers = {}
@@ -2207,6 +2448,28 @@ async def followups_list(status: str = Query("all")) -> JSONResponse:
             "folder": folder,
         })
 
+    # In-call callback requests ("call me in 10 min") — surfaced in the Tracker
+    # too, sharing follow_up_automation.json as the single source of truth.
+    _AUTO_STATUS_MAP = {"scheduled": "pending", "calling": "pending",
+                        "called": "completed", "failed": "missed",
+                        "cancelled": "dismissed"}
+    for a in _load_automation_store():
+        if a.get("source") != "in_call_callback":
+            continue
+        key = f"automation:{a['id']}"
+        entries.append({
+            "id": key, "source": "in_call_callback",
+            "contact_name": a.get("contact_name") or "",
+            "contact_phone": a.get("contact_phone") or "",
+            "follow_up_required": True,
+            "reason": "Caller requested a callback during the live call.",
+            "follow_up_date": a.get("scheduled_time"),
+            "priority": "high",
+            "status": overrides.get(key, {}).get("status")
+                      or _AUTO_STATUS_MAP.get(a.get("status"), "pending"),
+            "updated_at": a.get("called_at") or a.get("created_at"),
+        })
+
     for m in _load_manual_followups():
         key = f"manual:{m['id']}"
         ov_status = overrides.get(key, {}).get("status")
@@ -2379,6 +2642,85 @@ async def automation_create(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "automation": entry})
 
 
+CALLBACK_SPOOL_FILE = Path(__file__).parent / "_callback_spool.jsonl"
+
+
+def _create_callback_automation(body: dict, entries: list[dict]) -> dict | None:
+    """Append an in-call callback request to the automation store (mutates
+    `entries`). Returns the new entry, or None if deduped/invalid. Shared by the
+    HTTP endpoint and the spool drainer."""
+    phone = "".join(ch for ch in str(body.get("contact_phone", "")) if ch.isdigit())
+    scheduled = body.get("scheduled_time")
+    call_id = body.get("call_id") or ""
+    if len(phone) < 7 or not scheduled:
+        return None
+    # Idempotent: one scheduled callback per source call.
+    if any(e.get("source_id") == call_id and e.get("status") == "scheduled" for e in entries):
+        return None
+    import uuid as _uuid
+    entry = {
+        "id": _uuid.uuid4().hex[:10],
+        "source_id": call_id,
+        "source": "in_call_callback",
+        "contact_name": body.get("contact_name", "") or "",
+        "contact_phone": phone,
+        "past_call_context": body.get("past_call_context", "") or "",
+        "call_aim": "Caller requested a callback during the live call.",
+        "script_notes": body.get("raw", "") or "",
+        "scheduled_time": scheduled,
+        "linked_contact_id": None,
+        "status": "scheduled",
+        "created_at": _now_iso(),
+        "called_at": None,
+        "call_outcome": None,
+    }
+    entries.append(entry)
+    return entry
+
+
+@app.post("/api/followup-automation/callback")
+async def automation_create_callback(request: Request) -> JSONResponse:
+    """Register a callback the caller requested mid-call. The pipeline process
+    POSTs here at call end; the existing scheduler then auto-dials at the
+    requested time. Keeps the dashboard the single writer of the JSON store."""
+    body = await request.json()
+    entries = _load_automation_store()
+    entry = _create_callback_automation(body, entries)
+    if entry is None:
+        return JSONResponse({"ok": True, "deduped": True})
+    _save_automation_store(entries)
+    return JSONResponse({"ok": True, "automation": entry})
+
+
+def _drain_callback_spool() -> None:
+    """Ingest any callback requests the pipeline spooled while the dashboard was
+    unreachable. Append-only file → read once, truncate, replay through the
+    single-writer create path."""
+    if not CALLBACK_SPOOL_FILE.exists():
+        return
+    try:
+        lines = CALLBACK_SPOOL_FILE.read_text(encoding="utf-8").splitlines()
+        CALLBACK_SPOOL_FILE.write_text("", encoding="utf-8")
+    except Exception as exc:
+        logger.error("callback spool read failed: %r", exc)
+        return
+    if not lines:
+        return
+    entries = _load_automation_store()
+    changed = False
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            if _create_callback_automation(json.loads(line), entries) is not None:
+                changed = True
+        except Exception as exc:
+            logger.warning("bad callback spool line: %r", exc)
+    if changed:
+        _save_automation_store(entries)
+
+
 @app.patch("/api/followup-automation/{automation_id}")
 async def automation_update(automation_id: str, request: Request) -> JSONResponse:
     body = await request.json()
@@ -2470,6 +2812,7 @@ async def _automation_scheduler_loop() -> None:
     alone — Call Now is the only way to trigger them."""
     while True:
         try:
+            _drain_callback_spool()
             now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
             for entry in _load_automation_store():
                 if entry["status"] != "scheduled" or not entry.get("scheduled_time"):

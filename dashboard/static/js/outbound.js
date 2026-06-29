@@ -120,7 +120,8 @@ async function addOutboundContact(){
   const notes=document.getElementById('ob-notes').value.trim();
   if(!phone){showOBMsg('Phone number is required','var(--error)');return}
   try{
-    const d=await api('/api/outbound/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,name,notes})});
+    const r=await fetch('/api/outbound/contacts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,name,notes})});
+    const d=await r.json();
     if(d.ok){
       document.getElementById('ob-phone').value='';
       document.getElementById('ob-name').value='';

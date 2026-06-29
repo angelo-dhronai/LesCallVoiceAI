@@ -16,10 +16,18 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import re
 import time
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+    _IST = ZoneInfo("Asia/Kolkata")
+except Exception:  # pragma: no cover — fallback if tz database unavailable
+    _IST = timezone(timedelta(hours=5, minutes=30))
 
 from openai import AsyncOpenAI
 
@@ -79,13 +87,17 @@ _STAGE_ORDER = {
 
 MAX_RESPONSE_LENGTH = 400
 LLM_TIMEOUT = 5.0
-LLM_MAX_TOKENS = 160
-# Lowered 2.0 → 1.0s: the LLM's first sentence typically lands at ~1.8s, so a
-# 2.0s gate almost never fired and the caller heard dead air. At 1.0s a short
-# acknowledgment ("One moment…") plays ~1s after the caller stops, masking the
-# LLM round-trip and cutting *perceived* turn latency without touching the
-# turn-end wait or the model itself.
-FILLER_TIMEOUT_S = 1.0
+# Backstop for the 1–2 sentence brevity rule. A turn that obeys the prompt
+# lands well under this; the cap only bites on a runaway response, where a hard
+# stop is preferable to a 4s monologue. Kept generous enough that Devanagari
+# (token-heavy) two-sentence replies are never truncated mid-thought.
+LLM_MAX_TOKENS = 120
+# Lowered 1.0 → 0.7s: measured time-to-first-LLM-token sits at ~1.0s, so a 1.0s
+# gate fired right as the caller began to feel the silence. At 0.7s the short
+# acknowledgment ("One moment…") plays *before* that gap is perceived, fully
+# masking the LLM round-trip. Raising it would re-expose dead air; lowering it
+# much further would fire fillers even when the model would have answered fast.
+FILLER_TIMEOUT_S = 0.7
 LLM_STREAM_TIMEOUT_S = 7.0
 INTENT_CLASSIFY_TIMEOUT_S = 1.0
 
@@ -134,6 +146,7 @@ class ConversationState:
         self.decline_count: int = 0
         # Discovery tracking (inbound flow)
         self.discovery_turns: int = 0
+        self.stage_entry_turn: int = 0  # discovery_turns value when the current stage was entered
         self.purpose: str | None = None          # "self_use" / "investment" / "exploring"
         self.project_recommended: str | None = None  # project name mentioned to caller
 
@@ -359,8 +372,8 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
     # Identity question — "who is this", "kon bol raha hai", etc.
     # Highest priority among questions — gets a fast deterministic response
     _identity_phrases = [
-        "who is this", "who are you", "who is calling", "who is speaking",
-        "who am i speaking", "who am i talking",
+        "who is this", "who was this", "who are you", "who is calling", "who is speaking",
+        "who am i speaking", "who am i talking", "who called", "who's this", "who's calling",
         "which company", "what company", "where are you calling from",
         "where you calling from", "kahan se", "kis taraf se",
         "kon hai", "kaun hai", "kon bol", "kaun bol", "kon baat", "kaun baat",
@@ -536,11 +549,122 @@ _DECLINE_FAREWELL_RESPONSES: dict[str, str] = {
 # Filler responses (multilingual, Pramukh-specific)
 # ---------------------------------------------------------------------------
 
-_FILLER_RESPONSES: dict[str, list[str]] = {
-    "en": ["One moment...", "Sure, let me check..."],
-    "hi": ["एक सेकंड...", "बिल्कुल, बताता हूँ..."],
-    "gu": ["એક સેકન્ડ...", "બિલકુલ, જણાવું છું..."],
+# Fillers are organised into three *categories* so the phrase that buys time
+# fits what the caller just said.  A filler that sounds like the real answer is
+# already starting ("Let me check that for you…") masks LLM latency far better
+# than a generic stall ("One moment…") repeated every turn:
+#   - "lookup" : caller asked for information we need to fetch
+#                (question / location / property type / time) — implies action.
+#   - "ack"    : caller affirmed / greeted / thanked — a warm acknowledgement.
+#   - "think"  : neutral default for everything else.
+# _pick_filler() chooses the category from the turn's intent, then picks a
+# phrase at random *excluding the one used last* so it never repeats back to
+# back.  Each category carries enough variety that a multi-timeout call never
+# sounds like a broken record.
+_FILLER_BANK: dict[str, dict[str, list[str]]] = {
+    "en": {
+        "lookup": [
+            "Let me check that for you...",
+            "Let me pull that up...",
+            "Sure, give me one second...",
+            "Let me find the details...",
+            "Okay, looking into that...",
+        ],
+        "ack": [
+            "Hmm...",
+            "Okay...",
+            "Sure...",
+            "Right...",
+            "Got it...",
+        ],
+        "think": [
+            "Hmm...",
+            "Okay...",
+            "Sure...",
+            "Right...",
+            "Got it...",
+        ],
+    },
+    "hi": {
+        "lookup": [
+            "एक सेकंड, चेक करता हूँ...",
+            "हाँ, अभी देखता हूँ...",
+            "ज़रा देख लेता हूँ...",
+            "डिटेल्स निकालता हूँ...",
+            "हाँ, अभी बताता हूँ...",
+        ],
+        "ack": [
+            "Hmm...",
+            "Okay...",
+            "Sure...",
+            "हाँ...",
+            "जी...",
+        ],
+        "think": [
+            "Hmm...",
+            "Okay...",
+            "Sure...",
+            "हाँ...",
+            "जी...",
+        ],
+    },
+    "gu": {
+        "lookup": [
+            "એક સેકન્ડ, જોઉં છું...",
+            "હમણાં જણાવું છું...",
+            "જરા જોઈ લઉં...",
+            "ડિટેલ્સ કાઢું છું...",
+            "હા, હમણાં ચેક કરું છું...",
+        ],
+        "ack": [
+            "Hmm...",
+            "Okay...",
+            "Sure...",
+            "હા...",
+            "જી...",
+        ],
+        "think": [
+            "Hmm...",
+            "Okay...",
+            "Sure...",
+            "હા...",
+            "જી...",
+        ],
+    },
 }
+
+# Maps the turn's detected intent to a filler category.  "lookup" ("let me
+# check the details…") is reserved for intents where the agent genuinely has to
+# fetch project/availability data — using it elsewhere is exactly the bug we are
+# fixing (e.g. saying "let me check" when asked the agent's own name).  A plain
+# "question" is intentionally routed to the neutral "think" bank, never
+# "lookup", because keyword classification cannot tell a project query from a
+# quick factual one.  Anything not listed falls through to "think".
+_FILLER_CATEGORY_BY_INTENT: dict[str, str] = {
+    "location_selection": "lookup",
+    "property_type": "lookup",
+    "time_preference": "lookup",
+    "question": "think",    # keyword classification cannot tell a project query
+                            # from a quick factual one, so a plain question gets a
+                            # neutral acknowledgement, never "let me check".
+    "affirmation": "ack",
+    "negation": "ack",
+}
+
+# Intents that never warrant a filler.  Either the agent answers them instantly
+# via a deterministic shortcut (greeting, gratitude, identity, language switch,
+# objection, farewell), or any "buying time" phrase would sound wrong because
+# the real reply is immediate.  For these, no filler is spoken even if the LLM
+# is briefly slow — the pipeline simply waits for the answer (no dead-air risk
+# since these replies are short).
+_FILLER_SUPPRESS_INTENTS: frozenset[str] = frozenset({
+    "greeting",
+    "gratitude",
+    "farewell",
+    "identity_question",
+    "language_switch",
+    "objection",
+})
 
 # ---------------------------------------------------------------------------
 # Timeout / error fallbacks
@@ -568,23 +692,54 @@ _LANG_SWITCH_RESPONSES: dict[str, str] = {
 # Identity responses — fast deterministic answers for "who is this?"
 # ---------------------------------------------------------------------------
 
-_IDENTITY_RESPONSES: dict[str, str] = {
+# Response when caller asks "who are you / which company / where are you calling from"
+_INTRO_RESPONSES: dict[str, str] = {
     "en": (
-        "I'm calling from Pramukh Group, one of Gujarat's most trusted real estate developers. "
-        "You had shown interest in our properties and raised an inquiry. "
-        "I just wanted to have a quick chat about what you're looking for."
+        "I'm Vishal Patel from Pramukh Group — one of Gujarat's most trusted real estate developers. "
+        "How can I help you today?"
     ),
     "hi": (
-        "जी, मैं Pramukh Group से बात कर रहा हूँ, हम Gujarat के जाने-माने रियल एस्टेट डेवलपर हैं। "
-        "आपने हमारी प्रॉपर्टीज में इंटरेस्ट दिखाया था और इंक्वायरी भी की थी। "
-        "मैं बस आपसे इसके बारे में थोड़ी बात करना चाहता था।"
+        "मैं Vishal Patel हूँ, Pramukh Group से — Gujarat के सबसे भरोसेमंद real estate developers में से एक। "
+        "बताइए, आपके लिए क्या कर सकता हूँ?"
     ),
     "gu": (
-        "જી, હું Pramukh Group તરફથી બોલું છું, અમે Gujarat ના જાણીતા રિયલ એસ્ટેટ ડેવલપર છીએ. "
-        "તમે અમારી પ્રોપર્ટીઝમાં ઇન્ટરેસ્ટ દર્શાવ્યો હતો અને ઇન્ક્વાયરી પણ કરી હતી. "
-        "હું બસ આ વિશે થોડી વાત કરવા માંગતો હતો."
+        "હું Vishal Patel છું, Pramukh Group તરફથી — Gujarat ના સૌથી વિश्वासु real estate developers માંથી એક. "
+        "કહો, હું તમારા માટે શું કરી શકું?"
     ),
 }
+
+# Response only when caller explicitly asks "are you AI / bot / robot / human?"
+_IDENTITY_RESPONSES: dict[str, str] = {
+    "en": (
+        "Yes, you're right — I'm an AI agent, but no less capable than any telecaller. "
+        "I'm here to help you just like one! Now, how can I assist you?"
+    ),
+    "hi": (
+        "हाँ, आपने सही समझा — मैं एक AI agent हूँ, मगर किसी और telecaller से कम नहीं। "
+        "मैं आपकी पूरी मदद कर सकता हूँ! तो बताइए, क्या चाहिए आपको?"
+    ),
+    "gu": (
+        "હા, તમે સાચું સમજ્યા — હું એક AI agent છું, પણ કોઈ પણ telecaller થી ઓછો નથી. "
+        "હું તમારી પૂરી મદદ કરી શકું છું! કહો, શું જોઈએ છે?"
+    ),
+}
+
+# Phrases that explicitly ask whether the agent is AI/bot/robot — only these
+# should trigger the AI-acknowledgment response. "Who are you?" and "which
+# company?" are NOT AI questions; they get the intro response instead.
+_AI_QUESTION_PHRASES: list[str] = [
+    "are you ai", "are you an ai", "are you a bot", "are you bot",
+    "are you a robot", "are you robot", "are you real", "are you a real",
+    "are you human", "are you a human", "are you a person", "are you a real person",
+    "are you artificial", "artificial intelligence",
+    "real person", "real human", "actual person", "actual human",
+    "kya aap ai", "kya aap robot", "kya aap insaan", "kya aap human",
+    "kya aap real", "kya tum ai", "kya tum robot", "kya tum insaan",
+    "kya aap ek machine", "kya aap computer", "robot hai", "ai hai",
+    "क्या आप ai", "क्या आप robot", "क्या आप इंसान", "क्या आप real",
+    "शुद्ध ai", "क्या तुम robot", "machine ho", "computer ho",
+    "tame ai", "tame robot", "tame insaan", "tame real",
+]
 
 _LANG_FALLBACKS: dict[str, str] = {
     "hi": "माफ़ कीजिए, क्या आप दोबारा बोल सकते हैं?",
@@ -716,6 +871,7 @@ class ConversationRouter:
         model: str = "gpt-4o-mini",
         timeout: float = LLM_TIMEOUT,
         default_language: str = "hi",
+        agent_id: str | None = None,
     ) -> None:
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self._model = model
@@ -724,9 +880,31 @@ class ConversationRouter:
         self.memory = ConversationMemory()
         self.state = ConversationState()
         self.state.language = default_language
+
+        # ── Active agent persona + knowledge base (multi-agent / RAG) ────────
+        # Backward compatible: with no registry on disk, persona falls back to
+        # DEFAULT_PERSONA (identical to the previously-hardcoded strings) and
+        # there is no KB — so single-agent behaviour is unchanged.
+        self.agent_id = agent_id
+        self.persona: dict = {}
+        self.kb = None
+        try:
+            from ..agent import registry as _registry
+            if _registry.registry_exists():
+                self.agent_id = agent_id or _registry.get_active_agent_id()
+                self.persona = _registry.load_persona(self.agent_id)
+                if self.persona.get("default_language"):
+                    self.state.language = self.persona["default_language"]
+                self._load_knowledge_base()
+            else:
+                self.persona = dict(_registry.DEFAULT_PERSONA)
+        except Exception as exc:  # pragma: no cover — never break a call over this
+            logger.warning("[CONV] agent persona/KB load failed: %r", exc)
         self._response_counter = 0
         self._lang_cache: dict[str, tuple[str, float, str]] = {}
         self._filler_counter = 0
+        # Last filler phrase spoken — used by _pick_filler to avoid repeats.
+        self._last_filler: str | None = None
         self._speculative_yes: asyncio.Task | None = None
         self._speculative_no: asyncio.Task | None = None
         self._last_nudge_stage: str | None = None
@@ -737,6 +915,10 @@ class ConversationRouter:
         self._name_pending: str | None = None
         self._name_confirmed: bool = False
         self._name_pending_turn: int = 0   # turn index when _name_pending was set
+        # Phone-capture confirmation mode (feature 5)
+        self._phone_pending: str | None = None
+        self._phone_confirmed: bool = False
+        self._phone_pending_turn: int = 0
 
         if not self._api_key:
             logger.warning("[CONV] OPENAI_API_KEY not set -- LLM calls will fail")
@@ -748,6 +930,51 @@ class ConversationRouter:
                 timeout=self._timeout,
             )
         return self._client
+
+    # ------------------------------------------------------------------
+    # Knowledge base (RAG) — per-agent, loaded into RAM for fast retrieval
+    # ------------------------------------------------------------------
+
+    def _load_knowledge_base(self) -> None:
+        """Load the active agent's vector index into RAM. Called at init and on
+        hot-reload when the index changes on disk (no model reload needed)."""
+        if not self.agent_id or not self.persona.get("kb_enabled", True):
+            self.kb = None
+            return
+        try:
+            from ..agent.knowledge import KnowledgeIndex
+            self.kb = KnowledgeIndex.load_from_disk(self.agent_id)
+            if self.kb:
+                logger.info("[KB] Loaded %d chunks for agent %s",
+                            len(self.kb.chunks), self.agent_id)
+        except Exception as exc:
+            logger.warning("[KB] load failed: %r", exc)
+            self.kb = None
+
+    def _maybe_reload_kb(self) -> None:
+        """Cheap mtime check so KB uploads take effect mid-run without a restart."""
+        if not self.agent_id:
+            return
+        try:
+            from ..agent import knowledge as _kb
+            path = _kb._emb_file(self.agent_id)
+            mtime = os.path.getmtime(path) if os.path.exists(path) else None
+            cur = getattr(self.kb, "mtime", None)
+            if mtime is not None and mtime != cur:
+                self._load_knowledge_base()
+        except Exception:
+            pass
+
+    def _retrieve_knowledge(self, query: str) -> list[dict]:
+        """Top-k knowledge chunks relevant to the caller's latest turn. Never
+        raises — RAG must not break a call."""
+        if self.kb is None:
+            return []
+        try:
+            return self.kb.search(query)
+        except Exception as exc:
+            logger.warning("[KB] retrieval failed: %r", exc)
+            return []
 
     # ------------------------------------------------------------------
     # Opening greeting (outbound call starts here)
@@ -819,6 +1046,14 @@ class ConversationRouter:
 
         # --- Language detection + stabilization ---
         detected_lang, conf, src = await self.detect_language_v3(text)
+        # Numeric-only input (phone digits, amounts) looks like English to the
+        # detector but the caller is still speaking their primary language.
+        _non_alpha = re.sub(r'[\d\s\.\-\+/,]', '', text).strip()
+        if not _non_alpha and self.state.language in ("hi", "gu") and detected_lang == "en":
+            logger.info("[LANG] Numeric input — preserving %s", self.state.language)
+            detected_lang = self.state.language
+            src = "numeric_preserved"
+            conf = 1.0
         self.state.turn_count += 1
         logger.info('[LANG] "%s" -> %s (src=%s, conf=%.2f, locked=%s)',
                      text, detected_lang, src, conf, self.state.language_locked)
@@ -1057,7 +1292,12 @@ class ConversationRouter:
         if intent == "identity_question":
             _cancel_llm()
             lang = self.state.language
-            resp = _IDENTITY_RESPONSES.get(lang, _IDENTITY_RESPONSES["en"])
+            _lower = text.lower()
+            _is_ai_question = any(p in _lower for p in _AI_QUESTION_PHRASES)
+            if _is_ai_question:
+                resp = _IDENTITY_RESPONSES.get(lang, _IDENTITY_RESPONSES["en"])
+            else:
+                resp = _INTRO_RESPONSES.get(lang, _INTRO_RESPONSES["en"])
             self.memory.add_assistant(resp, language=lang)
             self._store_last_response(resp)
             if self.state.stage == STAGE_GREETING:
@@ -1114,6 +1354,32 @@ class ConversationRouter:
                 self._name_confirmed = True
                 logger.info("[NAME] Auto-accepted name after 2 turns: %r", self._name_pending)
                 self._name_pending = None
+
+        # Phone confirmation resolution (feature 5)
+        # Triggered after _extract_data_from_input captures a new number.
+        _cs_phone_now = self.memory.call_state.customer_phone
+        if (not self._phone_confirmed and not self._phone_pending and _cs_phone_now):
+            # Freshly captured number — hold it pending caller confirmation.
+            self._phone_pending = _cs_phone_now
+            self._phone_pending_turn = self.state.turn_count
+            self.memory.call_state.customer_phone = None
+            logger.info("[PHONE] Number pending confirmation: %r", self._phone_pending)
+
+        if self._phone_pending:
+            if intent == "affirmation":
+                self.memory.call_state.customer_phone = self._phone_pending
+                self._phone_confirmed = True
+                logger.info("[PHONE] Number confirmed: %r", self._phone_pending)
+                self._phone_pending = None
+            elif intent == "negation":
+                logger.info("[PHONE] Caller rejected number %r — clearing", self._phone_pending)
+                self._phone_pending = None
+            elif self.state.turn_count - self._phone_pending_turn >= 2:
+                # Caller kept talking without confirming — auto-accept.
+                self.memory.call_state.customer_phone = self._phone_pending
+                self._phone_confirmed = True
+                logger.info("[PHONE] Auto-accepted number: %r", self._phone_pending)
+                self._phone_pending = None
 
         # Advance from GREETING on first user response
         if self.state.stage == STAGE_GREETING:
@@ -1252,14 +1518,124 @@ class ConversationRouter:
                 cs.site_visit_requested = True
                 logger.info("[STATE_UPDATE] site_visit_requested=True (affirmation in INVITE_VISIT)")
 
+        # ── Callback request detection ("call me in 10 min / at 12 today") ─
+        if not cs.callback_requested:
+            cb_iso = self._extract_callback_time(text)
+            if cb_iso:
+                cs.callback_requested = True
+                cs.callback_iso = cb_iso
+                cs.callback_raw = text.strip()[:200]
+                logger.info("[CALLBACK] Callback requested at %s (%r)", cb_iso, cs.callback_raw)
+
         # ── Sync all layers into CallState ───────────────────────────────
         self._update_call_state()
         self.state.discovery_turns += 1
+
+    def _extract_callback_time(self, text: str) -> str | None:
+        """Detect a caller request to be called back ("call me in 10 minutes",
+        "after 10 mins", "at 12 o'clock today", "12 बजे call karna") and return
+        the target instant as a UTC ISO8601 string, or None.
+
+        Times are interpreted in Asia/Kolkata (the agent's locale) and stored as
+        UTC for the dashboard scheduler. Pure side-effect helper — never alters
+        the conversation flow."""
+        lower = text.lower()
+
+        # Must look like a callback request, not just any time mention. This
+        # keeps site-visit time phrases (handled by _extract_time_preference)
+        # from being mistaken for callback requests.
+        callback_cue = re.search(
+            r"\b(call|phone|ring|dial|callback|call back)\b.*\b(me|back|again|later)\b"
+            r"|\bcall me\b|\bcall back\b|\bcallback\b"
+            r"|(?:call|phone|kol|fon)\s*(karna|karo|kariye|karjo|karje|kar)"  # Hindi/Gujarati transliterated
+            r"|(कॉल|फ़ोन|फोन)\s*(कर|करना|करो|कीजिए|करना)"
+            r"|(કૉલ|ફોન|કોલ)\s*(કર|કરજો|કરો|કરજે)",
+            text + lower,
+        )
+        if not callback_cue:
+            return None
+
+        now_ist = datetime.now(_IST)
+        target: datetime | None = None
+
+        # --- Relative: "in/after N minutes/hours" (multilingual) ---
+        _UNIT = r"(min|minute|minutes|mins|मिनट|મિનિટ|hour|hours|hr|hrs|घंट|કલાક|ghanta|ghante|kalak)"
+        # English/leading-cue order: "in 10 minutes", "after 2 hours"
+        rel = re.search(
+            r"(?:\bin\b|\bafter\b)\D{0,6}?(\d{1,3})\s*" + _UNIT,
+            text + lower,
+        )
+        # Hindi/Gujarati postposition order: "10 मिनट बाद", "10 મિનિટ પછી",
+        # "10 minute baad" — number + unit then the after-word.
+        if not rel:
+            rel = re.search(
+                r"(\d{1,3})\s*" + _UNIT +
+                r"\s*(?:baad|બાદ|बाद|pachhi|pachi|પછી|me\b|mein|में|માં)",
+                text + lower,
+            )
+        if rel:
+            n = int(rel.group(1))
+            unit = rel.group(2)
+            if unit.startswith(("hour", "hr", "घंट", "કલાક", "ghant", "kalak")):
+                target = now_ist + timedelta(hours=min(n, 24))
+            else:
+                target = now_ist + timedelta(minutes=min(n, 24 * 60))
+
+        # --- Absolute: "at 12 o'clock today", "12 बजे", "5 pm" ---
+        if target is None:
+            hour_24 = self._parse_clock_hour(text, lower)
+            if hour_24 is not None:
+                wants_tomorrow = bool(
+                    re.search(r"\b(tomorrow|kal|kaale)\b", lower)
+                    or "कल" in text or "કાલે" in text)
+                cand = now_ist.replace(hour=hour_24, minute=0, second=0, microsecond=0)
+                if wants_tomorrow:
+                    cand += timedelta(days=1)
+                elif cand <= now_ist:
+                    # Hour already passed today and no "tomorrow" — push to next day.
+                    cand += timedelta(days=1)
+                target = cand
+
+        if target is None:
+            return None
+
+        # Never schedule in the past; cap absurd futures to 24h out.
+        if target <= now_ist:
+            target = now_ist + timedelta(seconds=60)
+        if target > now_ist + timedelta(hours=24):
+            target = now_ist + timedelta(hours=24)
+        return target.astimezone(timezone.utc).isoformat()
+
+    @staticmethod
+    def _parse_clock_hour(text: str, lower: str) -> int | None:
+        """Extract a 24-hour clock hour from English/Hindi/Gujarati time phrases.
+        Mirrors the hour logic in _extract_time_preference (Step 1)."""
+        m = re.search(r"\b(\d{1,2})(?::\d{2})?\s*(a\.?m\.?|p\.?m\.?)\b", lower)
+        if m:
+            h = int(m.group(1))
+            return (h % 12) + (12 if "p" in m.group(2) else 0)
+        m = re.search(r"(\d{1,2})(?::\d{2})?\s*(?:बजे|वजे|વાગે|baje|baaje|o'?clock|oclock)",
+                      text + lower)
+        if m:
+            h = int(m.group(1))
+            is_evening = bool(re.search(r"(शाम|સાંજે|saanje|shaam|evening|night|रात|રાત)", text + lower))
+            is_afternoon = bool(re.search(r"(दोपहर|બપોરે|bapore|dopahar|afternoon)", text + lower))
+            is_morning = bool(re.search(r"(सुबह|સવારે|savare|subah|morning)", text + lower))
+            if is_evening or is_afternoon:
+                return (h % 12) + 12
+            if is_morning:
+                return h % 12 if h != 12 else 12
+            if h == 12:
+                return 12  # "12 o'clock" → noon, the natural daytime reading
+            return (h % 12) + (12 if 1 <= h <= 7 else 0)
+        return None
 
     def _maybe_advance_stage(self) -> None:
         """Soft stage advancement — let collected data drive progression."""
         b = self.memory.booking
         dt = self.state.discovery_turns
+        # Turns spent in the current stage (resets on each stage change)
+        stage_turns = dt - self.state.stage_entry_turn
 
         if self.state.stage == STAGE_DISCOVERY:
             _has_name = bool(b.user_name or self.memory.call_state.customer_name)
@@ -1269,15 +1645,18 @@ class ConversationRouter:
             # want to buy. Fallback at 12 turns ensures the flow never stalls.
             if (_has_name and _has_location and dt >= 3) or dt >= 12:
                 self.state.stage = STAGE_PROJECT_MATCH
+                self.state.stage_entry_turn = dt
                 logger.info("[STAGE] DISCOVERY → PROJECT_MATCH (name=%s, loc=%s, turns=%d)",
                             b.user_name, b.location, dt)
 
         elif self.state.stage == STAGE_PROJECT_MATCH:
-            # Advance to visit invitation after sufficient project discussion.
-            # Reduced from 14 to 9 turns — keep momentum.
-            if dt >= 9:
+            # Spend at least 4 turns in PROJECT_MATCH discussing the property
+            # before moving to site visit invitation. This prevents the agent
+            # from immediately jumping to booking as soon as project is mentioned.
+            if stage_turns >= 4:
                 self.state.stage = STAGE_INVITE_VISIT
-                logger.info("[STAGE] PROJECT_MATCH → INVITE_VISIT")
+                self.state.stage_entry_turn = dt
+                logger.info("[STAGE] PROJECT_MATCH → INVITE_VISIT (stage_turns=%d)", stage_turns)
 
         elif self.state.stage == STAGE_INVITE_VISIT:
             if b.appointment_time:
@@ -1839,10 +2218,14 @@ class ConversationRouter:
                 llm_queue.get(), timeout=FILLER_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
-            filler = self._pick_filler()
-            self.state.filler_used = True
-            yield EngineResult(text=filler, is_shortcut=True, intent="filler")
-            first_chunk = await llm_queue.get()
+            if intent in _FILLER_SUPPRESS_INTENTS:
+                # This intent needs no filler — just wait for the real answer.
+                first_chunk = await llm_queue.get()
+            else:
+                filler = self._pick_filler(intent)
+                self.state.filler_used = True
+                yield EngineResult(text=filler, is_shortcut=True, intent="filler")
+                first_chunk = await llm_queue.get()
 
         if first_chunk is not None:
             full_parts.append(first_chunk)
@@ -1912,7 +2295,11 @@ class ConversationRouter:
 
     async def _call_llm_stream(self, text: str):
         client = self._get_client()
-        system = self._build_system_prompt()
+        # Retrieve knowledge-base context for the caller's latest turn (in-RAM,
+        # ~10-20ms). Empty list when no KB is configured — zero overhead path.
+        self._maybe_reload_kb()
+        kb_hits = self._retrieve_knowledge(text)
+        system = self._build_system_prompt(kb_hits=kb_hits)
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(self.memory.get_history_for_llm())
 
@@ -1934,6 +2321,17 @@ class ConversationRouter:
         })
 
         _SENTENCE_END = re.compile(r'[.!?।]\s')
+        # The FIRST chunk is flushed to TTS at the earliest clause boundary
+        # (comma / semicolon / sentence end) instead of waiting for a full
+        # sentence.  Time-to-first-audio is what the caller perceives as
+        # latency: emitting one clause sooner lets Sarvam start speaking while
+        # the model is still generating the rest of the sentence.  Subsequent
+        # chunks revert to full-sentence boundaries for natural prosody.
+        _CLAUSE_END = re.compile(r'[,;।.!?]\s')
+        # Don't emit a tiny opening fragment ("Yes," / "हाँ,") on its own — it
+        # sounds choppy.  Require at least this many characters before the
+        # boundary for the first flush.
+        _FIRST_CHUNK_MIN_CHARS = 12
         deadline = time.monotonic() + LLM_STREAM_TIMEOUT_S
 
         try:
@@ -1947,6 +2345,7 @@ class ConversationRouter:
 
             buffer = ""
             timed_out = False
+            first_emitted = False
             async for chunk in stream:
                 if time.monotonic() > deadline:
                     logger.warning("[LLM-TIMEOUT] fallback triggered after %.0fs",
@@ -1957,11 +2356,19 @@ class ConversationRouter:
                 if delta.content:
                     buffer += delta.content
                     while True:
-                        match = _SENTENCE_END.search(buffer)
+                        if not first_emitted:
+                            # First clause: flush early so audio starts sooner,
+                            # but only once we have enough text to sound natural.
+                            match = _CLAUSE_END.search(buffer)
+                            if match and len(buffer[:match.start()].strip()) < _FIRST_CHUNK_MIN_CHARS:
+                                match = None
+                        else:
+                            match = _SENTENCE_END.search(buffer)
                         if match:
                             sentence = buffer[:match.end()].strip()
                             buffer = buffer[match.end():]
                             if sentence:
+                                first_emitted = True
                                 yield _validate_response(sentence, self.state.language)
                         else:
                             break
@@ -1986,10 +2393,23 @@ class ConversationRouter:
     # System prompt — Pramukh Group domain
     # ------------------------------------------------------------------
 
-    def _build_system_prompt(self) -> str:  # noqa: C901
+    def _build_system_prompt(self, kb_hits: list[dict] | None = None) -> str:  # noqa: C901
         b = self.memory.booking
         cs = self.memory.call_state
         lang = self.state.language
+        # Persona (active agent) — falls back to DEFAULT_PERSONA values.
+        p = self.persona or {}
+        _p_name = p.get("agent_name", "Vishal Patel")
+        _p_role = p.get("role_line", "a warm, genuine, experienced inbound sales agent for Pramukh Group.")
+        _p_identity = p.get("identity") or [
+            "You are NOT reading a script. You are a real person having a real conversation.",
+            "Your job: make every caller feel genuinely heard and understood.",
+        ]
+        _p_brand = p.get("brand") or [
+            "Pramukh Group · 30 years · 60+ completed projects · ZERO stalled projects · RERA compliant",
+            "Surat · Vapi · Silvassa · Contact: +91 87583 70000",
+        ]
+        _p_portfolio = p.get("portfolio") or []
         lang_name = {"hi": "Hindi", "gu": "Gujarati", "en": "English"}.get(lang, "English")
 
         # ── LANGUAGE LOCK — put this FIRST so LLM sees it immediately ────────
@@ -2049,22 +2469,21 @@ class ConversationRouter:
                 "Ask for their name — ONE question only."
             ),
             STAGE_DISCOVERY: (
-                "You are a proactive property sales consultant. Your mission: qualify this caller "
-                "and build enough rapport to earn a site visit.\n"
+                "You are a warm, curious property consultant. Your mission right now: understand the caller.\n"
                 "\n"
                 "MANDATORY FLOW — after EVERY caller response:\n"
                 "  1. Acknowledge what they just said (1 sentence, genuinely).\n"
                 "  2. Check QUALIFICATION STATUS below — ask the NEXT MISSING FIELD in priority order.\n"
-                "  3. If all core fields are captured, pivot to a project recommendation naturally.\n"
+                "  3. If all core fields are captured, transition naturally: 'Based on what you've told me, I think I have just the right option for you...'\n"
                 "\n"
                 "COLLECTION PRIORITY (one question per turn, skip if already known):\n"
                 "  1. Name  2. City (Surat / Vapi / Silvassa)  3. Configuration (1/2/3 BHK)\n"
                 "  4. Budget (comfortable range — ask softly)  5. Purpose (self-use or investment)\n"
                 "  6. Timeline (when planning to buy)  7. Phone / WhatsApp\n"
                 "\n"
-                "Do NOT wait for the caller to volunteer information — ask for it warmly.\n"
-                "Do NOT skip fields — every answer helps you match the right property.\n"
-                "If the caller volunteers a field before you ask, capture it and move to the next one."
+                "Ask warmly, one field at a time. If the caller volunteers a field before you ask, capture it and move to the next one.\n"
+                "Do NOT mention site visits in this stage — focus entirely on understanding the caller's needs.\n"
+                "Do NOT skip fields — every answer helps you match the right property."
             ),
             STAGE_PROJECT_MATCH: (
                 "You have enough information. Now be the expert.\n"
@@ -2091,6 +2510,27 @@ class ConversationRouter:
                 "Keep the door open — any question, just call or WhatsApp."
             ),
         }
+        # For PROJECT_MATCH: build a phase-aware goal based on turns spent in this stage
+        _pm_stage_turns = self.state.discovery_turns - self.state.stage_entry_turn
+        _stage_goals[STAGE_PROJECT_MATCH] = (
+            "You have recommended a project. Now be the knowledgeable friend who knows this project inside-out.\n"
+            "\n"
+            "PHASE 1 — Property discussion (first 3 turns in this stage):\n"
+            "  · Introduce ONE specific project that fits their budget, location, and configuration.\n"
+            "  · Give 2 genuine reasons it suits THEM personally.\n"
+            "  · Invite them to ask questions about it — floor plans, amenities, possession, RERA.\n"
+            "  · Answer every question warmly and specifically.\n"
+            "  · Do NOT mention site visit yet. Let them get comfortable with the project first.\n"
+            "\n"
+            "PHASE 2 — Natural bridge (after 3+ turns of property discussion):\n"
+            "  · Only AFTER the caller has engaged with the project details, mention the site visit.\n"
+            "  · Say something natural like: 'Photos don't do it justice — aap ek baar dekh ke aao, phir decide karo.'\n"
+            "  · Keep it casual — not a hard sell. A suggestion, not a demand.\n"
+            "\n"
+            f"Currently in turn {_pm_stage_turns + 1} of this stage — "
+            + ("stay in PHASE 1, discuss the property. Do NOT push for site visit." if _pm_stage_turns < 3
+               else "you may now naturally suggest a site visit.")
+        )
         stage_goal = _stage_goals.get(self.state.stage, _stage_goals[STAGE_DISCOVERY])
 
         # ── Collected info ───────────────────────────────────────────────────
@@ -2123,21 +2563,22 @@ class ConversationRouter:
         _qprop = b.property_type or cs.property_type
         _qpurpose = self.state.purpose or cs.purpose
         _qbudget = b.budget or cs.budget
+        qa = self.memory.qa_tracker
         qual_needed: list[str] = []
-        if not _qname:
+        if not _qname and not qa.is_answered("name"):
             qual_needed.append("Name")
         # Priority order per sales flow: location → config → budget → purpose → timeline → phone
-        if not _qloc:
+        if not _qloc and not qa.is_answered("location"):
             qual_needed.append("City (Surat / Vapi / Silvassa)")
-        if not _qprop:
+        if not _qprop and not qa.is_answered("bhk"):
             qual_needed.append("Configuration (1/2/3 BHK)")
-        if not _qbudget:
+        if not _qbudget and not qa.is_answered("budget"):
             qual_needed.append("Budget (comfortable range — ask warmly)")
-        if not _qpurpose:
+        if not _qpurpose and not qa.is_answered("purpose"):
             qual_needed.append("Purpose (self-use or investment)")
-        if not cs.timeline:
+        if not cs.timeline and not qa.is_answered("timeline"):
             qual_needed.append("Timeline (when planning to buy)")
-        if not cs.customer_phone:
+        if not cs.customer_phone and not self._phone_pending and not self._phone_confirmed:
             qual_needed.append("Phone / WhatsApp")
         _qual_next = qual_needed[0] if qual_needed else None
 
@@ -2148,6 +2589,22 @@ class ConversationRouter:
                 "",
                 f"⚡ NAME CONFIRMATION REQUIRED: Caller just provided their name as {self._name_pending!r}.",
                 f"Your VERY NEXT response MUST confirm it: 'Your name is {self._name_pending}, right?' — nothing else first.",
+            ]
+
+        # Phone-capture confirmation instruction (feature 5)
+        phone_confirm_block: list[str] = []
+        if self._phone_pending:
+            _ph = self._phone_pending
+            # Format as spoken groups: 99308 52520 → "99 30 85 25 20"
+            _ph_groups = ' '.join(_ph[i:i+2] for i in range(0, len(_ph), 2))
+            phone_confirm_block = [
+                "",
+                f"⚡ PHONE CONFIRMATION REQUIRED: Caller just gave number {_ph}.",
+                f"Your VERY NEXT response MUST read it back and ask for confirmation.",
+                f"  Hindi:   'आपका WhatsApp नंबर {_ph_groups} है, क्या यह सही है?'",
+                f"  English: 'Your WhatsApp is {_ph_groups}, is that correct?'",
+                f"  Gujarati: 'તમારો WhatsApp {_ph_groups} છે, સાચું ને?'",
+                f"Use the language the caller is using. Say the EXACT number {_ph_groups}. Ask NOTHING else.",
             ]
 
         # ── Persistent CallState block ────────────────────────────────────────
@@ -2179,16 +2636,19 @@ class ConversationRouter:
         parts = [
             # Language lock FIRST — highest priority
             lang_header.get(lang, lang_header["en"]),
+            # Brevity is the #1 perceived-latency lever — keep it at the top too,
+            # not just buried in the guidelines, so the model actually obeys it.
+            "⚡ REPLY LENGTH: 1–2 short sentences MAX. This is a live phone call — "
+            "be brief, ask one thing, then stop.",
             *name_confirm_block,
+            *phone_confirm_block,
             "",
             "━━ AGENT IDENTITY ━━",
-            "You are Vishal Patel — a warm, genuine, experienced inbound sales agent for Pramukh Group.",
-            "You are NOT reading a script. You are a real person having a real conversation.",
-            "Your job: make every caller feel genuinely heard and understood.",
+            f"You are {_p_name} — {_p_role}",
+            *_p_identity,
             "",
             "━━ BRAND ━━",
-            "Pramukh Group · 30 years · 60+ completed projects · ZERO stalled projects · RERA compliant",
-            "Surat · Vapi · Silvassa · Contact: +91 87583 70000",
+            *_p_brand,
             "",
             "━━ CALL STATE ━━",
             f"Stage: {self.state.stage}  |  Language: {lang_name}  |  Turn: {self.state.turn_count}",
@@ -2243,22 +2703,16 @@ class ConversationRouter:
             "━━ CURRENT GOAL ━━",
             stage_goal,
             "",
-            "━━ PROJECT PORTFOLIO ━━",
-            "SURAT: Revanta (3BHK ₹1.11Cr+), Vivanta (3BHK ₹1.66Cr+), Satva (3BHK ₹1.26Cr+ NEAR-READY Dec 2025),",
-            "Agastya (4BHK ultra-premium), Central Park (3+4BHK ₹1.3Cr+), Aranya (3+4BHK luxury near airport),",
-            "Aranya II (3BHK ₹70L+ IT corridor).",
-            "VAPI: Aura (2+3BHK ₹34-40L READY), Sahaj (1+2BHK ₹22-29L completed), Vedanta (RERA).",
-            "SILVASSA: Sangath (2+3BHK), Yogi Woods (pool+gym), Shivanta (near schools), Swagat (ready).",
-            "COMMERCIAL: Orbit Series (Surat/Vapi shops, offices).",
-            "MATCH: Budget+Vapi→Sahaj/Aura | Mid+Surat→Aranya II | Premium+Surat→Revanta/Satva | Luxury→Vivanta/Agastya | Ready→Satva/Aura/Sahaj",
-            "",
+            *(["━━ PROJECT PORTFOLIO ━━", *_p_portfolio, ""] if _p_portfolio else []),
             "━━ CONVERSATION GUIDELINES ━━",
             "LISTEN + QUALIFY: Acknowledge what the caller said, THEN always move the qualification forward.",
             "Every turn must do two things: (1) respond to what was said, (2) ask the next missing field.",
             "If they asked a question — ANSWER IT, then smoothly return to qualification.",
             "SALES-DRIVEN: You are not a chatbot waiting for direction. You are a sales consultant guiding a conversation toward a booking.",
             "PACE: Speak at the caller's pace. One question at a time. Never stack questions.",
-            "3 sentences max per response. Phone call — brevity is warmth.",
+            "LENGTH (HARD LIMIT): Maximum 2 short sentences per response — ideally ONE. "
+            "This is a live phone call: long replies feel slow and the caller tunes out. "
+            "Acknowledge in a few words, ask ONE thing, stop. Never explain at length unless explicitly asked.",
             "Mirror their energy: excited → warm and enthusiastic, cautious → softer and reassuring.",
             "NEVER sound like an IVR, chatbot, or scripted call center agent.",
             "",
@@ -2274,13 +2728,16 @@ class ConversationRouter:
             "'Price too high' → ask their comfortable range, suggest lower options.",
             "'Need to ask family' → invite the whole family to visit together.",
             "'Comparing builders' → smart — but see ours first. 30 years, zero stalls, RERA.",
+            "'Remind me' / 'Call me tomorrow as a reminder' / 'Can you call me tomorrow?' → say YES enthusiastically: 'Bilkul, main kal aapko call karke yaad dilaunga! / Absolutely, I'll call you tomorrow as a reminder!' — NEVER say you can't make reminder calls.",
+            "'Are you AI?' / 'Are you a bot?' / 'Are you a robot?' / 'Kya aap AI ho?' → acknowledge warmly and confidently: English: 'Yes, I'm an AI agent — but no less capable than any telecaller. I'm here to help you just like one!' Hindi: 'Haan, aapne sahi samjha — main ek AI agent hoon, magar kisi aur telecaller se kam nahi. Main aapki poori madad kar sakta hoon!' NEVER deny being AI when directly asked.",
             "",
             "━━ FIRM RULES ━━",
             "✗ NEVER use hollow filler phrases: 'खुशी हुई', 'आपका जवाब सुनकर खुशी हुई', 'Happy to help', "
             "'It was a pleasure', 'आपकी बात सुनकर', 'ખુશી થઈ', 'Glad to hear'. "
             "Every sentence must either gather missing info, handle an objection, recommend a project, or push toward a site visit.",
             "✗ NEVER volunteer pricing, rates, payment plans, ROI, inventory levels, or discounts unprompted — only discuss these when the caller explicitly asks",
-            "✗ NEVER repeat the caller's phone number back to them unless they explicitly ask you to confirm it",
+            "✓ When the caller gives their WhatsApp/phone number, ALWAYS read it back in spoken digit-groups and ask '...क्या यह सही है? / is that correct?' in the caller's current language. Wait for confirmation before proceeding.",
+            "✓ After confirmation (हाँ/yes/जी), thank them briefly and move to the next topic.",
             "✗ NEVER ask for information that is already listed in PERSISTENT CALL STATE or ALREADY COLLECTED",
             "✗ NEVER ask budget before you know the caller's city and configuration (BHK size)",
             "✗ NEVER give more than 2 time options for site visit",
@@ -2289,6 +2746,7 @@ class ConversationRouter:
             "✗ NEVER say 'When can you come?' — always give exactly TWO specific time options",
             "✗ NEVER ask 'Do you have any questions?' or 'Any questions about the property?' — only answer questions when the caller asks one",
             "✗ NEVER push the conversation to a new topic if the caller is still on the current one",
+            "✗ NEVER mention site visit, site booking, or 'aap aa sakte ho' during DISCOVERY or PROJECT_MATCH phase 1 — only suggest a visit after discussing the project for at least 3 turns",
             "✗ NEVER give property pitches until the caller has expressed genuine interest",
             "✗ NEVER interrupt a caller's train of thought with an unrelated topic",
             "✓ Use caller's name naturally (2-3 times)",
@@ -2305,6 +2763,19 @@ class ConversationRouter:
         context_str = self.memory.context.to_prompt_string()
         if context_str:
             parts.append(f"\nKnown context:\n{context_str}")
+
+        # ── Knowledge base context (RAG) — placed last for high recency weight ─
+        if kb_hits:
+            parts.append("")
+            parts.append("━━ KNOWLEDGE BASE CONTEXT ━━")
+            parts.append(
+                "Verified facts from the company knowledge base. Use ONLY this "
+                "information to answer factual questions (pricing, specs, policies, "
+                "documents). If the answer isn't here, say you'll have someone "
+                "follow up — NEVER invent facts.")
+            for h in kb_hits:
+                src = h.get("filename", "")
+                parts.append(f"  · {h.get('text', '').strip()}" + (f"  [{src}]" if src else ""))
 
         return "\n".join(parts)
 
@@ -2525,11 +2996,23 @@ class ConversationRouter:
         self._response_counter += 1
         return resp
 
-    def _pick_filler(self) -> str:
+    def _pick_filler(self, intent: str = "general") -> str:
+        """Pick a context-appropriate filler that never repeats back to back.
+
+        The category is chosen from the turn's intent (lookup / ack / think) so
+        the phrase fits what the caller just said, then a phrase is drawn at
+        random from that category excluding the one used on the previous filler.
+        Falls back gracefully across category → language → English.
+        """
         lang = self.state.language
-        fillers = _FILLER_RESPONSES.get(lang, _FILLER_RESPONSES["en"])
-        resp = fillers[self._filler_counter % len(fillers)]
-        self._filler_counter += 1
+        bank = _FILLER_BANK.get(lang, _FILLER_BANK["en"])
+        category = _FILLER_CATEGORY_BY_INTENT.get(intent, "think")
+        choices = bank.get(category) or bank["think"]
+
+        # Avoid repeating the immediately-previous filler when alternatives exist.
+        candidates = [c for c in choices if c != self._last_filler] or choices
+        resp = random.choice(candidates)
+        self._last_filler = resp
         return resp
 
     # ------------------------------------------------------------------

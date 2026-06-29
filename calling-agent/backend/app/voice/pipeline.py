@@ -154,7 +154,9 @@ class VoicePipeline:
         event_hub: EventHub | None = None,
         mic_enabled: bool = True,
         skip_greeting: bool = False,
+        call_id: str | None = None,
     ) -> None:
+        self.call_id = call_id
         self.audio = audio_source or LocalMicSource(sample_rate=SAMPLE_RATE)
         self.sink = audio_sink or LocalSpeakerSink(sample_rate=SAMPLE_RATE)
         
@@ -727,6 +729,28 @@ class VoicePipeline:
                 ):
                     _bcp47_to_short = {"en-IN": "en", "hi-IN": "hi", "gu-IN": "gu"}
                     short = _bcp47_to_short.get(stt_result.detected_language)
+                    # Reconcile Sarvam's language tag against the transcript's actual
+                    # script. The script is ground truth for Hindi vs Gujarati and
+                    # cannot be faked: Devanagari (U+0900–097F) is Hindi, Gujarati
+                    # script (U+0A80–0AFF) is Gujarati. Sarvam intermittently mis-tags
+                    # Devanagari Hindi as gu-IN, which would flip the whole agent to
+                    # Gujarati mid-call. Hard rule: never switch TO Gujarati unless the
+                    # transcript actually contains Gujarati characters.
+                    if short:
+                        _has_deva = any("ऀ" <= c <= "ॿ" for c in transcript_text)
+                        _has_guj = any("઀" <= c <= "૿" for c in transcript_text)
+                        if _has_deva and not _has_guj:
+                            short = "hi"
+                        elif _has_guj and not _has_deva:
+                            short = "gu"
+                        elif short == "gu" and not _has_guj:
+                            # Latin/English or ambiguous text tagged Gujarati — refuse
+                            # the switch and keep the current language.
+                            logger.info(
+                                "[STT] Ignoring spurious gu-IN tag — no Gujarati script "
+                                "in transcript: %r", transcript_text[:60],
+                            )
+                            short = None
                     if short:
                         logger.info(
                             "[STT] Language auto-detected by Sarvam: %s → %s",

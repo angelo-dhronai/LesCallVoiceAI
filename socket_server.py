@@ -678,7 +678,13 @@ def ensure_recording_dir() -> None:
     prevent the playback path from running."""
     try:
         os.makedirs(RECORDING_DIR, exist_ok=True)
-        log.info("RECORDING_DIR ready: %s", RECORDING_DIR)
+        # socket_server runs as the invoking user (angelo) but FreeSWITCH runs
+        # as uid 999 (freeswitch) and is the process that writes the WAV via
+        # record_session. Default 0o755 leaves the dir non-writable by that
+        # user, which silently drops every ESL-triggered recording. Make it
+        # world-writable so FreeSWITCH can persist recordings regardless of user.
+        os.chmod(RECORDING_DIR, 0o777)
+        log.info("RECORDING_DIR ready: %s (mode 0o777)", RECORDING_DIR)
     except OSError as e:
         log.error("RECORDING_DIR setup failed: %r — record_session "
                   "will fail; playback path is unaffected", e)
@@ -2466,6 +2472,13 @@ def classify(cp: dict, counters: dict, last_reply: str,
 
 
 def main() -> None:
+    # Startup safety guards (see runtime_guard.py): never run as root, and
+    # ensure all shared runtime dirs exist + are world-writable. Running as
+    # root would poison shared file ownership and leave an unkillable process.
+    from runtime_guard import assert_not_root, bootstrap_runtime_dirs
+    assert_not_root("socket_server")
+    bootstrap_runtime_dirs()
+
     # P4-A: pre-create the recordings directory so record_session does
     # not fail on the first call before an operator has SSH'd in.
     ensure_recording_dir()

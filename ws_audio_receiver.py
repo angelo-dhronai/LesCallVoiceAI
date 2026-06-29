@@ -91,6 +91,13 @@ class _Phase15AudioDebugger:
         self.first_frame_logged = False
 
         os.makedirs(PHASE15_DEBUG_DIR, exist_ok=True)
+        # Keep the debug dir world-writable so a stray run under a different
+        # user (e.g. an accidental sudo start) can't leave it unwritable for
+        # the normal angelo-owned process. Best-effort — ignore if not owner.
+        try:
+            os.chmod(PHASE15_DEBUG_DIR, 0o777)
+        except OSError:
+            pass
 
         self.raw_path = os.path.join(
             PHASE15_DEBUG_DIR,
@@ -587,8 +594,19 @@ async def handle_connection(websocket, path: str, args):
                 # --------------------------------------------------
                 # DEBUG SAVE
                 # --------------------------------------------------
+                # Best-effort only. A failure here (e.g. the debug dir owned by
+                # another user / disk full) must NEVER propagate — otherwise it
+                # bubbles to WS_FRAME_ERROR and the frame is dropped before it
+                # reaches the pipeline, leaving the agent deaf for the whole call.
 
-                p15_debug.process_frame(raw_bytes)
+                try:
+                    p15_debug.process_frame(raw_bytes)
+                except Exception as exc:
+                    log.warning(
+                        "[P15_DEBUG_SKIP] conn=%s debug dump failed (ignored): %r",
+                        conn_id,
+                        exc,
+                    )
 
                 # --------------------------------------------------
                 # NORMALIZATION
@@ -915,6 +933,14 @@ async def main_async(args):
 
 
 def main():
+
+    # Startup safety guards (see runtime_guard.py): never run as root, and
+    # ensure all shared runtime dirs exist + are world-writable before the
+    # first audio frame arrives. This is what prevents the "deaf agent /
+    # PermissionError on every frame" failure class from ever recurring.
+    from runtime_guard import assert_not_root, bootstrap_runtime_dirs
+    assert_not_root("ws_audio_receiver")
+    bootstrap_runtime_dirs()
 
     p = argparse.ArgumentParser()
 

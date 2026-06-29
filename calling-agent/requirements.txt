@@ -32,3 +32,7 @@ typing_extensions==4.15.0
 uvicorn==0.45.0
 watchfiles==1.1.1
 websockets==16.0
+# Knowledge base (RAG): in-RAM embeddings + document parsing
+sentence-transformers>=3.0
+pypdf>=5.0
+python-docx>=1.1

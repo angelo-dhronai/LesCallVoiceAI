@@ -112,6 +112,20 @@ _GUJARATI_FUNC_QUALITY = frozenset({
 
 _QUALITY_THRESHOLD = 0.3  # reject if quality score is below this
 
+# Languages that Sarvam auto-detect commonly mis-fires to when receiving
+# Hindi/Gujarati telephony audio at 8kHz. When detected, we retry the
+# same audio with hi-IN to get a correct Hindi transcript.
+_LANGS_RETRY_AS_HINDI = frozenset({
+    "pa-IN",  # Punjabi — most frequent misfire for Hindi telephony
+    "mr-IN",  # Marathi
+    "ml-IN",  # Malayalam
+    "ta-IN",  # Tamil
+    "te-IN",  # Telugu
+    "kn-IN",  # Kannada
+    "bn-IN",  # Bengali / Assamese
+    "or-IN",  # Odia
+})
+
 
 def _score_transcript_quality(text: str) -> float:
     """
@@ -384,6 +398,22 @@ class STTRouter:
             return STTResult(text=text, detected_language=detected_lang)
 
         if not had_error:
+            # If Sarvam returned a known misfire language (Punjabi, Tamil, etc.)
+            # instead of Hindi/Gujarati, retry the same audio with hi-IN so the
+            # caller's actual Hindi speech is correctly transcribed.
+            if detected_lang in _LANGS_RETRY_AS_HINDI:
+                logger.info(
+                    "[STT] Unsupported lang detected (%s) — retrying with hi-IN",
+                    detected_lang,
+                )
+                retry_text, _, retry_lang = await self._try_provider(
+                    self._primary, "primary-hi-retry", audio_bytes, sample_rate, "hi-IN"
+                )
+                if retry_text:
+                    self._sarvam_rl_count = 0
+                    logger.info("[STT] Hindi retry succeeded: %r", retry_text)
+                    return STTResult(text=retry_text, detected_language=retry_lang or "hi-IN")
+
             # Sarvam processed the audio cleanly but found no speech.
             # Whisper would produce the same (empty or hallucinated) result,
             # so skip it entirely to avoid wasting quota.
@@ -475,7 +505,9 @@ class STTRouter:
                     "[STT] %s transcript %r rejected by validation (attempt %d)",
                     label, text, attempt,
                 )
-                return "", False, None
+                # Return detected_lang even on rejection so transcribe() can
+                # distinguish "wrong language detected" from "no speech".
+                return "", False, detected_lang
 
             except SarvamRateLimitError:
                 raise

@@ -1497,11 +1497,18 @@ class ConversationRouter:
                 self.memory.qa_tracker.mark_extracted("bhk", bhk.upper())
                 logger.info("[DISCOVERY] Config extracted: %s", bhk)
 
-        if not self.memory.booking.appointment_time:
+        # Capture the visit time. During scheduling stages we also allow the
+        # caller to RESCHEDULE — a newly stated time overwrites the previous one
+        # so the agent accepts their change instead of clinging to an old slot.
+        _sched_stage = self.state.stage in (STAGE_INVITE_VISIT, STAGE_CONFIRMATION)
+        if not self.memory.booking.appointment_time or _sched_stage:
             t = self._extract_time_preference(text, stage=self.state.stage)
-            if t:
+            if t and t != self.memory.booking.appointment_time:
                 self.memory.booking.appointment_time = t
-                logger.info("[DISCOVERY] Time extracted: %s", t)
+                # Keep CallState in sync on reschedule (its own sync only fills
+                # an empty value, so update it directly here).
+                self.memory.call_state.appointment_time = t
+                logger.info("[DISCOVERY] Visit time set/updated: %s", t)
 
         if not self.state.purpose:
             # Multi-word / script phrases: safe to use substring matching (rare false positives)
@@ -2088,20 +2095,28 @@ class ConversationRouter:
 
     def _extract_time_preference(self, text: str, stage: str | None = None) -> str | None:
         """
-        Match user-stated time/day to an available slot.
+        Capture the caller's requested visit time — and ACCEPT it.
 
-        Returns None when the user gave a SPECIFIC time that isn't on the
-        slot list — never silently fudges to a different slot. The engine's
-        scheduling reprompt path then offers the real available slots back.
+        Flexible by design: this is a mock calendar, so whatever day/time the
+        caller states is taken as-is. We never refuse a requested time or snap
+        it to a different fixed slot; `_AVAILABLE_SLOTS` are only *suggestions*
+        the agent offers to open the conversation. Returns a readable label
+        (e.g. "Tomorrow evening", "Day after tomorrow at 11:00 AM",
+        "in about 2 hours") or None only when the turn has no time reference.
 
-        The ``stage`` parameter gates the bare-affirmation heuristic (Step 5):
-        mapping a lone "yes/ok/haan" to the first slot only makes sense when
-        the agent just offered slots (INVITE_VISIT/CONFIRMATION).  In earlier
-        stages the same words are general affirmations and must NOT book time.
+        The ``stage`` parameter gates the bare-affirmation heuristic: mapping a
+        lone "yes/haan" to the first suggested slot only makes sense when the
+        agent just offered slots (INVITE_VISIT/CONFIRMATION). In earlier stages
+        the same words are general affirmations and must NOT book a time.
         """
         lower = text.lower()
 
-        # --- Step 1: extract specific hour if present ---
+        def _fmt_hour(h24: int) -> str:
+            meridiem = "AM" if h24 < 12 else "PM"
+            h12 = h24 % 12 or 12
+            return f"{h12}:00 {meridiem}"
+
+        # --- Step 1: specific hour if present ---
         hour_24: int | None = None
         # English "11 am", "6 pm", "5:00 pm"
         m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\b", lower)
@@ -2129,7 +2144,7 @@ class ConversationRouter:
                     # 8-12 → AM (morning) — fits typical site-visit phrasing
                     hour_24 = (h % 12) + (12 if 1 <= h <= 7 else 0)
 
-        # --- Step 2: extract day ---
+        # --- Step 2: day ---
         day: str | None = None
         if re.search(r"\b(today|aaj|aaje)\b", lower) or "आज" in text or "આજે" in text:
             day = "Today"
@@ -2142,48 +2157,45 @@ class ConversationRouter:
             day = "Day after tomorrow"
         elif re.search(r"\b(saturday|this saturday|weekend)\b", lower):
             day = "This Saturday"
+        elif re.search(r"\b(sunday)\b", lower):
+            day = "This Sunday"
 
-        # --- Step 3: if specific time given, match strictly against slots ---
-        if hour_24 is not None:
-            for slot in _AVAILABLE_SLOTS:
-                if day and slot["day"] != day:
-                    continue
-                if _slot_hour_24(slot["time"]) == hour_24:
-                    return f"{slot['day']} at {slot['time']}"
-            # User gave a specific hour with no matching slot — caller will
-            # reprompt with available options instead of locking a wrong time.
-            return None
-
-        # --- Step 4: no specific hour. Match by part-of-day + day. ---
+        # --- Step 3: part-of-day ---
         period: str | None = None
         if re.search(r"(सुबह|સવારે|savare|subah|morning)", text + lower):
             period = "morning"
         elif re.search(r"(दोपहर|બપોરે|bapore|dopahar|afternoon)", text + lower):
             period = "afternoon"
-        elif re.search(r"(शाम|સાંજે|saanje|shaam|evening|night)", text + lower):
+        elif re.search(r"(शाम|સાંજે|saanje|shaam|evening|night|रात|રાત)", text + lower):
             period = "evening"
 
-        if day or period:
-            for slot in _AVAILABLE_SLOTS:
-                if day and slot["day"] != day:
-                    continue
-                if period and _slot_period(slot["time"]) != period:
-                    continue
-                return f"{slot['day']} at {slot['time']}"
-            # Day matched but period didn't (e.g. user wants "Tomorrow evening"
-            # — no evening slots tomorrow). Don't fudge: caller reprompts.
-            if period:
-                return None
-            # Day-only match: take the first slot of that day.
-            for slot in _AVAILABLE_SLOTS:
-                if slot["day"] == day:
-                    return f"{slot['day']} at {slot['time']}"
+        # --- Step 4: relative ("in 2 hours", "दो घंटे में", "30 minutes") ---
+        rel_h = (re.search(r"\b(\d{1,2})\s*(?:hours?|hrs?|ghante|ghanta)\b", lower)
+                 or re.search(r"(\d{1,2})\s*(?:घंटे|घंटा|કલાક)", text))
+        rel_m = (re.search(r"\b(\d{1,3})\s*(?:minutes?|mins?|min)\b", lower)
+                 or re.search(r"(\d{1,3})\s*(?:मिनट|મિનિટ)", text))
 
-        # --- Step 5: bare affirmation → first available slot ---
-        # ONLY apply when the agent is actively offering time slots (INVITE_VISIT or
-        # CONFIRMATION stage).  In DISCOVERY/GREETING/PROJECT_MATCH stages the same
-        # words ("yes", "haan", "ji") are general affirmations — mapping them to a
-        # slot would silently pre-book a visit the caller never agreed to schedule.
+        # --- Build the label from whatever the caller actually said, and
+        #     ACCEPT it. Most specific → least specific. ---
+        if hour_24 is not None:
+            label = _fmt_hour(hour_24)
+            return f"{day} at {label}" if day else label
+        if day and period:
+            return f"{day} {period}"
+        if day:
+            return day
+        if rel_h:
+            n = rel_h.group(1)
+            return f"in about {n} hour{'s' if n != '1' else ''}"
+        if rel_m:
+            return f"in about {rel_m.group(1)} minutes"
+        if period:
+            return f"this {period}"
+
+        # --- Step 5: bare affirmation → first suggested slot ---
+        # ONLY when the agent is actively offering slots (INVITE_VISIT /
+        # CONFIRMATION). In earlier stages "yes/haan/ji" are general
+        # affirmations and must not silently pre-book a visit.
         _scheduling_stages = (STAGE_INVITE_VISIT, STAGE_CONFIRMATION)
         if stage is None or stage in _scheduling_stages:
             if re.search(r"\b(yes|yeah|ok|okay|sure|haan|ha|ji|theek|first|pehla)\b", lower):
@@ -2571,13 +2583,19 @@ class ConversationRouter:
             ),
             STAGE_INVITE_VISIT: (
                 "The caller is interested. Your only goal now: book the site visit.\n"
-                "Give EXACTLY TWO specific time options (from the available slots).\n"
-                "When they pick a slot, confirm: date, time, and their name for the register.\n"
-                "Ask for WhatsApp to send the site address and directions.\n"
-                "Do NOT give more options — scarcity creates urgency."
+                "You may suggest a couple of times to get started, but you are FULLY FLEXIBLE.\n"
+                "⚡ If the caller proposes ANY day or time — today, tomorrow, evening, "
+                "in a couple of hours, a specific hour, or a different day — say YES warmly "
+                "and accept it. Confirm that exact time back to them.\n"
+                "NEVER refuse a requested time, never say a time is 'already fixed', and never "
+                "insist the caller take a different slot. Accommodate what works for them.\n"
+                "Once they give a time, confirm the day + time and their name for the register, "
+                "and ask for WhatsApp to send the site address and directions."
             ),
             STAGE_CONFIRMATION: (
                 "Confirm the visit details: day, time, property, and caller's name.\n"
+                "⚡ If the caller wants to change the day or time, ACCEPT their new preference "
+                "warmly and confirm the new time — never refuse or repeat an old fixed slot.\n"
                 "Ask if any family member is joining (great buying decisions involve family).\n"
                 "Offer to WhatsApp the exact site address and parking instructions."
             ),
@@ -2640,19 +2658,24 @@ class ConversationRouter:
         _qpurpose = self.state.purpose or cs.purpose
         _qbudget = b.budget or cs.budget
         qa = self.memory.qa_tracker
+        # Use should_stop_asking (captured value OR asked enough times) rather
+        # than is_answered: a field with no captured value that was only asked
+        # once is still genuinely needed, so the agent re-asks it instead of
+        # skipping ahead — this is what prevents a stray fragment from causing a
+        # never-answered question (e.g. city) to be silently dropped.
         qual_needed: list[str] = []
-        if not _qname and not qa.is_answered("name"):
+        if not _qname and not qa.should_stop_asking("name"):
             qual_needed.append("Name")
         # Priority order per sales flow: location → config → budget → purpose → timeline → phone
-        if not _qloc and not qa.is_answered("location"):
+        if not _qloc and not qa.should_stop_asking("location"):
             qual_needed.append("City (Surat / Vapi / Silvassa)")
-        if not _qprop and not qa.is_answered("bhk"):
+        if not _qprop and not qa.should_stop_asking("bhk"):
             qual_needed.append("Configuration (1/2/3 BHK)")
-        if not _qbudget and not qa.is_answered("budget"):
+        if not _qbudget and not qa.should_stop_asking("budget"):
             qual_needed.append("Budget (comfortable range — ask warmly)")
-        if not _qpurpose and not qa.is_answered("purpose"):
+        if not _qpurpose and not qa.should_stop_asking("purpose"):
             qual_needed.append("Purpose (self-use or investment)")
-        if not cs.timeline and not qa.is_answered("timeline"):
+        if not cs.timeline and not qa.should_stop_asking("timeline"):
             qual_needed.append("Timeline (when planning to buy)")
         if not cs.customer_phone and not self._phone_pending and not self._phone_confirmed:
             qual_needed.append("Phone / WhatsApp")

@@ -1,6 +1,6 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect, useMemo } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { Phone, Upload, Plus, Trash2, Play, Square, ChevronDown } from 'lucide-react'
+import { Phone, Upload, Plus, Trash2, Play, Square, ChevronDown, PhoneCall } from 'lucide-react'
 import { post, patch, del, postForm } from '../api/mutate'
 import { useGet } from '../api/hooks/useApi'
 import { useToast } from '../components/Toast'
@@ -42,6 +42,7 @@ type CampaignStatus = {
   no_answer?: number; busy?: number; declined?: number; failed?: number
   skipped?: number; current_phone?: string | null; current_name?: string | null
   started_at?: string | null; stopped?: boolean; error?: string | null
+  concurrency?: number; inflight?: string[]
 }
 
 const DISPOSITION_OPTS = [
@@ -80,6 +81,21 @@ const CAMPAIGN_WHO = [
   { value: 'all', label: 'All' },
 ]
 
+// Extra client-side filters that compose on top of the server ones.
+const CALL_COUNT_FILTER = [
+  { value: 'all', label: 'Any # of calls' },
+  { value: 'never', label: 'Never called' },
+  { value: 'called', label: 'Called ≥ 1' },
+  { value: 'multi', label: 'Called ≥ 2' },
+]
+const LAST_CALLED_FILTER = [
+  { value: 'any', label: 'Any time' },
+  { value: 'never', label: 'Never' },
+  { value: 'today', label: 'Called today' },
+  { value: 'week', label: 'Last 7 days' },
+  { value: 'older', label: 'Older than 7 days' },
+]
+
 export default function Outbound() {
   const toast = useToast()
   const qc = useQueryClient()
@@ -88,10 +104,16 @@ export default function Outbound() {
     qc.invalidateQueries({ queryKey: ['outbound-stats'] })
   }
 
-  // filters
+  // filters — server-side
   const [cs, setCs] = useState<string>('all')
   const [dp, setDp] = useState<string>('all')
   const [q, setQ] = useState('')
+  // filters — client-side (compose on top of the fetched list)
+  const [callCount, setCallCount] = useState('all')
+  const [lastCalled, setLastCalled] = useState('any')
+
+  // selection
+  const [selected, setSelected] = useState<Set<Contact['id']>>(new Set())
 
   // add contacts form
   const [showAdd, setShowAdd] = useState(false)
@@ -104,6 +126,7 @@ export default function Outbound() {
   const [whoFilter, setWhoFilter] = useState('not_called')
   const [delay, setDelay] = useState('4')
   const [maxCalls, setMaxCalls] = useState('0')
+  const [concurrency, setConcurrency] = useState('1')
 
   const statsQ = useGet<StatsResp>(['outbound-stats'], '/outbound/stats')
   const contactsQ = useGet<ContactsResp>(
@@ -116,6 +139,51 @@ export default function Outbound() {
   const disp = statsQ.data?.dispositions ?? {}
   const contacts = Array.isArray(contactsQ.data?.contacts) ? contactsQ.data!.contacts! : []
   const camp = campaignQ.data ?? {}
+
+  // Apply the client-side filters. `visible` is the scope that "select all"
+  // and the row count operate on.
+  const visible = useMemo(() => {
+    const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0)
+    const weekAgo = Date.now() - 7 * 86400000
+    return contacts.filter((c) => {
+      const cc = Number(c.call_count ?? 0)
+      if (callCount === 'never' && cc !== 0) return false
+      if (callCount === 'called' && cc < 1) return false
+      if (callCount === 'multi' && cc < 2) return false
+
+      const lc = c.last_called_at ? new Date(c.last_called_at).getTime() : 0
+      if (lastCalled === 'never' && lc) return false
+      if (lastCalled === 'today' && lc < startOfToday.getTime()) return false
+      if (lastCalled === 'week' && (!lc || lc < weekAgo)) return false
+      if (lastCalled === 'older' && (!lc || lc >= weekAgo)) return false
+      return true
+    })
+  }, [contacts, callCount, lastCalled])
+
+  const allVisibleSelected = visible.length > 0 && visible.every((c) => selected.has(c.id))
+  const someSelected = selected.size > 0
+
+  const selectAllRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = someSelected && !allVisibleSelected
+  }, [someSelected, allVisibleSelected])
+
+  function toggleOne(id: Contact['id']) {
+    setSelected((prev) => {
+      const n = new Set(prev)
+      n.has(id) ? n.delete(id) : n.add(id)
+      return n
+    })
+  }
+  function toggleAllVisible() {
+    setSelected((prev) => {
+      const n = new Set(prev)
+      if (allVisibleSelected) visible.forEach((c) => n.delete(c.id))
+      else visible.forEach((c) => n.add(c.id))
+      return n
+    })
+  }
+  const clearSelection = () => setSelected(new Set())
 
   async function addContact() {
     if (!phone.trim()) { toast('Phone is required', 'warn'); return }
@@ -170,6 +238,7 @@ export default function Outbound() {
     try {
       await del(`/outbound/contacts/${id}`)
       toast('Deleted', 'success')
+      setSelected((prev) => { const n = new Set(prev); n.delete(id); return n })
       invalidate()
     } catch (e) {
       toast(`Failed: ${String((e as Error)?.message ?? e)}`, 'error')
@@ -181,6 +250,7 @@ export default function Outbound() {
     try {
       await del('/outbound/contacts/all')
       toast('All contacts cleared', 'success')
+      clearSelection()
       invalidate()
     } catch (e) {
       toast(`Failed: ${String((e as Error)?.message ?? e)}`, 'error')
@@ -193,8 +263,28 @@ export default function Outbound() {
         call_status_filter: whoFilter,
         delay_seconds: Number(delay) || 0,
         max_calls: Number(maxCalls) || 0,
+        concurrency: Number(concurrency) || 1,
       })
       toast('Campaign started', 'success')
+      qc.invalidateQueries({ queryKey: ['campaign'] })
+    } catch (e) {
+      toast(`Start failed: ${String((e as Error)?.message ?? e)}`, 'error')
+    }
+  }
+
+  // Run a campaign on exactly the selected contacts, at the chosen concurrency.
+  async function callSelected() {
+    const ids = [...selected]
+    if (!ids.length) { toast('No contacts selected', 'warn'); return }
+    const n = Number(concurrency) || 1
+    if (!confirm(`Call ${ids.length} selected contact${ids.length !== 1 ? 's' : ''}, up to ${n} at a time?`)) return
+    try {
+      const r = await post<{ total?: number }>('/outbound/campaign/start', {
+        contact_ids: ids,
+        concurrency: n,
+        delay_seconds: Number(delay) || 0,
+      })
+      toast(`Campaign started on ${r?.total ?? ids.length} contact${(r?.total ?? ids.length) !== 1 ? 's' : ''}`, 'success')
       qc.invalidateQueries({ queryKey: ['campaign'] })
     } catch (e) {
       toast(`Start failed: ${String((e as Error)?.message ?? e)}`, 'error')
@@ -223,6 +313,7 @@ export default function Outbound() {
   const total = Number(camp.total ?? 0)
   const completed = Number(camp.completed ?? 0)
   const progress = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0
+  const inflight = Array.isArray(camp.inflight) ? camp.inflight : []
 
   return (
     <div className="space-y-6">
@@ -294,21 +385,24 @@ export default function Outbound() {
       {/* 3. Campaign Runner */}
       <Card className="p-5">
         <div className="mb-4 font-display text-lg font-bold tracking-tight">Campaign Runner</div>
-        <div className="grid gap-3 sm:grid-cols-3">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <Field label="Who to call">
             <Select value={whoFilter} onChange={(e) => setWhoFilter(e.target.value)} className="w-full">
               {CAMPAIGN_WHO.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </Select>
           </Field>
-          <Field label="Delay (seconds)">
-            <Input type="number" value={delay} onChange={(e) => setDelay(e.target.value)} />
+          <Field label="Concurrent calls">
+            <Input type="number" min={1} max={10} value={concurrency} onChange={(e) => setConcurrency(e.target.value)} />
+          </Field>
+          <Field label="Stagger between launches (s)">
+            <Input type="number" min={0} value={delay} onChange={(e) => setDelay(e.target.value)} />
           </Field>
           <Field label="Max calls (0 = no limit)">
-            <Input type="number" value={maxCalls} onChange={(e) => setMaxCalls(e.target.value)} />
+            <Input type="number" min={0} value={maxCalls} onChange={(e) => setMaxCalls(e.target.value)} />
           </Field>
         </div>
-        <div className="mt-4 flex gap-2">
-          <Button onClick={startCampaign} disabled={!!camp.running}><Play size={15} /> Start</Button>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Button onClick={startCampaign} disabled={!!camp.running}><Play size={15} /> Start (by filter)</Button>
           <Button variant="danger" onClick={stopCampaign} disabled={!camp.running}><Square size={15} /> Stop</Button>
         </div>
 
@@ -316,14 +410,24 @@ export default function Outbound() {
           <div className="mt-5 space-y-3">
             <div className="flex items-center justify-between gap-3 text-[13px]">
               <div className="text-soft">
-                <span className="font-semibold text-[var(--text)]">{camp.current_name || '—'}</span>
-                {camp.current_phone && <span className="ml-2 text-dim tabular-nums">{camp.current_phone}</span>}
+                {Number(camp.concurrency ?? 1) > 1
+                  ? <span className="font-semibold text-[var(--text)]">Up to {camp.concurrency} calls at a time</span>
+                  : <>
+                      <span className="font-semibold text-[var(--text)]">{camp.current_name || '—'}</span>
+                      {camp.current_phone && <span className="ml-2 text-dim tabular-nums">{camp.current_phone}</span>}
+                    </>}
               </div>
               <div className="tabular-nums text-dim">{completed} / {total}</div>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-[var(--surface-2)]">
               <div className="h-full rounded-full bg-gradient-to-r from-mint-300 to-mint-500 transition-all" style={{ width: `${progress}%` }} />
             </div>
+            {inflight.length > 0 && (
+              <div className="text-[12px] text-dim">
+                <span className="font-semibold text-[var(--text)]">☎ {inflight.length} in progress: </span>
+                <span className="tabular-nums">{inflight.join(', ')}</span>
+              </div>
+            )}
             <div className="flex flex-wrap gap-2 text-[12px]">
               <Badge tone="mint">Answered {num(camp.answered)}</Badge>
               <Badge tone="amber">No answer {num(camp.no_answer)}</Badge>
@@ -345,6 +449,12 @@ export default function Outbound() {
       <div className="flex flex-wrap items-center gap-3">
         <Segmented options={CALL_STATUS_FILTER.map((o) => ({ value: o.value, label: o.label }))} value={cs} onChange={setCs} />
         <Segmented options={DISPOSITION_FILTER.map((o) => ({ value: o.value, label: o.label }))} value={dp} onChange={setDp} />
+        <Select value={callCount} onChange={(e) => setCallCount(e.target.value)}>
+          {CALL_COUNT_FILTER.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </Select>
+        <Select value={lastCalled} onChange={(e) => setLastCalled(e.target.value)}>
+          {LAST_CALLED_FILTER.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </Select>
         <SearchInput value={q} onChange={setQ} placeholder="Search phone or name…" className="w-56" />
         <div className="ml-auto">
           <Button variant="danger" size="sm" onClick={clearAll}><Trash2 size={14} /> Clear all</Button>
@@ -353,13 +463,48 @@ export default function Outbound() {
 
       {/* 5. Contacts table */}
       <Card className="p-5">
+        {/* Selection toolbar */}
+        <div className="mb-4 flex flex-wrap items-center gap-3 border-b border-[var(--border)] pb-4">
+          <label className="flex cursor-pointer items-center gap-2 text-[13px] text-soft">
+            <input
+              ref={selectAllRef}
+              type="checkbox"
+              className="h-4 w-4 accent-mint-500"
+              checked={allVisibleSelected}
+              onChange={toggleAllVisible}
+            />
+            Select all shown
+          </label>
+          <span className="text-[13px] tabular-nums text-dim">{selected.size} selected</span>
+          {someSelected && (
+            <Button size="sm" variant="ghost" onClick={clearSelection}>Clear</Button>
+          )}
+          <div className="ml-auto">
+            <Button
+              size="sm"
+              onClick={callSelected}
+              disabled={!someSelected || !!camp.running}
+              title={camp.running ? 'A campaign is already running' : undefined}>
+              <PhoneCall size={14} /> Call selected{someSelected ? ` (${selected.size})` : ''}
+            </Button>
+          </div>
+        </div>
+
         <AsyncState
           loading={contactsQ.isLoading}
           error={contactsQ.error}
-          empty={!contactsQ.isLoading && contacts.length === 0}
-          emptyLabel="No contacts yet — add some above">
+          empty={!contactsQ.isLoading && visible.length === 0}
+          emptyLabel="No contacts match these filters">
           <Table>
             <THead>
+              <TH className="w-8">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 accent-mint-500"
+                  checked={allVisibleSelected}
+                  onChange={toggleAllVisible}
+                />
+              </TH>
               <TH>#</TH>
               <TH>Phone</TH>
               <TH>Name</TH>
@@ -370,8 +515,16 @@ export default function Outbound() {
               <TH className="text-right">Actions</TH>
             </THead>
             <tbody>
-              {contacts.map((c, i) => (
-                <TR key={c.id ?? i}>
+              {visible.map((c, i) => (
+                <TR key={c.id ?? i} className={selected.has(c.id) ? 'bg-mint-500/5' : undefined}>
+                  <TD>
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 accent-mint-500"
+                      checked={selected.has(c.id)}
+                      onChange={() => toggleOne(c.id)}
+                    />
+                  </TD>
                   <TD className="text-dim tabular-nums">{i + 1}</TD>
                   <TD className="font-medium text-[var(--text)] tabular-nums">{c.phone ?? '—'}</TD>
                   <TD>{c.name || '—'}</TD>

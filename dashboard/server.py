@@ -1978,7 +1978,10 @@ CALL_STATUSES   = ("not_called", "answered", "no_answer", "busy", "declined", "f
 DISPOSITIONS    = ("not_classified", "interested", "site_visit_booked", "inquiry",
                    "in_doubt", "to_contact_later", "rejected")
 
-# Single active campaign state (one campaign runs at a time)
+# Single active campaign state (one campaign runs at a time). With
+# concurrency > 1 the campaign dials several numbers simultaneously; the
+# in-flight numbers are tracked in `inflight` and `current_phone` reflects the
+# most recently launched dial.
 _campaign: dict = {
     "running": False,
     "campaign_id": None,
@@ -1990,12 +1993,17 @@ _campaign: dict = {
     "declined": 0,
     "failed": 0,
     "skipped": 0,
+    "concurrency": 1,
+    "inflight": [],
     "current_phone": "",
     "current_name": "",
     "started_at": None,
     "stopped": False,
     "error": None,
 }
+
+# Hard ceiling on simultaneous outbound dials placed by a single campaign.
+MAX_CAMPAIGN_CONCURRENCY = 10
 _campaign_task: Any = None
 
 
@@ -2946,9 +2954,17 @@ async def campaign_start(request: Request) -> JSONResponse:
     filter_cs   = body.get("call_status_filter", "not_called")   # which contacts to call
     delay_secs  = float(body.get("delay_seconds", 4.0))
     max_calls   = int(body.get("max_calls", 0)) or None
+    concurrency = max(1, min(int(body.get("concurrency", 1) or 1), MAX_CAMPAIGN_CONCURRENCY))
+    # Optional explicit selection — when provided, call exactly these contacts
+    # (in the given order) and ignore the call_status filter entirely.
+    contact_ids = body.get("contact_ids") or []
 
     contacts = _load_outbound()
-    if filter_cs == "all":
+    if contact_ids:
+        idset = set(contact_ids)
+        by_id = {c["id"]: c for c in contacts}
+        to_call = [by_id[i] for i in contact_ids if i in by_id]
+    elif filter_cs == "all":
         to_call = contacts
     else:
         to_call = [c for c in contacts if c.get("call_status") == filter_cs]
@@ -2956,7 +2972,7 @@ async def campaign_start(request: Request) -> JSONResponse:
         to_call = to_call[:max_calls]
 
     if not to_call:
-        return JSONResponse({"ok": False, "reason": "No contacts match the filter"})
+        return JSONResponse({"ok": False, "reason": "No contacts match the selection"})
 
     import uuid as _uuid
     cid = _uuid.uuid4().hex[:8]
@@ -2965,6 +2981,7 @@ async def campaign_start(request: Request) -> JSONResponse:
         "total": len(to_call), "completed": 0,
         "answered": 0, "no_answer": 0, "busy": 0,
         "declined": 0, "failed": 0, "skipped": 0,
+        "concurrency": concurrency, "inflight": [],
         "current_phone": "", "current_name": "",
         "started_at": datetime.datetime.utcnow().isoformat() + "Z",
         "stopped": False, "error": None,
@@ -2972,21 +2989,31 @@ async def campaign_start(request: Request) -> JSONResponse:
 
     async def _run():
         global _campaign
-        try:
-            for contact in to_call:
-                if _campaign.get("stopped"):
-                    break
-                contact_id = contact["id"]
-                phone = re.sub(r"[^\d]", "", contact.get("phone", ""))
-                if len(phone) < 7:
-                    _campaign["skipped"] += 1
-                    _campaign["completed"] += 1
-                    continue
+        # Cap on simultaneously-active dials. `delay_secs` becomes the stagger
+        # between successive launches so `concurrency` calls don't all fire in
+        # the same instant (thundering herd on the SIP gateway + Sarvam).
+        sem = asyncio.Semaphore(concurrency)
+        inflight: set[str] = set()
 
+        async def _dial_one(contact: dict) -> None:
+            if _campaign.get("stopped"):
+                return
+            contact_id = contact["id"]
+            phone = re.sub(r"[^\d]", "", contact.get("phone", ""))
+            if len(phone) < 7:
+                _campaign["skipped"] += 1
+                _campaign["completed"] += 1
+                return
+            async with sem:
+                if _campaign.get("stopped"):
+                    return
+                inflight.add(phone)
+                _campaign["inflight"] = sorted(inflight)
                 _campaign["current_phone"] = phone
                 _campaign["current_name"] = contact.get("name", "")
-                logger.info("CAMPAIGN [%s] dialing %s (%s/%s)",
-                            cid, phone, _campaign["completed"] + 1, _campaign["total"])
+                logger.info("CAMPAIGN [%s] dialing %s (%s in-flight, %s/%s done)",
+                            cid, phone, len(inflight),
+                            _campaign["completed"], _campaign["total"])
                 _record_dial(phone, contact_id, contact.get("name", ""))
                 try:
                     proc = await asyncio.create_subprocess_exec(
@@ -3001,19 +3028,32 @@ async def campaign_start(request: Request) -> JSONResponse:
                 except Exception as e:
                     logger.error("campaign dial %s error: %r", phone, e)
                     cs = "failed"
+                finally:
+                    inflight.discard(phone)
+                    _campaign["inflight"] = sorted(inflight)
 
-                _update_contact_after_call(contact_id, cs)
-                key = cs if cs in _campaign else "failed"
-                _campaign[key] = _campaign.get(key, 0) + 1
-                _campaign["completed"] += 1
+            _update_contact_after_call(contact_id, cs)
+            key = cs if cs in _campaign else "failed"
+            _campaign[key] = _campaign.get(key, 0) + 1
+            _campaign["completed"] += 1
 
-                if not _campaign.get("stopped") and delay_secs > 0:
+        try:
+            tasks: list = []
+            for contact in to_call:
+                if _campaign.get("stopped"):
+                    break
+                tasks.append(asyncio.create_task(_dial_one(contact)))
+                # Stagger launches; the semaphore enforces the hard concurrency
+                # cap, this just smooths the ramp-up.
+                if delay_secs > 0:
                     await asyncio.sleep(delay_secs)
+            await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as e:
             logger.exception("campaign crashed: %r", e)
             _campaign["error"] = str(e)
         finally:
             _campaign["running"] = False
+            _campaign["inflight"] = []
             _campaign["current_phone"] = ""
             _campaign["current_name"] = ""
             logger.info("CAMPAIGN [%s] done: %s", cid, {k: _campaign[k] for k in

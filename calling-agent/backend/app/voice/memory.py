@@ -142,11 +142,16 @@ class ContextMemory:
 
 class QATracker:
     """
-    Tracks which discovery questions have been asked and whether the caller
-    answered them — even when data extraction failed to parse the value.
+    Tracks which discovery fields have been CAPTURED and how many times each
+    was asked.
 
-    This prevents the LLM from re-asking questions the caller already responded
-    to in natural speech, such as a mangled budget number or an informal name.
+    A field counts as answered ONLY when an extractor captures a real value for
+    it — never merely because a turn followed the question. This prevents a
+    trailing speech fragment (e.g. the tail of the caller's name) from being
+    mis-classified as the answer to a *different* question and causing that
+    question to be skipped and its data lost. A per-field ask counter lets the
+    agent move on after MAX_ASKS attempts so it never nags, while a captured
+    value suppresses re-asking permanently.
     """
 
     # Signals that indicate the agent is asking about a specific field.
@@ -185,12 +190,18 @@ class QATracker:
         ],
     }
 
+    # After asking a field this many times without capturing a usable value,
+    # stop asking it — the caller isn't giving a parseable answer and nagging
+    # hurts the call. A CAPTURED value suppresses re-asking permanently. Note
+    # this never skips a field on its first ask (which was the original bug).
+    MAX_ASKS = 2
+
     def __init__(self) -> None:
-        self._asked: dict[str, int] = {}    # field -> turn_index when asked
-        self._answered: dict[str, str] = {} # field -> user answer text (may be raw STT)
+        self._ask_count: dict[str, int] = {}   # field -> times the agent has asked
+        self._captured: dict[str, str] = {}     # field -> canonical extracted value
 
     def observe_agent_turn(self, agent_text: str, turn_index: int) -> None:
-        """Detect which field the agent just asked about."""
+        """Count which field the agent just asked about (fatigue tracking)."""
         lower = agent_text.lower()
         has_question = "?" in agent_text or any(
             w in lower for w in [
@@ -203,37 +214,56 @@ class QATracker:
         if not has_question:
             return
         for field, signals in self._FIELD_SIGNALS.items():
-            if field not in self._answered and any(s in lower for s in signals):
-                if field not in self._asked:
-                    self._asked[field] = turn_index
-                    logger.info("[QA] Agent asked about %r at turn %d", field, turn_index)
+            if field in self._captured:
+                continue
+            if any(s in lower for s in signals):
+                self._ask_count[field] = self._ask_count.get(field, 0) + 1
+                logger.info("[QA] Agent asked about %r (ask #%d)", field, self._ask_count[field])
 
     def observe_user_turn(self, user_text: str, turn_index: int) -> None:
-        """Mark pending asked-fields as answered by this user turn."""
-        for field, asked_at in list(self._asked.items()):
-            if field not in self._answered and turn_index > asked_at:
-                self._answered[field] = user_text[:100]
-                logger.info("[QA] Field %r answered: %r", field, user_text[:50])
+        """No-op by design.
+
+        Attribution is intentionally NOT inferred from turn arrival: a trailing
+        speech fragment (e.g. the tail of the caller's name) must never be
+        counted as the answer to whatever the agent last asked. A field becomes
+        answered only when an extractor captures a real value for it
+        (`mark_extracted`) — that is what keeps one question's stray fragment
+        from being mis-classified as the answer to a different question.
+        """
+        return
 
     def mark_extracted(self, field: str, value: str) -> None:
-        """Override answer with the successfully extracted canonical value."""
-        self._answered[field] = value
-        if field not in self._asked:
-            self._asked[field] = 0
+        """Record the canonical extracted value — the ONLY way a field becomes
+        'answered'. Permanently suppresses re-asking for that field."""
+        self._captured[field] = value
+        logger.info("[QA] Field %r captured: %r", field, value)
 
     def is_answered(self, field: str) -> bool:
-        return field in self._answered
+        """True only when a real value was captured for the field."""
+        return field in self._captured
+
+    def should_stop_asking(self, field: str) -> bool:
+        """True when the agent should no longer ask for a field — either it was
+        captured, or it has already been asked MAX_ASKS times without a usable
+        answer (move on rather than nag). Never true on a field's first ask."""
+        return field in self._captured or self._ask_count.get(field, 0) >= self.MAX_ASKS
 
     def to_prompt_block(self) -> str:
-        if not self._answered:
+        captured = self._captured
+        asked_out = [
+            f for f, c in self._ask_count.items()
+            if c >= self.MAX_ASKS and f not in captured
+        ]
+        if not captured and not asked_out:
             return ""
-        lines = ["━━ QUESTIONS ALREADY ANSWERED — NEVER RE-ASK ━━"]
-        for field, answer in self._answered.items():
-            lines.append(f"  · {field}: caller already responded ({answer!r})")
-        lines.append(
-            "Even if extraction was imperfect, the caller HAS answered these. "
-            "Move on — do NOT ask again."
-        )
+        lines = ["━━ ALREADY COLLECTED — NEVER RE-ASK ━━"]
+        for field, value in captured.items():
+            lines.append(f"  · {field}: {value!r} — confirmed; do NOT ask again")
+        if asked_out:
+            lines.append(
+                "  · Already asked without a clear answer (do NOT keep asking — "
+                "move the call forward): " + ", ".join(asked_out)
+            )
         return "\n".join(lines)
 
 

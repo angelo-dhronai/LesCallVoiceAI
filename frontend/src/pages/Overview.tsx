@@ -38,7 +38,7 @@ export default function Overview() {
               <span className="metric text-[52px] leading-none">{inr(d.month.cost, 2)}</span>
               <span className="mb-2 inline-flex items-center gap-1 rounded-full bg-mint-400/15 px-2 py-0.5 text-[12px] font-bold text-mint-600 dark:text-mint-300"><TrendingUp size={13} /> {num(d.month.calls)} calls</span>
             </div>
-            <div className="mt-1 text-[13px] text-dim">Sarvam STT + TTS usage · 30-day estimate</div>
+            <div className="mt-1 text-[13px] text-dim">STT + TTS usage · 30-day estimate</div>
             <div className="mt-5"><Sparkline data={d.spark.calls} color="var(--accent-2)" height={70} /></div>
             <div className="mt-4 grid grid-cols-3 gap-3">
               {[['Today', inr(d.today.cost)], ['Last 7 Days', inr(d.week.cost)], ['Inbound', num(d.totals.inbound)]].map(([k, v]) => (

@@ -26,6 +26,11 @@ class STTResult:
     text: str
     confidence: float = 1.0
     detected_language: str | None = None
+    # True when an empty result is due to a foreign / unsupported language being
+    # detected (Tamil, Punjabi, etc.) — i.e. almost certainly noise or cross-talk
+    # rather than genuine unclear Hindi/Gujarati/English. The pipeline uses this
+    # to suppress the "माफ़ कीजिए, आवाज़ स्पष्ट नहीं आई" fallback in that case.
+    noise_rejected: bool = False
 
 
 def normalize_pcm_audio(

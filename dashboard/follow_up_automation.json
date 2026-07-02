@@ -28,5 +28,20 @@
     "created_at": "2026-06-20T05:45:28.626Z",
     "called_at": null,
     "call_outcome": null
+  },
+  {
+    "id": "b6a57b7b4e",
+    "source_id": "call:919599761331_20260701_035214",
+    "contact_name": "",
+    "contact_phone": "919599761331",
+    "past_call_context": "Call summary: The sales agent, Vishal Patel, initiated a call with a prospect named Raj Bhatu to discuss property options. Raj expressed interest in properties located in Surat and was asked about his preference for the type of property. Customer intent: looking for property in Surat Why follow-up was flagged: To provide property options and continue the conversation",
+    "call_aim": "Provide property options based on Raj's preferences",
+    "script_notes": "",
+    "scheduled_time": null,
+    "linked_contact_id": null,
+    "status": "scheduled",
+    "created_at": "2026-07-01T05:22:51.554Z",
+    "called_at": null,
+    "call_outcome": null
   }
 ]

@@ -398,6 +398,13 @@ class STTRouter:
             return STTResult(text=text, detected_language=detected_lang)
 
         if not had_error:
+            # A foreign / unsupported language detected on Hindi-Gujarati-English
+            # audio almost always means the segment was noise or cross-talk, not a
+            # genuine in-language utterance. Flag it so the pipeline can skip the
+            # "please repeat" apology (Sarvam intermittently tags noise as Tamil
+            # etc., which otherwise produces a constant stream of false apologies).
+            foreign = detected_lang in _LANGS_RETRY_AS_HINDI
+
             # If Sarvam returned a known misfire language (Punjabi, Tamil, etc.)
             # instead of Hindi/Gujarati, retry the same audio with hi-IN so the
             # caller's actual Hindi speech is correctly transcribed.
@@ -420,7 +427,7 @@ class STTRouter:
             logger.info(
                 "[STT] Primary returned no speech (clean empty) — skipping fallback"
             )
-            return STTResult(text="")
+            return STTResult(text="", noise_rejected=foreign)
 
         # ── Primary had a genuine API/network error → try fallback ───────
         logger.info("[STT] Primary errored — routing to fallback provider")

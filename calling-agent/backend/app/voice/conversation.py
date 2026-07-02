@@ -363,14 +363,11 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
     if any(p in lower for p in _TIME_PATTERNS):
         return "time_preference"
 
-    # Affirmation
-    if re.search(r"\b(yes|yeah|yep|sure|okay|ok|haan|ji|theek|ha|barobar)\b", lower):
-        return "affirmation"
-    if any(w in lower for w in ["हां", "हाँ", "जी", "ठीक", "હા", "બરાબર"]):
-        return "affirmation"
-
     # Identity question — "who is this", "kon bol raha hai", etc.
-    # Highest priority among questions — gets a fast deterministic response
+    # Highest priority among questions — gets a fast deterministic response.
+    # Checked BEFORE affirmation: a polite honorific ("जी कौन बोल रहा है?")
+    # starts with "जी", which the affirmation rule below would otherwise
+    # misread as a "yes" and answer with a needless "Okay..." filler.
     _identity_phrases = [
         "who is this", "who was this", "who are you", "who is calling", "who is speaking",
         "who am i speaking", "who am i talking", "who called", "who's this", "who's calling",
@@ -391,6 +388,22 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
         return "identity_question"
     if any(p in lower for p in _identity_phrases):
         return "identity_question"
+
+    # Affirmation.  A leading honorific ("जी", "ji") or stray "ok/haan" must not
+    # mask a real question — "जी, कितने का है?" is a question, not a "yes", and
+    # should never earn an ack filler.  So an utterance carrying an interrogative
+    # marker (trailing "?" or a question word) is excluded here and falls through
+    # to the question classifier below.
+    _is_question = lower.endswith("?") or re.search(
+        r"\b(what|how|when|where|why|which|who|kitna|kab|kahan|kaun|kya|kyun|kon)\b",
+        lower,
+    ) or any(w in lower for w in ["कौन", "क्या", "कैसे", "कब", "कहां", "कितना", "क्यों",
+                                   "કોણ", "શું", "કેવી", "ક્યારે", "ક્યાં", "કેટલા", "કેમ"])
+    if not _is_question:
+        if re.search(r"\b(yes|yeah|yep|sure|okay|ok|haan|ji|theek|ha|barobar)\b", lower):
+            return "affirmation"
+        if any(w in lower for w in ["हां", "हाँ", "जी", "ठीक", "હા", "બરાબર"]):
+            return "affirmation"
 
     # Question — check before negation so कितना isn't caught by ना substring
     if lower.endswith("?") or re.search(r"\b(what|how|when|where|why|which|who|kitna|kab|kahan|kaun|kya|kyun|kon)\b", lower):
@@ -651,12 +664,12 @@ _FILLER_CATEGORY_BY_INTENT: dict[str, str] = {
     "negation": "ack",
 }
 
-# Intents that never warrant a filler.  Either the agent answers them instantly
-# via a deterministic shortcut (greeting, gratitude, identity, language switch,
-# objection, farewell), or any "buying time" phrase would sound wrong because
-# the real reply is immediate.  For these, no filler is spoken even if the LLM
-# is briefly slow — the pipeline simply waits for the answer (no dead-air risk
-# since these replies are short).
+# Intents that never warrant a filler.  NOTE: filler firing is now allowlist-
+# based — _consume_llm_with_filler only speaks a filler when the intent maps to
+# the "lookup" category (genuine project/availability fetch).  Every other intent
+# (greeting, affirmation, question, chit-chat, and those below) gets no filler,
+# because a "buying time" phrase there sounds wrong and mistimed.  This set is
+# kept as documentation of the intents that must never stall.
 _FILLER_SUPPRESS_INTENTS: frozenset[str] = frozenset({
     "greeting",
     "gratitude",
@@ -825,11 +838,49 @@ _GRACEFUL_CLOSE: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
+# Whole tokens containing any character from a script the agent never speaks
+# (Cyrillic, Greek, Arabic, Hebrew, CJK, Kana, Hangul, Thai, or other-Indic such
+# as Tamil/Telugu). The LLM occasionally hallucinates such a word — e.g. the
+# Russian "диапазон" for "range" — which TTS then mangles. We strip those tokens
+# so only Latin / Devanagari / Gujarati text reaches the caller.
+_FOREIGN_SCRIPT_RE = re.compile(
+    r"\S*["
+    r"Ѐ-ӿ"  # Cyrillic
+    r"Ͱ-Ͽ"  # Greek
+    r"֐-׿"  # Hebrew
+    r"؀-ۿ"  # Arabic
+    r"஀-௿"  # Tamil
+    r"ఀ-౿"  # Telugu
+    r"ಀ-೿"  # Kannada
+    r"ഀ-ൿ"  # Malayalam
+    r"฀-๿"  # Thai
+    r"぀-ヿ"  # Hiragana/Katakana
+    r"一-鿿"  # CJK
+    r"가-힯"  # Hangul
+    r"]\S*"
+)
+
+# English number-words used when a caller reads a phone number / amount aloud.
+# Input made up only of these (plus digits) is treated as numeric and must not
+# flip a Hindi/Gujarati call to English.
+_NUMBER_WORDS: frozenset[str] = frozenset({
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "oh", "o", "double", "triple", "number", "num", "no",
+    "hundred", "thousand", "lakh", "lakhs", "crore", "crores", "plus",
+    "star", "hash", "point", "and", "dot",
+})
+
+
 def _validate_response(text: str, expected_lang: str = "en") -> str:
     if not text or not text.strip():
         return _RESPONSE_FALLBACK
     cleaned = _MARKDOWN_RE.sub("", text)
-    cleaned = _EMOJI_RE.sub("", cleaned).strip()
+    cleaned = _EMOJI_RE.sub("", cleaned)
+    # Drop hallucinated foreign-script words before they reach TTS.
+    stripped = _FOREIGN_SCRIPT_RE.sub("", cleaned)
+    if stripped.strip():
+        cleaned = re.sub(r"\s{2,}", " ", stripped)
+    cleaned = cleaned.strip()
     if len(cleaned) > MAX_RESPONSE_LENGTH:
         truncated = cleaned[:MAX_RESPONSE_LENGTH]
         last_sentence = max(truncated.rfind("."), truncated.rfind("!"), truncated.rfind("?"))
@@ -1046,11 +1097,23 @@ class ConversationRouter:
 
         # --- Language detection + stabilization ---
         detected_lang, conf, src = await self.detect_language_v3(text)
-        # Numeric-only input (phone digits, amounts) looks like English to the
+        # Numeric input (phone digits, amounts) looks like English to the
         # detector but the caller is still speaking their primary language.
+        # This covers BOTH bare digits AND spelled-out number words — reading a
+        # phone number as "number one two..." / "double five" must never flip a
+        # Hindi/Gujarati call to English (that broke phone-number capture at the
+        # end of real calls).
         _non_alpha = re.sub(r'[\d\s\.\-\+/,]', '', text).strip()
-        if not _non_alpha and self.state.language in ("hi", "gu") and detected_lang == "en":
-            logger.info("[LANG] Numeric input — preserving %s", self.state.language)
+        _alpha_tokens = re.findall(r'[a-zA-Z]+', text.lower())
+        _is_number_like = bool(_alpha_tokens) and all(
+            t in _NUMBER_WORDS for t in _alpha_tokens
+        )
+        if (
+            self.state.language in ("hi", "gu")
+            and detected_lang == "en"
+            and (not _non_alpha or _is_number_like)
+        ):
+            logger.info("[LANG] Numeric/number-word input — preserving %s", self.state.language)
             detected_lang = self.state.language
             src = "numeric_preserved"
             conf = 1.0
@@ -1279,8 +1342,17 @@ class ConversationRouter:
             yield EngineResult(text=resp, is_shortcut=True, intent="objection")
             return
 
-        # --- Gratitude at any stage ---
-        if intent == "gratitude":
+        # --- Gratitude in EARLY stages only ---
+        # The canned gratitude reply re-asks the opening discovery question
+        # ("which city are you looking in?"), which is correct while we are still
+        # in GREETING/DISCOVERY but catastrophic later: once a booking is under
+        # way (project chosen, visit being scheduled, details being confirmed) a
+        # "thanks" — or, as on real calls, a MIS-HEARD turn classified as thanks —
+        # would otherwise reset the whole conversation and discard the captured
+        # name / property / appointment. Past DISCOVERY we fall through to the
+        # LLM, which has the full CallState + stage goal in its prompt and will
+        # acknowledge while staying on the current step.
+        if intent == "gratitude" and _STAGE_ORDER.get(self.state.stage, 0) <= _STAGE_ORDER[STAGE_DISCOVERY]:
             _cancel_llm()
             resp = self._localized_list("gratitude", ["You're welcome!", "Happy to help!"])
             self.memory.add_assistant(resp, language=self.state.language)
@@ -2218,14 +2290,18 @@ class ConversationRouter:
                 llm_queue.get(), timeout=FILLER_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
-            if intent in _FILLER_SUPPRESS_INTENTS:
-                # This intent needs no filler — just wait for the real answer.
-                first_chunk = await llm_queue.get()
-            else:
+            # Fire a filler ONLY when the turn genuinely needs a data lookup
+            # (location / property type / time) — that is the one case where
+            # "ज़रा देख लेता हूँ…" is both true and useful while we fetch project
+            # data. For greetings, affirmations, questions and chit-chat a stall
+            # phrase ("Okay…", "Sure…", "हाँ…") sounds wrong and mistimed, so it
+            # is suppressed; we simply wait the brief extra moment for the real
+            # answer instead of speaking a hollow acknowledgement.
+            if _FILLER_CATEGORY_BY_INTENT.get(intent) == "lookup":
                 filler = self._pick_filler(intent)
                 self.state.filler_used = True
                 yield EngineResult(text=filler, is_shortcut=True, intent="filler")
-                first_chunk = await llm_queue.get()
+            first_chunk = await llm_queue.get()
 
         if first_chunk is not None:
             full_parts.append(first_chunk)

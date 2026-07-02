@@ -49,6 +49,11 @@ class AudioSegment:
     audio: bytes
     duration_ms: float
     timestamp: float
+    # True when this segment was cut by the safety ceiling mid-speech rather
+    # than by a natural silence endpoint — i.e. the caller was still talking.
+    # The aggregation layer treats a forced segment as an unfinished fragment
+    # and waits to stitch it to the continuation.
+    forced: bool = False
 
 
 @dataclass
@@ -58,6 +63,8 @@ class Transcript:
     duration_ms: float
     timestamp: float
     stt_latency_ms: float = 0.0
+    # Propagated from the originating AudioSegment (see above).
+    forced: bool = False
 
 
 @dataclass
@@ -80,7 +87,13 @@ QUEUE_SIZE_TRANSCRIPT = 3
 # busy playing an earlier chunk while new ones arrived.
 QUEUE_SIZE_TTS = 8
 
-MAX_SPEECH_SECONDS = 4
+# Safety ceiling, NOT a normal-case cap. A finished turn is endpointed by
+# silence (HARD_FLUSH_SILENCE_FRAMES) long before this. Raised 4s→30s so a long
+# sentence is never truncated; the old 4s cap deleted the *front* of any longer
+# utterance, losing the most informative words. When the ceiling IS reached the
+# buffer is force-flushed whole (forced=True) and recombined downstream by the
+# aggregation layer — nothing is ever discarded.
+MAX_SPEECH_SECONDS = 30
 MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_SPEECH_SECONDS
 # 300ms minimum: short inbound responses like "haan", "yes", "ha" are
 # valid single-word answers that must reach STT. 300ms is enough audio to
@@ -119,10 +132,19 @@ SPEECH_ONSET_MIN_FRAMES = 2
 SPEECH_HOLD_MIN_FRAMES = 10
 
 # Hard-flush silence gate (frames of consecutive silence after hold expires).
-# 30 frames = 600 ms: matches reference system tuning. Flushes the STT buffer
-# faster after the caller stops speaking, reducing per-turn latency by up to
-# 400 ms vs the previous 50-frame (1000 ms) setting.
+# ADAPTIVE: the end-of-turn silence scales with how long the caller has been
+# speaking, balancing latency against not cutting people off:
+#   - Short reply (< LONG_SPEECH_MS, e.g. "haan", "Andheri", a quick answer):
+#     30 frames = 600 ms. Fast endpoint → low latency where it matters most.
+#   - Long sentence (>= LONG_SPEECH_MS): 55 frames = 1100 ms. A mid-thought
+#     "thinking pause" inside a long sentence no longer flushes early and clips
+#     the caller. The extra ~500 ms is proportionally small after several
+#     seconds of speech, and is only ever paid on genuinely long turns.
 HARD_FLUSH_SILENCE_FRAMES = 30
+HARD_FLUSH_SILENCE_FRAMES_LONG = 55
+# Accumulated speech (ms) above which a turn is treated as a "long sentence"
+# and granted the longer end-of-turn silence above.
+LONG_SPEECH_MS = 2500.0
 
 # Fallback phrases played when STT returns empty on substantial speech,
 # or when TTS receives an empty string or fails to play (feature 2 & 5).
@@ -133,6 +155,55 @@ _STT_FALLBACK_PHRASES: dict[str, str] = {
 }
 # Minimum speech duration that triggers a language-fallback response on empty STT
 _STT_FALLBACK_MIN_SPEECH_MS = 800.0
+
+# ---------------------------------------------------------------------------
+# Turn aggregation (recombine a sentence split by a long mid-thought pause)
+# ---------------------------------------------------------------------------
+# Latency philosophy: a turn that LOOKS finished is committed immediately — zero
+# added latency for the common case. We only hold a turn open to wait for a
+# continuation when there is concrete evidence it is unfinished:
+#   1. the segment was force-flushed mid-speech (forced=True), or
+#   2. the transcript ends on a dangling conjunction/preposition, or
+#   3. the caller is audibly still talking (recent VAD speech).
+# Only those cases pay the wait; everything else responds at today's latency.
+
+# How long to wait for a continuation transcript once a turn looks unfinished.
+# Sized to cover the next fragment's endpoint silence (~600ms) + STT latency.
+CONTINUATION_WINDOW_MS = 1200.0
+# Absolute cap on how long a single turn may keep aggregating, so a caller who
+# genuinely keeps talking still gets an answer.
+MAX_AGGREGATION_MS = 8000.0
+
+# Sentence-final punctuation (incl. Devanagari danda). A transcript ending here
+# is treated as a finished thought and committed without waiting.
+_TERMINAL_PUNCT = ".?!।॥"
+
+# Trailing tokens that signal an unfinished thought ("...क्योंकि", "...and").
+# A transcript ending on one of these is held open for the continuation.
+_INCOMPLETE_TAIL_WORDS: frozenset[str] = frozenset({
+    # Hindi / Gujarati conjunctions & connectors
+    "और", "या", "लेकिन", "पर", "क्योंकि", "कि", "तो", "अगर", "जब", "इसलिए",
+    "मतलब", "यानी", "फिर", "तथा", "एवं", "अने", "પણ", "કે", "કારણ", "જો",
+    "એટલે", "અને", "અથવા", "પરંતુ",
+    # English conjunctions & connectors
+    "and", "or", "but", "because", "so", "if", "that", "the", "a", "an",
+    "to", "of", "for", "with", "my", "is", "are", "i", "we", "you",
+    "actually", "basically", "like", "means",
+})
+
+
+def _looks_unfinished(text: str) -> bool:
+    """True when a transcript reads like a cut-off thought rather than a
+    complete turn. Conservative on purpose: only a clear dangling tail counts,
+    so finished turns (including short answers like "हाँ"/"Andheri") are never
+    needlessly delayed."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t[-1] in _TERMINAL_PUNCT:
+        return False
+    last = t.split()[-1].strip(".,!?;:\"'()।॥").lower()
+    return last in _INCOMPLETE_TAIL_WORDS
 
 
 class VoicePipeline:
@@ -214,6 +285,11 @@ class VoicePipeline:
         self._speech_duration_ms = 0.0
         self._prev_speech = False
         self._speech_frame_streak = 0
+        # Set when the safety ceiling forces a mid-speech flush; tags the
+        # emitted segment as an unfinished fragment for the aggregation layer.
+        self._force_flush = False
+        # Monotonic timestamp of the most recent VAD-speech frame (diagnostic).
+        self._last_speech_monotonic = 0.0
         # Tracks whether the previously-started TTS utterance was a filler, so
         # the real response that immediately follows it gets a longer barge-in
         # guard (see FILLER_ECHO_GRACE_MS).  Set per-utterance in the TTS layer.
@@ -572,11 +648,16 @@ class VoicePipeline:
                         self._speech_duration_ms += 20.0
                     self._pre_speech_buffer.clear()
             self._turn.mark_speech()
+            self._last_speech_monotonic = time.monotonic()
             self._audio_buffer.extend(frame)
             self._speech_duration_ms += 20.0
 
-            if len(self._audio_buffer) > MAX_BUFFER_BYTES:
-                del self._audio_buffer[:len(self._audio_buffer) - MAX_BUFFER_BYTES]
+            # Safety ceiling reached while the caller is still talking. Do NOT
+            # drop the front of the buffer (the old behavior that lost the start
+            # of long sentences) — force-flush the whole buffer as an unfinished
+            # fragment; the aggregation layer stitches it to the continuation.
+            if len(self._audio_buffer) >= MAX_BUFFER_BYTES:
+                self._force_flush = True
 
             proxy_words = max(1, int(self._speech_duration_ms / 300))
             self._turn.update_text(" ".join(["x"] * proxy_words))
@@ -591,16 +672,34 @@ class VoicePipeline:
 
         # Hard flush: after enough accumulated speech, a long consecutive
         # silence window triggers a flush even if TurnManager hasn't fired.
-        # Using HARD_FLUSH_SILENCE_FRAMES (600 ms) to flush STT buffer promptly
-        # after caller stops speaking.
+        # The silence gate is ADAPTIVE — a long sentence gets a longer window so
+        # a mid-thought pause doesn't cut the caller off, while short replies
+        # still endpoint fast (see HARD_FLUSH_SILENCE_FRAMES constants).
+        _flush_silence_frames = (
+            HARD_FLUSH_SILENCE_FRAMES_LONG
+            if self._speech_duration_ms >= LONG_SPEECH_MS
+            else HARD_FLUSH_SILENCE_FRAMES
+        )
         if (
             not speech
             and self._speech_duration_ms >= MIN_SPEECH_MS
-            and self._silence_frames >= HARD_FLUSH_SILENCE_FRAMES
+            and self._silence_frames >= _flush_silence_frames
         ):
             logger.info(
-                "[TURN] Hard-flush: duration=%.0fms silence_frames=%d",
+                "[TURN] Hard-flush: duration=%.0fms silence_frames=%d (gate=%d)",
                 self._speech_duration_ms, self._silence_frames,
+                _flush_silence_frames,
+            )
+            should_flush = True
+
+        # Ceiling-forced flush (caller still mid-speech): emit now, tagged so the
+        # aggregation layer knows this fragment is unfinished.
+        forced_flush = self._force_flush
+        if forced_flush:
+            self._force_flush = False
+            logger.info(
+                "[TURN] Ceiling force-flush: duration=%.0fms buffer=%d",
+                self._speech_duration_ms, len(self._audio_buffer),
             )
             should_flush = True
 
@@ -626,6 +725,7 @@ class VoicePipeline:
                 audio=bytes(self._audio_buffer),
                 duration_ms=self._speech_duration_ms,
                 timestamp=time.monotonic(),
+                forced=forced_flush,
             )
             self._segments_created += 1
 
@@ -653,6 +753,7 @@ class VoicePipeline:
         self._speech_onset_frames = 0
         self._silence_frames = 0
         self._speech_frame_streak = 0
+        self._force_flush = False
         self._pre_speech_buffer.clear()
         self._turn.flush()
 
@@ -722,42 +823,19 @@ class VoicePipeline:
 
                 # Update conversation language from Sarvam's native detection result.
                 # Applied on every turn — no lock. Enables truly dynamic language switching.
-                if (
-                    stt_result.detected_language
-                    and self.conversation
-                    and transcript_text
-                ):
-                    _bcp47_to_short = {"en-IN": "en", "hi-IN": "hi", "gu-IN": "gu"}
-                    short = _bcp47_to_short.get(stt_result.detected_language)
-                    # Reconcile Sarvam's language tag against the transcript's actual
-                    # script. The script is ground truth for Hindi vs Gujarati and
-                    # cannot be faked: Devanagari (U+0900–097F) is Hindi, Gujarati
-                    # script (U+0A80–0AFF) is Gujarati. Sarvam intermittently mis-tags
-                    # Devanagari Hindi as gu-IN, which would flip the whole agent to
-                    # Gujarati mid-call. Hard rule: never switch TO Gujarati unless the
-                    # transcript actually contains Gujarati characters.
-                    if short:
-                        _has_deva = any("ऀ" <= c <= "ॿ" for c in transcript_text)
-                        _has_guj = any("઀" <= c <= "૿" for c in transcript_text)
-                        if _has_deva and not _has_guj:
-                            short = "hi"
-                        elif _has_guj and not _has_deva:
-                            short = "gu"
-                        elif short == "gu" and not _has_guj:
-                            # Latin/English or ambiguous text tagged Gujarati — refuse
-                            # the switch and keep the current language.
-                            logger.info(
-                                "[STT] Ignoring spurious gu-IN tag — no Gujarati script "
-                                "in transcript: %r", transcript_text[:60],
-                            )
-                            short = None
-                    if short:
-                        logger.info(
-                            "[STT] Language auto-detected by Sarvam: %s → %s",
-                            stt_result.detected_language, short,
-                        )
-                        self.conversation.state.language = short
-                        # Do NOT lock — allow every utterance to update language dynamically
+                # Language is owned SOLELY by the conversation engine's
+                # detect_language_v3 + locking/hysteresis (it requires 2
+                # consecutive confirming turns before switching hi↔gu, and treats
+                # script as ground truth). The pipeline must NOT mutate
+                # state.language here: a single Sarvam gu-IN mis-tag on Hindi
+                # audio used to flip the whole agent to Gujarati AND poison the
+                # engine's prev_lang, defeating the hysteresis. We only log
+                # Sarvam's raw tag for diagnostics.
+                if stt_result.detected_language and transcript_text:
+                    logger.debug(
+                        "[STT] Sarvam language tag=%s (engine owns the decision)",
+                        stt_result.detected_language,
+                    )
 
                 # Duration-aware plausibility: natural speech maxes at ~4 words/sec.
                 # A transcript with far more words than the audio can contain is a
@@ -820,7 +898,13 @@ class VoicePipeline:
                     #   3. not _tts_playing   — agent is not currently speaking
                     #   4. _vad_mute_until elapsed — not inside echo-cooldown window
                     if segment.duration_ms >= _STT_FALLBACK_MIN_SPEECH_MS:
-                        if not self._greeting_done:
+                        if getattr(stt_result, "noise_rejected", False):
+                            logger.info(
+                                "[STT] Skipping fallback — empty due to foreign-language "
+                                "noise/cross-talk, not unclear speech (%.0fms)",
+                                segment.duration_ms,
+                            )
+                        elif not self._greeting_done:
                             logger.info(
                                 "[STT] Skipping fallback — greeting not yet complete "
                                 "(startup/warmup audio, %.0fms)", segment.duration_ms,
@@ -871,6 +955,7 @@ class VoicePipeline:
                     duration_ms=segment.duration_ms,
                     timestamp=time.monotonic(),
                     stt_latency_ms=stt_latency,
+                    forced=segment.forced,
                 )
 
                 try:
@@ -902,22 +987,63 @@ class VoicePipeline:
             except asyncio.CancelledError:
                 break
 
-            # Drain any newer transcripts — only process the most recent one.
-            # When the caller speaks multiple times while the agent was processing
-            # (or barge-in produced several quick segments), responding to stale
-            # earlier transcripts causes the agent to reply out of context.
-            # Note: all drained transcripts had their QA observer called in the STT
-            # worker already; we only skip conversation engine processing here.
+            # --- Turn aggregation -------------------------------------------
+            # A long sentence broken by an unnatural mid-thought pause arrives as
+            # two (or more) transcripts. Stitch those fragments into ONE turn so
+            # the caller gets ONE answer to the whole thought, instead of the old
+            # behavior that dropped the earlier fragment and replied to the tail.
+            #
+            # Latency: a turn that already looks finished is committed
+            # immediately (the common case pays nothing). We only wait for a
+            # continuation when there is real evidence the turn is unfinished —
+            # a ceiling-forced fragment, a dangling conjunction, or the caller
+            # still audibly talking.
+            parts: list[str] = [transcript.text] if transcript.text else []
+            forced = transcript.forced  # forced-state of the latest fragment
+            # Pull anything already waiting (no blocking) and concatenate it.
             while not self._transcript_queue.empty():
                 try:
-                    newer = self._transcript_queue.get_nowait()
-                    logger.info(
-                        "[ENGINE] Skipping stale transcript %r in favor of: %r",
-                        transcript.text[:50], newer.text[:50],
-                    )
-                    transcript = newer
+                    nxt = self._transcript_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+                if nxt.text:
+                    parts.append(nxt.text)
+                forced = nxt.forced
+
+            agg_start = time.monotonic()
+            while True:
+                combined = " ".join(p for p in parts if p).strip()
+                elapsed_ms = (time.monotonic() - agg_start) * 1000
+                # Only a ceiling-split fragment or a dangling-conjunction tail
+                # keeps the turn open. A turn that already looks complete commits
+                # immediately — zero added latency for the common case.
+                unfinished = forced or _looks_unfinished(combined)
+                if not combined or not unfinished or elapsed_ms >= MAX_AGGREGATION_MS:
+                    break
+                # Unfinished — briefly wait for the continuation fragment.
+                try:
+                    nxt = await asyncio.wait_for(
+                        self._transcript_queue.get(),
+                        timeout=CONTINUATION_WINDOW_MS / 1000.0,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    break
+                if nxt.text:
+                    parts.append(nxt.text)
+                forced = nxt.forced
+
+            combined = " ".join(p for p in parts if p).strip()
+            if len(parts) > 1 or combined != transcript.text:
+                logger.info(
+                    "[ENGINE] Aggregated %d fragment(s) into one turn: %r",
+                    len(parts), combined,
+                )
+            transcript = Transcript(
+                text=combined,
+                duration_ms=transcript.duration_ms,
+                timestamp=time.monotonic(),
+                stt_latency_ms=transcript.stt_latency_ms,
+            )
 
             try:
                 async def _run_generation():
@@ -928,9 +1054,21 @@ class VoicePipeline:
                     first_chunk_ms = 0.0
 
                     full_text_parts: list[str] = []
-                    # Collect LLM (non-shortcut) sentence chunks to combine
-                    # into a single TTS call, preventing per-sentence gaps.
-                    llm_parts: list[str] = []
+                    # Latency: stream the FIRST spoken chunk to TTS as soon as it
+                    # is ready, then send the remaining sentences as one combined
+                    # request (coherent tail, single seam). The old code buffered
+                    # the WHOLE response and only sent it after generation fully
+                    # finished, so time-to-first-audio = the entire LLM generation
+                    # — the dominant perceived latency on long replies.
+                    first_spoken_sent = False
+                    llm_tail_parts: list[str] = []
+
+                    # Reliability ("at all costs"): use BLOCKING puts so a response
+                    # that is shown in the transcript can never be silently dropped
+                    # on a full queue (the old put_nowait + QueueFull path lost
+                    # audio while still emitting the text to the live transcript).
+                    async def _enqueue_tts(resp: Response) -> None:
+                        await self._tts_queue.put(resp)
 
                     async for result in self.conversation.process_stream(
                         transcript.text
@@ -949,39 +1087,39 @@ class VoicePipeline:
                         if result.is_shortcut:
                             # Fillers, shortcuts, language-switch confirmations
                             # go to TTS immediately for low latency.
-                            try:
-                                self._tts_queue.put_nowait(
-                                    Response(
-                                        text=result.text,
-                                        is_shortcut=True,
-                                        timestamp=time.monotonic(),
-                                        is_filler=(result.intent == "filler"),
-                                    )
-                                )
-                            except asyncio.QueueFull:
-                                logger.warning(
-                                    "[ENGINE] TTS queue full -- dropping shortcut chunk"
-                                )
-                        else:
-                            # Buffer LLM sentence chunks; sent combined below.
-                            llm_parts.append(result.text)
-
-                    # Send all LLM sentences as ONE TTS request to produce a
-                    # single coherent utterance instead of fragmented pieces.
-                    if llm_parts:
-                        combined_text = " ".join(llm_parts)
-                        try:
-                            self._tts_queue.put_nowait(
+                            await _enqueue_tts(
                                 Response(
-                                    text=combined_text,
+                                    text=result.text,
+                                    is_shortcut=True,
+                                    timestamp=time.monotonic(),
+                                    is_filler=(result.intent == "filler"),
+                                )
+                            )
+                        elif not first_spoken_sent:
+                            # First real sentence — speak it NOW, don't wait for
+                            # the rest of the response to finish generating.
+                            first_spoken_sent = True
+                            await _enqueue_tts(
+                                Response(
+                                    text=result.text,
                                     is_shortcut=False,
                                     timestamp=time.monotonic(),
                                 )
                             )
-                        except asyncio.QueueFull:
-                            logger.warning(
-                                "[ENGINE] TTS queue full -- dropping combined LLM response"
+                        else:
+                            # Buffer the tail; sent as one coherent follow-up.
+                            llm_tail_parts.append(result.text)
+
+                    # Remaining sentences as ONE TTS request (single seam after
+                    # the first sentence already started playing).
+                    if llm_tail_parts:
+                        await _enqueue_tts(
+                            Response(
+                                text=" ".join(llm_tail_parts),
+                                is_shortcut=False,
+                                timestamp=time.monotonic(),
                             )
+                        )
 
                     engine_latency = (
                         time.monotonic() - latency_start

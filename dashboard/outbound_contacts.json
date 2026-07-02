@@ -29,8 +29,8 @@
     "added_at": "2026-06-27T05:23:56.495049Z",
     "call_status": "answered",
     "disposition": "not_classified",
-    "call_count": 4,
-    "last_called_at": "2026-06-27T07:22:41.777942Z",
+    "call_count": 7,
+    "last_called_at": "2026-07-01T05:43:08.953794Z",
     "call_notes": "",
     "call_history": [
       {
@@ -48,6 +48,18 @@
       {
         "ts": "2026-06-27T07:22:41.777942Z",
         "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-30T05:32:56.677069Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-30T07:28:10.431458Z",
+        "call_status": "busy"
+      },
+      {
+        "ts": "2026-07-01T05:43:08.953794Z",
+        "call_status": "answered"
       }
     ]
   },
@@ -59,8 +71,8 @@
     "added_at": "2026-06-27T05:39:14.462767Z",
     "call_status": "answered",
     "disposition": "not_classified",
-    "call_count": 3,
-    "last_called_at": "2026-06-29T06:47:06.651163Z",
+    "call_count": 6,
+    "last_called_at": "2026-07-01T05:46:42.415721Z",
     "call_notes": "",
     "call_history": [
       {
@@ -74,6 +86,18 @@
       {
         "ts": "2026-06-29T06:47:06.651163Z",
         "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-30T13:48:28.791144Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-30T13:51:27.808828Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-01T05:46:42.415721Z",
+        "call_status": "answered"
       }
     ]
   },
@@ -83,15 +107,27 @@
     "name": "Umang",
     "notes": "",
     "added_at": "2026-06-27T08:15:28.757287Z",
-    "call_status": "busy",
+    "call_status": "answered",
     "disposition": "not_classified",
-    "call_count": 1,
-    "last_called_at": "2026-06-27T08:18:08.811786Z",
+    "call_count": 4,
+    "last_called_at": "2026-06-30T13:51:50.593166Z",
     "call_notes": "",
     "call_history": [
       {
         "ts": "2026-06-27T08:18:08.811786Z",
         "call_status": "busy"
+      },
+      {
+        "ts": "2026-06-30T13:47:15.010338Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-30T13:47:45.088931Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-06-30T13:51:50.593166Z",
+        "call_status": "answered"
       }
     ]
   },
@@ -165,6 +201,32 @@
       },
       {
         "ts": "2026-06-29T07:59:09.688150Z",
+        "call_status": "answered"
+      }
+    ]
+  },
+  {
+    "id": "1782804667549_5737",
+    "phone": "+918628835737",
+    "name": "Moksh",
+    "notes": "",
+    "added_at": "2026-06-30T07:31:07.549017Z",
+    "call_status": "answered",
+    "disposition": "not_classified",
+    "call_count": 3,
+    "last_called_at": "2026-07-01T05:50:11.250630Z",
+    "call_notes": "",
+    "call_history": [
+      {
+        "ts": "2026-06-30T07:31:23.073252Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-01T05:18:13.174812Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-01T05:50:11.250630Z",
         "call_status": "answered"
       }
     ]

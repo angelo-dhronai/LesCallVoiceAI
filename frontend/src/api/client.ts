@@ -5,7 +5,14 @@ export async function api<T>(path: string, opts?: RequestInit): Promise<T> {
     headers: { 'Content-Type': 'application/json', ...(opts?.headers || {}) },
     ...opts,
   })
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+  if (!res.ok) {
+    let detail = ''
+    try {
+      const body = await res.clone().json()
+      detail = typeof body?.detail === 'string' ? body.detail : ''
+    } catch { /* non-JSON error body */ }
+    throw new Error(detail ? `${res.status}: ${detail}` : `${res.status} ${res.statusText}`)
+  }
   const ct = res.headers.get('content-type') || ''
   if (ct.includes('application/json')) return res.json()
   return (await res.text()) as unknown as T

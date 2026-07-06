@@ -31,7 +31,7 @@ DEFAULT_SPEAKER = "shubh"
 DEFAULT_SAMPLE_RATE = 16_000
 CONNECT_TIMEOUT = 5.0
 RECV_TIMEOUT = 10.0
-DRAIN_TIMEOUT = 2.0
+DRAIN_TIMEOUT = 0.5
 MAX_RECONNECT_ATTEMPTS = 3
 KEEPALIVE_INTERVAL = 30.0
 
@@ -272,10 +272,31 @@ class SarvamWSTTS(StreamingTTS):
                         return
 
                 elif isinstance(msg, ErrorResponse):
-                    logger.error(
-                        "[TTS:SarvamWS] Server error: %s (code=%s)",
-                        msg.data.message, msg.data.code,
+                    msg_text = getattr(msg.data, "message", "") or ""
+                    code = getattr(msg.data, "code", None)
+                    is_credit_error = (
+                        code == 402
+                        or "payment" in msg_text.lower()
+                        or "credit" in msg_text.lower()
+                        or "quota" in msg_text.lower()
                     )
+                    if is_credit_error:
+                        logger.error(
+                            "[SARVAM:CREDITS] TTS credits exhausted (code=%s): %s — "
+                            "attempting auto-rotation from key pool.",
+                            code, msg_text,
+                        )
+                        from .key_rotator import rotate as _rotate_key
+                        new_key = _rotate_key()
+                        if new_key:
+                            self._api_key = new_key
+                            self._sarvam_client = None
+                            logger.info("[TTS:SarvamWS] Key rotated — next speak() will use new key")
+                    else:
+                        logger.error(
+                            "[TTS:SarvamWS] Server error: %s (code=%s)",
+                            msg_text, code,
+                        )
                     await self._close_ws_locked()
                     return
 

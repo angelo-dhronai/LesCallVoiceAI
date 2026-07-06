@@ -69,8 +69,8 @@ STOP_SCRIPT   = RUNTIME_DIR / "stop_all.sh"
 ACTIVE_CALL_TIMEOUT_MINUTES = 20
 
 # Outbound dialing config — override via env vars if needed
-OUTBOUND_CALLER_ID  = os.environ.get("OUTBOUND_CALLER_ID",  "912264231897")
-OUTBOUND_GATEWAY    = os.environ.get("OUTBOUND_GATEWAY",    "16584853209835561.zt.plivo.com")
+OUTBOUND_CALLER_ID  = os.environ.get("OUTBOUND_CALLER_ID",  "918065953160")
+OUTBOUND_GATEWAY    = os.environ.get("OUTBOUND_GATEWAY",    "25935838218519915.zt.plivo.com")
 # Dialplan extension added in /etc/freeswitch/dialplan/default/outbound_ai.xml
 OUTBOUND_DP_EXT     = "outbound_ai_connect"
 OUTBOUND_DP_CTX     = "default"
@@ -86,6 +86,25 @@ app = FastAPI(title="LesCall Dashboard", docs_url=None, redoc_url=None)
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
+
+# Agent Builder control plane (create/edit/route/RAG/validate/activate) — mounted
+# on the same app+port the React dashboard already uses. `activate` writes
+# agents/active_agent.json, which the telephony bridge reads per call.
+try:
+    from agent_builder_api import router as agent_builder_router
+    app.include_router(agent_builder_router)
+    logging.getLogger("dashboard").info("Agent Builder API mounted")
+except Exception as _ab_exc:  # pragma: no cover - never take down the dashboard
+    logging.getLogger("dashboard").error("Agent Builder API NOT mounted: %r", _ab_exc)
+
+# Agent Copilot — conversational agent builder (ChatGPT-style dashboard homepage).
+# Interviews the user, then writes agents through the same Agent Builder plumbing.
+try:
+    from agent_copilot_api import router as agent_copilot_router
+    app.include_router(agent_copilot_router)
+    logging.getLogger("dashboard").info("Agent Copilot API mounted")
+except Exception as _cp_exc:  # pragma: no cover - never take down the dashboard
+    logging.getLogger("dashboard").error("Agent Copilot API NOT mounted: %r", _cp_exc)
 
 _img_dir = STATIC_DIR / "img"
 _img_dir.mkdir(parents=True, exist_ok=True)

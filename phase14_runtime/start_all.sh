@@ -10,6 +10,9 @@ mkdir -p "$RUN_DIR"
 rm -f "$RUNTIME_DIR/logs/latest"
 ln -s "$RUN_DIR" "$RUNTIME_DIR/logs/latest"
 
+# Prune old run dirs (keep newest 15) — logs once grew to 9.3 GB unbounded.
+ls -dt "$RUNTIME_DIR"/logs/run_* 2>/dev/null | tail -n +16 | xargs -r rm -rf 2>/dev/null
+
 echo "Starting Phase 14 Runtime..."
 echo "Log directory: $RUN_DIR"
 

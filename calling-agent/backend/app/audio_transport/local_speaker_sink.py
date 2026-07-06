@@ -7,6 +7,13 @@ from .base import AudioSink
 
 logger = logging.getLogger(__name__)
 
+# Pre-buffer: accumulate this many samples before releasing audio to the
+# playback thread. Absorbs momentary gaps between TTS HTTP stream chunks.
+# Kept short (100 ms) to minimise start-of-speech delay; Sarvam streams
+# chunks densely enough that 100 ms is sufficient to avoid audible gaps.
+_PREBUFFER_SAMPLES = 1600
+
+
 class LocalSpeakerSink(AudioSink):
     """
     Real-time speaker output using sounddevice.
@@ -23,11 +30,17 @@ class LocalSpeakerSink(AudioSink):
         self._audio_q: _queue.Queue[np.ndarray | None] = _queue.Queue(maxsize=200)
         self._playback_thread: threading.Thread | None = None
         self._running = False
+        self._prebuffer: list[np.ndarray] = []
+        self._prebuffer_samples: int = 0
+        self._prebuffer_done: bool = False
 
     async def start(self) -> None:
         if self._running:
             return
         self._running = True
+        self._prebuffer = []
+        self._prebuffer_samples = 0
+        self._prebuffer_done = False
         self._playback_thread = threading.Thread(target=self._play_loop, daemon=True)
         self._playback_thread.start()
         logger.info("[LocalSpeakerSink] Playback thread started")
@@ -63,28 +76,80 @@ class LocalSpeakerSink(AudioSink):
         if not self._running:
             return
 
-        # Convert PCM16 bytes to float32 for sounddevice
-        samples = np.frombuffer(pcm, dtype=np.int16)
-        audio_float = samples.astype(np.float32) / 32768.0
-        
-        try:
-            self._audio_q.put(audio_float, timeout=0.1)
-        except _queue.Full:
-            logger.warning("[LocalSpeakerSink] Audio queue full — dropping chunk")
+        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
-    async def stop(self) -> None:
+        if not self._prebuffer_done:
+            self._prebuffer.append(samples)
+            self._prebuffer_samples += len(samples)
+            if self._prebuffer_samples >= _PREBUFFER_SAMPLES:
+                # Pre-buffer full — flush everything to the playback queue at once
+                self._prebuffer_done = True
+                logger.debug(
+                    "[LocalSpeakerSink] Pre-buffer full (%d samples) — releasing to playback",
+                    self._prebuffer_samples,
+                )
+                combined = np.concatenate(self._prebuffer)
+                self._prebuffer = []
+                self._prebuffer_samples = 0
+                try:
+                    self._audio_q.put(combined, timeout=0.1)
+                except _queue.Full:
+                    logger.warning("[LocalSpeakerSink] Audio queue full — dropping pre-buffer")
+        else:
+            try:
+                self._audio_q.put(samples, timeout=0.1)
+            except _queue.Full:
+                logger.warning("[LocalSpeakerSink] Audio queue full — dropping chunk")
+
+    async def flush(self) -> None:
+        """Release any pre-buffer content that hasn't hit the threshold yet.
+
+        Called by tts_sarvam after speak() completes normally (not on barge-in).
+        This ensures short TTS utterances whose total audio is under 300ms still
+        get played — without flush() they would sit in the pre-buffer forever.
+        After flushing, reset pre-buffer state so the next speak() starts fresh.
+        """
         if not self._running:
             return
-        self._running = False
-        if self._audio_q:
+        if self._prebuffer:
+            combined = np.concatenate(self._prebuffer)
+            self._prebuffer = []
+            self._prebuffer_samples = 0
+            self._prebuffer_done = True
+            logger.debug(
+                "[LocalSpeakerSink] flush(): releasing %d pre-buffer samples to playback",
+                len(combined),
+            )
             try:
-                self._audio_q.put_nowait(None)
+                self._audio_q.put(combined, timeout=0.2)
             except _queue.Full:
-                pass
+                logger.warning("[LocalSpeakerSink] Audio queue full — dropping flush content")
+        # Reset so the NEXT speak() starts with a fresh pre-buffer
+        self._prebuffer_done = False
+
+    async def stop(self) -> None:
+        """Stop playback immediately (called on barge-in).
+
+        Discard the pre-buffer — on barge-in we don't want leftover audio
+        from the interrupted utterance to play after the caller speaks.
+        """
+        if not self._running:
+            return
+
+        # Discard any pending pre-buffer (barge-in means stop now, not drain)
+        self._prebuffer = []
+        self._prebuffer_samples = 0
+        self._prebuffer_done = False
+
+        self._running = False
+        try:
+            self._audio_q.put_nowait(None)
+        except _queue.Full:
+            pass
         if self._playback_thread:
             self._playback_thread.join(timeout=2.0)
             self._playback_thread = None
-        
+
         import sounddevice as sd
         try:
             sd.stop()

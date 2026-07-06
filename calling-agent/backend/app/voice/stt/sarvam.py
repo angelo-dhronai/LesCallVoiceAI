@@ -56,6 +56,10 @@ class SarvamSTT(STTProvider):
         self._api_url = api_url
         self._timeout = timeout
         self._model = model
+        # Per-call dynamic normalizer — adapts gain + noise-gating to THIS
+        # caller/line across the call. Falls back to raw audio on any error.
+        from .audio_norm import DynamicNormalizer
+        self._normalizer = DynamicNormalizer()
         self._client: httpx.AsyncClient | None = None
 
         if not self._api_key:
@@ -83,7 +87,12 @@ class SarvamSTT(STTProvider):
     ) -> STTResult:
         # Normalize amplitude: telephone audio is often quiet; boosting it
         # before upload significantly improves STT accuracy on quiet callers.
-        audio_bytes = normalize_pcm_audio(audio_bytes)
+        # Dynamic per-call normalization (AGC + noise-gate + soft-limit). Falls
+        # back to the static booster if the dynamic layer is unavailable.
+        if getattr(self, "_normalizer", None) is not None:
+            audio_bytes = self._normalizer.process(audio_bytes, sample_rate)
+        else:
+            audio_bytes = normalize_pcm_audio(audio_bytes)
         wav_data = pcm_to_wav(audio_bytes, sample_rate=sample_rate)
         duration_ms = len(audio_bytes) // (sample_rate * 2) * 1000
         logger.info(
@@ -101,6 +110,11 @@ class SarvamSTT(STTProvider):
             lang_code = language
         else:
             lang_code = f"{language}-IN"
+
+        # Re-read the live key so a rotation (ours or the watchdog's) applies
+        # on the next segment without a restart.
+        from ..key_rotator import current_key as _current_key
+        self._api_key = _current_key()
 
         client = self._get_client()
 
@@ -125,6 +139,19 @@ class SarvamSTT(STTProvider):
             )
             await self.close()
             raise
+
+        if response.status_code == 402:
+            logger.error(
+                "[SARVAM:CREDITS] HTTP 402 Payment Required — Sarvam STT credits exhausted. "
+                "Attempting auto-rotation from key pool."
+            )
+            from ..key_rotator import rotate as _rotate_key
+            new_key = _rotate_key()
+            if new_key:
+                self._api_key = new_key
+                self._client = None
+                logger.info("[STT:Sarvam] Key rotated — next STT call will use new key")
+            raise RuntimeError("[SARVAM:CREDITS] Credits exhausted — refill your Sarvam account.")
 
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")

@@ -13,6 +13,8 @@ import os
 # Add calling-agent to Python path to allow imports
 sys.path.insert(0, os.path.abspath('calling-agent'))
 
+from pathlib import Path
+
 from call_audit import audit_manager
 
 from backend.app.voice.pipeline import VoicePipeline
@@ -20,11 +22,151 @@ from backend.app.voice.event_hub import EventHub
 from backend.app.audio_transport.telephony_source import TelephonySource
 from backend.app.audio_transport.telephony_sink import TelephonySink
 
+# Data-driven agent runtime (replaces the old hardcoded ConversationRouter).
+# Telephony resolves the operator-selected "active" agent per call and runs it
+# through the exact same stack run.py uses for the CLI/web pipeline.
+from backend.app.voice.conversation import ConversationRouter
+from backend.app.voice.stt.router import STTRouter
+from backend.app.voice.tracking_stt import TrackingSarvamSTT, TrackingWhisperSTT
+from backend.app.voice.tracking_tts import TrackingSarvamTTS
+from backend.app.voice.credit_tracker import SarvamCreditTracker
+from backend.app.agent_definition.registry import agent_registry
+
 logger = logging.getLogger("call_bridge")
 
 # Telephony playback injection server details
 PLAYBACK_HOST = "127.0.0.1"
 PLAYBACK_PORT = 9004
+
+# ---------------------------------------------------------------------------
+# Active-agent resolution (single-active-agent model)
+# ---------------------------------------------------------------------------
+# Agents are YAML folders under calling-agent/agents/<slug>/agent.yaml. The
+# dashboard's Agent Builder "Activate" button writes agents/active_agent.json
+# ({"active": "<slug>"}); every inbound call runs that agent. Multi-agent /
+# per-DID routing can be layered on later via routing.yaml + resolve_agent().
+AGENTS_DIR = Path(os.path.abspath("calling-agent")) / "agents"
+ACTIVE_AGENT_FILE = AGENTS_DIR / "active_agent.json"
+DEFAULT_AGENT = os.environ.get("DEFAULT_AGENT", "pramukh")
+
+# Start the registry hot-reload watcher once for this process so edits made in
+# the builder take effect on the next call without a restart.
+try:
+    agent_registry.start_watcher(AGENTS_DIR)
+except Exception as _exc:  # pragma: no cover - watcher is best-effort
+    logger.warning("[BRIDGE] registry watcher not started: %r", _exc)
+
+
+def _resolve_active_agent_slug() -> str:
+    """Slug of the agent that should answer inbound calls.
+
+    Reads agents/active_agent.json; falls back to DEFAULT_AGENT, then to the
+    first agent folder that has an agent.yaml. Never raises.
+    """
+    try:
+        if ACTIVE_AGENT_FILE.exists():
+            data = json.loads(ACTIVE_AGENT_FILE.read_text(encoding="utf-8")) or {}
+            slug = data.get("active")
+            if slug and (AGENTS_DIR / slug / "agent.yaml").exists():
+                return slug
+    except Exception as exc:
+        logger.warning("[BRIDGE] Could not read active_agent.json: %r", exc)
+    if (AGENTS_DIR / DEFAULT_AGENT / "agent.yaml").exists():
+        return DEFAULT_AGENT
+    try:
+        for p in sorted(AGENTS_DIR.iterdir()):
+            if p.is_dir() and not p.name.startswith("_") and (p / "agent.yaml").exists():
+                return p.name
+    except Exception:
+        pass
+    return DEFAULT_AGENT
+
+
+# ---------------------------------------------------------------------------
+# Outbound dial linkage
+# ---------------------------------------------------------------------------
+# The dashboard logs every outbound dial (phone, contact name, timestamp) to
+# dashboard/call_link.json just before running the FreeSWITCH originate. When
+# a pipeline session starts shortly after a logged dial, this call is treated
+# as that outbound call and the contact's name/number are handed to the agent
+# so it can greet the person by name and confirm identity.
+CALL_LINK_FILE = Path(os.path.abspath("dashboard")) / "call_link.json"
+OUTBOUND_DIAL_MATCH_WINDOW_S = 120.0
+
+
+def _lookup_recent_outbound_dial(caller_number: str = "") -> dict | None:
+    """Most recent dial logged within the match window; prefers a phone match.
+
+    Best-effort timestamp heuristic (same contract as the dashboard's own
+    _classify_direction) — returns None on any doubt so inbound calls are
+    never mislabeled outbound.
+    """
+    try:
+        if not CALL_LINK_FILE.exists():
+            return None
+        entries = json.loads(CALL_LINK_FILE.read_text(encoding="utf-8")) or []
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        digits = "".join(c for c in (caller_number or "") if c.isdigit())[-10:]
+        best, best_age = None, None
+        for entry in entries[-50:]:
+            try:
+                dial_dt = datetime.datetime.fromisoformat(
+                    entry.get("dialed_at", "").replace("Z", "+00:00"))
+            except Exception:
+                continue
+            age = (now - dial_dt).total_seconds()
+            if not (0 <= age <= OUTBOUND_DIAL_MATCH_WINDOW_S):
+                continue
+            entry_digits = "".join(c for c in entry.get("phone", "") if c.isdigit())[-10:]
+            if digits and entry_digits and digits == entry_digits:
+                return entry  # exact phone match wins immediately
+            if best_age is None or age < best_age:
+                best, best_age = entry, age
+        return best
+    except Exception as exc:
+        logger.warning("[BRIDGE] outbound dial lookup failed: %r", exc)
+        return None
+
+
+def _build_agent_stack(conn_id: str):
+    """Resolve the active agent and build (slug, conversation, stt, tts) for a call.
+
+    Mirrors backend/run.py so telephony runs the data-driven agent identically
+    to the CLI/web pipeline: STT corrections + TTS voice come from the agent's
+    YAML. A load failure degrades to the default ConversationRouter rather than
+    dropping the call.
+    """
+    slug = _resolve_active_agent_slug()
+    agent_def = None
+    try:
+        agent_def = agent_registry.get(slug)
+    except Exception as exc:
+        logger.error("[%s] [BRIDGE] Failed to load agent '%s': %r — using default",
+                     conn_id, slug, exc)
+
+    call_id_provider = lambda: conn_id  # noqa: E731 - tiny provider closure
+    corrections = agent_def.knowledge_base.stt_corrections if agent_def else None
+    stt = STTRouter(
+        primary=TrackingSarvamSTT(call_id_provider=call_id_provider),
+        fallback=TrackingWhisperSTT(call_id_provider=call_id_provider),
+        stt_corrections=corrections,
+    )
+    tts_model, tts_speaker, tts_pace = "bulbul:v3", "shubh", 1.0
+    if agent_def:
+        dlang = agent_def.languages.default
+        vcfg = agent_def.languages.tts_voices.get(dlang)
+        if vcfg:
+            tts_model, tts_speaker = vcfg.model, vcfg.speaker
+            tts_pace = getattr(vcfg, "pace", 1.0) or 1.0
+    tts = TrackingSarvamTTS(
+        call_id_provider=call_id_provider,
+        model=tts_model,
+        speaker=tts_speaker,
+        pace=tts_pace,
+    )
+    conversation = ConversationRouter(agent_def=agent_def)
+    return slug, conversation, stt, tts
 
 class TelephonySession:
     """Manages one AI pipeline per phone call."""
@@ -37,11 +179,38 @@ class TelephonySession:
         self.sink = TelephonySink(sample_rate=sample_rate, conn_id=conn_id)
         self.hub = EventHub()
 
-        # Initialize VoicePipeline with telephony endpoints
+        # Resolve the operator-selected active agent and build its STT/TTS the
+        # same way run.py does, then run it through the telephony endpoints.
+        self.agent_slug, conversation, stt, tts = _build_agent_stack(conn_id)
+        logger.info("[%s] Active agent: %s", conn_id, self.agent_slug)
+
+        # Call context: was this session started by an outbound dial? If so,
+        # hand the dialed contact's name/number to the agent so it opens by
+        # confirming identity instead of asking who it's speaking with.
+        try:
+            dial = _lookup_recent_outbound_dial(caller_number)
+            if dial:
+                conversation.set_call_context(
+                    direction="outbound",
+                    contact_name=dial.get("name", ""),
+                    contact_phone=dial.get("phone", ""),
+                    conn_id=conn_id,
+                )
+                logger.info("[%s] Outbound call context: contact=%r phone=%s",
+                            conn_id, dial.get("name"), dial.get("phone"))
+            else:
+                conversation.set_call_context(conn_id=conn_id)
+        except Exception as exc:
+            logger.warning("[%s] set_call_context failed: %r", conn_id, exc)
+
+        # Initialize VoicePipeline with telephony endpoints + data-driven agent
         self.pipeline = VoicePipeline(
             audio_source=self.source,
             audio_sink=self.sink,
             event_hub=self.hub,
+            conversation=conversation,
+            stt=stt,
+            tts=tts,
             mic_enabled=True,
             skip_greeting=skip_greeting,
         )
@@ -68,6 +237,7 @@ class TelephonySession:
     async def start(self):
         """Starts the AI pipeline and the playback injection loop."""
         self._running = True
+        SarvamCreditTracker.get().start_call(self.conn_id)
         self.pipeline_task = asyncio.create_task(self.pipeline.run_until_shutdown())
         self.playback_task = asyncio.create_task(self._playback_loop())
         self.event_task = asyncio.create_task(self._event_loop())
@@ -112,6 +282,29 @@ class TelephonySession:
         await self.sink.stop()
         self._print_summary()
 
+        # Persist the conversation-state snapshot (slots + audit trail) so every
+        # call leaves a machine-readable record of what was collected and when.
+        try:
+            conv = getattr(self.pipeline, "conversation", None)
+            sm = getattr(conv, "state_mgr", None)
+            if sm is not None:
+                # Cancel any in-flight LLM slot extractor BEFORE snapshotting so
+                # a late merge can't land after the file is written.
+                task = getattr(conv, "_slot_extract_task", None)
+                if task is not None and not task.done():
+                    task.cancel()
+                call_dir = audit_manager.call_dir(self.conn_id) if hasattr(audit_manager, "call_dir") else None
+                if not call_dir:
+                    call_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "recordings", "_state")
+                os.makedirs(call_dir, exist_ok=True)
+                state_path = os.path.join(call_dir, f"state_{self.conn_id}.json")
+                with open(state_path, "w", encoding="utf-8") as f:
+                    f.write(sm.to_json())
+                logger.info("[%s] Conversation state persisted: %s", self.conn_id, state_path)
+        except Exception as exc:
+            logger.warning("[%s] State persistence failed: %r", self.conn_id, exc)
+
         # Close audit session — collect language from conversation state
         try:
             lang = "unknown"
@@ -126,6 +319,11 @@ class TelephonySession:
             )
         except Exception as exc:
             logger.warning("[%s] Audit close failed: %r", self.conn_id, exc)
+
+        try:
+            SarvamCreditTracker.get().end_call(self.conn_id)
+        except Exception as exc:
+            logger.warning("[%s] Credit end_call failed: %r", self.conn_id, exc)
 
         logger.info(f"[{self.conn_id}] Session stopped")
 

@@ -1,0 +1,8 @@
+# Pramukh Group — telephony routing rules
+# This agent is the default fallback for all unmatched calls.
+# No DID constraint here so it can act as the catch-all.
+
+did: ""                         # leave empty to match only as a fallback
+caller_id_prefixes: []
+time_windows: []
+fallback_agent: ""              # terminal — no further fallback

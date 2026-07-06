@@ -37,35 +37,25 @@ class Turn:
 
 @dataclass
 class BookingData:
-    """Structured booking state for Pramukh Group appointments."""
-    location: str | None = None       # "Surat", "Vapi", "Silvassa"
-    property_type: str | None = None  # "2 BHK", "3 BHK", etc.
+    """
+    Universal booking state — valid for any calling agent domain.
+    Domain-specific collected fields (location, BHK, department, concern, etc.)
+    live in domain_fields so this class never needs editing per-agent.
+    """
+    user_name: str | None = None
+    user_phone: str | None = None
     appointment_date: str | None = None
     appointment_time: str | None = None
-    user_name: str | None = None
     confirmed: bool = False
-    # New fields driven by the project / status / rent-or-buy flow
-    project: str | None = None              # caller-named Pramukh project
-    property_status: str | None = None      # "ready_made" / "under_construction"
-    transaction_type: str | None = None     # "rent" / "buy"
-    budget: str | None = None              # caller's stated budget (e.g. "70 lakh")
+    # Agent-specific key-value pairs: "location", "property_type", "department", etc.
+    domain_fields: dict = field(default_factory=dict)
 
     def summary(self) -> str:
         parts = []
         if self.user_name:
             parts.append(f"Name: {self.user_name}")
-        if self.project:
-            parts.append(f"Project: {self.project}")
-        if self.property_status:
-            parts.append(f"Status: {self.property_status}")
-        if self.transaction_type:
-            parts.append(f"Intent: {self.transaction_type}")
-        if self.location:
-            parts.append(f"Location: {self.location}")
-        if self.property_type:
-            parts.append(f"Type: {self.property_type}")
-        if self.budget:
-            parts.append(f"Budget: {self.budget}")
+        for k, v in self.domain_fields.items():
+            parts.append(f"{k.replace('_', ' ').title()}: {v}")
         if self.appointment_date:
             parts.append(f"Date: {self.appointment_date}")
         if self.appointment_time:
@@ -73,10 +63,6 @@ class BookingData:
         return ", ".join(parts) if parts else "No details yet"
 
     def next_missing_field(self) -> str | None:
-        if not self.location:
-            return "location"
-        if not self.property_type:
-            return "property_type"
         if not self.appointment_date and not self.appointment_time:
             return "appointment"
         return None
@@ -85,31 +71,20 @@ class BookingData:
 @dataclass
 class CallState:
     """
-    Persistent per-call state — accumulated for the entire conversation.
-
-    This is the canonical state object injected into every LLM prompt so
-    the agent never re-asks for information already collected.
-
-    Fields map directly to the requirements:
-      customer_name, customer_phone, selected_project, selected_location,
-      site_visit_requested, appointment_date, appointment_time,
-      language, conversation_stage.
+    Universal per-call state — valid for any calling agent domain.
+    Domain-specific fields (project, location, BHK, department, etc.)
+    live in domain_fields so this class never needs editing per-agent.
+    Injected into every LLM prompt so the agent never re-asks confirmed info.
     """
     customer_name: str | None = None
-    customer_phone: str | None = None       # stored internally; never read back verbatim
-    selected_project: str | None = None     # first confirmed project; locked for session
-    selected_location: str | None = None    # Surat / Vapi / Silvassa
-    property_type: str | None = None        # "2 BHK", "3 BHK", etc.
-    purpose: str | None = None              # "self_use" / "investment"
-    budget: str | None = None              # caller's stated budget
-    site_visit_requested: bool = False
+    customer_phone: str | None = None   # stored internally; never read back verbatim
     appointment_date: str | None = None
     appointment_time: str | None = None
     language: str = "hi"
     conversation_stage: str = "GREETING"
-    booking_validated: bool = False         # True once all mandatory fields pass
-    timeline: str | None = None             # caller's stated timeline (e.g. "3 months", "immediate")
-    preferred_visit_date: str | None = None # caller's stated preferred visit date
+    booking_validated: bool = False
+    # Agent-specific key-value pairs: "selected_project", "location", "department", etc.
+    domain_fields: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -179,9 +154,11 @@ class QATracker:
         ],
     }
 
-    def __init__(self) -> None:
+    def __init__(self, field_signals: dict[str, list[str]] | None = None) -> None:
         self._asked: dict[str, int] = {}    # field -> turn_index when asked
         self._answered: dict[str, str] = {} # field -> user answer text (may be raw STT)
+        # Per-agent field signals; fall back to the class-level built-in default.
+        self._active_signals = field_signals if field_signals else self._FIELD_SIGNALS
 
     def observe_agent_turn(self, agent_text: str, turn_index: int) -> None:
         """Detect which field the agent just asked about."""
@@ -196,7 +173,7 @@ class QATracker:
         )
         if not has_question:
             return
-        for field, signals in self._FIELD_SIGNALS.items():
+        for field, signals in self._active_signals.items():
             if field not in self._answered and any(s in lower for s in signals):
                 if field not in self._asked:
                     self._asked[field] = turn_index
@@ -237,13 +214,17 @@ class ConversationMemory:
     and the question-answer tracker.
     """
 
-    def __init__(self, max_turns: int = MAX_SHORT_TERM_TURNS) -> None:
+    def __init__(
+        self,
+        max_turns: int = MAX_SHORT_TERM_TURNS,
+        field_signals: dict[str, list[str]] | None = None,
+    ) -> None:
         self._max_turns = max_turns
         self._turns: list[Turn] = []
         self.context = ContextMemory()
         self.booking = BookingData()
         self.call_state = CallState()
-        self.qa_tracker = QATracker()
+        self.qa_tracker = QATracker(field_signals=field_signals or None)
 
     @property
     def turns(self) -> list[Turn]:
@@ -320,6 +301,17 @@ class ConversationMemory:
             "nervous", "anxious", "worried", "scared", "afraid", "confused",
             "fantastic", "wonderful", "excellent", "perfect", "amazing",
             "awesome", "fabulous", "fabulous", "cool", "nice", "bit",
+            # Present-participle verbs that follow "I'm" in problem reports —
+            # never a name. "I'm having/facing/experiencing issues" etc.
+            "having", "facing", "experiencing", "dealing", "struggling",
+            "looking", "trying", "getting", "seeing", "finding", "making",
+            "running", "taking", "giving", "putting", "keeping", "using",
+            "working", "calling", "saying", "telling", "hoping", "wanting",
+            "going", "coming", "waiting", "talking", "asking", "thinking",
+            "planning", "searching", "checking", "testing", "building",
+            "solving", "fixing", "handling", "managing", "running",
+            "fighting", "battling", "suffering", "losing", "missing",
+            "unable", "unable", "just", "currently", "already", "also",
             # Intensifiers / adverbs that precede a state word
             "very", "really", "so", "too", "quite", "pretty", "more", "much",
             "still", "all", "right", "kind", "sort", "of", "feeling",

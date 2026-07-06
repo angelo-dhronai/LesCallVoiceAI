@@ -5,11 +5,178 @@
     "name": "shubhangi Vijay pawar",
     "notes": "project manager",
     "added_at": "2026-06-19T12:36:47.014827Z",
-    "call_status": "not_called",
-    "disposition": "not_classified",
-    "call_count": 0,
-    "last_called_at": null,
+    "call_status": "answered",
+    "disposition": "to_contact_later",
+    "call_count": 5,
+    "last_called_at": "2026-07-06T10:22:16.326095Z",
     "call_notes": "",
-    "call_history": []
+    "call_history": [
+      {
+        "ts": "2026-07-04T06:34:09.977323Z",
+        "call_status": "no_answer"
+      },
+      {
+        "ts": "2026-07-04T06:35:50.010750Z",
+        "call_status": "no_answer"
+      },
+      {
+        "ts": "2026-07-06T06:56:20.293605Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T06:57:25.201111Z",
+        "call_status": "failed"
+      },
+      {
+        "ts": "2026-07-06T10:22:16.326095Z",
+        "call_status": "answered"
+      }
+    ]
+  },
+  {
+    "id": "1783145525580_0227",
+    "phone": "+917042340227",
+    "name": "Alwyn",
+    "notes": "",
+    "added_at": "2026-07-04T06:12:05.580448Z",
+    "call_status": "answered",
+    "disposition": "to_contact_later",
+    "call_count": 5,
+    "last_called_at": "2026-07-06T09:57:09.973976Z",
+    "call_notes": "",
+    "call_history": [
+      {
+        "ts": "2026-07-04T09:30:06.168928Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T07:01:21.641687Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T09:57:03.035267Z",
+        "call_status": "no_answer"
+      },
+      {
+        "ts": "2026-07-06T09:57:04.193144Z",
+        "call_status": "busy"
+      },
+      {
+        "ts": "2026-07-06T09:57:09.973976Z",
+        "call_status": "answered"
+      }
+    ]
+  },
+  {
+    "id": "1783145552288_2864",
+    "phone": "+918076562864",
+    "name": "Angelo",
+    "notes": "",
+    "added_at": "2026-07-04T06:12:32.288917Z",
+    "call_status": "answered",
+    "disposition": "not_classified",
+    "call_count": 22,
+    "last_called_at": "2026-07-06T10:51:16.082233Z",
+    "call_notes": "",
+    "call_history": [
+      {
+        "ts": "2026-07-04T09:50:10.125821Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-04T13:32:16.141724Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-04T13:40:09.953785Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T04:43:52.756712Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T05:20:09.081912Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T05:21:08.966888Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T05:41:08.482874Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T05:43:10.299568Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T05:45:54.204020Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T06:36:24.695955Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T06:41:22.779620Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T06:54:49.671353Z",
+        "call_status": "failed"
+      },
+      {
+        "ts": "2026-07-06T06:55:13.964967Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T07:14:44.403578Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T07:17:16.590245Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T07:19:45.624751Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T07:21:43.029341Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T09:55:00.722126Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T10:50:25.392057Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-06T10:51:16.082233Z",
+        "call_status": "answered"
+      }
+    ]
+  },
+  {
+    "id": "1783147083547_6878",
+    "phone": "+918626056878",
+    "name": "Kunika",
+    "notes": "",
+    "added_at": "2026-07-04T06:38:03.547491Z",
+    "call_status": "busy",
+    "disposition": "not_classified",
+    "call_count": 1,
+    "last_called_at": "2026-07-04T06:38:41.834722Z",
+    "call_notes": "",
+    "call_history": [
+      {
+        "ts": "2026-07-04T06:38:41.834722Z",
+        "call_status": "busy"
+      }
+    ]
   }
 ]

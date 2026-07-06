@@ -80,17 +80,18 @@ QUEUE_SIZE_TRANSCRIPT = 3
 # busy playing an earlier chunk while new ones arrived.
 QUEUE_SIZE_TTS = 8
 
-MAX_SPEECH_SECONDS = 4
+MAX_SPEECH_SECONDS = 25
 MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_SPEECH_SECONDS
 # 300ms minimum: short inbound responses like "haan", "yes", "ha" are
 # valid single-word answers that must reach STT. 300ms is enough audio to
 # distinguish real speech from a click/breath without missing short replies.
 MIN_SPEECH_MS = 300.0
 BARGE_IN_COOLDOWN_MS = 400.0
-# Lowered 5→3 frames: telephony callers often speak immediately after hearing
-# the agent; requiring 5 sustained frames (100ms) was causing their first
-# syllable to be swallowed before barge-in triggered.
-BARGE_IN_MIN_FRAMES = 3
+# 5 sustained frames (100ms) before barge-in fires. 3 frames (60ms) was
+# too hair-trigger: brief noise or the tail of a TTS echo could satisfy it
+# and cut the agent mid-sentence. 5 frames still catches a genuine
+# interrupt within the first spoken syllable (~100-150ms).
+BARGE_IN_MIN_FRAMES = 5
 
 # Barge-in grace for the utterance that immediately FOLLOWS a filler
 # ("एक सेकंड…", "One moment…").  A filler's own audio echoes back through the
@@ -107,11 +108,18 @@ FILLER_ECHO_GRACE_MS = 1500.0
 
 # Echo cooldown after TTS ends naturally: prevents residual TTS audio from
 # being re-captured by the microphone and sent to STT as "user speech".
-# In telephony mode the TTS speaker and caller mic are on separate paths, but
-# we still add a small margin for packet-level delays and codec artifacts.
-# In local-mic mode (development) acoustic echo from the room can persist for
-# 1-2 seconds, so a longer window is essential to avoid self-transcription.
-TTS_ECHO_COOLDOWN_MS = 400.0 if TELEPHONY_MODE else 1500.0
+# In telephony mode the TTS speaker and caller mic are on separate paths.
+# In local-mic mode: reduced from 1500ms to 600ms. 1500ms was swallowing the
+# caller's first 3-4 words when they responded immediately after the agent.
+# Real acoustic echo decays within 100-300ms in headphone/normal setups.
+# The echo gate now also exits early if sustained real speech is detected
+# (see ECHO_EARLY_EXIT_FRAMES below), providing a second layer of protection.
+TTS_ECHO_COOLDOWN_MS = 400.0 if TELEPHONY_MODE else 600.0
+
+# Minimum consecutive loud frames during the echo cooldown window that signal
+# real caller speech rather than echo. Echo is short-lived (1-3 frames);
+# a human speaking produces sustained energy well above this threshold.
+ECHO_EARLY_EXIT_FRAMES = 5
 
 # Onset lowered 3→2 frames: catch speech sooner so the very first word after
 # a pause isn't clipped. Hold kept at 10 for noise immunity.
@@ -119,10 +127,26 @@ SPEECH_ONSET_MIN_FRAMES = 2
 SPEECH_HOLD_MIN_FRAMES = 10
 
 # Hard-flush silence gate (frames of consecutive silence after hold expires).
-# 30 frames = 600 ms: matches reference system tuning. Flushes the STT buffer
-# faster after the caller stops speaking, reducing per-turn latency by up to
-# 400 ms vs the previous 50-frame (1000 ms) setting.
-HARD_FLUSH_SILENCE_FRAMES = 30
+# LATENCY: this is dead air the caller hears after they stop talking before the
+# agent even begins to think. 700 ms (35 frames) is the balance point — low
+# enough to feel snappy, high enough to tolerate a natural breath pause. Any
+# mid-sentence split it does cause is re-merged by TRANSCRIPT_MERGE_WINDOW_MS
+# below, so we get responsiveness without splitting one utterance into two turns.
+# (History: 30→45→55 crept up to fight splits; the merge window makes that moot.)
+HARD_FLUSH_SILENCE_FRAMES = 35
+
+# Debounce window (ms) after the first transcript arrives before firing the LLM.
+# Catches follow-on STT segments from the same split utterance so they can be
+# merged into one turn rather than generating two separate agent responses.
+# 800 ms gives STT enough time to return the second segment when the caller
+# paused briefly mid-sentence.
+TRANSCRIPT_MERGE_WINDOW_MS = 550.0
+
+# Post-response continuation window (ms). If TTS completed cleanly and a short
+# fragment (≤ 4 words) arrives within this window, it is likely a trailing
+# clause of the previous caller turn ("for that", "yes, and also..."). Prepend
+# the previous turn's text so the LLM has full context.
+POST_RESPONSE_MERGE_MS = 800.0
 
 # Fallback phrases played when STT returns empty on substantial speech,
 # or when TTS receives an empty string or fails to play (feature 2 & 5).
@@ -196,6 +220,16 @@ class VoicePipeline:
         self._vad_mute_until = 0.0
         self._barge_in_occurred = False
         self._mic_enabled = mic_enabled
+        # Turn accumulator: tracks full caller text across segments within one
+        # turn. Preserved when barge-in fires so the next STT fragment is merged
+        # with prior context. Cleared when TTS completes a clean (non-barge-in)
+        # response, meaning the caller has been fully answered.
+        self._turn_accumulator: str = ""
+        # Last fully-processed caller text and the time TTS finished for it.
+        # Used to detect short trailing fragments ("for that") that arrive after
+        # a clean TTS completion and should be merged with the previous turn.
+        self._last_user_text: str = ""
+        self._last_tts_end: float = 0.0
         # Issue 4: skip greeting on reconnect — caller already heard it
         self._skip_greeting: bool = skip_greeting
         # Warmup gate — set after all provider warmups complete (feature 6)
@@ -206,6 +240,11 @@ class VoicePipeline:
         # When skip_greeting=True we mark it done immediately so barge-in
         # and STT fallback are active from the start.
         self._greeting_done: bool = skip_greeting
+        # Counts consecutive STT failures (empty transcript while user spoke).
+        # Reset to 0 on any successful transcript.  When it hits the limit the
+        # pipeline plays the agent's graceful-close phrase and stops queuing
+        # more fallbacks — preventing an infinite "sorry I couldn't hear you" loop.
+        self._stt_consecutive_fallbacks: int = 0
 
         # VAD + buffering state
         self._audio_buffer = bytearray()
@@ -221,6 +260,7 @@ class VoicePipeline:
         self._speech_onset_frames = 0  # debounce: frames since speech started
         self._silence_frames = 0       # debounce: frames since last speech
         self._pre_speech_buffer: list[bytes] = []  # look-back to recover onset clip
+        self._echo_gate_speech_frames: int = 0    # sustained frames during echo cooldown
 
         # Diagnostic counters — logged at session end to trace audio path
         self._vad_frames_seen: int = 0
@@ -252,7 +292,7 @@ class VoicePipeline:
         # trailing syllables.  min_words raised so single-frame noise doesn't
         # trigger a turn.
         self._turn = TurnManager(TurnManagerConfig(
-            silence_threshold_ms=1400.0,
+            silence_threshold_ms=1600.0,
             grace_window_ms=300.0,
             min_words_short=2,
             min_words_long=3,
@@ -283,19 +323,29 @@ class VoicePipeline:
                 logger.info("[WARMUP] LLM warmup queued")
             warmup_coros.append(self.conversation.warmup())
 
+        # CRITICAL LATENCY FIX: warm up in the BACKGROUND. The greeting is canned
+        # TTS and does NOT need the LLM — but LLM warmup is a real ~4-5s call to
+        # a US endpoint. Awaiting it here used to delay the caller's first word by
+        # ~10s. Now the greeting plays immediately while warmup runs concurrently
+        # (it finishes long before the caller's first reply needs STT/LLM).
         if warmup_coros:
-            try:
-                results = await asyncio.wait_for(
-                    asyncio.gather(*warmup_coros, return_exceptions=True),
-                    timeout=5.0,
-                )
-                errs = [r for r in results if isinstance(r, Exception)]
-                if errs:
-                    for e in errs:
-                        logger.warning("[WARMUP] Error: %s", e)
-            except asyncio.TimeoutError:
-                logger.warning("[WARMUP] Timed out after 5s — proceeding anyway")
-        self._warmup_done.set()
+            async def _bg_warmup():
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*warmup_coros, return_exceptions=True),
+                        timeout=8.0,
+                    )
+                    for r in results:
+                        if isinstance(r, Exception):
+                            logger.warning("[WARMUP] Error: %s", r)
+                except asyncio.TimeoutError:
+                    logger.warning("[WARMUP] Timed out — proceeding anyway")
+                finally:
+                    self._warmup_done.set()
+                    logger.info("[WARMUP] Background warmup complete")
+            asyncio.create_task(_bg_warmup())
+        else:
+            self._warmup_done.set()
 
         self._tasks = [
             asyncio.create_task(self._audio_vad_layer(), name="audio_vad"),
@@ -522,24 +572,42 @@ class VoicePipeline:
             # PHASE17_DEBUG_DISABLE_BARGE_IN_END
 
         # === ECHO COOLDOWN after TTS ends naturally ===
-        # During this window any captured audio is TTS residue (room echo in
-        # local-mic mode, or codec artifacts in telephony). Discard it so it
-        # never reaches STT and gets mistaken for user speech.
+        # During this window audio is likely TTS residue. Discard it unless
+        # sustained real speech is detected, in which case exit early.
         if time.monotonic() < self._vad_mute_until:
-            if self._audio_buffer:
+            if raw_speech:
+                self._echo_gate_speech_frames = getattr(self, '_echo_gate_speech_frames', 0) + 1
+            else:
+                self._echo_gate_speech_frames = 0
+
+            if self._echo_gate_speech_frames >= ECHO_EARLY_EXIT_FRAMES:
+                # Sustained loud speech during cooldown — this is a real caller,
+                # not echo. Exit the mute window early and let speech through.
                 logger.info(
-                    "[ECHO-GATE] Discarding %d bytes of post-TTS audio "
-                    "(%.0fms cooldown remaining)",
-                    len(self._audio_buffer),
+                    "[ECHO-GATE] Early exit: %d sustained speech frames detected "
+                    "(%.0fms cooldown remaining) — treating as real caller speech",
+                    self._echo_gate_speech_frames,
                     (self._vad_mute_until - time.monotonic()) * 1000,
                 )
-                self._audio_buffer.clear()
-                self._speech_duration_ms = 0.0
-                self._turn.flush()
-            self._prev_speech = False
-            self._speech_onset_frames = 0
-            self._silence_frames = 0
-            return
+                self._vad_mute_until = 0.0
+                self._echo_gate_speech_frames = 0
+                # Fall through to normal VAD processing below
+            else:
+                if self._audio_buffer:
+                    logger.debug(
+                        "[ECHO-GATE] Discarding %d bytes of post-TTS audio "
+                        "(%.0fms cooldown remaining, echo_frames=%d)",
+                        len(self._audio_buffer),
+                        (self._vad_mute_until - time.monotonic()) * 1000,
+                        self._echo_gate_speech_frames,
+                    )
+                    self._audio_buffer.clear()
+                    self._speech_duration_ms = 0.0
+                    self._turn.flush()
+                self._prev_speech = False
+                self._speech_onset_frames = 0
+                self._silence_frames = 0
+                return
 
         # === Normal VAD processing ===
         if raw_speech:
@@ -589,8 +657,8 @@ class VoicePipeline:
 
         # Hard flush: after enough accumulated speech, a long consecutive
         # silence window triggers a flush even if TurnManager hasn't fired.
-        # Using HARD_FLUSH_SILENCE_FRAMES (600 ms) to flush STT buffer promptly
-        # after caller stops speaking.
+        # Using HARD_FLUSH_SILENCE_FRAMES (1100 ms) to flush STT buffer after
+        # the caller stops speaking while tolerating mid-sentence breath pauses.
         if (
             not speech
             and self._speech_duration_ms >= MIN_SPEECH_MS
@@ -694,13 +762,22 @@ class VoicePipeline:
                 # English is also passed explicitly when locked — Sarvam handles
                 # English-IN well and it prevents misclassification on accented
                 # English with Indian words.
+                # Default: auto-detect every turn (prevents a lock feedback loop
+                # and enables dynamic language switching). BUT an agent may pin STT
+                # to one language via languages.stt_forced_language (e.g. "hi-IN")
+                # when it is single-language and auto-detect misfires (Hindi tagged
+                # as Punjabi/Tamil/Malayalam).
                 _stt_lang = "unknown"
-                # Always use unknown for auto-detection — prevents the feedback loop
-                # where language_locked forces STT to a specific language, causing
-                # cross-language transcripts to be mis-detected and keeping the lock
-                # active. Sarvam's auto-detection on each turn enables true dynamic
-                # language switching as required.
-                logger.debug("[STT-WORKER] stt_lang=unknown (auto-detect every turn)")
+                _forced_lang = ""
+                if self.conversation and hasattr(self.conversation, "_def"):
+                    _forced_lang = getattr(
+                        self.conversation._def.languages, "stt_forced_language", ""
+                    ) or ""
+                if _forced_lang:
+                    _stt_lang = _forced_lang
+                    logger.debug("[STT-WORKER] stt_lang forced to %s by agent config", _stt_lang)
+                else:
+                    logger.debug("[STT-WORKER] stt_lang=unknown (auto-detect every turn)")
                 _seg_samples = np.frombuffer(segment.audio, dtype=np.int16).astype(np.float32)
                 _seg_rms = float(np.sqrt(np.mean(_seg_samples ** 2))) if len(_seg_samples) else 0.0
                 logger.info(
@@ -815,24 +892,58 @@ class VoicePipeline:
                             )
                         else:
                             lang = self.conversation.state.language if self.conversation else "en"
-                            fallback = _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
-                            logger.info(
-                                "[STT] Unrecognized speech (%.0fms, lang=%s) — queuing language-fallback phrase",
-                                segment.duration_ms, lang,
-                            )
-                            try:
-                                self._tts_queue.put_nowait(Response(
-                                    text=fallback,
-                                    is_shortcut=True,
-                                    timestamp=time.monotonic(),
-                                ))
-                            except asyncio.QueueFull:
-                                logger.warning("[STT] TTS queue full — cannot play language-fallback phrase")
+                            self._stt_consecutive_fallbacks += 1
+                            _MAX_STT_FALLBACKS = 4
+                            if self._stt_consecutive_fallbacks > _MAX_STT_FALLBACKS:
+                                # Break the infinite loop: too many consecutive failures.
+                                # Play a graceful-close phrase and stop queuing more fallbacks.
+                                logger.warning(
+                                    "[STT] %d consecutive STT failures — playing graceful close to break loop",
+                                    self._stt_consecutive_fallbacks,
+                                )
+                                close_text = None
+                                if self.conversation and hasattr(self.conversation, '_def'):
+                                    rb = self.conversation._def.response_bank
+                                    close_text = (
+                                        rb.graceful_close.get(lang)
+                                        or rb.lang_fallbacks.get(lang)
+                                        or rb.response_fallback
+                                    )
+                                if not close_text:
+                                    close_text = {
+                                        "hi": "क्षमा कीजिए, मुझे आपकी आवाज़ सुनने में परेशानी हो रही है। कृपया बाद में कॉल करें।",
+                                        "gu": "માફ કરશો, મને સાંભળવામાં તકલીફ છે. કૃપા કરીને પછીથી કૉલ કરો.",
+                                        "en": "I'm sorry, I'm having trouble hearing you. Please try calling again shortly.",
+                                    }.get(lang, "I'm sorry, I'm having trouble hearing you. Please try calling again.")
+                                try:
+                                    self._tts_queue.put_nowait(Response(
+                                        text=close_text,
+                                        is_shortcut=True,
+                                        timestamp=time.monotonic(),
+                                    ))
+                                except asyncio.QueueFull:
+                                    pass
+                            else:
+                                fallback = _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
+                                logger.info(
+                                    "[STT] Unrecognized speech (%.0fms, lang=%s, attempt %d/%d) — queuing fallback",
+                                    segment.duration_ms, lang,
+                                    self._stt_consecutive_fallbacks, _MAX_STT_FALLBACKS,
+                                )
+                                try:
+                                    self._tts_queue.put_nowait(Response(
+                                        text=fallback,
+                                        is_shortcut=True,
+                                        timestamp=time.monotonic(),
+                                    ))
+                                except asyncio.QueueFull:
+                                    logger.warning("[STT] TTS queue full — cannot play language-fallback phrase")
                     else:
                         logger.info("[STT] Empty transcript (%.0fms) — below fallback threshold, skipping",
                                     segment.duration_ms)
                     continue
 
+                self._stt_consecutive_fallbacks = 0  # successful transcript — reset failure streak
                 logger.info("[STT] %r (%.0fms latency)", transcript_text, stt_latency)
 
                 if self._hub is not None:
@@ -878,22 +989,107 @@ class VoicePipeline:
             except asyncio.CancelledError:
                 break
 
-            # Drain any newer transcripts — only process the most recent one.
-            # When the caller speaks multiple times while the agent was processing
-            # (or barge-in produced several quick segments), responding to stale
-            # earlier transcripts causes the agent to reply out of context.
-            # Note: all drained transcripts had their QA observer called in the STT
-            # worker already; we only skip conversation engine processing here.
+            # Debounce: wait a short window for a follow-on segment from the same
+            # utterance. VAD may split one sentence at a natural pause and fire
+            # two STT results in quick succession. Merging them prevents two
+            # separate LLM calls and two back-to-back agent responses.
+            try:
+                follow_on = await asyncio.wait_for(
+                    self._transcript_queue.get(),
+                    timeout=TRANSCRIPT_MERGE_WINDOW_MS / 1000.0,
+                )
+                time_gap = follow_on.timestamp - transcript.timestamp
+                if time_gap < 3.0:
+                    # Close in time — continuation of the same utterance; merge.
+                    merged_text = transcript.text.rstrip(" .,") + " " + follow_on.text.lstrip()
+                    logger.info(
+                        "[ENGINE] Merging split segments (%.1fs gap): %r + %r",
+                        time_gap, transcript.text[:35], follow_on.text[:35],
+                    )
+                    transcript = Transcript(
+                        text=merged_text,
+                        duration_ms=transcript.duration_ms + follow_on.duration_ms,
+                        timestamp=follow_on.timestamp,
+                        stt_latency_ms=follow_on.stt_latency_ms,
+                    )
+                else:
+                    # Gap too large — from a genuinely separate prior turn; discard.
+                    logger.info(
+                        "[ENGINE] Dropping old segment (%.1fs gap): %r",
+                        time_gap, follow_on.text[:40],
+                    )
+            except asyncio.TimeoutError:
+                pass  # No follow-on within window — proceed with single transcript
+
+            # Drain any remaining queued transcripts.
+            # Transcripts that arrived recently (within 3 s) are very likely
+            # continuations of the same utterance — the VAD split a long
+            # sentence at a natural pause and two STT results landed in quick
+            # succession. Merge them into the current turn so the LLM sees the
+            # full sentence. Older transcripts are genuinely stale (leftover
+            # from a previous turn while the agent was speaking) and are dropped.
+            _drain_now = time.monotonic()
             while not self._transcript_queue.empty():
                 try:
-                    newer = self._transcript_queue.get_nowait()
-                    logger.info(
-                        "[ENGINE] Skipping stale transcript %r in favor of: %r",
-                        transcript.text[:50], newer.text[:50],
-                    )
-                    transcript = newer
+                    candidate = self._transcript_queue.get_nowait()
+                    age_s = _drain_now - candidate.timestamp
+                    if age_s <= 3.0:
+                        merged_text = transcript.text.rstrip(" .,") + " " + candidate.text.lstrip()
+                        transcript = Transcript(
+                            text=merged_text,
+                            duration_ms=transcript.duration_ms + candidate.duration_ms,
+                            timestamp=candidate.timestamp,
+                            stt_latency_ms=candidate.stt_latency_ms,
+                        )
+                        logger.info(
+                            "[ENGINE] Merging late continuation (%.1fs): %r + %r",
+                            age_s, transcript.text[:40], candidate.text[:40],
+                        )
+                    else:
+                        logger.info(
+                            "[ENGINE] Discarding stale transcript (%.1fs old): %r",
+                            age_s, candidate.text[:50],
+                        )
                 except asyncio.QueueEmpty:
                     break
+
+            # ── Turn accumulator (Change 3) ──────────────────────────────────
+            # Determine the effective text the LLM will receive this turn.
+            #
+            # Case A — barge-in context: if the caller interrupted the agent
+            # mid-response, _turn_accumulator holds what they said before the
+            # interruption. Prepend it so the LLM sees the complete caller turn,
+            # not just the barge-in fragment.
+            #
+            # Case B — post-response continuation: if TTS finished cleanly a
+            # moment ago and the new transcript is very short (≤ 4 words), it is
+            # likely a trailing clause ("for that", "yes, and...") that arrived
+            # just after the VAD split. Prepend the previous turn's text.
+            now = time.monotonic()
+            effective_text = transcript.text
+            if self._turn_accumulator:
+                effective_text = (
+                    self._turn_accumulator.rstrip(" .,") + " " + transcript.text.lstrip()
+                )
+                logger.info(
+                    "[ENGINE] Prepending barge-in context to transcript: %r + %r → %r",
+                    self._turn_accumulator[:40], transcript.text[:40], effective_text[:60],
+                )
+            elif (
+                self._last_user_text
+                and (now - self._last_tts_end) < POST_RESPONSE_MERGE_MS / 1000.0
+                and len(transcript.text.split()) <= 4
+            ):
+                effective_text = (
+                    self._last_user_text.rstrip(" .,") + " " + transcript.text.lstrip()
+                )
+                logger.info(
+                    "[ENGINE] Merging post-response fragment %r with prior turn %r → %r",
+                    transcript.text[:35], self._last_user_text[:35], effective_text[:60],
+                )
+            # Save for potential next barge-in
+            self._turn_accumulator = effective_text
+            self._last_user_text = effective_text
 
             try:
                 async def _run_generation():
@@ -909,7 +1105,7 @@ class VoicePipeline:
                     llm_parts: list[str] = []
 
                     async for result in self.conversation.process_stream(
-                        transcript.text
+                        effective_text
                     ):
 
                         if first_result is None:
@@ -939,11 +1135,53 @@ class VoicePipeline:
                                     "[ENGINE] TTS queue full -- dropping shortcut chunk"
                                 )
                         else:
-                            # Buffer LLM sentence chunks; sent combined below.
-                            llm_parts.append(result.text)
+                            # First LLM sentence → TTS immediately to cut
+                            # perceived latency. Remaining sentences are buffered
+                            # and sent as one follow-up request once the LLM
+                            # finishes, avoiding per-sentence TTS gaps.
+                            #
+                            # Exception: if the first chunk ends on a dangling
+                            # conjunction ("but", "and", "however", …), it is an
+                            # incomplete thought mid-stream. Sending it alone
+                            # produces sentences like "I understand but" that
+                            # confuse callers. Buffer it and merge with the next
+                            # chunk so the caller hears a complete sentence.
+                            _DANGLING_END = re.compile(
+                                r'\b(but|and|or|yet|however|also|so|although|'
+                                r'though|because|since|if|when|while|after|'
+                                r'before|as|that|which|who|whom)\s*[,.]?\s*$',
+                                re.IGNORECASE,
+                            )
+                            if not llm_parts:
+                                if _DANGLING_END.search(result.text.rstrip()):
+                                    logger.debug(
+                                        "[ENGINE] First sentence ends on conjunction — buffering: %r",
+                                        result.text[:60],
+                                    )
+                                    llm_parts.append(result.text)
+                                else:
+                                    try:
+                                        self._tts_queue.put_nowait(
+                                            Response(
+                                                text=result.text,
+                                                is_shortcut=False,
+                                                timestamp=time.monotonic(),
+                                            )
+                                        )
+                                        logger.debug(
+                                            "[ENGINE] First LLM sentence → TTS immediately: %r",
+                                            result.text[:60],
+                                        )
+                                    except asyncio.QueueFull:
+                                        logger.warning(
+                                            "[ENGINE] TTS queue full — buffering first sentence"
+                                        )
+                                        llm_parts.append(result.text)
+                            else:
+                                llm_parts.append(result.text)
 
-                    # Send all LLM sentences as ONE TTS request to produce a
-                    # single coherent utterance instead of fragmented pieces.
+                    # Send remaining LLM sentences (2nd sentence onwards) as
+                    # one combined TTS request to avoid inter-sentence gaps.
                     if llm_parts:
                         combined_text = " ".join(llm_parts)
                         try:
@@ -1043,7 +1281,7 @@ class VoicePipeline:
             # already drains this queue via _flush_pipeline_queues(), so this
             # cap only fires on genuinely stuck pipelines.
             age_ms = (time.monotonic() - response.timestamp) * 1000
-            if age_ms > 30000:
+            if age_ms > 8000:
                 logger.warning("[TTS] Dropping stale response (%.0fms old): %r",
                                age_ms, response.text[:50])
                 continue
@@ -1142,7 +1380,14 @@ class VoicePipeline:
 
                 if self._barge_in_occurred:
                     self._barge_in_occurred = False
+                    # Accumulator intentionally kept: the next transcript will be
+                    # merged with what the caller said before the interruption.
                 else:
+                    # Clean completion — caller was fully answered. Clear the
+                    # turn accumulator so the next turn starts fresh. Record
+                    # when TTS ended for post-response continuation detection.
+                    self._turn_accumulator = ""
+                    self._last_tts_end = time.monotonic()
                     # Issue 3: In telephony mode the echo of TTS audio returns
                     # via mod_audio_stream with a delay of:
                     #   injection_overhead + audio_playback_duration

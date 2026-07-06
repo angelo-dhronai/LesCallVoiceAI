@@ -12,6 +12,8 @@ import re
 import logging
 from rapidfuzz import fuzz
 
+from ...agent_definition.schema import STTCorrections
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -387,12 +389,17 @@ def _apply_corrections(text: str, corrections: dict[str, str]) -> str:
     return text
 
 
-def post_process_transcript(text: str, language: str = "en") -> str:
+def post_process_transcript(
+    text: str,
+    language: str = "en",
+    corrections: STTCorrections | None = None,
+) -> str:
     """
     Apply domain-specific corrections to STT output.
 
-    Order: BHK normalization -> city corrections -> language-specific
-    corrections -> real estate terms.
+    Order: phonetic → BHK normalisation → city → real-estate → project names.
+    If `corrections` is provided, its tables are applied as an additional pass
+    after the built-in tables, letting agent-specific overrides take priority.
     """
     if not text or not text.strip():
         return text
@@ -409,6 +416,13 @@ def post_process_transcript(text: str, language: str = "en") -> str:
         result = _apply_corrections(result, _HINDI_CORRECTIONS)
     if language in ("gu", "en", "unknown"):
         result = _apply_corrections(result, _GUJARATI_CORRECTIONS)
+
+    # Agent-specific corrections overlay — applied last so they win on conflict.
+    if corrections is not None:
+        result = _apply_corrections(result, corrections.phonetic_corrections)
+        result = _apply_corrections(result, corrections.city_corrections)
+        result = _apply_corrections(result, corrections.real_estate_corrections)
+        result = _apply_corrections(result, corrections.project_name_corrections)
 
     if result != text:
         logger.info("[STT-PP] %r -> %r", text, result)

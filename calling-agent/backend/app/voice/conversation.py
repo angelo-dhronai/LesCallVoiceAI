@@ -14,6 +14,7 @@ shortcuts for low latency.
 
 from __future__ import annotations
 
+import json
 import asyncio
 import os
 import re
@@ -25,33 +26,9 @@ from openai import AsyncOpenAI
 
 from .memory import ConversationMemory, BookingData, CallState
 from .stt.post_processor import match_location, match_bhk
+from ..agent_definition import AgentDefinition, get_pramukh_agent
 
 # ---------------------------------------------------------------------------
-# Known Pramukh Group projects — used for project-context locking
-# Keys are lowercase substrings; values are (canonical_name, location).
-# Longer keys listed first so _extract_project_from_text() matches
-# "aranya ii" before "aranya".
-# ---------------------------------------------------------------------------
-_KNOWN_PROJECTS: dict[str, tuple[str, str]] = {
-    "central park":  ("Central Park",  "Surat"),
-    "aranya ii":     ("Aranya II",     "Surat"),
-    "aranya 2":      ("Aranya II",     "Surat"),
-    "yogi woods":    ("Yogi Woods",    "Silvassa"),
-    "revanta":       ("Revanta",       "Surat"),
-    "vivanta":       ("Vivanta",       "Surat"),
-    "satva":         ("Satva",         "Surat"),
-    "agastya":       ("Agastya",       "Surat"),
-    "aranya":        ("Aranya",        "Surat"),
-    "aura":          ("Aura",          "Vapi"),
-    "sahaj":         ("Sahaj",         "Vapi"),
-    "vedanta":       ("Vedanta",       "Vapi"),
-    "sangath":       ("Sangath",       "Silvassa"),
-    "shivanta":      ("Shivanta",      "Silvassa"),
-    "swagat":        ("Swagat",        "Silvassa"),
-    "orbit":         ("Orbit",         "Surat"),
-    # legacy / alias names that may appear in STT output
-    "oak cove":      ("Oak Cove",      "Surat"),
-}
 
 # ---------------------------------------------------------------------------
 # Stages
@@ -138,59 +115,30 @@ class ConversationState:
         self.project_recommended: str | None = None  # project name mentioned to caller
 
 
-# ---------------------------------------------------------------------------
-# Available appointment slots (mock — replace with real calendar API)
-# ---------------------------------------------------------------------------
-
-_AVAILABLE_SLOTS = [
-    {"day": "Tomorrow", "time": "10:00 AM"},
-    {"day": "Tomorrow", "time": "2:00 PM"},
-    {"day": "Day after tomorrow", "time": "11:00 AM"},
-    {"day": "This Saturday", "time": "10:00 AM"},
-    {"day": "This Saturday", "time": "3:00 PM"},
-]
-
-_SLOTS_EN = ", ".join(f"{s['day']} at {s['time']}" for s in _AVAILABLE_SLOTS[:3])
-_SLOTS_HI = "कल सुबह 10 बजे, कल दोपहर 2 बजे, या परसों सुबह 11 बजे"
-_SLOTS_GU = "કાલે સવારે 10 વાગે, કાલે બપોરે 2 વાગે, અથવા પરમ દિવસે સવારે 11 વાગે"
 
 
-# ---------------------------------------------------------------------------
-# Intent detection — domain-specific for Pramukh Group
-# ---------------------------------------------------------------------------
-
-_LOCATION_NAMES = {
-    "surat", "vapi", "silvassa",
-    "સુરત", "વાપી", "સિલવાસા",
-    "सूरत", "वापी", "सिलवासा",
-}
-
-_OBJECTION_PATTERNS = [
-    "not interested", "busy right now", "call later", "already using",
-    "don't need", "no time", "don't want", "stop calling",
-    "not looking", "no need", "wrong number", "remove my number",
-    # "later" / "not now" — deferral is an objection, treat it kindly
-    "talk later", "later please", "maybe later", "some other time",
-    "another time", "not right now", "call me later", "call later",
-    "call back later", "call you later",
-    "baad mein baat", "baad me baat", "baadme baat",
-    "phir baat", "phir karte", "phir baat karenge",
-    "abhi nahi", "abhi nai", "abhi busy",
-    "fursat nahi",
-]
-
-_TIME_PATTERNS = [
-    "morning", "afternoon", "evening", "tomorrow", "today",
-    "this weekend", "saturday", "sunday", "next week",
-    "10 am", "11 am", "2 pm", "3 pm",
-    "subah", "dopahar", "shaam", "kal", "parso", "aaj",
-    "savare", "bapore", "saanje", "kaale", "aaje",
-    "सुबह", "दोपहर", "शाम", "कल", "परसों", "आज",
-    "સવારે", "બપોરે", "સાંજે", "કાલે", "આજે",
-]
+# Universal objection/deferral phrases — fallback when an agent defines no
+# objection_patterns of its own (English + romanized Hindi core set). Without
+# this, agents with an empty YAML list silently lose objection handling.
+_DEFAULT_OBJECTION_PATTERNS = (
+    "not interested", "busy right now", "call later", "call me later",
+    "call back later", "don't need", "dont need", "no time", "don't want",
+    "stop calling", "not looking", "no need", "wrong number",
+    "remove my number", "talk later", "later please", "maybe later",
+    "some other time", "another time", "not right now",
+    "baad mein baat", "baad me baat", "phir baat", "phir baat karenge",
+    "abhi nahi", "abhi nai", "abhi busy", "fursat nahi",
+)
 
 
-def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
+def detect_intent(
+    text: str,
+    stage: str = STAGE_GREETING,
+    *,
+    location_aliases: frozenset[str] = frozenset(),
+    objection_patterns: list[str] | tuple[()] = (),
+    time_patterns: list[str] | tuple[()] = (),
+) -> str:
     """Classify user input into a domain intent. Fast and deterministic."""
     if not text or not text.strip():
         return "general"
@@ -198,7 +146,7 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
     lower = text.lower().strip()
 
     # Objection — highest priority
-    if any(p in lower for p in _OBJECTION_PATTERNS):
+    if any(p in lower for p in (objection_patterns or _DEFAULT_OBJECTION_PATTERNS)):
         return "objection"
     if any(w in lower for w in ["दिलचस्पी नहीं", "बिज़ी", "ज़रूरत नहीं",
                                   "રસ નથી", "વ્યસ્ત", "જરૂર નથી"]):
@@ -336,7 +284,7 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
     loc = match_location(lower)
     if loc:
         return "location_selection"
-    if any(w in lower for w in _LOCATION_NAMES):
+    if location_aliases and any(w in lower for w in location_aliases):
         return "location_selection"
 
     # BHK / property type
@@ -347,7 +295,7 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
         return "property_type"
 
     # Time preference
-    if any(p in lower for p in _TIME_PATTERNS):
+    if any(p in lower for p in time_patterns):
         return "time_preference"
 
     # Affirmation
@@ -506,91 +454,7 @@ def _slot_period(time_str: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Objection responses (multilingual, Pramukh-specific)
-# ---------------------------------------------------------------------------
-
-_OBJECTION_RESPONSES: dict[str, list[str]] = {
-    "en": [
-        "Of course, I completely understand. Would another time work better for a quick call? Otherwise no problem at all.",
-        "No problem at all — when would be a more convenient time? Just a brief chat.",
-    ],
-    "hi": [
-        "जी बिल्कुल, मैं समझता हूँ। क्या किसी और समय एक छोटी सी बात हो सकती है? वरना कोई बात नहीं।",
-        "कोई बात नहीं। आप बताइए कब सुविधाजनक रहेगा, बस एक छोटी सी बात करनी है।",
-    ],
-    "gu": [
-        "જી બિલકુલ, હું સમજું છું. શું બીજા કોઈ સમયે થોડી વાત થઈ શકે? નહીંતર કોઈ વાત નહીં.",
-        "કોઈ વાત નહીં. તમે જણાવો ક્યારે અનુકૂળ રહેશે, બસ થોડી વાત કરવી છે.",
-    ],
-}
-
-# Used after a SECOND deferral/objection in the same call — we back off
-# completely with a warm goodbye instead of pushing.
-_DECLINE_FAREWELL_RESPONSES: dict[str, str] = {
-    "en": "Of course, no problem at all. I won't take any more of your time — have a wonderful day, take care!",
-    "hi": "जी बिल्कुल, कोई बात नहीं। मैं आपका और समय नहीं लूँगा। आपका दिन शुभ रहे, फिर मिलते हैं!",
-    "gu": "જી બિલકુલ, કોઈ વાત નહીં. હું તમારો વધુ સમય નહીં લઉં. તમારો દિવસ શુભ રહે, ફરી મળીશું!",
-}
-
-# ---------------------------------------------------------------------------
-# Filler responses (multilingual, Pramukh-specific)
-# ---------------------------------------------------------------------------
-
-_FILLER_RESPONSES: dict[str, list[str]] = {
-    "en": ["One moment...", "Sure, let me check..."],
-    "hi": ["एक सेकंड...", "बिल्कुल, बताता हूँ..."],
-    "gu": ["એક સેકન્ડ...", "બિલકુલ, જણાવું છું..."],
-}
-
-# ---------------------------------------------------------------------------
-# Timeout / error fallbacks
-# ---------------------------------------------------------------------------
-
-_TIMEOUT_FALLBACKS: dict[str, str] = {
-    "en": "Let me get back to you on that.",
-    "hi": "मैं इस पर वापस आता हूँ।",
-    "gu": "હું આના પર પાછો આવું છું.",
-}
-
 _RESPONSE_FALLBACK = "Sorry, could you repeat that?"
-
-# ---------------------------------------------------------------------------
-# Language switch confirmation responses
-# ---------------------------------------------------------------------------
-
-_LANG_SWITCH_RESPONSES: dict[str, str] = {
-    "hi": "जी बिल्कुल, हम हिंदी में बात करते हैं। बताइए, मैं आपकी कैसे मदद कर सकता हूँ?",
-    "en": "Sure, let's continue in English. How can I help you?",
-    "gu": "જી બિલકુલ, ચાલો ગુજરાતીમાં વાત કરીએ. બોલો, હું તમારી કેવી રીતે મદદ કરી શકું?",
-}
-
-# ---------------------------------------------------------------------------
-# Identity responses — fast deterministic answers for "who is this?"
-# ---------------------------------------------------------------------------
-
-_IDENTITY_RESPONSES: dict[str, str] = {
-    "en": (
-        "I'm calling from Pramukh Group, one of Gujarat's most trusted real estate developers. "
-        "You had shown interest in our properties and raised an inquiry. "
-        "I just wanted to have a quick chat about what you're looking for."
-    ),
-    "hi": (
-        "जी, मैं Pramukh Group से बात कर रहा हूँ, हम Gujarat के जाने-माने रियल एस्टेट डेवलपर हैं। "
-        "आपने हमारी प्रॉपर्टीज में इंटरेस्ट दिखाया था और इंक्वायरी भी की थी। "
-        "मैं बस आपसे इसके बारे में थोड़ी बात करना चाहता था।"
-    ),
-    "gu": (
-        "જી, હું Pramukh Group તરફથી બોલું છું, અમે Gujarat ના જાણીતા રિયલ એસ્ટેટ ડેવલપર છીએ. "
-        "તમે અમારી પ્રોપર્ટીઝમાં ઇન્ટરેસ્ટ દર્શાવ્યો હતો અને ઇન્ક્વાયરી પણ કરી હતી. "
-        "હું બસ આ વિશે થોડી વાત કરવા માંગતો હતો."
-    ),
-}
-
-_LANG_FALLBACKS: dict[str, str] = {
-    "hi": "माफ़ कीजिए, क्या आप दोबारा बोल सकते हैं?",
-    "gu": "માફ કરશો, શું તમે ફરીથી બોલી શકો?",
-    "en": "Sorry, could you repeat that?",
-}
 
 # ---------------------------------------------------------------------------
 # Repeat-request detection patterns (multilingual)
@@ -604,65 +468,6 @@ _REPEAT_DETECT_PATTERNS = [
     "ફરી બોલ", "ફરી",
 ]
 
-# ---------------------------------------------------------------------------
-# Localized responses for shortcut intents
-# ---------------------------------------------------------------------------
-
-_LOCALIZED_RESPONSES: dict[str, dict[str, list[str] | str]] = {
-    "hi": {
-        "greeting": ["हेलो! Pramukh Group से बात कर रहा हूँ।", "हेलो! बोलिए, कैसे मदद कर सकता हूँ?"],
-        "farewell": "अच्छा, फिर मिलते हैं! Pramukh Group से कॉल के लिए धन्यवाद।",
-        "gratitude": ["शुक्रिया! तो बताइए, आप किस शहर में प्रॉपर्टी देख रहे हैं?", "आपका स्वागत है! तो आगे बात करते हैं।"],
-        "closing": "बहुत अच्छा! हम आपको डिटेल्स भेज देंगे। धन्यवाद!",
-    },
-    "gu": {
-        "greeting": ["હેલો! Pramukh Group તરફથી બોલું છું.", "હેલો! બોલો, કેવી રીતે મદદ કરી શકું?"],
-        "farewell": "સારું, ફરી મળીશું! Pramukh Group તરફથી કૉલ માટે આભાર.",
-        "gratitude": ["આભાર! તો બોલો, ક્યા શહેરમાં property જોવી છે?", "આપનું સ્વાગત છે! ચાલો આગળ વાત કરીએ."],
-        "closing": "ખૂબ સરસ! અમે તમને ડિટેલ્સ મોકલીશું. આભાર!",
-    },
-}
-
-# ---------------------------------------------------------------------------
-# Proactive stage prompts — used only as fallback; LLM drives primary flow
-# ---------------------------------------------------------------------------
-
-_PROACTIVE_PROMPTS: dict[str, dict[str, str]] = {
-    STAGE_DISCOVERY: {
-        "en": "What kind of property are you looking for — for yourself or as an investment?",
-        "hi": "आप किस तरह की प्रॉपर्टी ढूंढ रहे हैं — अपने रहने के लिए या investment के लिए?",
-        "gu": "તમે કેવા પ્રકારની પ્રોપર્ટી શોધી રહ્યા છો — ખુદ રહેવા માટે કે investment માટે?",
-    },
-    STAGE_PROJECT_MATCH: {
-        "en": "Based on what you've shared, I have a great option in mind for you.",
-        "hi": "आप ने जो बताया उसके हिसाब से, मेरे पास आपके लिए एक बहुत अच्छा option है।",
-        "gu": "તમે જે જણાવ્યું તે જોઈને, મારી પાસે તમારા માટે ખૂબ સારો option છે.",
-    },
-    STAGE_INVITE_VISIT: {
-        "en": f"Would you like to schedule a site visit? We have slots: {_SLOTS_EN}. Which works for you?",
-        "hi": f"क्या एक site visit schedule कर सकते हैं? हमारे पास ये slots हैं: {_SLOTS_HI}। कौन सा सही रहेगा?",
-        "gu": f"શું આપણે site visit schedule કરી શકીએ? અમારી પાસે આ slots છે: {_SLOTS_GU}. કયો ચાલશે?",
-    },
-}
-
-# ---------------------------------------------------------------------------
-# Opening greeting — inbound warm welcome, bilingual for language detection
-# ---------------------------------------------------------------------------
-
-_OPENING_GREETING: str = (
-    "Hello! Namaste — this is Vishal Patel calling from Pramukh Group. "
-    "Hope I haven't caught you at a bad time."
-)
-
-# ---------------------------------------------------------------------------
-# Graceful close — when user declines twice
-# ---------------------------------------------------------------------------
-
-_GRACEFUL_CLOSE: dict[str, str] = {
-    "en": "Thank you so much for your time! If you ever want to explore options, feel free to call back. Have a great day!",
-    "hi": "आपके समय के लिए बहुत बहुत धन्यवाद! जब भी dekhna ho, call kariye. आपका दिन शुभ हो।",
-    "gu": "તમારા સમય માટે ખૂબ ખૂબ આભાર! ક્યારે પણ જોવું હોય, call karjo. તમારો દિવસ શુભ રહે.",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -713,15 +518,31 @@ class ConversationRouter:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gpt-4o-mini",
-        timeout: float = LLM_TIMEOUT,
+        model: str | None = None,
+        timeout: float | None = None,
         default_language: str = "hi",
+        agent_def: AgentDefinition | None = None,
     ) -> None:
-        self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
-        self._model = model
-        self._timeout = timeout
+        # Agent definition drives all domain-specific behaviour.
+        # Explicit constructor args override the definition for backward compat.
+        self._def: AgentDefinition = agent_def or get_pramukh_agent()
+        # LLM provider is swappable via env WITHOUT code changes — set all three
+        # to move off US-hosted OpenAI onto a fast in-region endpoint (e.g. Gemini
+        # OpenAI-compat) and cut ~1s of trans-Pacific latency per turn:
+        #   LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+        #   LLM_API_KEY=<key>   LLM_MODEL=gemini-2.0-flash-lite
+        # Defaults preserve the previous behaviour (OpenAI, gpt-4o-mini).
+        self._api_key = (
+            api_key
+            or os.environ.get("LLM_API_KEY", "").strip()
+            or os.environ.get("OPENAI_API_KEY", "")
+        )
+        self._base_url = os.environ.get("LLM_BASE_URL", "").strip() or None
+        self._model = model or os.environ.get("LLM_MODEL", "").strip() or self._def.llm_config.model
+        self._timeout = timeout if timeout is not None else self._def.llm_config.timeout_s
         self._client: AsyncOpenAI | None = None
-        self.memory = ConversationMemory()
+        _qa_signals = self._def.knowledge_base.qa_field_signals or None
+        self.memory = ConversationMemory(field_signals=_qa_signals)
         self.state = ConversationState()
         self.state.language = default_language
         self._response_counter = 0
@@ -737,17 +558,137 @@ class ConversationRouter:
         self._name_pending: str | None = None
         self._name_confirmed: bool = False
         self._name_pending_turn: int = 0   # turn index when _name_pending was set
+        self._rag_context: str = ""        # populated from documents before each LLM call
+
+        # Call context — direction defaults to the agent's configured type;
+        # the telephony bridge overrides per call via set_call_context()
+        # (e.g. an outbound dial carries the dialed contact's name/number).
+        self.call_direction: str = (getattr(self._def, "call_direction", "") or "inbound").lower()
+        self.outbound_contact_name: str = ""
+        self.outbound_contact_phone: str = ""
+        self.conn_id: str = ""
+
+        # Conversation State Management layer — per-call structured memory:
+        # extraction, merge, audit trail, missing-slot detection, and the
+        # single authoritative state block injected into every system prompt.
+        from .state_manager import build_state_manager
+        self.state_mgr = build_state_manager(self._def, language=default_language)
+        # Fallback LLM (lazy; see _get_fallback_client).
+        self._fallback_client: AsyncOpenAI | None = None
+        self._fallback_model: str = "gpt-4o-mini"
+        # Async LLM slot-extractor bookkeeping (strong ref; latest turn only).
+        self._slot_extract_task: asyncio.Task | None = None
+        self._slot_extract_enabled = (
+            os.environ.get("ENABLE_LLM_SLOT_EXTRACTOR", "true").lower() != "false"
+        )
 
         if not self._api_key:
             logger.warning("[CONV] OPENAI_API_KEY not set -- LLM calls will fail")
 
     def _get_client(self) -> AsyncOpenAI:
         if self._client is None:
-            self._client = AsyncOpenAI(
-                api_key=self._api_key,
-                timeout=self._timeout,
-            )
+            _kwargs = {"api_key": self._api_key, "timeout": self._timeout}
+            if self._base_url:
+                _kwargs["base_url"] = self._base_url
+            self._client = AsyncOpenAI(**_kwargs)
         return self._client
+
+    def _get_fallback_client(self) -> AsyncOpenAI | None:
+        """Secondary LLM used when the primary fails (quota/429/auth/network).
+
+        Config: LLM_FALLBACK_BASE_URL / LLM_FALLBACK_MODEL / LLM_FALLBACK_API_KEY.
+        Defaults to OpenAI gpt-4o-mini on OPENAI_API_KEY — always funded here,
+        slower (US) but a slow answer beats a canned 'please repeat'. Returns
+        None when no usable fallback exists or it would duplicate the primary.
+        """
+        if self._fallback_client is not None:
+            return self._fallback_client
+        fb_key = (os.environ.get("LLM_FALLBACK_API_KEY", "").strip()
+                  or os.environ.get("OPENAI_API_KEY", "").strip())
+        fb_base = os.environ.get("LLM_FALLBACK_BASE_URL", "").strip() or None
+        self._fallback_model = (os.environ.get("LLM_FALLBACK_MODEL", "").strip()
+                                or "gpt-4o-mini")
+        if not fb_key:
+            return None
+        if fb_base == self._base_url and self._fallback_model == self._model:
+            return None  # identical to primary — nothing to fall back to
+        _kwargs = {"api_key": fb_key, "timeout": self._timeout}
+        if fb_base:
+            _kwargs["base_url"] = fb_base
+        self._fallback_client = AsyncOpenAI(**_kwargs)
+        return self._fallback_client
+
+    # ------------------------------------------------------------------
+    # Call context (direction + outbound contact identity)
+    # ------------------------------------------------------------------
+
+    def set_call_context(
+        self,
+        direction: str | None = None,
+        contact_name: str = "",
+        contact_phone: str = "",
+        conn_id: str = "",
+    ) -> None:
+        """Per-call override set by the telephony bridge before the greeting.
+
+        For outbound dials the dashboard logs the contact's name/number at
+        dial time (dashboard/call_link.json); the bridge passes them here so
+        the agent can greet the contact by name and confirm identity."""
+        if direction:
+            self.call_direction = direction.lower()
+        if contact_name:
+            self.outbound_contact_name = contact_name.strip()
+            # Prefill so missing-slot detection never re-asks for the name;
+            # the prompt still instructs an identity confirmation first.
+            if not self.memory.call_state.customer_name:
+                self.memory.call_state.customer_name = self.outbound_contact_name
+        if contact_phone:
+            self.outbound_contact_phone = contact_phone.strip()
+        if conn_id:
+            self.conn_id = conn_id
+        logger.info("[CONTEXT] direction=%s contact=%r", self.call_direction,
+                    self.outbound_contact_name or None)
+
+    # ------------------------------------------------------------------
+    # Calendar availability + booking persistence
+    # ------------------------------------------------------------------
+
+    def _agent_folder(self) -> str:
+        try:
+            from ..documents.store import get_folder_by_agent_id
+            return get_folder_by_agent_id(self._def.agent_id) or ""
+        except Exception:
+            return ""
+
+    def _available_calendar_slots(self) -> list:
+        """Configured mock_slots minus slots already booked in bookings.json."""
+        try:
+            from ..agent_definition.calendar_store import available_slots
+            return available_slots(self._def, self._agent_folder())
+        except Exception:
+            return list(self._def.calendar.mock_slots or [])
+
+    def _record_calendar_booking(self, appointment_time: str) -> None:
+        """Persist a booked slot so later calls see it as taken. Best-effort."""
+        try:
+            from ..agent_definition.calendar_store import add_booking
+            folder = self._agent_folder()
+            if not folder:
+                return
+            slot_day, _, slot_time = appointment_time.partition(" at ")
+            b = self.memory.booking
+            cs = self.memory.call_state
+            add_booking(
+                folder,
+                slot_day=slot_day.strip(),
+                slot_time=slot_time.strip(),
+                appointment_time=appointment_time,
+                caller_name=b.user_name or cs.customer_name or self.outbound_contact_name,
+                caller_phone=cs.customer_phone or self.outbound_contact_phone,
+                conn_id=self.conn_id,
+            )
+        except Exception as exc:
+            logger.warning("[CALENDAR] booking persistence failed: %r", exc)
 
     # ------------------------------------------------------------------
     # Opening greeting (outbound call starts here)
@@ -756,7 +697,21 @@ class ConversationRouter:
     async def generate_opening(self) -> EngineResult:
         """Inbound warm welcome — agent answers the call.
         Bilingual so caller can respond in their preferred language."""
-        greeting = _OPENING_GREETING
+        greeting = self._def.response_bank.opening_greeting
+        # Outbound personalization: greet the dialed contact by name. Canonical
+        # form is {contact_name}; also tolerate the template syntaxes LLM
+        # editors keep inventing (${contact_name}, {{contact_name}}, [name],
+        # <contact>) — a raw template token must NEVER be spoken to a caller.
+        _ph = re.compile(
+            r"(?:\$\{|\{\{|\{|\[|<)\s*"
+            r"(?:contact[ _\-]?name|customer[ _\-]?name|person[ _\-]?name|callee[ _\-]?name|contact|name)"
+            r"\s*(?:\}\}|\}|\]|>)"
+            r"|\$contact[ _\-]?name\b",
+            re.IGNORECASE,
+        )
+        if _ph.search(greeting):
+            _who = self.outbound_contact_name or "sir/ma'am"
+            greeting = _ph.sub(lambda _m: _who, greeting)  # lambda: name is literal, not a regex template
         self.memory.add_assistant(greeting, language=self.state.language)
         self.state.stage = STAGE_GREETING
         # Store for last-response memory (feature 3)
@@ -791,20 +746,53 @@ class ConversationRouter:
         _prev_booking_name = self.memory.booking.user_name
 
         # Context-aware name capture: if agent just asked for name, treat this
-        # short response as the caller's name (even without "my name is" prefix)
-        if not self.memory.booking.user_name:
+        # short response as the caller's name (even without "my name is" prefix).
+        # Skipped while a name confirmation is pending — the reply to "Your
+        # name is X, right?" is a yes/no, and capturing it here used to store
+        # garbage like "Nahi Rajesh" as the confirmed name.
+        if not self.memory.booking.user_name and not self._name_pending:
             ctx_name = self._extract_name_if_asked(text)
+            if ctx_name:
+                # Drop confirmation words that leak into the capture window.
+                _toks = [t for t in ctx_name.split()
+                         if t.lower() not in ("nahi", "no", "haan", "yes", "ji", "han")]
+                ctx_name = " ".join(_toks) if _toks else ""
             if ctx_name:
                 self.memory.booking.user_name = ctx_name
                 self.memory.context.user_name = ctx_name
                 self.memory.call_state.customer_name = ctx_name
                 _prev_booking_name = ctx_name  # treat as already known
-                logger.info("[NAME] Context-aware capture: %r", ctx_name)
+                # Direct answer to an explicit name question = high confidence:
+                # confirm immediately and write through to the state manager.
+                # (Previously _name_confirmed stayed False on this path, the
+                # sync gate never fired, and the state block demanded the name
+                # be re-asked forever — the critical review finding.)
+                self._name_confirmed = True
+                self.state_mgr.set_externally("name", ctx_name, source="system")
+                logger.info("[NAME] Context-aware capture (confirmed): %r", ctx_name)
 
         self.memory.add_user(text, language=self.state.language)
 
         # QA: record this user turn against any pending asked-fields
         self.memory.qa_tracker.observe_user_turn(text, self.memory.turn_index)
+
+        # ── Conversation State layer: extract + merge EVERY user turn ──
+        # Runs BEFORE shortcut routing so slot values embedded in shortcut
+        # turns ("thank you, 2BHK works") are never dropped. Pure regex,
+        # <1 ms — adds nothing to perceived latency.
+        try:
+            _state_changes = self.state_mgr.observe_user(text)
+            if _state_changes:
+                logger.info("[STATE] Turn extracted %d field(s): %s",
+                            len(_state_changes),
+                            ", ".join(f"{c.field}={c.new!r}" for c in _state_changes))
+            else:
+                # LLM gap-filler ONLY when the regex pass found nothing new:
+                # structured utterances are already covered, and this halves
+                # extractor request volume against the shared Groq quota.
+                self._spawn_slot_extractor(text)
+        except Exception:
+            logger.exception("[STATE] observe_user failed (continuing)")
 
         # Name-capture: if a new name was just extracted this turn, hold for confirmation
         if (not self._name_confirmed
@@ -815,6 +803,7 @@ class ConversationRouter:
             self._name_pending_turn = self.state.turn_count
             self.memory.booking.user_name = None
             self.memory.context.user_name = None
+            self.state_mgr.mark_pending("name")
             logger.info("[NAME] Name pending confirmation: %r", self._name_pending)
 
         # --- Language detection + stabilization ---
@@ -948,7 +937,14 @@ class ConversationRouter:
         self.state.objection_handled = False
 
         # --- Intent detection ---
-        intent = detect_intent(text, self.state.stage)
+        _kb = self._def.knowledge_base
+        intent = detect_intent(
+            text,
+            self.state.stage,
+            location_aliases=frozenset(_kb.location_aliases),
+            objection_patterns=_kb.objection_patterns,
+            time_patterns=_kb.time_patterns,
+        )
 
         # --- Fire LLM in background (parallel with deterministic routing) ---
         llm_queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -1030,8 +1026,8 @@ class ConversationRouter:
             if self.state.decline_count >= 2:
                 self.state.is_closing = True
                 self.state.stage = STAGE_CLOSING
-                resp = _DECLINE_FAREWELL_RESPONSES.get(
-                    self.state.language, _DECLINE_FAREWELL_RESPONSES["en"]
+                resp = self._def.response_bank.decline_farewell.get(
+                    self.state.language, self._def.response_bank.decline_farewell["en"]
                 )
                 self.memory.add_assistant(resp, language=self.state.language)
                 self._store_last_response(resp)
@@ -1057,11 +1053,11 @@ class ConversationRouter:
         if intent == "identity_question":
             _cancel_llm()
             lang = self.state.language
-            resp = _IDENTITY_RESPONSES.get(lang, _IDENTITY_RESPONSES["en"])
+            resp = self._def.response_bank.identity_responses.get(lang, self._def.response_bank.identity_responses["en"])
             self.memory.add_assistant(resp, language=lang)
             self._store_last_response(resp)
             if self.state.stage == STAGE_GREETING:
-                self.state.stage = STAGE_DISCOVERY
+                self.state.stage = self._post_greeting_stage()
             yield EngineResult(text=resp, is_shortcut=True, intent="identity_question")
             return
 
@@ -1079,7 +1075,7 @@ class ConversationRouter:
             # Explicit caller requests should persist but allow natural switching.
             self.state.language_lock_turns = -7
             self.state.language_history = [new_lang] * 5
-            resp = _LANG_SWITCH_RESPONSES.get(new_lang, _LANG_SWITCH_RESPONSES["hi"])
+            resp = self._def.response_bank.lang_switch_responses.get(new_lang, self._def.response_bank.lang_switch_responses["hi"])
             self.memory.add_assistant(resp, language=new_lang)
             self._store_last_response(resp)
             logger.info("[LANG-LOCK] explicit_switch lang=%s lock_turns=%d (persists ~17 turns)",
@@ -1094,16 +1090,28 @@ class ConversationRouter:
         # Extract any structured info as a side effect (non-blocking)
         self._extract_data_from_input(text, intent)
 
+        # Write-through: sync legacy extractor results into the state manager
+        # so the CONVERSATION STATE block reflects everything, whichever
+        # extractor caught it first.
+        try:
+            self._sync_state_manager()
+        except Exception:
+            logger.exception("[STATE] sync failed (continuing)")
+
         # Name confirmation resolution (feature 4)
         if self._name_pending:
             if intent == "affirmation":
                 self.memory.booking.user_name = self._name_pending
                 self.memory.context.user_name = self._name_pending
                 self._name_confirmed = True
+                self.state_mgr.set_externally("name", self._name_pending, source="system")
                 logger.info("[NAME] Confirmed name: %r", self._name_pending)
                 self._name_pending = None
             elif intent == "negation":
-                logger.info("[NAME] Caller rejected name %r — clearing pending", self._name_pending)
+                logger.info("[NAME] Caller rejected name %r — discarding pending", self._name_pending)
+                # discard (not clear): also nulls any value that leaked into
+                # the slot, so a rejected name can never become ground truth.
+                self.state_mgr.discard_pending("name")
                 self._name_pending = None
             elif self.state.turn_count - self._name_pending_turn >= 2:
                 # Caller neither confirmed nor denied after 2 turns — auto-accept.
@@ -1112,13 +1120,14 @@ class ConversationRouter:
                 self.memory.context.user_name = self._name_pending
                 self.memory.call_state.customer_name = self._name_pending
                 self._name_confirmed = True
+                self.state_mgr.set_externally("name", self._name_pending, source="system")
                 logger.info("[NAME] Auto-accepted name after 2 turns: %r", self._name_pending)
                 self._name_pending = None
 
         # Advance from GREETING on first user response
         if self.state.stage == STAGE_GREETING:
-            self.state.stage = STAGE_DISCOVERY
-            logger.info("[STAGE] GREETING → DISCOVERY")
+            self.state.stage = self._post_greeting_stage()
+            logger.info("[STAGE] GREETING → %s", self.state.stage)
 
         # =============================================================
         # SOFT STAGE ADVANCEMENT based on collected data
@@ -1145,17 +1154,17 @@ class ConversationRouter:
         lower = text.lower()
         cs = self.memory.call_state
 
-        if not self.memory.booking.location:
+        if "location" not in cs.domain_fields:
             loc = self._extract_location(text)
             if loc:
-                self.memory.booking.location = loc
+                cs.domain_fields["location"] = loc
                 self.memory.qa_tracker.mark_extracted("location", loc)
                 logger.info("[DISCOVERY] Location extracted: %s", loc)
 
-        if not self.memory.booking.property_type:
+        if "property_type" not in cs.domain_fields:
             bhk = self._extract_bhk(text)
             if bhk:
-                self.memory.booking.property_type = bhk.upper()
+                cs.domain_fields["property_type"] = bhk.upper()
                 self.memory.qa_tracker.mark_extracted("bhk", bhk.upper())
                 logger.info("[DISCOVERY] Config extracted: %s", bhk)
 
@@ -1163,9 +1172,10 @@ class ConversationRouter:
             t = self._extract_time_preference(text, stage=self.state.stage)
             if t:
                 self.memory.booking.appointment_time = t
+                self._record_calendar_booking(t)
                 logger.info("[DISCOVERY] Time extracted: %s", t)
 
-        if not self.state.purpose:
+        if not self.state.purpose and "purpose" not in cs.domain_fields:
             # Multi-word / script phrases: safe to use substring matching (rare false positives)
             invest_kw_exact = [
                 "rental income", "rental return", "return on investment",
@@ -1199,131 +1209,236 @@ class ConversationRouter:
                 self.memory.qa_tracker.mark_extracted("purpose", "self_use")
 
         # ── Budget extraction ─────────────────────────────────────────────
-        if not self.memory.booking.budget:
+        if "budget" not in cs.domain_fields:
             budget = self._extract_budget(text)
             if budget:
-                self.memory.booking.budget = budget
+                cs.domain_fields["budget"] = budget
                 self.memory.qa_tracker.mark_extracted("budget", budget)
                 logger.info("[DISCOVERY] Budget extracted: %s", budget)
 
         # ── Timeline extraction ───────────────────────────────────────────
-        if not cs.timeline:
+        if "timeline" not in cs.domain_fields:
             timeline = self._extract_timeline(text)
             if timeline:
-                cs.timeline = timeline
+                cs.domain_fields["timeline"] = timeline
                 self.memory.qa_tracker.mark_extracted("timeline", timeline)
                 logger.info("[DISCOVERY] Timeline extracted: %s", timeline)
 
-        # ── Project detection (persistent context lock) ──────────────────
-        if not cs.selected_project:
-            proj_result = self._extract_project_from_text(text)
-            if proj_result:
-                proj_name, proj_loc = proj_result
-                cs.selected_project = proj_name
-                # Mirror back into state and booking for full consistency
-                self.state.project_recommended = proj_name
-                if not self.memory.booking.project:
-                    self.memory.booking.project = proj_name
-                # Auto-infer location from project if not yet captured
-                if not cs.selected_location:
-                    cs.selected_location = proj_loc
-                if not self.memory.booking.location:
-                    self.memory.booking.location = proj_loc
+        # ── Entity detection (persistent context lock) ───────────────────
+        # Match against known_projects/entities in the agent definition.
+        # First match is locked for the session (stored in domain_fields).
+        if "matched_entity" not in cs.domain_fields:
+            entity_result = self._extract_project_from_text(text)
+            if entity_result:
+                entity_name, entity_loc = entity_result
+                cs.domain_fields["matched_entity"] = entity_name
+                if entity_loc:
+                    cs.domain_fields["entity_location"] = entity_loc
+                self.state.project_recommended = entity_name
                 logger.info(
-                    "[STATE_UPDATE] selected_project=%r inferred_location=%r",
-                    proj_name, proj_loc,
+                    "[STATE_UPDATE] matched_entity=%r location=%r",
+                    entity_name, entity_loc,
                 )
-        elif self.state.project_recommended and not cs.selected_project:
-            # project_recommended set elsewhere (e.g. LLM), sync to call_state
-            cs.selected_project = self.state.project_recommended
-
-        # ── Site-visit intent detection ──────────────────────────────────
-        if not cs.site_visit_requested:
-            visit_kw = [
-                "site visit", "visit", "come see", "site tour", "show me",
-                "dekhna chahta", "dekhna chahti", "dekhne aana", "dekhna hai",
-                "joiyu", "jovu che", "aavvu che", "joyu",
-                "dikhao", "dikhaiye", "site pe aana",
-            ]
-            if any(kw in lower for kw in visit_kw):
-                cs.site_visit_requested = True
-                logger.info("[STATE_UPDATE] site_visit_requested=True (keyword match)")
-            elif intent == "affirmation" and self.state.stage == STAGE_INVITE_VISIT:
-                cs.site_visit_requested = True
-                logger.info("[STATE_UPDATE] site_visit_requested=True (affirmation in INVITE_VISIT)")
 
         # ── Sync all layers into CallState ───────────────────────────────
         self._update_call_state()
         self.state.discovery_turns += 1
 
+    def _post_greeting_stage(self) -> str:
+        """Stage to enter after the greeting turn. Legacy flows land on
+        DISCOVERY; custom-id flows (builder/copilot agents whose stages don't
+        include DISCOVERY) start at their OWN first stage. Without this, the
+        unknown 'DISCOVERY' id fell through _maybe_advance_stage's index-0
+        fallback with the turn budget already spent, so the first custom
+        stage's goal never governed a single LLM turn (e.g. an outbound
+        CONFIRM_PERSON stage was skipped and the pitch fired on turn 1 even
+        when a stranger answered the phone)."""
+        stages = self._def.call_flow.stages
+        if not stages or any(s.id == STAGE_DISCOVERY for s in stages):
+            return STAGE_DISCOVERY
+        return stages[0].id
+
     def _maybe_advance_stage(self) -> None:
-        """Soft stage advancement — let collected data drive progression."""
+        """Domain-agnostic stage advancement driven by turn count and booking events."""
         b = self.memory.booking
+        cs = self.memory.call_state
+        stage_list = self._def.call_flow.stages
+        current_idx = next((i for i, s in enumerate(stage_list) if s.id == self.state.stage), 0)
+        if current_idx >= len(stage_list) - 1:
+            return  # already at last stage
+
+        next_stage_id = stage_list[current_idx + 1].id
+        last_stage_id = stage_list[-1].id
+        current_def = stage_list[current_idx]
         dt = self.state.discovery_turns
 
+        # Booking confirmed → jump to last stage (CLOSING equivalent)
+        if b.confirmed and self.state.stage != last_stage_id:
+            self.state.stage = last_stage_id
+            self.state.is_closing = True
+            self.state.discovery_turns = 0
+            logger.info("[STAGE] → %s (booking confirmed)", last_stage_id)
+            return
+
+        # Appointment time captured → advance once, then stop reacting to this
+        # event. getattr guard: appointment_advanced was never initialized in
+        # ConversationState — the bare attribute access raised AttributeError
+        # the first time an appointment was ever captured (latent prod bug).
+        if b.appointment_time and not getattr(self.state, "appointment_advanced", False):
+            self.state.appointment_advanced = True
+            self.state.stage = next_stage_id
+            self.state.discovery_turns = 0
+            logger.info("[STAGE] → %s (appointment_time set)", next_stage_id)
+            return
+
+        # Slot-aware early advancement: when the caller front-loads their
+        # requirements ("3BHK in Vapi under 50 lakhs"), don't hold them in
+        # DISCOVERY for the scripted turn count — advance as soon as every
+        # required discovery slot is filled.
         if self.state.stage == STAGE_DISCOVERY:
-            _has_name = bool(b.user_name or self.memory.call_state.customer_name)
-            _has_location = bool(b.location or self.memory.call_state.selected_location)
-            # Advance once BOTH name + location are known (3+ turns), so the agent
-            # doesn't pitch projects before knowing who the caller is and where they
-            # want to buy. Fallback at 12 turns ensures the flow never stalls.
-            if (_has_name and _has_location and dt >= 3) or dt >= 12:
-                self.state.stage = STAGE_PROJECT_MATCH
-                logger.info("[STAGE] DISCOVERY → PROJECT_MATCH (name=%s, loc=%s, turns=%d)",
-                            b.user_name, b.location, dt)
+            gaps = self.state_mgr.detect_missing_slots()
+            _required = sum(1 for s in self.state_mgr.slots.values() if s.required)
+            # Guards: pending counts as incomplete, and name-only agents
+            # (pitch flows) never early-advance — a captured name is not
+            # "discovery complete"; their pacing stays turn-count driven.
+            if _required >= 2 and not gaps["missing"] and not gaps.get("pending"):
+                self.state.stage = next_stage_id
+                self.state.discovery_turns = 0
+                logger.info("[STAGE] → %s (all required slots filled — early advance)",
+                            next_stage_id)
+                return
 
-        elif self.state.stage == STAGE_PROJECT_MATCH:
-            # Advance to visit invitation after sufficient project discussion.
-            # Reduced from 14 to 9 turns — keep momentum.
-            if dt >= 9:
-                self.state.stage = STAGE_INVITE_VISIT
-                logger.info("[STAGE] PROJECT_MATCH → INVITE_VISIT")
+        # Turn-count based advancement
+        threshold = current_def.turns_until_advance
+        if dt >= threshold:
+            self.state.stage = next_stage_id
+            self.state.discovery_turns = 0
+            logger.info("[STAGE] → %s (turn threshold %d reached)", next_stage_id, threshold)
 
-        elif self.state.stage == STAGE_INVITE_VISIT:
-            if b.appointment_time:
-                self.state.stage = STAGE_CONFIRMATION
-                logger.info("[STAGE] INVITE_VISIT → CONFIRMATION")
-
-        elif self.state.stage == STAGE_CONFIRMATION:
-            if b.confirmed:
-                valid, missing = self._validate_booking_for_closing()
-                if valid:
-                    self.state.stage = STAGE_CLOSING
-                    self.state.is_closing = True
-                    logger.info("[STAGE] CONFIRMATION → CLOSING (booking validated)")
-                else:
-                    logger.info(
-                        "[STAGE] CLOSING blocked — missing: %s",
-                        ", ".join(missing),
-                    )
-
-        logger.info(
-            "[STAGE-STATE] stage=%s turns=%d | loc=%s bhk=%s purpose=%s appt=%s confirmed=%s",
-            self.state.stage,
-            self.state.discovery_turns,
-            b.location or "—",
-            b.property_type or "—",
-            self.state.purpose or "—",
-            b.appointment_time or "—",
-            b.confirmed,
+        logger.debug(
+            "[STAGE-STATE] stage=%s turns=%d/%d appt=%s confirmed=%s domain=%s",
+            self.state.stage, dt, current_def.turns_until_advance,
+            b.appointment_time or "—", b.confirmed, cs.domain_fields,
         )
 
     # ------------------------------------------------------------------
     # Call-state management helpers
     # ------------------------------------------------------------------
 
+    def _sync_state_manager(self) -> None:
+        """Write-through legacy extraction results into the state manager.
+
+        The legacy extractors (_extract_data_from_input, memory name/phone
+        capture) write into cs.domain_fields / booking; the state manager is
+        the single source of truth for the prompt, so mirror everything in.
+        """
+        cs = self.memory.call_state
+        b = self.memory.booking
+        sm = self.state_mgr
+        mapping = {
+            "location": "location",
+            "budget": "budget",
+            "timeline": "timeline",
+            "purpose": "purpose",
+        }
+        for src_key, slot in mapping.items():
+            val = cs.domain_fields.get(src_key)
+            if val is not None:
+                sm.merge_state({slot: val}, source="legacy", fill_only=True)
+        ptype = cs.domain_fields.get("property_type")
+        if ptype:
+            # Legacy stores "3 BHK"-style values under property_type.
+            target = "bhk" if "bhk" in str(ptype).lower() else "property_type"
+            sm.merge_state({target: str(ptype).replace(" ", "").upper()
+                            if target == "bhk" else ptype},
+                           source="legacy", fill_only=True)
+        if b.user_name and self._name_confirmed:
+            sm.set_externally("name", b.user_name, source="legacy")
+        # Meeting-booking agents: a booked appointment IS the meeting time —
+        # write it through so the state block never re-asks after booking.
+        if b.appointment_time and "meeting_time" in sm.state:
+            when = f"{b.appointment_date or ''} {b.appointment_time}".strip()
+            sm.set_externally("meeting_time", when, source="legacy")
+
+    # ── Async LLM slot extraction (gap-filler; never on the hot path) ───
+
+    def _spawn_slot_extractor(self, text: str) -> None:
+        """Fire a background LLM extraction for slots the regexes missed.
+
+        Latency-safe: runs concurrently with response generation; result
+        merges with fill_only=True so a slow/stale completion can only fill
+        still-empty slots, never overwrite anything newer. At most one task
+        in flight — a new turn cancels the previous extractor.
+        """
+        if not self._slot_extract_enabled or not self._api_key:
+            return
+        if len(text.split()) < 3:
+            return
+        missing = self.state_mgr.detect_missing_slots()["missing"]
+        if not missing:
+            return
+        if self._slot_extract_task and not self._slot_extract_task.done():
+            self._slot_extract_task.cancel()
+        self._slot_extract_task = asyncio.create_task(
+            self._llm_extract_slots(text, missing), name="slot_extractor",
+        )
+
+    async def _llm_extract_slots(self, text: str, missing: list[str]) -> None:
+        try:
+            client = self._get_client()
+            keys = ", ".join(f'"{m}"' for m in missing)
+            resp = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=self._model,
+                    messages=[{
+                        "role": "system",
+                        "content": (
+                            "Extract structured fields from one caller utterance "
+                            "(may be Hinglish/Hindi/Gujarati/English, possibly noisy "
+                            "phone-call ASR). Return ONLY a JSON object with exactly "
+                            f"these keys: {{{keys}}}. Use null for anything not "
+                            "clearly stated. Values must be short canonical strings "
+                            "(e.g. \"3BHK\", \"50 Lakhs\", \"Vapi\", \"Next month\", "
+                            "\"Yes\", \"No\")."
+                        ),
+                    }, {"role": "user", "content": text}],
+                    max_tokens=120,
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                ),
+                timeout=2.5,
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not m:
+                return
+            data = {k: v for k, v in json.loads(m.group(0)).items()
+                    if isinstance(v, (str, int, float)) and str(v).strip()
+                    and str(v).lower() not in ("null", "none", "unknown", "n/a")}
+            if data:
+                changes = self.state_mgr.merge_state(
+                    data, source="llm", utterance=text, fill_only=True)
+                if changes:
+                    logger.info("[STATE:LLM] Gap-filled %s",
+                                ", ".join(f"{c.field}={c.new!r}" for c in changes))
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception as exc:
+            logger.debug("[STATE:LLM] extractor skipped: %s", exc)
+
     def _extract_project_from_text(self, text: str) -> tuple[str, str] | None:
         """Return (canonical_name, location) if a known project is mentioned.
 
-        Keys in _KNOWN_PROJECTS are sorted longest-first so multi-word names
+        Project keys are sorted longest-first so multi-word names
         like 'aranya ii' are matched before shorter substrings like 'aranya'.
         Word-boundary matching prevents short names (aura, orbit, satva) from
         spuriously matching inside unrelated words.
         """
         lower = text.lower()
-        for key in sorted(_KNOWN_PROJECTS, key=len, reverse=True):
+        _projects = self._def.knowledge_base.known_projects
+        for key in sorted(_projects, key=len, reverse=True):
             if re.search(r'\b' + re.escape(key) + r'\b', lower):
-                return _KNOWN_PROJECTS[key]
+                return _projects[key]
         return None
 
     def _update_call_state(self) -> None:
@@ -1342,53 +1457,14 @@ class ConversationRouter:
         elif cs.customer_name and not b.user_name:
             b.user_name = cs.customer_name
 
-        # Location
-        if b.location and not cs.selected_location:
-            cs.selected_location = b.location
-            logger.info("[STATE_UPDATE] selected_location=%r (from booking)", cs.selected_location)
-        elif cs.selected_location and not b.location:
-            b.location = cs.selected_location
-
-        # Project — also keep state.project_recommended in sync
-        if b.project and not cs.selected_project:
-            cs.selected_project = b.project
-            self.state.project_recommended = b.project
-            logger.info("[STATE_UPDATE] selected_project=%r (from booking)", cs.selected_project)
-        elif cs.selected_project and not b.project:
-            b.project = cs.selected_project
-            self.state.project_recommended = cs.selected_project
-        elif self.state.project_recommended and not cs.selected_project:
-            cs.selected_project = self.state.project_recommended
-            b.project = self.state.project_recommended
-
-        # Appointment
+        # Appointment — sync both directions
         if b.appointment_time and not cs.appointment_time:
             cs.appointment_time = b.appointment_time
         elif cs.appointment_time and not b.appointment_time:
             b.appointment_time = cs.appointment_time
+            self._record_calendar_booking(b.appointment_time)
         if b.appointment_date and not cs.appointment_date:
             cs.appointment_date = b.appointment_date
-
-        # Property type (BHK)
-        if b.property_type and not cs.property_type:
-            cs.property_type = b.property_type
-            logger.info("[STATE_UPDATE] property_type=%r (from booking)", cs.property_type)
-        elif cs.property_type and not b.property_type:
-            b.property_type = cs.property_type
-
-        # Purpose
-        if self.state.purpose and not cs.purpose:
-            cs.purpose = self.state.purpose
-            logger.info("[STATE_UPDATE] purpose=%r (from state)", cs.purpose)
-        elif cs.purpose and not self.state.purpose:
-            self.state.purpose = cs.purpose
-
-        # Budget
-        if b.budget and not cs.budget:
-            cs.budget = b.budget
-            logger.info("[STATE_UPDATE] budget=%r (from booking)", cs.budget)
-        elif cs.budget and not b.budget:
-            b.budget = cs.budget
 
         # Language + Stage always mirror live state
         cs.language = self.state.language
@@ -1399,16 +1475,13 @@ class ConversationRouter:
             self.memory.qa_tracker.mark_extracted("name", cs.customer_name)
 
         logger.info(
-            "[STATE] name=%s phone=%s project=%s loc=%s visit=%s "
-            "appt=%s stage=%s lang=%s",
+            "[STATE] name=%s phone=%s appt=%s stage=%s lang=%s domain=%s",
             cs.customer_name or "—",
             ("***" + cs.customer_phone[-4:]) if cs.customer_phone else "—",
-            cs.selected_project or "—",
-            cs.selected_location or "—",
-            cs.site_visit_requested,
             cs.appointment_time or "—",
             cs.conversation_stage,
             cs.language,
+            cs.domain_fields,
         )
 
     def _compute_missing_booking_fields(self) -> list[str]:
@@ -1419,15 +1492,11 @@ class ConversationRouter:
         cs = self.memory.call_state
         b = self.memory.booking
         missing: list[str] = []
-        if cs.site_visit_requested or b.appointment_time or cs.appointment_time:
+        if b.appointment_time or cs.appointment_time:
             if not (b.user_name or cs.customer_name):
                 missing.append("customer name")
             if not cs.customer_phone:
                 missing.append("phone number")
-            if not (b.project or cs.selected_project):
-                missing.append("project selection")
-            if not (b.appointment_time or cs.appointment_time):
-                missing.append("visit date and time")
         return missing
 
     def _validate_booking_for_closing(self) -> tuple[bool, list[str]]:
@@ -1440,9 +1509,8 @@ class ConversationRouter:
         missing = self._compute_missing_booking_fields()
         valid = len(missing) == 0
         logger.info(
-            "[BOOKING_VALIDATION] valid=%s site_visit=%s missing=%s",
+            "[BOOKING_VALIDATION] valid=%s missing=%s",
             valid,
-            cs.site_visit_requested,
             missing if missing else "none",
         )
         if missing:
@@ -1693,12 +1761,17 @@ class ConversationRouter:
             day = "This Saturday"
 
         # --- Step 3: if specific time given, match strictly against slots ---
+        # Only offer/accept slots that are still free (bookings.json aware).
+        _slots = self._available_calendar_slots()
+        if not _slots:
+            return None
         if hour_24 is not None:
-            for slot in _AVAILABLE_SLOTS:
-                if day and slot["day"] != day:
+            for slot in _slots:
+                if day and slot.day != day:
                     continue
-                if _slot_hour_24(slot["time"]) == hour_24:
-                    return f"{slot['day']} at {slot['time']}"
+                if _slot_hour_24(slot.time) == hour_24:
+                    # (was slot['day']/slot['time'] — TypeError on dataclass slots)
+                    return f"{slot.day} at {slot.time}"
             # User gave a specific hour with no matching slot — caller will
             # reprompt with available options instead of locking a wrong time.
             return None
@@ -1713,20 +1786,20 @@ class ConversationRouter:
             period = "evening"
 
         if day or period:
-            for slot in _AVAILABLE_SLOTS:
-                if day and slot["day"] != day:
+            for slot in _slots:
+                if day and slot.day != day:
                     continue
-                if period and _slot_period(slot["time"]) != period:
+                if period and _slot_period(slot.time) != period:
                     continue
-                return f"{slot['day']} at {slot['time']}"
+                return f"{slot.day} at {slot.time}"
             # Day matched but period didn't (e.g. user wants "Tomorrow evening"
             # — no evening slots tomorrow). Don't fudge: caller reprompts.
             if period:
                 return None
             # Day-only match: take the first slot of that day.
-            for slot in _AVAILABLE_SLOTS:
-                if slot["day"] == day:
-                    return f"{slot['day']} at {slot['time']}"
+            for slot in _slots:
+                if slot.day == day:
+                    return f"{slot.day} at {slot.time}"
 
         # --- Step 5: bare affirmation → first available slot ---
         # ONLY apply when the agent is actively offering time slots (INVITE_VISIT or
@@ -1736,9 +1809,9 @@ class ConversationRouter:
         _scheduling_stages = (STAGE_INVITE_VISIT, STAGE_CONFIRMATION)
         if stage is None or stage in _scheduling_stages:
             if re.search(r"\b(yes|yeah|ok|okay|sure|haan|ha|ji|theek|first|pehla)\b", lower):
-                return f"{_AVAILABLE_SLOTS[0]['day']} at {_AVAILABLE_SLOTS[0]['time']}"
+                return f"{_slots[0].day} at {_slots[0].time}"
             if any(w in text for w in ("ठीक", "हां", "हाँ", "જી", "હા", "બરાબર", "ઠીક")):
-                return f"{_AVAILABLE_SLOTS[0]['day']} at {_AVAILABLE_SLOTS[0]['time']}"
+                return f"{_slots[0].day} at {_slots[0].time}"
 
         return None
 
@@ -1765,52 +1838,47 @@ class ConversationRouter:
 
     def _build_confirmation_prompt(self) -> str:
         b = self.memory.booking
+        cs = self.memory.call_state
         lang = self.state.language
+        entity = cs.domain_fields.get("matched_entity") or ""
+        appt = b.appointment_time or ""
         if lang == "hi":
-            return (
-                f"तो मैं नोट कर लेता हूँ -- {b.location or 'आपकी लोकेशन'} में "
-                f"{b.property_type or 'प्रॉपर्टी'} के लिए "
-                f"{b.appointment_time or 'कल'} को साइट विजिट। "
-                "क्या ये सही है?"
-            )
+            ctx = f"{entity} के लिए " if entity else ""
+            return f"तो मैं नोट कर लेता हूँ — {ctx}{appt or 'कल'} का अपॉइंटमेंट। क्या ये सही है?"
         elif lang == "gu":
-            return (
-                f"તો હું નોંધ કરી લઉં -- {b.location or 'તમારી લોકેશન'} માં "
-                f"{b.property_type or 'પ્રોપર્ટી'} માટે "
-                f"{b.appointment_time or 'કાલે'} ની સાઇટ મુલાકાત. "
-                "આ બરાબર છે?"
-            )
-        return (
-            f"Let me confirm -- a site visit for {b.property_type or 'your property'} "
-            f"in {b.location or 'your chosen location'}, "
-            f"scheduled for {b.appointment_time or 'tomorrow'}. "
-            "Does that work for you?"
-        )
+            ctx = f"{entity} માટે " if entity else ""
+            return f"તો હું નોંધ કરી લઉં — {ctx}{appt or 'કાલ'} ની મુલાકાત. આ બરાબર છે?"
+        ctx = f"for {entity} " if entity else ""
+        return f"Let me confirm — your appointment {ctx}is scheduled for {appt or 'tomorrow'}. Does that work?"
 
     def _build_closing_message(self) -> str:
         b = self.memory.booking
+        cs = self.memory.call_state
         lang = self.state.language
+        name = cs.customer_name or ""
+        appt = b.appointment_time or ""
+        company = self._def.identity.company_name
         if lang == "hi":
             return (
-                f"बहुत अच्छा! आपकी {b.location} में {b.property_type} की "
-                f"साइट विजिट {b.appointment_time} के लिए बुक हो गई है। "
-                "हम आपको एक कन्फर्मेशन मैसेज भेजेंगे। Pramukh Group चुनने के लिए धन्यवाद!"
+                f"बहुत अच्छा{', ' + name if name else ''}! "
+                f"आपका अपॉइंटमेंट {appt} के लिए कन्फर्म हो गया है। "
+                f"हम आपको एक कन्फर्मेशन मैसेज भेजेंगे। {company} के लिए धन्यवाद!"
             )
         elif lang == "gu":
             return (
-                f"ખૂબ સરસ! તમારી {b.location} માં {b.property_type} ની "
-                f"સાઇટ મુલાકાત {b.appointment_time} માટે બુક થઈ ગઈ છે. "
-                "અમે તમને કન્ફર્મેશન મેસેજ મોકલીશું. Pramukh Group પસંદ કરવા માટે આભાર!"
+                f"ખૂબ સરસ{', ' + name if name else ''}! "
+                f"તમારી {appt} ની મુલાકાત કન્ફર્મ થઈ ગઈ છે. "
+                f"અમે તમને કન્ફર્મેશન મેસેજ મોકલીશું. {company} માટે આભાર!"
             )
         return (
-            f"Wonderful! Your site visit for {b.property_type} in {b.location} "
-            f"is booked for {b.appointment_time}. "
-            "We'll send you a confirmation message. Thank you for choosing Pramukh Group!"
+            f"Wonderful{', ' + name if name else ''}! "
+            f"Your appointment is confirmed for {appt}. "
+            f"We'll send you a confirmation message. Thank you for choosing {company}!"
         )
 
     def _get_proactive_prompt(self, stage: str) -> str:
         lang = self.state.language
-        prompts = _PROACTIVE_PROMPTS.get(stage, {})
+        prompts = self._def.response_bank.proactive_prompts.get(stage, {})
         return prompts.get(lang, prompts.get("en", ""))
 
     # ------------------------------------------------------------------
@@ -1836,7 +1904,7 @@ class ConversationRouter:
         first_chunk = None
         try:
             first_chunk = await asyncio.wait_for(
-                llm_queue.get(), timeout=FILLER_TIMEOUT_S,
+                llm_queue.get(), timeout=self._def.llm_config.filler_timeout_s,
             )
         except asyncio.TimeoutError:
             filler = self._pick_filler()
@@ -1901,7 +1969,7 @@ class ConversationRouter:
             pass
         except Exception:
             logger.exception("[LLM] Background stream failed")
-            fallback = _LANG_FALLBACKS.get(self.state.language, _RESPONSE_FALLBACK)
+            fallback = self._def.response_bank.lang_fallbacks.get(self.state.language, self._def.response_bank.response_fallback)
             try:
                 queue.put_nowait(fallback)
             except asyncio.QueueFull:
@@ -1912,6 +1980,19 @@ class ConversationRouter:
 
     async def _call_llm_stream(self, text: str):
         client = self._get_client()
+
+        # RAG: retrieve relevant document chunks for this turn (non-blocking try/except
+        # so a missing documents module or API error never interrupts the conversation)
+        self._rag_context = ""
+        try:
+            from ..documents.store import get_folder_by_agent_id, has_documents
+            _agent_folder = get_folder_by_agent_id(self._def.agent_id)
+            if _agent_folder and has_documents(_agent_folder):
+                from ..documents.embeddings import retrieve_context
+                self._rag_context = retrieve_context(_agent_folder, text)
+        except Exception:
+            pass
+
         system = self._build_system_prompt()
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(self.memory.get_history_for_llm())
@@ -1924,54 +2005,100 @@ class ConversationRouter:
             "gu": "Use Gujarati (Gujarati script preferred, or romanized Gujarati). NOT Hindi, NOT English.",
             "en": "Use English only. NOT Hindi, NOT Gujarati.",
         }
-        messages.append({
-            "role": "system",
-            "content": (
+        if getattr(self._def.languages, "allow_code_mixing", False) and self.state.language != "en":
+            # Hinglish mode — the opposite of pure-language enforcement. Encourage
+            # natural code-mixing so the agent sounds like a real person, not a
+            # textbook. Keep the base script (e.g. Devanagari for Hindi) so TTS
+            # renders it correctly, but let common English words flow through.
+            _final = (
+                f"FINAL INSTRUCTION: Reply in natural HINGLISH. Write the {lang_name} words in "
+                f"their native script (Devanagari for Hindi) and keep everyday English words in "
+                f"English/Latin letters — e.g. 'नमस्ते! मैं Ananya बात कर रही हूँ, Mr. Ben आपसे "
+                f"एक quick meeting करना चाहते हैं।'. Do NOT romanize the Hindi (never write 'main "
+                f"aapse baat'), and do NOT translate common English words into pure {lang_name}. "
+                f"Mix in the English words Indians actually say (meeting, time, business, company, "
+                f"help, sure, ok, actually, AI, schedule). Keep it to 1 short, warm spoken sentence."
+            )
+        else:
+            _final = (
                 f"FINAL INSTRUCTION: Your ENTIRE response must be in {lang_name}. "
                 f"{_lang_script_note.get(self.state.language, '')} "
                 f"Do NOT mix languages. Do NOT switch mid-sentence."
-            ),
-        })
+            )
+        messages.append({"role": "system", "content": _final})
 
         _SENTENCE_END = re.compile(r'[.!?।]\s')
-        deadline = time.monotonic() + LLM_STREAM_TIMEOUT_S
+        # Clause boundary (comma/colon/semicolon too) — used ONLY for the first
+        # emission so audio starts at the model's first natural pause instead of
+        # waiting for a whole sentence. Cuts first-audio latency noticeably.
+        _CLAUSE_END = re.compile(r'[,;:।.!?]\s')
+        _first_emitted = False
+        deadline = time.monotonic() + self._def.llm_config.stream_timeout_s
 
         try:
-            stream = await client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                max_tokens=LLM_MAX_TOKENS,
-                temperature=0.7,
-                stream=True,
-            )
+            # Primary LLM, with automatic fallback: Groq's free tier has a
+            # shared tokens-per-day cap — when the primary fails (429/quota/
+            # auth/network), retry ONCE on the fallback provider instead of
+            # dropping the caller to a canned "please repeat" line.
+            try:
+                stream = await client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    max_tokens=self._def.llm_config.max_tokens,
+                    temperature=0.7,
+                    stream=True,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as _primary_exc:
+                fb = self._get_fallback_client()
+                if fb is None:
+                    raise
+                logger.warning(
+                    "[LLM] Primary (%s) failed: %s — falling back to %s",
+                    self._model, _primary_exc, self._fallback_model,
+                )
+                stream = await fb.chat.completions.create(
+                    model=self._fallback_model,
+                    messages=messages,
+                    max_tokens=self._def.llm_config.max_tokens,
+                    temperature=0.7,
+                    stream=True,
+                )
 
             buffer = ""
             timed_out = False
             async for chunk in stream:
                 if time.monotonic() > deadline:
                     logger.warning("[LLM-TIMEOUT] fallback triggered after %.0fs",
-                                   LLM_STREAM_TIMEOUT_S)
+                                   self._def.llm_config.stream_timeout_s)
                     timed_out = True
                     break
                 delta = chunk.choices[0].delta
                 if delta.content:
                     buffer += delta.content
                     while True:
-                        match = _SENTENCE_END.search(buffer)
-                        if match:
-                            sentence = buffer[:match.end()].strip()
-                            buffer = buffer[match.end():]
-                            if sentence:
-                                yield _validate_response(sentence, self.state.language)
-                        else:
+                        # First chunk: break at the earliest clause pause (>=4
+                        # words) to start speaking fast. After that: full
+                        # sentences, for natural delivery.
+                        pat = _SENTENCE_END if _first_emitted else _CLAUSE_END
+                        match = pat.search(buffer)
+                        if not match:
                             break
+                        sentence = buffer[:match.end()].strip()
+                        if not _first_emitted and len(sentence.split()) < 4:
+                            break  # too short to ship alone — wait for more
+                        buffer = buffer[match.end():]
+                        if sentence:
+                            yield _validate_response(sentence, self.state.language)
+                            _first_emitted = True
 
             if timed_out:
                 if buffer.strip():
                     yield _validate_response(buffer.strip(), self.state.language)
                 else:
-                    yield _TIMEOUT_FALLBACKS.get(
-                        self.state.language, _TIMEOUT_FALLBACKS["en"]
+                    yield self._def.response_bank.timeout_fallbacks.get(
+                        self.state.language, self._def.response_bank.timeout_fallbacks["en"]
                     )
             elif buffer.strip():
                 yield _validate_response(buffer.strip(), self.state.language)
@@ -1980,7 +2107,7 @@ class ConversationRouter:
             return
         except Exception as exc:
             logger.error("[LLM] Stream failed: %s", exc)
-            yield _LANG_FALLBACKS.get(self.state.language, _RESPONSE_FALLBACK)
+            yield self._def.response_bank.lang_fallbacks.get(self.state.language, self._def.response_bank.response_fallback)
 
     # ------------------------------------------------------------------
     # System prompt — Pramukh Group domain
@@ -1993,105 +2120,34 @@ class ConversationRouter:
         lang_name = {"hi": "Hindi", "gu": "Gujarati", "en": "English"}.get(lang, "English")
 
         # ── LANGUAGE LOCK — put this FIRST so LLM sees it immediately ────────
-        _modern_lang_note = {
-            "hi": (
-                "Use natural, modern conversational Hindi — exactly how a friendly salesperson "
-                "in Surat or Mumbai speaks. Code-switch to English words that Indians use daily: "
-                "'property', 'flat', 'site visit', 'booking', 'ready-to-move', 'investment', 'budget'. "
-                "AVOID formal/Sanskritized vocabulary: say 'investment' not 'nivesh', "
-                "'use' or 'istemaal' not 'upyog', 'jagah' or 'location' not 'sthan', "
-                "'mauka' not 'avsar'. Sound like a real person, not a dictionary."
-            ),
-            "gu": (
-                "Use natural, modern conversational Gujarati — exactly how a friendly person "
-                "from Surat speaks. Code-switch to English words Gujaratis use daily: "
-                "'property', 'flat', 'site visit', 'booking', 'ready-to-move', 'investment', 'budget'. "
-                "AVOID overly formal Gujarati. Use 'investment' not 'rokaan', "
-                "'jagya' or 'location' not formal equivalents. Sound real and warm."
-            ),
-            "en": (
-                "Use natural, friendly conversational English — warm, real, not corporate. "
-                "Like a knowledgeable friend who happens to work in real estate."
-            ),
-        }
+        _register_notes = self._def.languages.register_notes
+        _supported_langs = set(self._def.languages.supported)
 
-        lang_header = {
-            "hi": (
-                f"⚡ LANGUAGE = HINDI. You MUST write ONLY in Hindi.\n"
-                f"Every single word must be Hindi. Not Gujarati. Not English (except common code-switch words).\n"
-                f"Even if previous responses were in another language — respond in HINDI NOW.\n"
-                f"If you write Gujarati script or full English sentences, you are FAILING.\n"
-                f"{_modern_lang_note['hi']}\n"
-                f"You are FLUENT in Hindi, Gujarati, and English. NEVER refuse to speak any language."
-            ),
-            "gu": (
-                f"⚡ LANGUAGE = GUJARATI. You MUST write ONLY in Gujarati.\n"
-                f"Every single word must be Gujarati. Not Hindi. Not English (except common code-switch words).\n"
-                f"Even if previous responses were in Hindi — respond in GUJARATI NOW.\n"
-                f"If you write Hindi/Devanagari script or full English sentences, you are FAILING.\n"
-                f"{_modern_lang_note['gu']}\n"
-                f"You are FLUENT in Gujarati, Hindi, and English. NEVER refuse to speak any language."
-            ),
-            "en": (
-                f"⚡ LANGUAGE = ENGLISH. You MUST write ONLY in English.\n"
-                f"Every single word must be English. No Hindi. No Gujarati.\n"
-                f"Even if previous responses were in another language — respond in ENGLISH NOW.\n"
-                f"{_modern_lang_note['en']}\n"
-                f"You are FLUENT in English, Hindi, and Gujarati. NEVER refuse to speak any language."
-            ),
-        }
+        # Build lang_header only for languages this agent supports.
+        # Using .get() so missing entries get a plain lock line instead of KeyError.
+        def _make_lang_header(code: str, name: str) -> str:
+            note = _register_notes.get(code, "")
+            other_langs = ", ".join(c for c in _supported_langs if c != code)
+            note_line = f"\n{note}" if note else ""
+            return (
+                f"⚡ LANGUAGE = {name.upper()}. You MUST write ONLY in {name}.\n"
+                f"Every single word must be {name}."
+                + (f" Not {other_langs}." if other_langs else "")
+                + f" No full sentences in any other language.\n"
+                f"Even if previous responses were in another language — respond in {name.upper()} NOW."
+                + note_line
+            )
+
+        lang_header = {code: _make_lang_header(code, {"hi": "Hindi", "en": "English", "gu": "Gujarati",
+                       "mr": "Marathi", "ta": "Tamil", "te": "Telugu"}.get(code, code.upper()))
+                       for code in _supported_langs}
+        # Ensure the 'en' fallback always exists for .get() below
+        if "en" not in lang_header:
+            lang_header["en"] = _make_lang_header("en", "English")
 
         # ── Stage-specific goal ──────────────────────────────────────────────
-        _stage_goals = {
-            STAGE_GREETING: (
-                "Caller just responded to your introduction. "
-                "Warmly acknowledge what they said in their language. "
-                "Ask for their name — ONE question only."
-            ),
-            STAGE_DISCOVERY: (
-                "You are a proactive property sales consultant. Your mission: qualify this caller "
-                "and build enough rapport to earn a site visit.\n"
-                "\n"
-                "MANDATORY FLOW — after EVERY caller response:\n"
-                "  1. Acknowledge what they just said (1 sentence, genuinely).\n"
-                "  2. Check QUALIFICATION STATUS below — ask the NEXT MISSING FIELD in priority order.\n"
-                "  3. If all core fields are captured, pivot to a project recommendation naturally.\n"
-                "\n"
-                "COLLECTION PRIORITY (one question per turn, skip if already known):\n"
-                "  1. Name  2. City (Surat / Vapi / Silvassa)  3. Configuration (1/2/3 BHK)\n"
-                "  4. Budget (comfortable range — ask softly)  5. Purpose (self-use or investment)\n"
-                "  6. Timeline (when planning to buy)  7. Phone / WhatsApp\n"
-                "\n"
-                "Do NOT wait for the caller to volunteer information — ask for it warmly.\n"
-                "Do NOT skip fields — every answer helps you match the right property.\n"
-                "If the caller volunteers a field before you ask, capture it and move to the next one."
-            ),
-            STAGE_PROJECT_MATCH: (
-                "You have enough information. Now be the expert.\n"
-                "Pick EXACTLY ONE project that fits what this caller described — budget, location, purpose.\n"
-                "Name the project. Give 2 specific reasons why it fits THEM personally.\n"
-                "Never list the whole portfolio — make it feel like a personal recommendation.\n"
-                "End your recommendation with a natural bridge toward a site visit:\n"
-                "'Photos don't do it justice — would you like to see it in person?'"
-            ),
-            STAGE_INVITE_VISIT: (
-                "The caller is interested. Your only goal now: book the site visit.\n"
-                "Give EXACTLY TWO specific time options (from the available slots).\n"
-                "When they pick a slot, confirm: date, time, and their name for the register.\n"
-                "Ask for WhatsApp to send the site address and directions.\n"
-                "Do NOT give more options — scarcity creates urgency."
-            ),
-            STAGE_CONFIRMATION: (
-                "Confirm the visit details: day, time, property, and caller's name.\n"
-                "Ask if any family member is joining (great buying decisions involve family).\n"
-                "Offer to WhatsApp the exact site address and parking instructions."
-            ),
-            STAGE_CLOSING: (
-                "Warm, genuine close using caller's name. Express real excitement about meeting them. "
-                "Keep the door open — any question, just call or WhatsApp."
-            ),
-        }
-        stage_goal = _stage_goals.get(self.state.stage, _stage_goals[STAGE_DISCOVERY])
+        _stage_goals = self._def.call_flow.stage_goals
+        stage_goal = _stage_goals.get(self.state.stage, next(iter(_stage_goals.values()), ""))
 
         # ── Collected info ───────────────────────────────────────────────────
         # Use confirmed name only; pending name gets its own confirmation block above
@@ -2103,14 +2159,7 @@ class ConversationRouter:
             collected_lines.append(f"Name just given (UNCONFIRMED): {self._name_pending!r}")
         if self.state.purpose:
             collected_lines.append(f"Purpose: {self.state.purpose}")
-        if b.location:
-            collected_lines.append(f"Location interest: {b.location}")
-        if b.property_type:
-            collected_lines.append(f"Configuration: {b.property_type}")
-        if b.budget:
-            collected_lines.append(f"Budget: {b.budget}")
-        if cs.timeline:
-            collected_lines.append(f"Timeline: {cs.timeline}")
+
         if self.state.project_recommended:
             collected_lines.append(f"Project discussed: {self.state.project_recommended}")
         if b.appointment_time:
@@ -2119,27 +2168,7 @@ class ConversationRouter:
 
         # ── Qualification status (for DISCOVERY stage guidance) ───────────────
         _qname = b.user_name or cs.customer_name
-        _qloc = b.location or cs.selected_location
-        _qprop = b.property_type or cs.property_type
-        _qpurpose = self.state.purpose or cs.purpose
-        _qbudget = b.budget or cs.budget
-        qual_needed: list[str] = []
-        if not _qname:
-            qual_needed.append("Name")
-        # Priority order per sales flow: location → config → budget → purpose → timeline → phone
-        if not _qloc:
-            qual_needed.append("City (Surat / Vapi / Silvassa)")
-        if not _qprop:
-            qual_needed.append("Configuration (1/2/3 BHK)")
-        if not _qbudget:
-            qual_needed.append("Budget (comfortable range — ask warmly)")
-        if not _qpurpose:
-            qual_needed.append("Purpose (self-use or investment)")
-        if not cs.timeline:
-            qual_needed.append("Timeline (when planning to buy)")
-        if not cs.customer_phone:
-            qual_needed.append("Phone / WhatsApp")
-        _qual_next = qual_needed[0] if qual_needed else None
+
 
         # Name-capture confirmation instruction (feature 4)
         name_confirm_block: list[str] = []
@@ -2158,23 +2187,112 @@ class ConversationRouter:
             dont_reask.append(f"caller's name ({cs.customer_name})")
         if cs.customer_phone:
             dont_reask.append("caller's phone number (stored; do not repeat back)")
-        if cs.selected_project:
-            dont_reask.append(f"which property ({cs.selected_project})")
-        if cs.selected_location:
-            dont_reask.append(f"city/location ({cs.selected_location})")
-        if cs.property_type or b.property_type:
-            dont_reask.append(f"property size/configuration ({cs.property_type or b.property_type})")
-        if cs.purpose or self.state.purpose:
-            dont_reask.append(f"purpose ({cs.purpose or self.state.purpose})")
-        if cs.budget or b.budget:
-            dont_reask.append(f"budget ({cs.budget or b.budget})")
-        if cs.timeline:
-            dont_reask.append(f"timeline ({cs.timeline})")
-        if cs.appointment_time:
-            dont_reask.append(f"visit time ({cs.appointment_time})")
 
-        # Missing mandatory fields block (when site visit is in scope)
-        missing_fields = self._compute_missing_booking_fields()
+        _pers = getattr(self._def, "personality", None)
+        _pronouns = (_pers.pronouns if _pers else None) or getattr(self._def.identity, "pronouns", "she")
+        _is_female = _pronouns.lower() == "she"
+        _pronoun_instruction = (
+            "Your pronouns are she/her. Use feminine agreement in every language. "
+            "In Hindi: ALWAYS use chahti, sakti, aayi, gayi, karungi, bataungi, samjhi, rahi — "
+            "NEVER chahta, sakta, aaya, gaya, karunga, batauga, samjha, raha. "
+            "In Gujarati: use feminine verb forms consistently."
+            if _is_female else
+            "Your pronouns are he/him. Use masculine agreement in every language. "
+            "In Hindi: ALWAYS use chahta, sakta, aaya, gaya, karunga, batauga, samjha, raha — "
+            "NEVER chahti, sakti, aayi, gayi, karungi, bataungi, samjhi, rahi. "
+            "In Gujarati: use masculine verb forms consistently."
+        )
+
+        # Personality / speaking style block
+        _personality_lines: list[str] = []
+        if _pers:
+            _energy_map = {
+                "low": "Calm and measured. Speak slowly and thoughtfully. Never rush.",
+                "medium": "Balanced energy — warm and engaged without being overpowering.",
+                "high": "High energy and enthusiasm. Be upbeat, punchy, and genuinely excited. Short sentences. Positive tone.",
+            }
+            _tone_map = {
+                "professional": "Maintain a polished, formal tone. Precise language. No slang.",
+                "conversational": "Conversational and natural. Speak like a knowledgeable friend, not a corporate bot.",
+                "friendly": "Warm, friendly, and encouraging. Use light informal language. Make the caller feel comfortable.",
+                "formal": "Strictly formal. No contractions. Deferential and structured.",
+            }
+            _style_map = {
+                "concise": "1-2 sentences maximum per turn. Be direct.",
+                "natural": "2-3 sentences per turn. Natural conversational flow.",
+                "detailed": "3-4 sentences. Give context and explanation where useful.",
+            }
+            _personality_lines = [
+                "",
+                "━━ PERSONALITY ━━",
+                f"Energy: {_energy_map.get(_pers.energy, _energy_map['medium'])}",
+                f"Tone: {_tone_map.get(_pers.tone, _tone_map['conversational'])}",
+                f"Response length: {_style_map.get(_pers.style, _style_map['natural'])}",
+            ]
+            if _pers.lingo:
+                _personality_lines.append(f"Vocabulary: {_pers.lingo}")
+            if _pers.custom_instructions:
+                _personality_lines.append(f"Persona: {_pers.custom_instructions}")
+
+        # ── Call direction — inbound vs outbound demand opposite approaches ──
+        _direction = (self.call_direction or "inbound").lower()
+        _direction_lines: list[str] = ["", ]
+        if _direction == "outbound":
+            _direction_lines += [
+                "━━ CALL TYPE: OUTBOUND — YOU PLACED THIS CALL ━━",
+                "You dialed this person; they did not call you. That changes everything about your approach:",
+                "▸ YOU LEAD THE CALL. Never wait for the other person to drive — you always know the next step and steer toward it.",
+                "▸ State who you are and why you're calling within the first two turns. Never leave them guessing.",
+                "▸ Your purpose: connect with them, pitch the relevant product/service, and resolve any queries they had requested answers for.",
+                "▸ Respect their time — they didn't plan this call. Be warm but purposeful; every turn moves toward your goal.",
+                "▸ If they're busy, offer to keep it to one minute or ask for a better time — do NOT just hang up.",
+                "▸ Handle 'not interested' gracefully once, with one strong value point — then respect a second no.",
+            ]
+            if self.outbound_contact_name:
+                _contact_phone_note = (
+                    " (number stored internally — never read it out unless they ask you to confirm it)"
+                    if self.outbound_contact_phone else ""
+                )
+                _direction_lines += [
+                    "",
+                    f"▸ CONTACT: You are calling {self.outbound_contact_name}{_contact_phone_note}.",
+                    f"▸ Early in the call, confirm you're speaking with the right person: e.g. 'Am I speaking with {self.outbound_contact_name}?'",
+                    f"▸ If it IS them, use their name naturally (not every turn). If it's someone else, politely ask if {self.outbound_contact_name} is available.",
+                    "▸ Do NOT re-ask for their name — you already have it.",
+                ]
+        else:
+            _direction_lines += [
+                "━━ CALL TYPE: INBOUND — THE CALLER CAME TO YOU ━━",
+                "They dialed in with a reason: a question, an issue, a request, or interest in a product/service.",
+                "▸ LISTEN FIRST. Find out why they called before pitching anything.",
+                "▸ Your purpose: accept and resolve their issues, requests and demands; answer questions accurately; schedule appointments/visits when they're interested.",
+                "▸ Make them feel welcomed and heard — they chose to reach out; reward that.",
+                "▸ Once their need is clear, guide them decisively to the resolution or the booking — don't leave them hanging.",
+            ]
+
+        # ── Calendar availability (live — excludes already-booked slots) ──────
+        _cal_lines: list[str] = []
+        if self._def.calendar.mock_slots:
+            _free = [] if b.appointment_time else self._available_calendar_slots()
+            if b.appointment_time:
+                pass  # already scheduled — surfaced in CALL STATE above
+            elif _free:
+                _slot_list = ", ".join(f"{s.day} at {s.time}" for s in _free)
+                _cal_lines = [
+                    "",
+                    "━━ APPOINTMENT CALENDAR (LIVE AVAILABILITY) ━━",
+                    f"Free slots right now: {_slot_list}",
+                    "▸ Offer ONLY slots from this list — never invent other times.",
+                    "▸ Offer at most TWO options at a time.",
+                    "▸ When the caller asks what times are available, mention free slots from this list.",
+                    "▸ Once the caller picks a slot, confirm it back clearly — it will be reserved for them.",
+                ]
+            else:
+                _cal_lines = [
+                    "",
+                    "━━ APPOINTMENT CALENDAR ━━",
+                    "All published slots are currently booked. Take the caller's preferred day/time as a request and say the team will call back to confirm — do NOT promise a specific slot.",
+                ]
 
         parts = [
             # Language lock FIRST — highest priority
@@ -2182,75 +2300,53 @@ class ConversationRouter:
             *name_confirm_block,
             "",
             "━━ AGENT IDENTITY ━━",
-            "You are Vishal Patel — a warm, genuine, experienced inbound sales agent for Pramukh Group.",
+            f"You are {self._def.identity.agent_name} — a warm, genuine, experienced {self._def.identity.role_description} for {self._def.identity.company_name}.",
             "You are NOT reading a script. You are a real person having a real conversation.",
             "Your job: make every caller feel genuinely heard and understood.",
+            _pronoun_instruction,
+            *_direction_lines,
             "",
             "━━ BRAND ━━",
-            "Pramukh Group · 30 years · 60+ completed projects · ZERO stalled projects · RERA compliant",
-            "Surat · Vapi · Silvassa · Contact: +91 87583 70000",
+            self._def.identity.company_tagline,
+            f"{' · '.join(self._def.knowledge_base.locations)} · Contact: {self._def.identity.contact}",
             "",
             "━━ CALL STATE ━━",
             f"Stage: {self.state.stage}  |  Language: {lang_name}  |  Turn: {self.state.turn_count}",
-            "Known so far:",
-            collected_str,
+            *([f"  · Visit scheduled: {b.appointment_time}"] if b.appointment_time else []),
+            *(["  · Phone: captured (stored internally — never repeat it back)"]
+              if cs.customer_phone else []),
             "",
-            "━━ PERSISTENT CALL STATE ━━",
-            f"  customer_name        : {cs.customer_name or '(not yet captured)'}",
-            f"  customer_phone       : {'captured (stored internally)' if cs.customer_phone else '(not yet captured)'}",
-            f"  selected_project     : {cs.selected_project or '(none yet)'}",
-            f"  selected_location    : {cs.selected_location or '(none yet)'}",
-            f"  property_type        : {cs.property_type or '(none yet)'}",
-            f"  purpose              : {cs.purpose or '(none yet)'}",
-            f"  budget               : {cs.budget or '(none yet)'}",
-            f"  site_visit_requested : {cs.site_visit_requested}",
-            f"  appointment_time     : {cs.appointment_time or '(none yet)'}",
-            f"  booking_validated    : {cs.booking_validated}",
+            # THE single authoritative state block: filled/missing slots,
+            # audit-backed values, rolling summary, and the one next question.
+            # Replaces the old CONFIRMED FIELDS / ALREADY COLLECTED / Known-so-far
+            # trio that used to overlap and occasionally contradict each other.
+            self.state_mgr.build_prompt_context(
+                self.state.language,
+                # Discovery-style prompting for the legacy ids AND for the
+                # first two stages of custom-id flows (position-based —
+                # custom ids like CONFIRM_PERSON/OPENING are never in the
+                # legacy tuple, which silently disabled the strong ask-next-
+                # missing-slot directive for builder-created agents).
+                stage_discovery=(
+                    self.state.stage in (STAGE_GREETING, STAGE_DISCOVERY)
+                    or next((i for i, s in enumerate(self._def.call_flow.stages)
+                             if s.id == self.state.stage), 0) <= 1
+                ),
+            ),
             *([
                 "",
-                "━━ ACTIVE PROJECT CONTEXT ━━",
-                f"The caller is discussing: {cs.selected_project}"
-                + (f" ({cs.selected_location})" if cs.selected_location else "") + ".",
-                f"ALL questions about location, amenities, pricing, distance, availability → answer in the context of {cs.selected_project}.",
-                f"DO NOT ask which property they are discussing. It is {cs.selected_project}.",
-            ] if cs.selected_project else []),
-            *([
-                "",
-                "━━ MANDATORY FIELDS STILL NEEDED ━━",
-                f"Site visit requested. Still need: {', '.join(missing_fields)}.",
-                "Collect ONE missing field per turn before confirming the booking.",
-            ] if missing_fields else []),
-            *([
-                "",
-                "━━ ALREADY COLLECTED — DO NOT RE-ASK ━━",
-                f"You already have: {'; '.join(dont_reask)}.",
-                "NEVER ask for any of these again. Use them naturally in your responses.",
-            ] if dont_reask else []),
-            *([
-                "",
-                "━━ QUALIFICATION STATUS ━━",
-                f"  Still needed (in priority order): {' → '.join(qual_needed)}",
-                f"  ⚡ NEXT FIELD TO ASK: {_qual_next}",
-                "  After acknowledging what the caller said, ask for this field — warmly, naturally.",
-                "  Do NOT skip it. Do NOT ask two questions at once.",
-            ] if qual_needed else [
-                "",
-                "━━ QUALIFICATION STATUS ━━",
-                "  ✅ All core qualification fields captured.",
-                "  Your priority now: recommend a matching project and book the site visit.",
-            ]),
+                "━━ ACTIVE CONTEXT ━━",
+                f"The caller is interested in: {cs.domain_fields['matched_entity']}.",
+                f"Answer specific questions in the context of: {cs.domain_fields['matched_entity']}.",
+                f"DO NOT ask which one they want — it is: {cs.domain_fields['matched_entity']}.",
+            ] if "matched_entity" in cs.domain_fields else []),
             "",
             "━━ CURRENT GOAL ━━",
             stage_goal,
+            *_cal_lines,
             "",
-            "━━ PROJECT PORTFOLIO ━━",
-            "SURAT: Revanta (3BHK ₹1.11Cr+), Vivanta (3BHK ₹1.66Cr+), Satva (3BHK ₹1.26Cr+ NEAR-READY Dec 2025),",
-            "Agastya (4BHK ultra-premium), Central Park (3+4BHK ₹1.3Cr+), Aranya (3+4BHK luxury near airport),",
-            "Aranya II (3BHK ₹70L+ IT corridor).",
-            "VAPI: Aura (2+3BHK ₹34-40L READY), Sahaj (1+2BHK ₹22-29L completed), Vedanta (RERA).",
-            "SILVASSA: Sangath (2+3BHK), Yogi Woods (pool+gym), Shivanta (near schools), Swagat (ready).",
-            "COMMERCIAL: Orbit Series (Surat/Vapi shops, offices).",
-            "MATCH: Budget+Vapi→Sahaj/Aura | Mid+Surat→Aranya II | Premium+Surat→Revanta/Satva | Luxury→Vivanta/Agastya | Ready→Satva/Aura/Sahaj",
+            f"━━ {self._def.knowledge_base.portfolio_section_label} ━━",
+            self._def.knowledge_base.portfolio_prompt_text,
             "",
             "━━ CONVERSATION GUIDELINES ━━",
             "LISTEN + QUALIFY: Acknowledge what the caller said, THEN always move the qualification forward.",
@@ -2261,6 +2357,36 @@ class ConversationRouter:
             "3 sentences max per response. Phone call — brevity is warmth.",
             "Mirror their energy: excited → warm and enthusiastic, cautious → softer and reassuring.",
             "NEVER sound like an IVR, chatbot, or scripted call center agent.",
+            *_personality_lines,
+            "",
+            "━━ NATURAL CONVERSATION STYLE (CRITICAL) ━━",
+            "",
+            "▸ ACKNOWLEDGMENT — weave a brief natural acknowledgment INTO the flow of your response.",
+            "  Do NOT bolt a standalone acknowledgment word onto the front of every sentence.",
+            "  A filler phrase (e.g. 'One moment please...', 'Haanji!') may already have been",
+            "  played to the caller before your response arrives. If so, skip any opening",
+            "  acknowledgment and go straight to your answer.",
+            "  When no filler was played, a single woven-in word is enough:",
+            "    ✓ 'Right, so a 2BHK in Ahmedabad — let me see...'",
+            "    ✓ 'Sure, we do cover Gujarat...'",
+            "    ✓ 'Yeah, that's a good point actually...'",
+            "    ✗ 'Got it! Absolutely! So...' — never stack acknowledgments.",
+            "  Vary the word every turn. Never use the same one twice in a row.",
+            "",
+            "▸ DO NOT ECHO THE CALLER verbatim. Never say 'I understand you're looking for a 2BHK in Ahmedabad.'",
+            "  Instead, absorb it and move naturally: 'Okay so a 2BHK in Ahmedabad — let me see...'",
+            "  or 'Right, Ahmedabad — good choice actually.' Paraphrase lightly, then continue.",
+            "",
+            "▸ USE CONTRACTIONS always. Write as you'd speak:",
+            "  'I'll' not 'I will', 'I'm' not 'I am', 'we've' not 'we have',",
+            "  'it's' not 'it is', 'don't' not 'do not', 'can't' not 'cannot'.",
+            "  BANNED phrases: 'I would be happy to assist', 'Thank you for sharing that information',",
+            "  'I appreciate your patience', 'I understand your concern', 'As per your requirement'.",
+            "",
+            "▸ CONVERSATIONAL REPAIR — when correcting yourself or redirecting, sound human:",
+            "  Use: 'Actually, let me rephrase that—', 'Sorry, what I mean is—',",
+            "       'Hmm, let me put that differently—', 'Right, so actually—'",
+            "  NOT: 'I apologize for the confusion, let me clarify', 'Let me correct myself'.",
             "",
             "━━ ANTI-REPETITION (CRITICAL) ━━",
             "Look at the conversation history. If you already asked something, DO NOT ask it again.",
@@ -2281,8 +2407,7 @@ class ConversationRouter:
             "Every sentence must either gather missing info, handle an objection, recommend a project, or push toward a site visit.",
             "✗ NEVER volunteer pricing, rates, payment plans, ROI, inventory levels, or discounts unprompted — only discuss these when the caller explicitly asks",
             "✗ NEVER repeat the caller's phone number back to them unless they explicitly ask you to confirm it",
-            "✗ NEVER ask for information that is already listed in PERSISTENT CALL STATE or ALREADY COLLECTED",
-            "✗ NEVER ask budget before you know the caller's city and configuration (BHK size)",
+            "✗ NEVER ask for information that is already marked ✓ in CONVERSATION STATE",
             "✗ NEVER give more than 2 time options for site visit",
             "✗ NEVER dump the whole portfolio on one caller",
             "✗ NEVER make up prices or dates not listed above",
@@ -2291,9 +2416,11 @@ class ConversationRouter:
             "✗ NEVER push the conversation to a new topic if the caller is still on the current one",
             "✗ NEVER give property pitches until the caller has expressed genuine interest",
             "✗ NEVER interrupt a caller's train of thought with an unrelated topic",
-            "✓ Use caller's name naturally (2-3 times)",
+            "✓ Use caller's name naturally — at most once every 4-5 turns. Do NOT open every response with their name.",
             "✓ No bullet points, lists, markdown, or emojis in your spoken responses",
             "✓ Only say things that are a direct, natural response to what the caller just said",
+            "✓ Use contractions: I'll, I'm, we've, it's, don't, can't — always",
+            "✓ Open each turn with a varied natural acknowledgment (Got it / Sure / Right / Absolutely — never twice in a row)",
         ]
 
         # QA tracker block — second layer of anti-repetition enforcement
@@ -2305,6 +2432,10 @@ class ConversationRouter:
         context_str = self.memory.context.to_prompt_string()
         if context_str:
             parts.append(f"\nKnown context:\n{context_str}")
+
+        if self._rag_context:
+            parts.append("")
+            parts.append(self._rag_context)
 
         return "\n".join(parts)
 
@@ -2520,15 +2651,95 @@ class ConversationRouter:
 
     def _pick_objection_response(self) -> str:
         lang = self.state.language
-        responses = _OBJECTION_RESPONSES.get(lang, _OBJECTION_RESPONSES["en"])
+        bank = self._def.response_bank.objection_responses
+        responses = bank.get(lang, bank["en"])
         resp = responses[self._response_counter % len(responses)]
         self._response_counter += 1
         return resp
 
     def _pick_filler(self) -> str:
+        """Return one filler phrase, chosen by input type.
+
+        Two tiers:
+        - APPROVAL filler  — for simple affirmations ("yes", "ok", "haan").
+          Signals agreement only, no "I'm looking something up" implication.
+          Examples: "Sure!", "Haanji!", "Of course!"
+        - THINKING filler  — for information requests / complex questions.
+          Signals the agent is retrieving or reasoning.
+          Examples: "One moment please...", "Ek minute...", "Batati hoon..."
+
+        The YAML bank (response_bank.filler_responses) provides thinking fillers
+        for agents that want branded phrasing. The approval pool is always
+        code-driven so it stays short and varied across all agents.
+        """
         lang = self.state.language
-        fillers = _FILLER_RESPONSES.get(lang, _FILLER_RESPONSES["en"])
-        resp = fillers[self._filler_counter % len(fillers)]
+
+        # ── Classify the caller's last turn ──────────────────────────────────
+        last_user = ""
+        for t in reversed(self.memory.turns):
+            if t.role == "user":
+                last_user = t.text.lower().strip()
+                break
+
+        _ACK_TOKENS = {
+            # English affirmations
+            "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "fine",
+            "good", "alright", "right", "agreed", "please", "go ahead",
+            "of course", "sounds good", "great", "perfect", "wonderful",
+            # Hindi affirmations
+            "haan", "ha", "haa", "ji", "haanji", "bilkul", "zaroor",
+            "theek", "sahi", "accha", "thik", "wah", "haan ji",
+            # Gujarati affirmations
+            "ha", "haa", "ji", "bilkul", "zaroor", "saru", "thik chhe",
+        }
+        clean_words = set(re.sub(r"[^\w\s]", "", last_user).split())
+        is_simple_ack = (
+            len(clean_words) <= 6
+            and bool(clean_words & _ACK_TOKENS)
+            and "?" not in last_user
+        )
+
+        # ── Approval pool — short, instant, no checking implication ──────────
+        _APPROVAL: dict[str, list[str]] = {
+            "en": ["Sure!", "Of course!", "Absolutely!", "Okay!", "Right, sure."],
+            "hi": ["Haanji!", "Zaroor!", "Bilkul!", "Ji haan!", "Haan, bilkul!"],
+            "gu": ["Haanji!", "Zaroor!", "Bilkul!", "Ji!", "Haan!"],
+        }
+
+        # ── Thinking pool — implies retrieving / reasoning ───────────────────
+        # Use the YAML bank when the agent has branded thinking phrases;
+        # fall back to the built-in pool otherwise.
+        bank = self._def.response_bank.filler_responses
+        yaml_thinking = bank.get(lang, bank.get("en", []))
+        _THINKING_BUILTIN: dict[str, list[str]] = {
+            "en": [
+                "One moment please...",
+                "Let me check...",
+                "Sure, one second...",
+                "Let me look into that...",
+            ],
+            "hi": [
+                "Ek minute...",
+                "Batati hoon...",
+                "Ek second, dekh leti hoon...",
+                "Haan, check karti hoon...",
+            ],
+            "gu": [
+                "Ek minute...",
+                "Joi leti hoon...",
+                "Ek second...",
+                "Jova dyo...",
+            ],
+        }
+
+        if is_simple_ack:
+            pool = _APPROVAL.get(lang, _APPROVAL["en"])
+        elif yaml_thinking:
+            pool = yaml_thinking
+        else:
+            pool = _THINKING_BUILTIN.get(lang, _THINKING_BUILTIN["en"])
+
+        resp = pool[self._filler_counter % len(pool)]
         self._filler_counter += 1
         return resp
 
@@ -2579,7 +2790,7 @@ class ConversationRouter:
     # ------------------------------------------------------------------
 
     def _localized(self, key: str, fallback: str) -> str:
-        loc = _LOCALIZED_RESPONSES.get(self.state.language, {})
+        loc = self._def.response_bank.localized_responses.get(self.state.language, {})
         val = loc.get(key)
         if val is None:
             return fallback
@@ -2588,7 +2799,7 @@ class ConversationRouter:
         return val
 
     def _localized_list(self, key: str, en_list: list[str]) -> str:
-        loc = _LOCALIZED_RESPONSES.get(self.state.language, {})
+        loc = self._def.response_bank.localized_responses.get(self.state.language, {})
         val = loc.get(key)
         if isinstance(val, list):
             resp = val[self._response_counter % len(val)]

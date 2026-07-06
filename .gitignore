@@ -31,3 +31,11 @@ recordings/
 
 #runtimelogs
 phase14_runtime/live_calls_state.json
+
+# Agent runtime state (active-agent selection + build cache)
+calling-agent/agents/active_agent.json
+calling-agent/backend/logs/
+frontend/tsconfig.tsbuildinfo
+
+# Copilot chat session persistence
+dashboard/copilot_sessions/

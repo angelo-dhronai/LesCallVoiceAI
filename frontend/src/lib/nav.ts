@@ -1,7 +1,8 @@
 import {
   LayoutDashboard, Radio, ListChecks, Mic2, AlarmClock, ScrollText,
   MessagesSquare, BrainCircuit, Microscope, LineChart, Bot, PhoneOutgoing,
-  Wallet, Settings2, HeartPulse, SlidersHorizontal,
+  Wallet, HeartPulse, SlidersHorizontal, Boxes, Sparkles, ScanSearch,
+  MessageCircle,
 } from 'lucide-react'
 
 export type NavItem = { to: string; label: string; icon: any; badge?: boolean }
@@ -9,9 +10,13 @@ export type NavGroup = { title: string; items: NavItem[] }
 
 export const NAV: NavGroup[] = [
   {
+    title: 'Copilot',
+    items: [{ to: '/', label: 'Copilot', icon: MessageCircle }],
+  },
+  {
     title: 'Monitoring',
     items: [
-      { to: '/', label: 'Overview', icon: LayoutDashboard },
+      { to: '/overview', label: 'Overview', icon: LayoutDashboard },
       { to: '/live', label: 'Live Calls', icon: Radio, badge: true },
       { to: '/activity', label: 'Call Activity', icon: ListChecks },
       { to: '/recordings', label: 'Recordings', icon: Mic2 },
@@ -30,6 +35,14 @@ export const NAV: NavGroup[] = [
     ],
   },
   {
+    title: 'Build',
+    items: [
+      { to: '/build/agents', label: 'Agents', icon: Boxes },
+      { to: '/build/agents/new', label: 'Create Agent', icon: Sparkles },
+      { to: '/build/intent', label: 'Intent Preview', icon: ScanSearch },
+    ],
+  },
+  {
     title: 'Campaigns',
     items: [{ to: '/outbound', label: 'Outbound Calls', icon: PhoneOutgoing }],
   },
@@ -42,7 +55,6 @@ export const NAV: NavGroup[] = [
     items: [
       { to: '/control', label: 'Runtime Control', icon: SlidersHorizontal },
       { to: '/health', label: 'Health', icon: HeartPulse },
-      { to: '/agent-settings', label: 'Agent Settings', icon: Settings2 },
     ],
   },
 ]

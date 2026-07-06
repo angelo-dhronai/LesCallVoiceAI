@@ -1,0 +1,8 @@
+# GameZone India / Gamer Man — telephony routing
+# Replace the DID with the actual inbound number when going live.
+
+did: "+910000000003"
+caller_id_prefixes: []
+time_windows:
+  - {start: 10, end: 22}    # 10am–10pm gaming store hours
+fallback_agent: "pramukh"

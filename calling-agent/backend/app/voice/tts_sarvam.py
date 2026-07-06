@@ -20,6 +20,7 @@ import numpy as np
 import sounddevice as sd
 
 from .tts_stream import StreamingTTS, TTSChunk
+from .key_rotator import current_key
 from ..audio_transport.base import AudioSink
 from ..audio_transport.local_speaker_sink import LocalSpeakerSink
 
@@ -137,11 +138,16 @@ class SarvamTTS(StreamingTTS):
             "output_audio_codec": "linear16",
         }
 
-        max_retries = 2
+        # Budget covers both connection retries AND hot-swapping through the
+        # backup key pool when a key returns 402 (out of credits).
+        max_retries = 8
         for attempt in range(max_retries):
             if self._cancelled:
                 return
 
+            # Always use the live key so a rotation (ours or the watchdog's)
+            # is picked up on the very next attempt without a restart.
+            self._api_key = current_key()
             client = self._get_client()
             try:
                 async with client.stream(
@@ -153,6 +159,25 @@ class SarvamTTS(StreamingTTS):
                     },
                     json=payload,
                 ) as response:
+                    if response.status_code == 402:
+                        body = await response.aread()
+                        logger.error(
+                            "[SARVAM:CREDITS] TTS HTTP 402 — %s — rotating key from pool.",
+                            body[:200],
+                        )
+                        from .key_rotator import rotate as _rotate_key
+                        new_key = _rotate_key()
+                        if new_key:
+                            self._api_key = new_key
+                            self._client = None  # force fresh TLS with new key
+                            logger.info(
+                                "[TTS:Sarvam] Key rotated — retrying speak() with new key"
+                            )
+                            continue
+                        logger.error(
+                            "[TTS:Sarvam] No backup key available — cannot speak"
+                        )
+                        return
                     if response.status_code != 200:
                         body = await response.aread()
                         logger.error(

@@ -26,6 +26,7 @@ from .base import STTProvider, STTResult  # noqa: F401 — re-exported for pipel
 from .sarvam import SarvamSTT, SarvamRateLimitError
 from .openai_whisper import OpenAIWhisperSTT
 from .post_processor import post_process_transcript
+from ...agent_definition.schema import STTCorrections
 
 logger = logging.getLogger(__name__)
 
@@ -314,12 +315,14 @@ class STTRouter:
         min_length: int = MIN_TRANSCRIPT_LENGTH,
         max_retries: int = MAX_RETRIES,
         min_confidence: float = MIN_CONFIDENCE,
+        stt_corrections: STTCorrections | None = None,
     ) -> None:
         self._primary = primary or SarvamSTT()
         self._fallback = fallback or OpenAIWhisperSTT()
         self._min_length = min_length
         self._max_retries = max_retries
         self._min_confidence = min_confidence
+        self._stt_corrections = stt_corrections
 
         # Rate-limit state (Sarvam HTTP 429 tracking)
         self._sarvam_rl_until: float = 0.0   # monotonic time when backoff expires
@@ -410,7 +413,7 @@ class STTRouter:
     def _post_process(self, text: str, language: str) -> str:
         if not text:
             return text
-        return post_process_transcript(text, language)
+        return post_process_transcript(text, language, self._stt_corrections)
 
     async def _try_provider(
         self,

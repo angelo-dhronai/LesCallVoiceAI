@@ -1,0 +1,8 @@
+# Horizon Homes (demo_realty) — telephony routing rules
+# Replace the DID below with the actual inbound number assigned to this agent.
+# Calls landing on this DID are routed to the demo_realty rental agent.
+
+did: "+910000000001"            # TODO: replace with real DID
+caller_id_prefixes: []
+time_windows: []
+fallback_agent: "pramukh"      # if DID match fails, fall through to Pramukh

@@ -1,0 +1,10 @@
+# Serene Health Clinics — telephony routing rules
+# Replace the DID below with the actual inbound number for the health helpline.
+# Business hours: 9am-8pm only; after-hours calls fall back to Pramukh (or a
+# future after-hours agent).
+
+did: "+910000000002"            # TODO: replace with real DID
+caller_id_prefixes: []
+time_windows:
+  - {start: 9, end: 20}        # 9am–8pm; after hours fall through to fallback
+fallback_agent: "pramukh"

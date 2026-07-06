@@ -39,3 +39,6 @@ frontend/tsconfig.tsbuildinfo
 
 # Copilot chat session persistence
 dashboard/copilot_sessions/
+
+dashboard/sarvam_key_status.json
+

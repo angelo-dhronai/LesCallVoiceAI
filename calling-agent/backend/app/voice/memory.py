@@ -116,6 +116,17 @@ class CallState:
     callback_requested: bool = False
     callback_iso: str | None = None          # UTC ISO8601 — when to dial back
     callback_raw: str | None = None          # original phrase, for context/debug
+    # Qualification slots added with the ConversationStateManager layer
+    loan_required: str | None = None         # "yes" / "no" — home-loan needed
+    transaction_type: str | None = None      # "buy" / "rent"
+    occupation: str | None = None            # e.g. "business" / "service"
+    property_category: str | None = None     # "apartment" / "villa" / "plot" / "commercial"
+
+    def to_dict(self) -> dict:
+        """Plain-dict snapshot of every field (raw values, phone unmasked —
+        mask at the presentation layer, e.g. StateManager.snapshot())."""
+        from dataclasses import asdict
+        return asdict(self)
 
 
 @dataclass
@@ -187,6 +198,11 @@ class QATracker:
         "timeline": [
             "when", "how soon", "timeline", "kab", "कब", "ક્યારे",
             "planning to buy", "when are you looking",
+        ],
+        "loan": [
+            "loan", "home loan", "emi", "finance", "funding",
+            "लोन", "ईएमआई", "લોન", "loan loge", "loan lenge",
+            "self funded", "cash payment",
         ],
     }
 

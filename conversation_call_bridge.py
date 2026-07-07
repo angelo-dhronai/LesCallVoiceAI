@@ -151,7 +151,30 @@ class TelephonySession:
         except Exception as exc:
             logger.warning("[%s] Callback follow-up emit failed: %r", self.conn_id, exc)
 
+        # Persist the final conversation-state snapshot (slots, missing
+        # fields, audit trail, running summary) next to the call transcript so
+        # the dashboard/lead pipeline can consume it. Never breaks teardown.
+        try:
+            self._persist_state_snapshot(transcript_path)
+        except Exception as exc:
+            logger.warning("[%s] State snapshot persist failed: %r", self.conn_id, exc)
+
         logger.info(f"[{self.conn_id}] Session stopped")
+
+    def _persist_state_snapshot(self, transcript_path) -> None:
+        state_mgr = getattr(getattr(self.pipeline, "conversation", None), "state_mgr", None)
+        if state_mgr is None or not transcript_path:
+            return
+        out_dir = os.path.dirname(transcript_path)
+        if not out_dir or not os.path.isdir(out_dir):
+            return
+        out_path = os.path.join(out_dir, "conversation_state.json")
+        snapshot = state_mgr.snapshot()
+        snapshot["call_id"] = self.conn_id
+        snapshot["caller_number"] = self.caller_number or ""
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        logger.info("[%s] Conversation state persisted to %s", self.conn_id, out_path)
 
     async def _emit_callback_followup(self, transcript_path) -> None:
         """If CallState carries a callback request, register it with the

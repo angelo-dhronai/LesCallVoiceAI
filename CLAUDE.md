@@ -116,12 +116,23 @@ Five independent async tasks connected by bounded queues:
 - **`tts_sarvam.py` — SarvamTTS**: HTTP streaming to `api.sarvam.ai/text-to-speech/stream`, model `bulbul:v3`, speaker `shubh`. Audio chunks are written to the `AudioSink` as they arrive (true streaming, no buffer-all-first).
 - **`tts_stream.py` — StreamingTTS**: abstract base class. `MockStreamingTTS` available for testing.
 
+### Conversation State Management (`app/voice/state_manager.py`)
+
+`ConversationStateManager` is the **single write path for qualification slots** (location, configuration/BHK, budget, timeline, purpose, loan_required, transaction_type, occupation, property_category, project). One instance per call, owned by `ConversationRouter` (`router.state_mgr`).
+
+- **`ingest_user_turn(text, intent)`** runs on EVERY turn (including shortcut turns — a "thanks, 3BHK in Vapi" no longer loses its slots) and strictly **before** the speculative LLM task is created, so the system prompt always sees fresh state. It is synchronous pure Python — never add an `await` into this path.
+- **Merge policies**: a null extraction never overwrites data; preference slots are LATEST_WINS ("actually make it a 2BHK" updates state + audit trail); `project` is CORRECTION_GATED (passing mentions rejected, explicit correction cues like "nahi nahi, X" accepted); name/phone/appointment are EXTERNAL — still owned by the pending-confirmation and stage-gated machinery in `conversation.py`, the manager only audits them via `observe_external()`.
+- **Write-through**: the manager writes both legacy stores (`BookingData` and `CallState`) so all `b.X or cs.X` readers stay consistent. `CallState` remains the external contract.
+- **`build_prompt_context()`** renders PERSISTENT CALL STATE + RUNNING SUMMARY + RECENT CORRECTIONS + ALREADY COLLECTED + QUALIFICATION STATUS (with the single NEXT FIELD TO ASK and a suggested question in the caller's language) — injected into every system prompt by `_build_system_prompt`.
+- **Audit trail**: every accepted/rejected slot change (`SlotChange`: field, old, new, turn, source, correction) — surfaced in the `{"type": "state"}` event-hub event after each turn and persisted to `recordings/<conn_id>/conversation_state.json` at call end by the bridge.
+- Optional LLM-assisted gap-filling behind `ENABLE_LLM_SLOT_EXTRACTION=true` (fill-only, never overwrites a deterministic capture; off by default).
+
 ### Memory (`app/voice/memory.py`)
 
 Three-layer memory injected into each LLM call:
 1. **`ConversationMemory`** — sliding window of last 5 turns.
 2. **`ContextMemory`** — extracted `user_name`, `intent`, `topic`, `sentiment`.
-3. **`CallState`** — structured booking fields; the ground truth for what has been confirmed.
+3. **`CallState`** — structured booking fields; the ground truth for what has been confirmed. Slot writes go through `ConversationStateManager` (above); name/phone keep their dedicated capture flows.
 
 Phone numbers are extracted and stored internally; they are never read back verbatim to the caller.
 

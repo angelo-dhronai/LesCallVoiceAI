@@ -38690,5 +38690,863 @@
     "recommended_follow_up_date": "2023-10-30",
     "_analyzed_at": "2026-07-02T06:43:44.228Z",
     "_model": "gpt-4o-mini"
+  },
+  "919599761331_20260702_065230": {
+    "summary": "The sales agent, Vishal Patel, initiated a call with a prospect named Raj Bhatt. They exchanged greetings in Hindi and the agent inquired about the city where Raj is interested in viewing properties.",
+    "customer_intent": "interested in property viewing",
+    "key_points": [
+      "Agent introduced himself and asked for the customer's name",
+      "Agent inquired about the city for property viewing"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Agent should provide information about properties in the mentioned cities",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "property viewing",
+      "customer introduction"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide property options based on the customer's city preference",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-02T06:53:36.924Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919599761331_20260702_072807": {
+    "summary": "The sales agent, Vishal Patel from Pramukh Group, initiated a call to understand the customer's needs. The customer responded positively in Hindi, indicating they are available to talk.",
+    "customer_intent": "to discuss their needs",
+    "key_points": [
+      "Agent introduced himself and the company",
+      "Customer indicated they are available to talk"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Continue the conversation to gather more information about the customer's needs",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "customer needs assessment"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "The call is still ongoing and no follow-up is needed at this moment.",
+    "follow_up_priority": "null",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-02T07:29:06.507Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919599761331_20260702_074235": {
+    "summary": "The sales agent, Vishal Patel from Pramukh Group, initiates a call with a prospect who responds positively. The agent asks for the prospect's name and location.",
+    "customer_intent": null,
+    "key_points": [
+      "Agent introduced himself and his company",
+      "Customer responded positively to the call"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Continue the conversation by asking more about the customer's needs or interests",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "introduction",
+      "customer location inquiry"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "The conversation is still in the introductory phase.",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-02T07:43:29.150Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919599761331_20260702_074306": {
+    "summary": "The sales agent, Vishal Patel from Pramukh Group, initiated a call with a prospect. The prospect confirmed that it was a good time to talk.",
+    "customer_intent": null,
+    "key_points": [
+      "Agent introduced himself and his company",
+      "Customer was available to talk"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Continue the conversation to gather more information from the customer.",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "The conversation is just beginning.",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-02T07:44:17.532Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919599761331_20260702_074828": {
+    "summary": "The sales agent, Vishal Patel from Pramukh Group, initiates a call with a prospect named Aditya to discuss property options. Aditya responds positively and provides his name, indicating he is open to the conversation.",
+    "customer_intent": "inquire about property options",
+    "key_points": [
+      "Agent introduced himself and asked for the customer's name",
+      "Customer provided his name and showed willingness to engage"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Agent should continue discussing property options with Aditya.",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "property inquiry"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide property options based on the customer's location preference.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-02T07:49:38.563Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919599761331_20260702_075814": {
+    "summary": "The call was between a sales agent and a prospect named Aditya, who is looking to purchase a 2 BHK property in Surat for investment purposes. They scheduled a property viewing for Saturday at 5 PM.",
+    "customer_intent": "buy a 2 BHK property in Surat",
+    "key_points": [
+      "Aditya is looking for a 2 BHK property in Surat",
+      "He has a budget of 40 to 80 lakh and plans to visit in two weeks"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Confirm the property viewing appointment and provide additional property details",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "property investment",
+      "property viewing scheduling"
+    ],
+    "products_mentioned": [
+      "2 BHK property"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "to confirm the appointment and provide further information",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-11-04",
+    "_analyzed_at": "2026-07-02T08:01:03.721Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919599761331_20260702_080917": {
+    "summary": "The call begins with the sales agent, Vishal Patel, introducing himself and checking if it's a good time for the prospect to talk.",
+    "customer_intent": null,
+    "key_points": [],
+    "customer_questions": [],
+    "suggested_next_action": "Agent should wait for the customer to respond and engage in conversation.",
+    "sentiment": "neutral",
+    "lead_quality": null,
+    "objections": [],
+    "topics": [],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "No specific follow-up is needed at this stage as the call is just starting.",
+    "follow_up_priority": null,
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-02T08:10:09.822Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918628835737_20260702_102640": {
+    "summary": "The call begins with the agent introducing himself and his company, but the customer seems confused and does not recognize the agent.",
+    "customer_intent": "clarification on who is calling",
+    "key_points": [
+      "Agent introduced himself and his company",
+      "Customer expressed confusion"
+    ],
+    "customer_questions": [
+      "\u0915\u094b\u0923?"
+    ],
+    "suggested_next_action": "Agent should clarify who he is and the purpose of the call",
+    "sentiment": "neutral",
+    "lead_quality": "cold",
+    "objections": [],
+    "topics": [
+      "introduction",
+      "customer confusion"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "The call did not progress due to customer confusion.",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-02T10:27:23.099Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918767865050_20260702_102811": {
+    "summary": "The call involved a sales agent, Vishal Patel, trying to communicate with a caller who initially spoke in a different language. The agent offered to continue in English, but the caller seemed to be struggling with the language transition.",
+    "customer_intent": "assistance in English",
+    "key_points": [
+      "Caller requested communication in English",
+      "Agent confirmed ability to speak English"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Agent should clarify the customer's needs in English",
+    "sentiment": "neutral",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "language preference",
+      "customer assistance"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "The call did not progress to a point requiring follow-up.",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-02T10:29:43.559Z",
+    "_model": "gpt-4o-mini"
+  },
+  "917042340227_20260702_102750": {
+    "summary": "The sales agent, Vishal, reached out to a prospect named Raj to discuss property options. Raj expressed interest in finding flats in Mumbai, but the agent informed him that their company specializes in properties located in Surat, Vapi, and Silvassa.",
+    "customer_intent": "find flats in Mumbai",
+    "key_points": [
+      "Agent introduced himself and asked for the customer's name.",
+      "Customer is looking for properties in Mumbai, but the agent only offers properties in specific cities."
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Agent should provide information about properties in Surat, Vapi, or Silvassa.",
+    "sentiment": "neutral",
+    "lead_quality": "cold",
+    "objections": [],
+    "topics": [
+      "property search",
+      "location preferences"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "The customer is looking for properties outside the agent's offerings.",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-02T10:29:48.548Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918628835737_20260702_102749": {
+    "summary": "The sales agent, Vishal Patel from Pramukh Group, called the prospect to inquire if they were interested in purchasing property. The prospect seemed confused about the purpose of the call and asked for clarification.",
+    "customer_intent": "clarification on the call purpose",
+    "key_points": [
+      "Agent introduced himself and the company",
+      "Prospect asked why they were being called"
+    ],
+    "customer_questions": [
+      "\u0906\u092a\u0928\u0947 \u0915\u0949\u0932 \u0915\u094d\u092f\u094b\u0902 \u0915\u093f\u092f\u093e \u0939\u0948?"
+    ],
+    "suggested_next_action": "Agent should clarify the purpose of the call and provide more information about property options.",
+    "sentiment": "neutral",
+    "lead_quality": "cold",
+    "objections": [],
+    "topics": [
+      "real estate inquiry"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": true,
+    "follow_up_reason": "The prospect needs more information to understand the call's purpose.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "null",
+    "_analyzed_at": "2026-07-02T10:29:52.666Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918076562864_20260702_102941": {
+    "summary": "The call is an introduction from Vishal Patel of Pramukh Group, who is reaching out to assist the caller with their property needs. The caller responds in Hindi, asking who the agent is.",
+    "customer_intent": "inquire about property needs",
+    "key_points": [
+      "Agent introduces himself and his company",
+      "Caller asks for the agent's identity"
+    ],
+    "customer_questions": [
+      "\u092c\u0924\u093e\u0913 \u0915\u094c\u0928 \u0939\u094b?"
+    ],
+    "suggested_next_action": "Continue the conversation to understand the customer's property needs",
+    "sentiment": "neutral",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "property needs assistance"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "The call is still in the introductory phase.",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-02T10:30:42.149Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918628835737_20260702_102945": {
+    "summary": "The sales agent, Vishal Patel, called the prospect, Moksh, to discuss his interest in renting a furnished 2 BHK apartment in Vapi. Moksh shared his budget and moving timeline, and the agent offered to help him find suitable properties.",
+    "customer_intent": "looking for a rental apartment",
+    "key_points": [
+      "Customer is interested in a furnished 2 BHK apartment in Vapi.",
+      "Customer's budget for rent is between \u20b920,000 to \u20b923,000."
+    ],
+    "customer_questions": [
+      "\u0915\u094d\u092f\u093e \u092c\u091c\u091f \u092e\u0947\u0902 \u091f\u0942 \u092c\u0947\u091a \u0915\u0947 \u092e\u093f\u0932 \u091c\u093e\u090f\u0902\u0917\u0947?"
+    ],
+    "suggested_next_action": "Agent should provide options for available apartments and schedule a site visit.",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "rental apartments",
+      "customer budget",
+      "moving timeline"
+    ],
+    "products_mentioned": [
+      "furnished 2 BHK apartment"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide apartment options and confirm a site visit.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-11-10",
+    "_analyzed_at": "2026-07-02T10:33:47.841Z",
+    "_model": "gpt-4o-mini"
+  },
+  "917042340227_20260702_102939": {
+    "summary": "The call was between Vishal Patel from Pramukh Group and a prospect named Raj, who is looking for a 3 BHK property in Vapi within a budget of 60-70 lakhs. Raj expressed interest in the property but was busy and did not want to discuss further details at the moment.",
+    "customer_intent": "inquire about 3 BHK properties",
+    "key_points": [
+      "Raj is looking for a 3 BHK property in Vapi.",
+      "His budget is 60-70 lakhs."
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Send Raj more information about the Aura project via WhatsApp.",
+    "sentiment": "neutral",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "property inquiry",
+      "budget discussion"
+    ],
+    "products_mentioned": [
+      "Aura"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "Raj expressed interest but was busy to discuss further.",
+    "follow_up_priority": "medium",
+    "recommended_follow_up_date": "null",
+    "_analyzed_at": "2026-07-02T10:33:52.842Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918626056878_20260702_102951": {
+    "summary": "The call was between Vishal from Pramukh Group and a prospect named Kanika, who is interested in purchasing a 2 BHK property in Vapi. They discussed her budget and scheduled a site visit for the following day.",
+    "customer_intent": "looking for a 2 BHK property",
+    "key_points": [
+      "Kanika is interested in properties in Vapi.",
+      "She has a budget of around 50 to 60 lakhs."
+    ],
+    "customer_questions": [
+      "are any properties available?"
+    ],
+    "suggested_next_action": "Confirm the site visit details and send information about the property.",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "property inquiry",
+      "site visit scheduling"
+    ],
+    "products_mentioned": [
+      "Sahaj project"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "To confirm the site visit and provide property details.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-10-05",
+    "_analyzed_at": "2026-07-02T10:37:44.922Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918767865050_20260702_102942": {
+    "summary": "The call involved a sales agent, Vishal, trying to assist Shubhaangi in finding a property in Surat. Shubhaangi expressed interest in a 2 BHK property with lake views but ultimately decided not to proceed with scheduling a visit at this time.",
+    "customer_intent": "looking for property information",
+    "key_points": [
+      "Customer is interested in a 2 BHK property in Surat.",
+      "Customer specifically wants a lake view."
+    ],
+    "customer_questions": [
+      "what all facilities i might get?",
+      "may i know the names first? what all properties do you have?"
+    ],
+    "suggested_next_action": "Follow up with Shubhaangi in the future regarding property options.",
+    "sentiment": "neutral",
+    "lead_quality": "warm",
+    "objections": [
+      "not interested right now"
+    ],
+    "topics": [
+      "property search",
+      "amenities",
+      "lake view options"
+    ],
+    "products_mentioned": [
+      "Aranya",
+      "Vivanta"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "Customer expressed interest but is not ready to proceed at this time.",
+    "follow_up_priority": "medium",
+    "recommended_follow_up_date": "2023-11-01",
+    "_analyzed_at": "2026-07-02T10:37:50.009Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919599761331_20260702_121121": {
+    "summary": "The sales agent, Vishal Patel, contacted Raj Bhatu to discuss property options in Surat. Raj expressed interest in any type of property without specifying a preference for BHK or budget.",
+    "customer_intent": "looking for property in Surat",
+    "key_points": [
+      "Customer is interested in properties in Surat",
+      "Customer is flexible regarding the type of property"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Agent should inquire about the customer's budget to provide suitable property options.",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "property search",
+      "location preference"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide property options based on the customer's budget.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "null",
+    "_analyzed_at": "2026-07-02T12:13:42.754Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919599761331_20260702_121329": {
+    "summary": "The sales agent, Vishal, initiated a call with a prospect named Angelo. They exchanged names and the agent inquired about the city of interest for further discussion.",
+    "customer_intent": "inquire about city options",
+    "key_points": [
+      "Agent introduced himself and asked for the customer's name",
+      "Customer provided their name and was asked about their city of interest"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Continue the conversation by discussing the city options",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "customer identification",
+      "city options"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "The conversation is ongoing and no specific follow-up is required yet.",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-02T12:14:31.776Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918076562864_20260703_070051": {
+    "summary": "The call was between a sales agent and a prospect named Elvin, who is looking for a 3 BHK property in Vapi. The agent asked about Elvin's budget and the intended use of the property.",
+    "customer_intent": "looking for a 3 BHK property",
+    "key_points": [
+      "Customer is interested in Vapi properties",
+      "Budget is above one crore"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Provide property options that fit the customer's criteria",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "real estate",
+      "property search"
+    ],
+    "products_mentioned": [
+      "3 BHK property"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide property options and further assist the customer",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "null",
+    "_analyzed_at": "2026-07-03T07:03:17.685Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918626056878_20260703_070324": {
+    "summary": "The call involved a sales agent discussing property options in Vapi with a prospect. The customer expressed interest in purchasing a property for personal use, with a budget of around 60 to 70 lakhs, and is looking for more details about a specific project.",
+    "customer_intent": "looking for property details",
+    "key_points": [
+      "Customer is interested in properties in Vapi.",
+      "Budget is around 60 to 70 lakhs for personal use."
+    ],
+    "customer_questions": [
+      "i need to allow to predict",
+      "i'm looking for more details about the project"
+    ],
+    "suggested_next_action": "Provide detailed information about the Aura project and its amenities.",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "property search",
+      "specific project details"
+    ],
+    "products_mentioned": [
+      "Aura project"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "Customer expressed interest in more details about the project.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-11-01",
+    "_analyzed_at": "2026-07-03T07:07:08.875Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919599761331_20260704_060013": {
+    "summary": "The call was between Vishal Patel from Pramukh Group and a prospect named Raj Bhattu, who is interested in purchasing a property in Surat, Gujarat. Raj specifically inquired about 4 BHK properties and discussed his requirements with the agent.",
+    "customer_intent": "buy a property in Surat",
+    "key_points": [
+      "Raj is looking for a 4 BHK property in Surat.",
+      "Vishal provided information about Pramukh Group and asked about Raj's budget."
+    ],
+    "customer_questions": [
+      "can you tell me about some properties that i can buy in gujarat?",
+      "did you catch my name, vishal?"
+    ],
+    "suggested_next_action": "Provide Raj with options for 4 BHK properties in Surat and ask for his budget.",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "real estate properties in Surat",
+      "customer requirements for property"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide property options and discuss budget.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "null",
+    "_analyzed_at": "2026-07-04T06:02:35.926Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918076562864_20260704_060240": {
+    "summary": "The sales agent, Vishal Patel, initiates a friendly conversation with the prospect, Raj Bhatu, and inquires about his location. The call appears to be in the early stages of building rapport.",
+    "customer_intent": null,
+    "key_points": [
+      "Agent introduces himself and asks about the customer's name.",
+      "Agent engages in small talk about the customer's location."
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Continue the conversation to understand the customer's needs.",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "introduction",
+      "small talk"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "The conversation is still in the introductory phase.",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-04T06:03:25.341Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918076562864_20260704_060714": {
+    "summary": "The sales agent, Vishal Patel, is reaching out to a prospect named Raj Wadwa to discuss property options in the cities of Surat, Vapi, or Silvassa. Raj expresses interest in looking for a property specifically in Vapi.",
+    "customer_intent": "looking for property in Vapi",
+    "key_points": [
+      "Agent introduced himself and asked about the customer's name.",
+      "Customer confirmed interest in properties in Vapi."
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Provide property options available in Vapi.",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "property search",
+      "location preferences"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide property options and further assist the customer.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-10-30",
+    "_analyzed_at": "2026-07-04T06:08:46.369Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919586587878_20260704_061042": {
+    "summary": "The call was between Vishal Patel from Pramukh Group and a prospect named Raj, who is interested in learning more about housing projects in Vapi. Raj expressed interest in 3 BHK and 4 BHK options and scheduled a visit to see a sample flat at the Aura project.",
+    "customer_intent": "learn more about housing projects",
+    "key_points": [
+      "Raj is interested in 3 BHK and 4 BHK options.",
+      "A visit to the Aura project is scheduled for tomorrow at 10:00 AM."
+    ],
+    "customer_questions": [
+      "can i get the project details of 3 bhk?",
+      "what is the square feet of the unit?",
+      "is sample plate ready?"
+    ],
+    "suggested_next_action": "Send Raj the address and parking instructions via WhatsApp.",
+    "sentiment": "positive",
+    "lead_quality": "hot",
+    "objections": [],
+    "topics": [
+      "housing projects",
+      "specific project details",
+      "scheduling a visit"
+    ],
+    "products_mentioned": [
+      "Aura"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide Raj with the address and parking instructions for the visit.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-10-06",
+    "_analyzed_at": "2026-07-04T06:14:55.540Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919925247652_20260704_065040": {
+    "summary": "The sales agent, Vishal Patel from Pramukh Group, initiated a call with a prospect. The conversation is in Hindi, and the agent is trying to establish rapport by asking for the customer's name.",
+    "customer_intent": null,
+    "key_points": [
+      "Agent introduced himself and the company",
+      "Agent greeted the customer in Hindi"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Continue the conversation to gather more information from the customer.",
+    "sentiment": "neutral",
+    "lead_quality": "cold",
+    "objections": [],
+    "topics": [
+      "introduction",
+      "greeting"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "No specific follow-up needed at this stage as the conversation is just beginning.",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-04T06:51:12.513Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919925247652_20260704_065108": {
+    "summary": "The call begins with the sales agent, Vishal Patel, introducing himself and checking if it's a good time for the prospect to talk.",
+    "customer_intent": null,
+    "key_points": [],
+    "customer_questions": [],
+    "suggested_next_action": "Wait for the customer to respond and engage in conversation.",
+    "sentiment": "neutral",
+    "lead_quality": null,
+    "objections": [],
+    "topics": [],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "No specific follow-up needed at this stage.",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-04T06:52:01.399Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919925247652_20260704_065657": {
+    "summary": "The call was between a sales agent and a prospect named Ajit, who is looking to buy a 3 BHK flat within a month with a budget of 40 lakh. The agent gathered information about Ajit's preferences and assured him of finding the right property.",
+    "customer_intent": "buy a 3 BHK flat",
+    "key_points": [
+      "Ajit wants to buy a flat within a month",
+      "Budget is 40 lakh"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "The agent should follow up with Ajit to provide property options.",
+    "sentiment": "positive",
+    "lead_quality": "hot",
+    "objections": [],
+    "topics": [
+      "real estate",
+      "property purchase"
+    ],
+    "products_mentioned": [
+      "3 BHK flat"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide property options and maintain engagement.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-11-01",
+    "_analyzed_at": "2026-07-04T07:00:25.080Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918076562864_20260704_074030": {
+    "summary": "The call was between Vishal Patel from Pramukh Group and a prospect named Raj Bhatu. Raj expressed interest in properties in Surat, Vapi, and Silvassa, and inquired about various projects and options available.",
+    "customer_intent": "inquire about properties",
+    "key_points": [
+      "Raj is interested in properties in Surat, Vapi, and Silvassa.",
+      "He is looking for options including 4 BHK properties."
+    ],
+    "customer_questions": [
+      "\u0909\u0938\u0915\u0947 \u0905\u0932\u093e\u0935\u093e \u092e\u0941\u091d\u0947 \u092c\u093e\u092a\u094d\u092a\u0940 \u0914\u0930 silvassa \u0915\u0947 \u092c\u093e\u0930\u0947 \u092e\u0947\u0902 \u092d\u0940 \u0925\u094b\u095c\u093e \u0938\u093e \u092c\u0924\u093e \u0926\u094b\u0964"
+    ],
+    "suggested_next_action": "Provide detailed information about the properties and projects in the mentioned areas.",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "property options in Surat, Vapi, and Silvassa"
+    ],
+    "products_mentioned": [
+      "\u0930\u093f\u0935\u093e\u0902\u0924\u093e",
+      "\u0935\u093f\u0935\u093e\u0902\u0924\u093e",
+      "\u0938\u0924\u0935\u093e",
+      "\u0911\u0930\u093e",
+      "\u0938\u0939\u091c",
+      "\u0938\u0902\u0917\u0920",
+      "\u092f\u094b\u0917\u0940 \u0935\u0941\u0921\u094d\u0938",
+      "\u0905\u0917\u0938\u094d\u0924\u094d\u092f \u092a\u094d\u0930\u094b\u091c\u0947\u0915\u094d\u091f"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide more detailed information about the properties Raj is interested in.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-10-30",
+    "_analyzed_at": "2026-07-04T07:42:46.385Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918141586004_20260704_075848": {
+    "summary": "The call begins with the sales agent, Vishal Patel, introducing himself and checking if it's a good time for the prospect to talk.",
+    "customer_intent": null,
+    "key_points": [],
+    "customer_questions": [],
+    "suggested_next_action": "Continue the conversation to understand the customer's needs.",
+    "sentiment": "neutral",
+    "lead_quality": null,
+    "objections": [],
+    "topics": [],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "No specific follow-up needed at this stage.",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-04T07:59:27.041Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918141586004_20260704_075920": {
+    "summary": "The sales agent, Vishal Patel from Pramukh Group, initiated a call to discuss property assistance. The prospect responded in Hindi, asking who the agent is and what the call is about.",
+    "customer_intent": "inquire about the agent's purpose",
+    "key_points": [
+      "Agent introduced himself and the company",
+      "Customer asked for clarification on the agent's purpose"
+    ],
+    "customer_questions": [
+      "\u0915\u093f\u0938\u0915\u093e \u0915\u093e\u092e \u0939\u0948 \u0906\u092a\u0915\u094b?"
+    ],
+    "suggested_next_action": "The agent should clarify the services offered and engage the customer further.",
+    "sentiment": "neutral",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "property assistance"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": true,
+    "follow_up_reason": "The agent needs to provide more information about the services to engage the customer.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-04T08:00:16.974Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919586887878_20260704_093031": {
+    "summary": "The call was between Vishal Patel from Pramukh Group and Payal Bhattu, who is looking for a property in Vapi. Payal initially requested a 1.5 BHK flat but was informed that only 2 BHK options are available, leading to a discussion about potential projects and scheduling a site visit.",
+    "customer_intent": "inquire about property options",
+    "key_points": [
+      "Payal is looking for a 1.5 BHK flat in Vapi.",
+      "Vishal offered a site visit for a 2 BHK option."
+    ],
+    "customer_questions": [
+      "can you tell me something about blue stone?"
+    ],
+    "suggested_next_action": "Confirm the appointment for the site visit and provide further details about the 2 BHK options.",
+    "sentiment": "neutral",
+    "lead_quality": "warm",
+    "objections": [
+      "Payal is specifically looking for a 1.5 BHK, which is not available."
+    ],
+    "topics": [
+      "property options in Vapi",
+      "site visit scheduling"
+    ],
+    "products_mentioned": [
+      "Aura",
+      "Sahaj"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "To confirm the appointment and provide additional information about the properties.",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-10-04",
+    "_analyzed_at": "2026-07-04T09:38:23.798Z",
+    "_model": "gpt-4o-mini"
+  },
+  "918076562864_20260704_095106": {
+    "summary": "The sales agent, Vishal, called a prospect named Raj. Raj was busy and requested to call back after his meal.",
+    "customer_intent": "to call back after eating",
+    "key_points": [
+      "Raj is currently unavailable due to a meal",
+      "Vishal offered to help when Raj is free"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Wait for Raj to call back after his meal",
+    "sentiment": "neutral",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "call scheduling",
+      "availability"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "Raj will initiate the call after his meal",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-04T09:52:01.820Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919909979222_20260704_103308": {
+    "summary": "The sales agent, Vishal Patel, called Harshal Patel to discuss property options in Surat. Harshal is interested in investing in properties with a budget of three to four crore and plans to make a purchase within four months.",
+    "customer_intent": "looking for investment properties in Surat",
+    "key_points": [
+      "Customer is interested in Surat for property investment",
+      "Budget range is three to four crore"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Provide specific property options in Surat to the customer",
+    "sentiment": "positive",
+    "lead_quality": "hot",
+    "objections": [],
+    "topics": [
+      "property investment",
+      "budget range",
+      "purchase timeline"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": true,
+    "follow_up_reason": "Customer is interested in specific properties and has a clear timeline for purchase",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-11-01",
+    "_analyzed_at": "2026-07-04T10:36:33.772Z",
+    "_model": "gpt-4o-mini"
+  },
+  "919599761331_20260706_100025": {
+    "summary": "The sales agent, Vishal Patel, called the prospect, Alvin, to discuss property options. Alvin is interested in properties located in Silvassa and is looking for a specific configuration.",
+    "customer_intent": "looking for properties in Silvassa",
+    "key_points": [
+      "Customer is interested in Silvassa for property search",
+      "Agent inquired about property configuration preferences"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Provide property options in Silvassa based on the configuration preferences",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "property search",
+      "location preferences",
+      "configuration options"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide property options and further assist the customer",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "null",
+    "_analyzed_at": "2026-07-06T10:02:03.229Z",
+    "_model": "gpt-4o-mini"
   }
 }

@@ -33,33 +33,12 @@ from openai import AsyncOpenAI
 
 from .memory import ConversationMemory, BookingData, CallState
 from .stt.post_processor import match_location, match_bhk
+from . import state_manager as _sm
+from .state_manager import ConversationStateManager
 
-# ---------------------------------------------------------------------------
-# Known Pramukh Group projects — used for project-context locking
-# Keys are lowercase substrings; values are (canonical_name, location).
-# Longer keys listed first so _extract_project_from_text() matches
-# "aranya ii" before "aranya".
-# ---------------------------------------------------------------------------
-_KNOWN_PROJECTS: dict[str, tuple[str, str]] = {
-    "central park":  ("Central Park",  "Surat"),
-    "aranya ii":     ("Aranya II",     "Surat"),
-    "aranya 2":      ("Aranya II",     "Surat"),
-    "yogi woods":    ("Yogi Woods",    "Silvassa"),
-    "revanta":       ("Revanta",       "Surat"),
-    "vivanta":       ("Vivanta",       "Surat"),
-    "satva":         ("Satva",         "Surat"),
-    "agastya":       ("Agastya",       "Surat"),
-    "aranya":        ("Aranya",        "Surat"),
-    "aura":          ("Aura",          "Vapi"),
-    "sahaj":         ("Sahaj",         "Vapi"),
-    "vedanta":       ("Vedanta",       "Vapi"),
-    "sangath":       ("Sangath",       "Silvassa"),
-    "shivanta":      ("Shivanta",      "Silvassa"),
-    "swagat":        ("Swagat",        "Silvassa"),
-    "orbit":         ("Orbit",         "Surat"),
-    # legacy / alias names that may appear in STT output
-    "oak cove":      ("Oak Cove",      "Surat"),
-}
+# Known Pramukh Group projects — canonical source now lives in
+# state_manager.KNOWN_PROJECTS; re-exported here for existing callers.
+_KNOWN_PROJECTS = _sm.KNOWN_PROJECTS
 
 # ---------------------------------------------------------------------------
 # Stages
@@ -702,6 +681,20 @@ _LANG_SWITCH_RESPONSES: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
+# Mid-conversation greeting ("hello" heard after the call is already underway)
+# ---------------------------------------------------------------------------
+# The opening greeting is delivered once by generate_opening(). A "hello" /
+# "namaste" heard LATER (stage past GREETING) is the caller checking the line,
+# not restarting — replying with a fresh greeting makes the call feel repeated.
+# Answer with a natural "can you hear me?" instead. Localized like every other
+# shortcut response (state.language -> en / hi / gu, .get() with en fallback).
+_AUDIO_CHECK_RESPONSES: dict[str, str] = {
+    "en": "Yes, I'm here — can you hear me clearly?",
+    "hi": "जी हाँ, मैं यहीं हूँ — क्या आपको मेरी आवाज़ आ रही है?",
+    "gu": "જી હા, હું અહીં જ છું — શું તમને મારો અવાજ સંભળાય છે?",
+}
+
+# ---------------------------------------------------------------------------
 # Identity responses — fast deterministic answers for "who is this?"
 # ---------------------------------------------------------------------------
 
@@ -931,6 +924,10 @@ class ConversationRouter:
         self.memory = ConversationMemory()
         self.state = ConversationState()
         self.state.language = default_language
+        # Single write path for qualification slots — extraction, merge
+        # policies, audit trail, running summary, missing-slot detection.
+        self.state_mgr = ConversationStateManager(self.memory, self.state)
+        self._enrich_task: asyncio.Task | None = None
 
         # ── Active agent persona + knowledge base (multi-agent / RAG) ────────
         # Backward compatible: with no registry on disk, persona falls back to
@@ -1248,6 +1245,23 @@ class ConversationRouter:
         # --- Intent detection ---
         intent = detect_intent(text, self.state.stage)
 
+        # --- Unified slot extraction + state merge ---
+        # Runs on EVERY turn (shortcut or not) and strictly BEFORE the LLM
+        # task below is created, so (a) the system prompt is always built from
+        # fresh state, and (b) a turn classified as a shortcut (farewell,
+        # gratitude, …) can no longer lose slots the caller volunteered in it.
+        self.state_mgr.ingest_user_turn(text, intent)
+
+        # Optional LLM-assisted slot extraction (fill-only, never overwrites a
+        # deterministic capture) — lands by the next turn at the latest.
+        if self.state_mgr.llm_extraction_enabled() and self._api_key:
+            if self._enrich_task and not self._enrich_task.done():
+                self._enrich_task.cancel()
+            self._enrich_task = asyncio.create_task(
+                self.state_mgr.llm_enrich(self._get_client(), self._model, text),
+                name="slot_enrich",
+            )
+
         # --- Fire LLM in background (parallel with deterministic routing) ---
         llm_queue: asyncio.Queue[str | None] = asyncio.Queue()
         llm_done = asyncio.Event()
@@ -1399,6 +1413,24 @@ class ConversationRouter:
             yield EngineResult(text=resp, is_shortcut=True, intent="language_switch")
             return
 
+        # --- Greeting AFTER the conversation has started ---
+        # The opening greeting is spoken once by generate_opening(); on the
+        # caller's first turn the stage is still GREETING and we fall through so
+        # discovery can begin (initial greeting unchanged). But a "hello" heard
+        # once the call is underway (stage past GREETING) is the caller checking
+        # the line — a fresh greeting makes the call feel restarted. Reply with a
+        # natural "can you hear me?" instead. Mirrors the objection handler's
+        # `stage != STAGE_GREETING` guard above.
+        if intent == "greeting" and self.state.stage != STAGE_GREETING:
+            _cancel_llm()
+            resp = _AUDIO_CHECK_RESPONSES.get(
+                self.state.language, _AUDIO_CHECK_RESPONSES["en"]
+            )
+            self.memory.add_assistant(resp, language=self.state.language)
+            self._store_last_response(resp)
+            yield EngineResult(text=resp, is_shortcut=True, intent="greeting")
+            return
+
         # =============================================================
         # NON-SHORTCUT ROUTING — extract data, advance stage, let LLM respond
         # =============================================================
@@ -1479,23 +1511,17 @@ class ConversationRouter:
     # ------------------------------------------------------------------
 
     def _extract_data_from_input(self, text: str, intent: str) -> None:
-        """Extract structured data as a side effect — never blocks the flow."""
+        """Turn bookkeeping for non-shortcut turns.
+
+        Qualification slots (location, configuration, budget, timeline,
+        purpose, loan, project, …) are extracted and merged EARLIER in
+        process_stream by ConversationStateManager.ingest_user_turn(), which
+        runs on every turn. This method keeps only what is genuinely
+        stage-dependent (appointment time / reschedule, site-visit intent,
+        callback) plus the discovery-turn counter that drives stage timing.
+        """
         lower = text.lower()
         cs = self.memory.call_state
-
-        if not self.memory.booking.location:
-            loc = self._extract_location(text)
-            if loc:
-                self.memory.booking.location = loc
-                self.memory.qa_tracker.mark_extracted("location", loc)
-                logger.info("[DISCOVERY] Location extracted: %s", loc)
-
-        if not self.memory.booking.property_type:
-            bhk = self._extract_bhk(text)
-            if bhk:
-                self.memory.booking.property_type = bhk.upper()
-                self.memory.qa_tracker.mark_extracted("bhk", bhk.upper())
-                logger.info("[DISCOVERY] Config extracted: %s", bhk)
 
         # Capture the visit time. During scheduling stages we also allow the
         # caller to RESCHEDULE — a newly stated time overwrites the previous one
@@ -1509,78 +1535,6 @@ class ConversationRouter:
                 # an empty value, so update it directly here).
                 self.memory.call_state.appointment_time = t
                 logger.info("[DISCOVERY] Visit time set/updated: %s", t)
-
-        if not self.state.purpose:
-            # Multi-word / script phrases: safe to use substring matching (rare false positives)
-            invest_kw_exact = [
-                "rental income", "rental return", "return on investment",
-                "kiraya", "kiraye",
-                "रिटर्न", "निवेश", "ભાડું", "રોકાણ",
-            ]
-            self_use_kw_exact = [
-                "self use", "self-use", "own use",
-                "apne liye", "rehna",
-                "ઘર", "રહેવા", "ખુદ", "ફેમિલી",
-            ]
-            # Single English words that need word-boundary matching to avoid
-            # false positives ("returns my call", "staying on topic", etc.)
-            _invest_bound_re = re.compile(
-                r'\b(?:investment|investing|investor|invest|appreciation|'
-                r'rental income|rental return|profit|yield)\b'
-                r'|\breturn on investment\b',
-                re.IGNORECASE
-            )
-            _self_use_bound_re = re.compile(
-                r'\b(?:family|families|stay|staying|live|living|reside|residing|'
-                r'ghar|makan|rahega|settle|settling)\b', re.IGNORECASE
-            )
-            if (any(kw in lower or kw in text for kw in invest_kw_exact)
-                    or _invest_bound_re.search(lower)):
-                self.state.purpose = "investment"
-                self.memory.qa_tracker.mark_extracted("purpose", "investment")
-            elif (any(kw in lower or kw in text for kw in self_use_kw_exact)
-                    or _self_use_bound_re.search(lower)):
-                self.state.purpose = "self_use"
-                self.memory.qa_tracker.mark_extracted("purpose", "self_use")
-
-        # ── Budget extraction ─────────────────────────────────────────────
-        if not self.memory.booking.budget:
-            budget = self._extract_budget(text)
-            if budget:
-                self.memory.booking.budget = budget
-                self.memory.qa_tracker.mark_extracted("budget", budget)
-                logger.info("[DISCOVERY] Budget extracted: %s", budget)
-
-        # ── Timeline extraction ───────────────────────────────────────────
-        if not cs.timeline:
-            timeline = self._extract_timeline(text)
-            if timeline:
-                cs.timeline = timeline
-                self.memory.qa_tracker.mark_extracted("timeline", timeline)
-                logger.info("[DISCOVERY] Timeline extracted: %s", timeline)
-
-        # ── Project detection (persistent context lock) ──────────────────
-        if not cs.selected_project:
-            proj_result = self._extract_project_from_text(text)
-            if proj_result:
-                proj_name, proj_loc = proj_result
-                cs.selected_project = proj_name
-                # Mirror back into state and booking for full consistency
-                self.state.project_recommended = proj_name
-                if not self.memory.booking.project:
-                    self.memory.booking.project = proj_name
-                # Auto-infer location from project if not yet captured
-                if not cs.selected_location:
-                    cs.selected_location = proj_loc
-                if not self.memory.booking.location:
-                    self.memory.booking.location = proj_loc
-                logger.info(
-                    "[STATE_UPDATE] selected_project=%r inferred_location=%r",
-                    proj_name, proj_loc,
-                )
-        elif self.state.project_recommended and not cs.selected_project:
-            # project_recommended set elsewhere (e.g. LLM), sync to call_state
-            cs.selected_project = self.state.project_recommended
 
         # ── Site-visit intent detection ──────────────────────────────────
         if not cs.site_visit_requested:
@@ -1608,6 +1562,9 @@ class ConversationRouter:
 
         # ── Sync all layers into CallState ───────────────────────────────
         self._update_call_state()
+        # Audit any externally-owned slot that changed this turn (appointment
+        # time set/rescheduled above, name/phone confirmed by their flows).
+        self.state_mgr.observe_external(utterance=text)
         self.state.discovery_turns += 1
 
     def _extract_callback_time(self, text: str) -> str | None:
@@ -1772,17 +1729,8 @@ class ConversationRouter:
 
     def _extract_project_from_text(self, text: str) -> tuple[str, str] | None:
         """Return (canonical_name, location) if a known project is mentioned.
-
-        Keys in _KNOWN_PROJECTS are sorted longest-first so multi-word names
-        like 'aranya ii' are matched before shorter substrings like 'aranya'.
-        Word-boundary matching prevents short names (aura, orbit, satva) from
-        spuriously matching inside unrelated words.
-        """
-        lower = text.lower()
-        for key in sorted(_KNOWN_PROJECTS, key=len, reverse=True):
-            if re.search(r'\b' + re.escape(key) + r'\b', lower):
-                return _KNOWN_PROJECTS[key]
-        return None
+        Delegates to state_manager.extract_project (single source of truth)."""
+        return _sm.extract_project(text)
 
     def _update_call_state(self) -> None:
         """Sync CallState from ConversationState + BookingData.
@@ -1912,80 +1860,23 @@ class ConversationRouter:
     # Data extraction helpers
     # ------------------------------------------------------------------
 
+    # The four extractors below delegate to state_manager (single source of
+    # truth); the methods remain so existing callers/tests keep working.
+
     def _extract_budget(self, text: str) -> str | None:
         """Extract budget range from user input (lakh/crore amounts)."""
-        lower = text.lower()
-        # Crore patterns: "1 crore", "1.5 crore", "डेढ़ करोड़", etc.
-        m = re.search(r"(\d+(?:\.\d+)?)\s*(?:crore|cr\.?|करोड़|karod|cr\b)", lower)
-        if m:
-            return f"{m.group(1)} crore"
-        # Lakh patterns: "70 lakh", "50-60 lakh", "70L", etc.
-        m = re.search(r"(\d+(?:\.\d+)?)\s*(?:lakh|lac|l\b|लाख|lakh)", lower)
-        if m:
-            return f"{m.group(1)} lakh"
-        # Range: "50 to 70 lakh"
-        m = re.search(r"(\d+)\s*(?:to|-)\s*(\d+)\s*(?:lakh|lac|l\b|लाख)", lower)
-        if m:
-            return f"{m.group(1)}-{m.group(2)} lakh"
-        # Gujarati/Hindi script numbers with lakh
-        if "લાખ" in text or "करोड़" in text:
-            m = re.search(r"(\d+(?:\.\d+)?)\s*(?:લાખ|करोड़)", text)
-            if m:
-                unit = "lakh" if "લાખ" in text else "crore"
-                return f"{m.group(1)} {unit}"
-        return None
+        return _sm.extract_budget(text)
 
     def _extract_location(self, text: str) -> str | None:
-        loc = match_location(text)
-        if loc:
-            return loc.capitalize()
-        lower = text.lower()
-        for city in ["surat", "vapi", "silvassa"]:
-            if city in lower:
-                return city.capitalize()
-        for hi, en in [("सूरत", "Surat"), ("वापी", "Vapi"), ("सिलवासा", "Silvassa")]:
-            if hi in text:
-                return en
-        for gu, en in [("સુરત", "Surat"), ("વાપી", "Vapi"), ("સિલવાસા", "Silvassa")]:
-            if gu in text:
-                return en
-        return None
+        return _sm.extract_location(text)
 
     def _extract_bhk(self, text: str) -> str | None:
-        bhk = match_bhk(text)
-        if bhk:
-            return bhk
-        m = re.search(r"(\d)\s*(?:bhk|bed)", text, re.IGNORECASE)
-        if m and 1 <= int(m.group(1)) <= 5:
-            return f"{m.group(1)} bhk"
-        return None
+        bhk = _sm.extract_bhk(text)
+        return bhk.lower() if bhk else None   # historical contract: "2 bhk"
 
     def _extract_timeline(self, text: str) -> str | None:
         """Extract caller's stated purchase/move-in timeline."""
-        lower = text.lower()
-        # Immediate / ready now
-        if re.search(r"\b(immediate|right away|asap|ready now|abhi|abhi chahiye|turant)\b", lower):
-            return "immediate"
-        if any(w in lower for w in ["अभी", "तुरंत", "હમણાં"]):
-            return "immediate"
-        # Within N months
-        m = re.search(r"(\d+)\s*(?:month|mahine|महीने|maheena|महीनों|mashina|mashin)", lower)
-        if m:
-            return f"{m.group(1)} months"
-        # Within N years
-        m = re.search(r"(\d+)\s*(?:year|saal|साल|varsh|वर्ष|varsha)", lower)
-        if m:
-            return f"{m.group(1)} year(s)"
-        # End of year / this year
-        if re.search(r"\b(end of year|this year|is saal|is varsh|2025|2026)\b", lower):
-            return "this year"
-        # 6 months / half year
-        if re.search(r"\b(6 months?|six months?|chhe mahine|6 mahine)\b", lower):
-            return "6 months"
-        # 3 months / quarter
-        if re.search(r"\b(3 months?|three months?|teen mahine|quarter)\b", lower):
-            return "3 months"
-        return None
+        return _sm.extract_timeline(text)
 
     # Name extraction signals — checked against the last agent response
     _NAME_ASK_SIGNALS = [
@@ -2567,7 +2458,8 @@ class ConversationRouter:
                 "COLLECTION PRIORITY (one question per turn, skip if already known):\n"
                 "  1. Name  2. City (Surat / Vapi / Silvassa)  3. Configuration (1/2/3 BHK)\n"
                 "  4. Budget (comfortable range — ask softly)  5. Purpose (self-use or investment)\n"
-                "  6. Timeline (when planning to buy)  7. Phone / WhatsApp\n"
+                "  6. Timeline (when planning to buy)  7. Loan requirement (loan / self-funded — ask softly)\n"
+                "  8. Phone / WhatsApp\n"
                 "\n"
                 "Ask warmly, one field at a time. If the caller volunteers a field before you ask, capture it and move to the next one.\n"
                 "Do NOT mention site visits in this stage — focus entirely on understanding the caller's needs.\n"
@@ -2627,59 +2519,22 @@ class ConversationRouter:
         )
         stage_goal = _stage_goals.get(self.state.stage, _stage_goals[STAGE_DISCOVERY])
 
-        # ── Collected info ───────────────────────────────────────────────────
-        # Use confirmed name only; pending name gets its own confirmation block above
-        caller_name = b.user_name or (self.memory.context.user_name if not self._name_pending else None)
-        collected_lines = []
-        if caller_name:
-            collected_lines.append(f"Caller name: {caller_name}")
+        # ── Collected info + qualification — single source: StateManager ────
+        collected_lines = self.state_mgr.known_summary_lines()
         if self._name_pending:
-            collected_lines.append(f"Name just given (UNCONFIRMED): {self._name_pending!r}")
-        if self.state.purpose:
-            collected_lines.append(f"Purpose: {self.state.purpose}")
-        if b.location:
-            collected_lines.append(f"Location interest: {b.location}")
-        if b.property_type:
-            collected_lines.append(f"Configuration: {b.property_type}")
-        if b.budget:
-            collected_lines.append(f"Budget: {b.budget}")
-        if cs.timeline:
-            collected_lines.append(f"Timeline: {cs.timeline}")
-        if self.state.project_recommended:
-            collected_lines.append(f"Project discussed: {self.state.project_recommended}")
-        if b.appointment_time:
-            collected_lines.append(f"Visit scheduled: {b.appointment_time}")
+            collected_lines.insert(0, f"Name just given (UNCONFIRMED): {self._name_pending!r}")
         collected_str = "\n".join(f"  · {c}" for c in collected_lines) or "  · Nothing collected yet"
 
-        # ── Qualification status (for DISCOVERY stage guidance) ───────────────
-        _qname = b.user_name or cs.customer_name
-        _qloc = b.location or cs.selected_location
-        _qprop = b.property_type or cs.property_type
-        _qpurpose = self.state.purpose or cs.purpose
-        _qbudget = b.budget or cs.budget
-        qa = self.memory.qa_tracker
-        # Use should_stop_asking (captured value OR asked enough times) rather
-        # than is_answered: a field with no captured value that was only asked
-        # once is still genuinely needed, so the agent re-asks it instead of
-        # skipping ahead — this is what prevents a stray fragment from causing a
-        # never-answered question (e.g. city) to be silently dropped.
-        qual_needed: list[str] = []
-        if not _qname and not qa.should_stop_asking("name"):
-            qual_needed.append("Name")
-        # Priority order per sales flow: location → config → budget → purpose → timeline → phone
-        if not _qloc and not qa.should_stop_asking("location"):
-            qual_needed.append("City (Surat / Vapi / Silvassa)")
-        if not _qprop and not qa.should_stop_asking("bhk"):
-            qual_needed.append("Configuration (1/2/3 BHK)")
-        if not _qbudget and not qa.should_stop_asking("budget"):
-            qual_needed.append("Budget (comfortable range — ask warmly)")
-        if not _qpurpose and not qa.should_stop_asking("purpose"):
-            qual_needed.append("Purpose (self-use or investment)")
-        if not cs.timeline and not qa.should_stop_asking("timeline"):
-            qual_needed.append("Timeline (when planning to buy)")
-        if not cs.customer_phone and not self._phone_pending and not self._phone_confirmed:
-            qual_needed.append("Phone / WhatsApp")
-        _qual_next = qual_needed[0] if qual_needed else None
+        # Slots mid-confirmation are handled by their dedicated ⚡ blocks below,
+        # so keep them out of the qualification queue for this turn.
+        _suppress: set[str] = set()
+        if self._name_pending:
+            _suppress.add("name")
+        if self._phone_pending or self._phone_confirmed:
+            _suppress.add("phone")
+        # PERSISTENT CALL STATE + RUNNING SUMMARY + RECENT CORRECTIONS +
+        # ALREADY COLLECTED + QUALIFICATION STATUS, all from the state manager.
+        state_context = self.state_mgr.build_prompt_context(language=lang, suppress=_suppress)
 
         # Name-capture confirmation instruction (feature 4)
         name_confirm_block: list[str] = []
@@ -2706,29 +2561,6 @@ class ConversationRouter:
                 f"Use the language the caller is using. Say the EXACT number {_ph_groups}. Ask NOTHING else.",
             ]
 
-        # ── Persistent CallState block ────────────────────────────────────────
-        # Build "already collected — do not re-ask" list
-        # Issues 7 & 8: include ALL collected fields so the LLM never re-asks.
-        dont_reask: list[str] = []
-        if cs.customer_name:
-            dont_reask.append(f"caller's name ({cs.customer_name})")
-        if cs.customer_phone:
-            dont_reask.append("caller's phone number (stored; do not repeat back)")
-        if cs.selected_project:
-            dont_reask.append(f"which property ({cs.selected_project})")
-        if cs.selected_location:
-            dont_reask.append(f"city/location ({cs.selected_location})")
-        if cs.property_type or b.property_type:
-            dont_reask.append(f"property size/configuration ({cs.property_type or b.property_type})")
-        if cs.purpose or self.state.purpose:
-            dont_reask.append(f"purpose ({cs.purpose or self.state.purpose})")
-        if cs.budget or b.budget:
-            dont_reask.append(f"budget ({cs.budget or b.budget})")
-        if cs.timeline:
-            dont_reask.append(f"timeline ({cs.timeline})")
-        if cs.appointment_time:
-            dont_reask.append(f"visit time ({cs.appointment_time})")
-
         # Missing mandatory fields block (when site visit is in scope)
         missing_fields = self._compute_missing_booking_fields()
 
@@ -2754,17 +2586,7 @@ class ConversationRouter:
             "Known so far:",
             collected_str,
             "",
-            "━━ PERSISTENT CALL STATE ━━",
-            f"  customer_name        : {cs.customer_name or '(not yet captured)'}",
-            f"  customer_phone       : {'captured (stored internally)' if cs.customer_phone else '(not yet captured)'}",
-            f"  selected_project     : {cs.selected_project or '(none yet)'}",
-            f"  selected_location    : {cs.selected_location or '(none yet)'}",
-            f"  property_type        : {cs.property_type or '(none yet)'}",
-            f"  purpose              : {cs.purpose or '(none yet)'}",
-            f"  budget               : {cs.budget or '(none yet)'}",
-            f"  site_visit_requested : {cs.site_visit_requested}",
-            f"  appointment_time     : {cs.appointment_time or '(none yet)'}",
-            f"  booking_validated    : {cs.booking_validated}",
+            state_context,
             *([
                 "",
                 "━━ ACTIVE PROJECT CONTEXT ━━",
@@ -2779,25 +2601,6 @@ class ConversationRouter:
                 f"Site visit requested. Still need: {', '.join(missing_fields)}.",
                 "Collect ONE missing field per turn before confirming the booking.",
             ] if missing_fields else []),
-            *([
-                "",
-                "━━ ALREADY COLLECTED — DO NOT RE-ASK ━━",
-                f"You already have: {'; '.join(dont_reask)}.",
-                "NEVER ask for any of these again. Use them naturally in your responses.",
-            ] if dont_reask else []),
-            *([
-                "",
-                "━━ QUALIFICATION STATUS ━━",
-                f"  Still needed (in priority order): {' → '.join(qual_needed)}",
-                f"  ⚡ NEXT FIELD TO ASK: {_qual_next}",
-                "  After acknowledging what the caller said, ask for this field — warmly, naturally.",
-                "  Do NOT skip it. Do NOT ask two questions at once.",
-            ] if qual_needed else [
-                "",
-                "━━ QUALIFICATION STATUS ━━",
-                "  ✅ All core qualification fields captured.",
-                "  Your priority now: recommend a matching project and book the site visit.",
-            ]),
             "",
             "━━ CURRENT GOAL ━━",
             stage_goal,

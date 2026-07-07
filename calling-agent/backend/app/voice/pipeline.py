@@ -25,6 +25,7 @@ import numpy as np
 from .audio_input import SAMPLE_RATE, SAMPLES_PER_FRAME
 from .vad import VoiceActivityDetector
 from .stt.router import STTRouter
+from .stt.base import classify_segment
 from .tts_stream import StreamingTTS, MockStreamingTTS
 from .tts_sarvam import SarvamTTS
 from .turn_manager import TurnManager, TurnManagerConfig
@@ -98,7 +99,15 @@ MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_SPEECH_SECONDS
 # 300ms minimum: short inbound responses like "haan", "yes", "ha" are
 # valid single-word answers that must reach STT. 300ms is enough audio to
 # distinguish real speech from a click/breath without missing short replies.
-MIN_SPEECH_MS = 300.0
+# ADAPTIVE_AUDIO lowers this to 180ms: crisp single words ("हाँ", "नहीं",
+# "Vapi") are often 200-300ms and were being discarded outright. The adaptive
+# VAD's noise-floor tracking + rms_floor gate keep clicks/breaths out, so the
+# shorter floor is safe. ADAPTIVE_SHORT_SPEECH=0 restores the exact 300ms gate.
+_ADAPTIVE_SHORT_SPEECH = (
+    os.environ.get("ADAPTIVE_AUDIO", "1") != "0"
+    and os.environ.get("ADAPTIVE_SHORT_SPEECH", "1") != "0"
+)
+MIN_SPEECH_MS = 180.0 if _ADAPTIVE_SHORT_SPEECH else 300.0
 BARGE_IN_COOLDOWN_MS = 400.0
 # Lowered 5→3 frames: telephony callers often speak immediately after hearing
 # the agent; requiring 5 sustained frames (100ms) was causing their first
@@ -329,10 +338,15 @@ class VoicePipeline:
         # thought before the agent jumps in.  Grace window 300 ms absorbs
         # trailing syllables.  min_words raised so single-frame noise doesn't
         # trigger a turn.
+        # min_words_short 2→1 under ADAPTIVE_SHORT_SPEECH so a genuine single-word
+        # reply ("हाँ", "Vapi") can endpoint via the TurnManager instead of waiting
+        # on the hard-flush silence path. Noise immunity is preserved by the VAD
+        # threshold + rms_floor gate (a proxy-word only accrues from real speech
+        # frames) and by MIN_SPEECH_MS still discarding sub-180ms blips.
         self._turn = TurnManager(TurnManagerConfig(
             silence_threshold_ms=1400.0,
             grace_window_ms=300.0,
-            min_words_short=2,
+            min_words_short=1 if _ADAPTIVE_SHORT_SPEECH else 2,
             min_words_long=3,
         ))
 
@@ -804,16 +818,24 @@ class VoicePipeline:
                 # active. Sarvam's auto-detection on each turn enables true dynamic
                 # language switching as required.
                 logger.debug("[STT-WORKER] stt_lang=unknown (auto-detect every turn)")
-                _seg_samples = np.frombuffer(segment.audio, dtype=np.int16).astype(np.float32)
-                _seg_rms = float(np.sqrt(np.mean(_seg_samples ** 2))) if len(_seg_samples) else 0.0
+                # Stage-0 measurement: fingerprint the segment (rms, voiced
+                # level, peak, clip ratio, class) so the adaptive handling of
+                # soft / normal / loud / clipped audio is observable per turn.
+                _seg = classify_segment(segment.audio)
+                _seg_rms = _seg["rms"]
                 logger.info(
                     "[STT-WORKER] Submitting segment: %.0fms audio (%d bytes) "
-                    "queued %.0fms ago lang=%s rms=%.0f",
+                    "queued %.0fms ago lang=%s rms=%.0f speech=%.0f peak=%.0f "
+                    "clip=%.3f class=%s",
                     segment.duration_ms,
                     len(segment.audio),
                     (time.monotonic() - segment.timestamp) * 1000,
                     _stt_lang,
                     _seg_rms,
+                    _seg["speech"],
+                    _seg["peak"],
+                    _seg["clip_ratio"],
+                    _seg["klass"],
                 )
                 stt_result = await self.stt.transcribe(
                     segment.audio, sample_rate=SAMPLE_RATE, language=_stt_lang,
@@ -1150,6 +1172,18 @@ class VoicePipeline:
                                 "first_chunk_ms": round(first_chunk_ms),
                                 "total_latency_ms": round(total_latency),
                             })
+
+                            # Conversation-state snapshot after every turn —
+                            # additive event; consumers that don't know
+                            # "state" ignore it (bridge only reads user/agent).
+                            state_mgr = getattr(self.conversation, "state_mgr", None)
+                            if state_mgr is not None:
+                                try:
+                                    self._hub.emit_nowait(
+                                        {"type": "state", **state_mgr.snapshot()}
+                                    )
+                                except Exception:
+                                    logger.exception("[PIPELINE] state snapshot failed")
 
                 self._current_generation_task = asyncio.create_task(
                     _run_generation()

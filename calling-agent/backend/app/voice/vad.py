@@ -7,9 +7,16 @@ Energy-based VAD using numpy-vectorized mean-absolute computation.
 from __future__ import annotations
 
 import logging
+import os
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Master switch (shared intent with stt.base.ADAPTIVE_AUDIO). Default ON.
+# ADAPTIVE_AUDIO=0 freezes the VAD to its exact legacy one-shot-calibrated
+# threshold behaviour.
+ADAPTIVE_AUDIO = os.environ.get("ADAPTIVE_AUDIO", "1") != "0"
 
 
 class VoiceActivityDetector:
@@ -48,6 +55,26 @@ class VoiceActivityDetector:
         self._last_energy: float = 0.0
         self._log_counter = 0
 
+        # --- Adaptive noise tracking (dynamic per-line/per-moment threshold) ---
+        # The legacy VAD freezes its threshold once at calibration and clamps it
+        # up to `minimum_threshold` (260 in telephony). On a quiet line whose
+        # real noise floor is ~40, that 260 clamp silently drops soft/weak/distant
+        # voices whose speech energy lands in the 108-260 band. The adaptive
+        # tracker follows the true noise floor and sets the turn-detection
+        # threshold to a fixed SNR margin above it, so soft speech is captured
+        # while a genuinely noisy line still raises the bar.
+        self._adaptive = ADAPTIVE_AUDIO
+        # Frozen baseline captured at calibration — barge-in ALWAYS uses this, so
+        # the TTS-interrupt / echo path is unaffected by adaptive turn-detection.
+        self._calibrated_threshold: float = self._threshold
+        self._noise_ema: float = 0.0
+        self._noise_alpha: float = 0.05          # slow tracker (~1s to converge)
+        self._adaptive_multiplier: float = 2.5   # SNR margin over the noise floor
+        # Adaptive threshold may drop BELOW the (deliberately high) fixed
+        # minimum_threshold to catch soft speech, but never below a safe margin
+        # over the absolute rms floor — so comfort-noise never reads as speech.
+        self._adaptive_floor: float = max(minimum_rms_floor * 1.8, 90.0)
+
     @property
     def threshold(self) -> float:
         return self._threshold
@@ -62,8 +89,12 @@ class VoiceActivityDetector:
 
     @property
     def barge_in_threshold(self) -> float:
+        # Barge-in is pinned to the frozen calibration baseline (identical to the
+        # calibrated threshold when adaptive is off), so adaptive turn-detection
+        # changes can never make barge-in more or less sensitive than before.
+        base = self._calibrated_threshold if self._adaptive else self._threshold
         return max(
-            self._threshold * self._barge_in_multiplier,
+            base * self._barge_in_multiplier,
             self._barge_in_minimum,
         )
 
@@ -113,6 +144,24 @@ class VoiceActivityDetector:
 
             return False
 
+        # Adaptive noise tracking: update the noise floor estimate using ONLY
+        # frames close to the current estimate (well below speech). Loud frames
+        # and mid-word pauses stay above the noise gate and never update it, so
+        # the tracker cannot chase the speaker or inflate mid-utterance. The
+        # turn-detection threshold is then set to a fixed SNR margin above the
+        # tracked floor, bounded by [adaptive_floor, maximum_threshold].
+        if self._adaptive:
+            noise_gate = max(self._noise_ema * 3.0, self._adaptive_floor)
+            if energy < noise_gate:
+                self._noise_ema = (
+                    (1.0 - self._noise_alpha) * self._noise_ema
+                    + self._noise_alpha * energy
+                )
+                raw = self._noise_ema * self._adaptive_multiplier
+                self._threshold = float(
+                    min(max(raw, self._adaptive_floor), self._maximum_threshold)
+                )
+
         # Post-calibration: ignore absolute silence (below the noise floor).
         if energy < self._minimum_rms_floor:
             return False
@@ -136,6 +185,19 @@ class VoiceActivityDetector:
         capped = min(raw, self._maximum_threshold)
 
         self._threshold = max(capped, self._minimum_threshold)
+
+        # Freeze the calibrated value as the barge-in baseline, then seed the
+        # adaptive noise tracker from the measured quiet-frame noise and set the
+        # initial adaptive turn-detection threshold. This lets a quiet line drop
+        # below the fixed minimum_threshold (to catch soft voices) immediately,
+        # while a noisy line keeps a high bar.
+        self._calibrated_threshold = self._threshold
+        if self._adaptive:
+            self._noise_ema = max(noise_p95, 1.0)
+            raw_adaptive = self._noise_ema * self._adaptive_multiplier
+            self._threshold = float(
+                min(max(raw_adaptive, self._adaptive_floor), self._maximum_threshold)
+            )
 
         if raw > self._maximum_threshold:
             logger.warning(

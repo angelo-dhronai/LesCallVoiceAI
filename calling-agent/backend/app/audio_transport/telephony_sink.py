@@ -30,6 +30,13 @@ class TelephonySink(AudioSink):
         # Duration of the most recently flushed WAV (seconds).  Read by
         # VoicePipeline._tts_layer to size the echo-suppression mute window.
         self.last_flush_duration: float = 0.0
+        # Monotonic timestamp until which injected audio is expected to still
+        # be playing on the call (playback is serialized by the bridge's
+        # _playback_loop, so flushes queue back-to-back).  Read by the
+        # pipeline's barge-in guard: while injected audio is in flight, its
+        # echo returns via mod_audio_stream and must not be mistaken for the
+        # caller interrupting.
+        self.playback_busy_until: float = 0.0
         
         if not os.path.exists(self._tmp_dir):
             os.makedirs(self._tmp_dir, exist_ok=True)
@@ -83,6 +90,14 @@ class TelephonySink(AudioSink):
             # Record duration so the pipeline can size its echo-suppression
             # mute window to cover the full playback + injection latency.
             self.last_flush_duration = pcm_size / (2 * self._sample_rate)
+            # Playback is serialized: this WAV starts after any still-playing
+            # one ends. 0.7s covers injection overhead, 0.1s the bridge's
+            # inter-file pacing gap.
+            now = time.monotonic()
+            self.playback_busy_until = (
+                max(now + 0.7, self.playback_busy_until)
+                + self.last_flush_duration + 0.1
+            )
             logger.debug(
                 "[%s] [TelephonySink] flush duration=%.2fs (%d bytes)",
                 self._conn_id, self.last_flush_duration, pcm_size,

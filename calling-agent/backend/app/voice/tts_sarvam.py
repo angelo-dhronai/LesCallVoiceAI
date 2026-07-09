@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import queue as _queue
+import re
 import threading
 
 import httpx
@@ -39,6 +40,58 @@ _LANG_CODE_MAP = {
     "hi": "hi-IN",
     "gu": "gu-IN",
 }
+
+# Incremental-playback chunking. Long utterances are synthesized in parts and
+# flushed to the sink part-by-part, so telephony playback of part 1 starts
+# while part 2 is still being synthesized. Without this, TelephonySink holds
+# the entire utterance until the full Sarvam stream completes — a 14s reply
+# adds ~8s of dead air before the caller hears anything.
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?।])\s+")
+_CLAUSE_BOUNDARY_RE = re.compile(r"(?<=[,;:])\s+")
+_FIRST_CHUNK_MAX_CHARS = 90    # small first part → fastest speech onset
+_CHUNK_MAX_CHARS = 180
+# Matches the +0.1s inter-file pacing gap in conversation_call_bridge.py's
+# _playback_loop; used when reporting total utterance duration for echo-mute.
+_INTER_WAV_PACING_S = 0.1
+
+
+def _split_for_streaming(text: str) -> list[str]:
+    """Split TTS text into parts synthesized and flushed incrementally.
+
+    Splits at sentence enders first; LLM replies are often comma-run-ons with
+    no sentence-ending punctuation until the very end, so any "sentence"
+    longer than the chunk cap is further split at clause punctuation. Pieces
+    are then greedily packed: a small first part for fast onset, larger
+    follow-ups so pacing gaps stay rare.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    pieces: list[str] = []
+    for sentence in _SENTENCE_BOUNDARY_RE.split(text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) > _CHUNK_MAX_CHARS:
+            pieces.extend(
+                p.strip() for p in _CLAUSE_BOUNDARY_RE.split(sentence) if p.strip()
+            )
+        else:
+            pieces.append(sentence)
+
+    chunks: list[str] = []
+    current = ""
+    for piece in pieces:
+        limit = _FIRST_CHUNK_MAX_CHARS if not chunks else _CHUNK_MAX_CHARS
+        if current and len(current) + 1 + len(piece) > limit:
+            chunks.append(current)
+            current = piece
+        else:
+            current = f"{current} {piece}" if current else piece
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 class SarvamTTS(StreamingTTS):
@@ -99,20 +152,40 @@ class SarvamTTS(StreamingTTS):
             return
 
         chunk_count = 0
-        
+
         # Ensure sink is started
         await self._sink.start()
 
+        parts = _split_for_streaming(text)
+        if len(parts) > 1:
+            logger.info(
+                "[TTS:Sarvam] Utterance split into %d parts for incremental playback",
+                len(parts),
+            )
+        total_duration = 0.0
+        flushed_parts = 0
+
         try:
-            async for chunk in self._stream_audio(text):
+            for part in parts:
                 if self._cancelled:
-                    logger.info("[TTS:Sarvam] Cancelled mid-stream")
                     break
-                
-                await self._sink.write_frame(chunk.audio)
-                chunk_count += 1
-                if chunk_count == 1:
-                    logger.info("[TTS:Sarvam] First chunk sent to sink")
+                async for chunk in self._stream_audio(part):
+                    if self._cancelled:
+                        logger.info("[TTS:Sarvam] Cancelled mid-stream")
+                        break
+
+                    await self._sink.write_frame(chunk.audio)
+                    chunk_count += 1
+                    if chunk_count == 1:
+                        logger.info("[TTS:Sarvam] First chunk sent to sink")
+                if self._cancelled:
+                    break
+                # Incremental flush: hand this part's audio to the transport
+                # now so playback starts before later parts are synthesized.
+                if hasattr(self._sink, 'flush'):
+                    await self._sink.flush()
+                    total_duration += getattr(self._sink, 'last_flush_duration', 0.0)
+                    flushed_parts += 1
 
         except Exception:
             logger.exception("[TTS:Sarvam] speak() failed")
@@ -121,8 +194,20 @@ class SarvamTTS(StreamingTTS):
             self._playing = False
             if hasattr(self._sink, 'flush') and not self._cancelled:
                 await self._sink.flush()
+                # The pipeline reads last_flush_duration after speak() returns
+                # to size its echo-mute window for the WHOLE utterance. With
+                # incremental flushes it only holds the last part, so restore
+                # the utterance total (plus the bridge's pacing gap per extra
+                # WAV file).
+                if flushed_parts > 1 and hasattr(self._sink, 'last_flush_duration'):
+                    self._sink.last_flush_duration = (
+                        total_duration + _INTER_WAV_PACING_S * (flushed_parts - 1)
+                    )
             if not self._cancelled:
-                logger.info("[TTS:Sarvam] Playback complete (%d chunks)", chunk_count)
+                logger.info(
+                    "[TTS:Sarvam] Playback complete (%d chunks, %d parts)",
+                    chunk_count, flushed_parts or 1,
+                )
             self._reset()
 
     async def _stream_audio(self, text: str):

@@ -7,8 +7,8 @@
     "added_at": "2026-06-19T12:36:47.014827Z",
     "call_status": "answered",
     "disposition": "to_contact_later",
-    "call_count": 5,
-    "last_called_at": "2026-07-06T10:22:16.326095Z",
+    "call_count": 6,
+    "last_called_at": "2026-07-08T08:13:33.002178Z",
     "call_notes": "",
     "call_history": [
       {
@@ -29,6 +29,10 @@
       },
       {
         "ts": "2026-07-06T10:22:16.326095Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T08:13:33.002178Z",
         "call_status": "answered"
       }
     ]
@@ -75,50 +79,10 @@
     "added_at": "2026-07-04T06:12:32.288917Z",
     "call_status": "answered",
     "disposition": "not_classified",
-    "call_count": 22,
-    "last_called_at": "2026-07-06T10:51:16.082233Z",
+    "call_count": 32,
+    "last_called_at": "2026-07-08T08:11:21.463733Z",
     "call_notes": "",
     "call_history": [
-      {
-        "ts": "2026-07-04T09:50:10.125821Z",
-        "call_status": "answered"
-      },
-      {
-        "ts": "2026-07-04T13:32:16.141724Z",
-        "call_status": "answered"
-      },
-      {
-        "ts": "2026-07-04T13:40:09.953785Z",
-        "call_status": "answered"
-      },
-      {
-        "ts": "2026-07-06T04:43:52.756712Z",
-        "call_status": "answered"
-      },
-      {
-        "ts": "2026-07-06T05:20:09.081912Z",
-        "call_status": "answered"
-      },
-      {
-        "ts": "2026-07-06T05:21:08.966888Z",
-        "call_status": "answered"
-      },
-      {
-        "ts": "2026-07-06T05:41:08.482874Z",
-        "call_status": "answered"
-      },
-      {
-        "ts": "2026-07-06T05:43:10.299568Z",
-        "call_status": "answered"
-      },
-      {
-        "ts": "2026-07-06T05:45:54.204020Z",
-        "call_status": "answered"
-      },
-      {
-        "ts": "2026-07-06T06:36:24.695955Z",
-        "call_status": "answered"
-      },
       {
         "ts": "2026-07-06T06:41:22.779620Z",
         "call_status": "answered"
@@ -158,6 +122,46 @@
       {
         "ts": "2026-07-06T10:51:16.082233Z",
         "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T05:00:51.187914Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T06:15:30.736771Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T07:32:12.500439Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T07:42:42.872725Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T07:43:24.364944Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T08:00:30.516995Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T08:02:05.786735Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T08:05:16.669322Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T08:09:35.525470Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T08:11:21.463733Z",
+        "call_status": "answered"
       }
     ]
   },
@@ -176,6 +180,32 @@
       {
         "ts": "2026-07-04T06:38:41.834722Z",
         "call_status": "busy"
+      }
+    ]
+  },
+  {
+    "id": "1783491424354_5737",
+    "phone": "+918628835737",
+    "name": "Moksh",
+    "notes": "",
+    "added_at": "2026-07-08T06:17:04.354598Z",
+    "call_status": "answered",
+    "disposition": "not_classified",
+    "call_count": 3,
+    "last_called_at": "2026-07-08T08:11:51.619196Z",
+    "call_notes": "",
+    "call_history": [
+      {
+        "ts": "2026-07-08T06:17:15.384811Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T06:23:11.280539Z",
+        "call_status": "answered"
+      },
+      {
+        "ts": "2026-07-08T08:11:51.619196Z",
+        "call_status": "answered"
       }
     ]
   }

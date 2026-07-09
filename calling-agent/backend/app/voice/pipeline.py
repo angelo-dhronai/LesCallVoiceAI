@@ -515,8 +515,20 @@ class VoicePipeline:
 
             elapsed = (time.monotonic() - self._tts_start_time) * 1000
 
+            # Incremental TTS flushing means injected audio can already be
+            # playing on the call while speak() is still synthesizing later
+            # parts — its echo returns via mod_audio_stream DURING
+            # _tts_playing. While the sink reports playback in flight,
+            # require a longer sustained-speech streak so echo can't cancel
+            # the rest of the utterance. A real interrupter clears the bar in
+            # ~200ms; LocalSpeakerSink has no playback_busy_until, so CLI
+            # mode is unaffected.
+            min_frames = BARGE_IN_MIN_FRAMES
+            if time.monotonic() < getattr(self.sink, 'playback_busy_until', 0.0):
+                min_frames = BARGE_IN_MIN_FRAMES * 2
+
             if (
-                self._speech_frame_streak >= BARGE_IN_MIN_FRAMES
+                self._speech_frame_streak >= min_frames
                 and elapsed > self._barge_in_min_elapsed_ms
             ):
                 logger.info(
@@ -1395,10 +1407,32 @@ class VoicePipeline:
                     # so agent speech leaked into STT.  Use the actual audio
                     # duration from TelephonySink (if available) to cover the
                     # full echo window.
+                    now = time.monotonic()
+                    busy_until = getattr(self.sink, 'playback_busy_until', 0.0)
                     audio_dur = getattr(self.sink, 'last_flush_duration', 0.0)
-                    if audio_dur > 0.0:
-                        # 700 ms covers injection pipeline overhead; audio_dur
-                        # covers the full playback window; 200 ms is safety buffer.
+                    if busy_until > 0.0:
+                        # With incremental flushing, earlier parts of the
+                        # utterance already played on the call WHILE speak()
+                        # was still synthesizing later parts.  Anchoring the
+                        # full utterance duration at speak()-return (old
+                        # formula) therefore muted the pipeline for many
+                        # seconds AFTER playback actually ended, swallowing
+                        # the caller's reply.  The sink's flush-anchored
+                        # playback clock already accounts for audio that has
+                        # played; mute only until it says playback ends,
+                        # plus a short echo tail.
+                        mute_s = max(
+                            max(busy_until - now, 0.0) + 0.2,
+                            TTS_ECHO_COOLDOWN_MS / 1000.0,
+                        )
+                        logger.info(
+                            "[ECHO-MUTE] Window %.1fs (playback ends in %.1fs "
+                            "+ 0.2s tail)",
+                            mute_s, max(busy_until - now, 0.0),
+                        )
+                    elif audio_dur > 0.0:
+                        # Sink tracks flush duration but not a playback
+                        # clock: fall back to duration-anchored window.
                         mute_s = 0.7 + audio_dur + 0.2
                         logger.info(
                             "[ECHO-MUTE] Extended window %.1fs "
@@ -1407,6 +1441,6 @@ class VoicePipeline:
                         )
                     else:
                         mute_s = TTS_ECHO_COOLDOWN_MS / 1000.0
-                    self._vad_mute_until = time.monotonic() + mute_s
+                    self._vad_mute_until = now + mute_s
 
         logger.info("[TTS] Layer stopped")

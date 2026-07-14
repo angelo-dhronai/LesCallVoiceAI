@@ -61,6 +61,14 @@ MIGRATIONS: list[str] = [
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_owner_sig"
     " ON contacts(owner, sig_digits)",
     "CREATE INDEX IF NOT EXISTS idx_calls_contact ON calls(contact_id)",
+    # AgentSpec v2 post-call outcomes (plan §4.6): deterministic outcome id +
+    # kind computed by the bridge at teardown when post_call.outcomes is
+    # configured (NULL = today, including Pramukh until backfilled).
+    "ALTER TABLE calls ADD COLUMN outcome TEXT",
+    "ALTER TABLE calls ADD COLUMN outcome_kind TEXT",
+    # Callback auto-dial context: why we are calling back (call_aim / past
+    # context) — rendered as a WHY-YOU-ARE-CALLING-BACK prompt block.
+    "ALTER TABLE call_links ADD COLUMN context_note TEXT",
 ]
 
 _init_lock = threading.Lock()

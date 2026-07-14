@@ -229,7 +229,7 @@ llm_config:
   stream_timeout_s: 7
   filler_timeout_s: 0.6
   intent_classify_timeout_s: 1
-  max_response_length: 300
+  max_response_length: 400
   extra_never_rules:
   - Never state the 60,000 salary figure unless the other person asks what salary
     or revision Angelo expects — until then say the team was thinking of an increase

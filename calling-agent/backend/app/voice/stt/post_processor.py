@@ -406,9 +406,15 @@ def post_process_transcript(
 
     result = _apply_corrections(text, _PHONETIC_CORRECTIONS)
     result = _normalize_bhk(result)
-    result = _apply_corrections(result, _CITY_CORRECTIONS)
-    result = _apply_corrections(result, _REAL_ESTATE_CORRECTIONS)
-    result = _apply_corrections(result, _PROJECT_NAME_CORRECTIONS)
+    # The Pramukh-domain tables (cities/real-estate/project names) are gated
+    # behind stt_corrections.use_builtin_tables (default true = today's
+    # behaviour for every existing agent; the Copilot writes false for new
+    # non-real-estate agents so 'bhk'-style corrections never fire on them).
+    _use_builtin = corrections is None or getattr(corrections, "use_builtin_tables", True)
+    if _use_builtin:
+        result = _apply_corrections(result, _CITY_CORRECTIONS)
+        result = _apply_corrections(result, _REAL_ESTATE_CORRECTIONS)
+        result = _apply_corrections(result, _PROJECT_NAME_CORRECTIONS)
 
     # "unknown" = first turn, language not yet locked — apply all Indic corrections
     # so Gujarati/Hindi content is normalised regardless of detection order.

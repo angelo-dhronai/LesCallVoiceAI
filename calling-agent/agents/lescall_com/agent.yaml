@@ -164,7 +164,7 @@ llm_config:
   stream_timeout_s: 7.0
   filler_timeout_s: 0.6
   intent_classify_timeout_s: 1.0
-  max_response_length: 300
+  max_response_length: 400
   extra_never_rules: []
   extra_always_rules:
   - Always keep replies to 1-2 short spoken sentences.

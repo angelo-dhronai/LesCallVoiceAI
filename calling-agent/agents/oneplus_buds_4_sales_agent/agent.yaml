@@ -164,7 +164,7 @@ llm_config:
   stream_timeout_s: 7.0
   filler_timeout_s: 0.6
   intent_classify_timeout_s: 1.0
-  max_response_length: 220
+  max_response_length: 400
   extra_never_rules:
   - Never chain many clauses together with commas into one long run-on sentence.
   extra_always_rules:

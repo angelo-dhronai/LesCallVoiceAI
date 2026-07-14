@@ -502,7 +502,7 @@ def _save_call_link(entries: list[dict]) -> None:
 
 
 def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
-                 owner: str = "") -> None:
+                 owner: str = "", context_note: str = "") -> None:
     entry = {
         "phone": phone, "contact_id": contact_id, "name": name,
         "dialed_at": _now_iso(),
@@ -513,6 +513,9 @@ def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
         # Tenant that placed the dial — so call-history direction matching
         # never grafts another tenant's contact name/phone onto a call row.
         "owner": owner,
+        # Why we are calling (callback aim / past context) — the bridge feeds
+        # it into the WHY-YOU-ARE-CALLING-BACK prompt block.
+        "context_note": context_note,
     }
     try:
         from shared.db.database import get_db
@@ -520,9 +523,10 @@ def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
         with get_db() as db:
             db.execute(
                 "INSERT INTO call_links (owner, phone, sig_digits, contact_id,"
-                " name, agent_slug, dialed_at) VALUES (?,?,?,?,?,?,?)",
+                " name, agent_slug, dialed_at, context_note)"
+                " VALUES (?,?,?,?,?,?,?,?)",
                 (owner, phone, significant_digits(phone), contact_id, name,
-                 agent_slug, entry["dialed_at"]))
+                 agent_slug, entry["dialed_at"], context_note or None))
             # Dial records only matter inside the matching windows; prune
             # anything older than a week (replaces the file's last-5000 cap).
             cutoff = (datetime.datetime.utcnow()
@@ -1500,16 +1504,59 @@ _ANALYSIS_SYSTEM_PROMPT = """You analyze a phone call transcript between a sales
 Use null/empty values honestly if the transcript is too short or unclear to judge something — never invent specifics that aren't supported by the transcript."""
 
 
+def _agent_scoring_context(folder: str) -> str:
+    """v2 (plan §4.6): when the call's agent configures post_call.scoring,
+    return an agent-context block appended to the analysis system prompt.
+    Any other case returns '' — the existing prompt byte-for-byte."""
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            row = db.execute(
+                "SELECT agent_slug, collected_data FROM calls "
+                "WHERE call_key=? ORDER BY id DESC LIMIT 1", (folder,)).fetchone()
+        if not row or not row["agent_slug"]:
+            return ""
+        from backend.app.agent_definition.registry import agent_registry
+        agent = agent_registry.get(row["agent_slug"])
+        scoring = agent.post_call.scoring or {}
+        if not scoring.get("enabled"):
+            return ""
+        lines = ["", "AGENT CONTEXT (score against THIS agent's actual job):",
+                 f"- Agent: {agent.identity.agent_name} for "
+                 f"{agent.identity.company_name} ({agent.identity.role_description})"]
+        if agent.call_flow.call_goal:
+            lines.append(f"- Call mission: {agent.call_flow.call_goal}")
+        goals = [f"{s.id}: {s.goal}" for s in agent.call_flow.stages if s.goal]
+        if goals:
+            lines.append("- Stage goals: " + " | ".join(goals)[:1500])
+        outcomes = agent.post_call.outcomes or []
+        if outcomes:
+            lines.append("- Outcome taxonomy: " + "; ".join(
+                f"{o.get('id')}({o.get('kind')})" for o in outcomes if isinstance(o, dict)))
+        if scoring.get("criteria_prompt"):
+            lines.append(f"- Scoring criteria: {scoring['criteria_prompt']}")
+        if scoring.get("score_labels"):
+            lines.append("- Score labels to use: " + ", ".join(
+                str(x) for x in scoring["score_labels"]))
+        if row["collected_data"]:
+            lines.append(f"- Data collected on the call: {str(row['collected_data'])[:1200]}")
+        return "\n".join(lines)
+    except Exception as exc:
+        logger.warning("agent scoring context failed for %s: %r", folder, exc)
+        return ""
+
+
 async def _analyze_transcript(folder: str) -> dict:
     messages = _read_transcript(folder)
     if not messages:
         raise ValueError("No transcript available for this call")
     transcript_text = "\n".join(f"{m['speaker']}: {m['text']}" for m in messages)
     client = _get_analysis_client()
+    _sys_prompt = _ANALYSIS_SYSTEM_PROMPT + _agent_scoring_context(folder)
     response = await client.chat.completions.create(
         model=_ANALYSIS_MODEL,
         messages=[
-            {"role": "system", "content": _ANALYSIS_SYSTEM_PROMPT},
+            {"role": "system", "content": _sys_prompt},
             {"role": "user", "content": f"Transcript:\n{transcript_text}"},
         ],
         response_format={"type": "json_object"},
@@ -3102,6 +3149,7 @@ def _automation_row_to_dict(r: dict) -> dict:
     return {
         "id": r["legacy_id"],
         "source_id": r["source_id"],
+        "owner": r.get("owner") or "",
         "contact_name": r["contact_name"] or "",
         "contact_phone": r["contact_phone"] or "",
         "past_call_context": r["past_call_context"] or "",
@@ -3319,16 +3367,43 @@ async def _dial_automation_entry(automation_id: str) -> None:
     if not _update_automation(automation_id, {"status": "calling"},
                               expect_status="scheduled"):
         return
-    # Background automation runs as the platform admin (the founding operator).
+    # v2 fix (plan §4.6): the callback dials AS THE OWNER of the automation
+    # row (legacy rows without an owner keep running as the platform admin),
+    # so a tenant's callback never goes out with another tenant's identity.
     import auth as _auth
+    _cb_owner = entry.get("owner") or _auth.DEFAULT_OWNER
     try:
-        _ident = _outbound_identity(_auth.DEFAULT_OWNER)
-    except OutboundIdentityError:
+        _ident = _outbound_identity(_cb_owner)
+    except OutboundIdentityError as exc:
+        if _cb_owner != _auth.DEFAULT_OWNER:
+            _update_automation(automation_id,
+                               {"status": "failed",
+                                "call_outcome": f"no outbound identity: {exc}",
+                                "called_at": _now_iso()})
+            return
         _ident = {"caller_id": OUTBOUND_CALLER_ID, "gateway_name": ADMIN_GATEWAY_NAME,
                   "agent_slug": _active_agent_slug(), "source": "admin-global"}
-    _dial_slug = _ident["agent_slug"]
+    # Prefer the ORIGINAL call's agent over the globally-active one — the
+    # caller expects to hear back from the same agent, not whoever is live.
+    _src_agent = ""
+    try:
+        from shared.db.database import get_db as _get_db
+        with _get_db() as _db:
+            _row = _db.execute(
+                "SELECT agent_slug FROM calls WHERE (call_key=? OR conn_id=?) "
+                "AND (owner=? OR ? = '') ORDER BY id DESC LIMIT 1",
+                (entry.get("source_id") or "", entry.get("source_id") or "",
+                 _cb_owner, entry.get("owner") or "")).fetchone()
+            if _row and _row["agent_slug"]:
+                _src_agent = _row["agent_slug"]
+    except Exception as exc:
+        logger.warning("automation source-agent lookup failed: %r", exc)
+    _dial_slug = _src_agent or _ident["agent_slug"]
+    # WHY-YOU-ARE-CALLING-BACK context for the live agent prompt.
+    _ctx_bits = [entry.get("call_aim") or "", entry.get("past_call_context") or ""]
+    _context_note = ". ".join(b.strip().rstrip(".") for b in _ctx_bits if b.strip())[:800]
     _record_dial(phone, entry["id"], entry.get("contact_name", ""), agent_slug=_dial_slug,
-                 owner=_auth.DEFAULT_OWNER)
+                 owner=_cb_owner, context_note=_context_note)
 
     try:
         fs_out = await _fs_esl_exec(_fs_originate_cmd(
@@ -3346,6 +3421,44 @@ async def _dial_automation_entry(automation_id: str) -> None:
         import auth as _auth
         _update_contact_after_call(entry["linked_contact_id"], cs, _auth.DEFAULT_OWNER)
     logger.info("FOLLOWUP_AUTOMATION %s -> %s (%s)", automation_id, phone, cs)
+
+
+@app.get("/api/followups/whatsapp-pending")
+async def whatsapp_pending(request: Request) -> JSONResponse:
+    """Calls where the agent PROMISED WhatsApp media (branch action
+    promise_whatsapp_media → collected_data.flags.whatsapp_promised) — the
+    fulfillment queue's first consumer (plan §4.3 item 4). Owner-scoped."""
+    owner = _acting_owner(request)
+    import auth as _auth
+    rows: list[dict] = []
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            q = ("SELECT conn_id, call_key, phone, contact_id, agent_slug, "
+                 "started_at, collected_data, owner FROM calls "
+                 "WHERE collected_data LIKE ? ")
+            args: list = ['%"whatsapp_promised": true%']
+            if not _auth.is_admin(owner):
+                q += "AND owner=? "
+                args.append(owner)
+            q += "ORDER BY started_at DESC LIMIT 200"
+            for r in db.execute(q, tuple(args)).fetchall():
+                d = dict(r)
+                try:
+                    flags = (json.loads(d.get("collected_data") or "{}")
+                             .get("flags") or {})
+                except Exception:
+                    flags = {}
+                rows.append({
+                    "conn_id": d["conn_id"], "call_key": d["call_key"],
+                    "phone": d["phone"], "contact_id": d["contact_id"],
+                    "agent_slug": d["agent_slug"], "started_at": d["started_at"],
+                    "assets": flags.get("whatsapp_assets") or [],
+                })
+    except Exception as exc:
+        logger.error("whatsapp-pending query failed: %r", exc)
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, "pending": rows})
 
 
 @app.post("/api/followup-automation/{automation_id}/call-now")

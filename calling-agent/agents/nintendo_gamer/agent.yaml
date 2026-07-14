@@ -319,7 +319,7 @@ llm_config:
   stream_timeout_s: 10.0
   filler_timeout_s: 1.5
   intent_classify_timeout_s: 1.0
-  max_response_length: 160
+  max_response_length: 400
   extra_always_rules:
     - "Always mention specific game titles when pitching a console — make recommendations personal to what they enjoy."
     - "When handling price objections, reframe as value: compare to mobile game spend or what a single PS5 game costs."

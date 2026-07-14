@@ -140,6 +140,25 @@ class SarvamTTS(StreamingTTS):
     def set_language(self, lang: str) -> None:
         self._language = lang
 
+    def set_voice(self, model: str | None = None, speaker: str | None = None,
+                  pace: float | None = None) -> None:
+        """v2: per-language voice on mid-call language switch. Invalid models
+        are ignored (the current voice keeps playing rather than 400-ing)."""
+        if model:
+            if model in VALID_MODELS:
+                self._model = model
+            else:
+                logger.warning("[TTS:Sarvam] set_voice: invalid model %r ignored", model)
+        if speaker:
+            self._speaker = speaker
+        if pace:
+            try:
+                p = float(pace)
+                if 0.5 <= p <= 2.0:
+                    self._pace = p
+            except (TypeError, ValueError):
+                pass
+
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             # keepalive_expiry=60: idle connections older than 60s are never

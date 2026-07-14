@@ -799,7 +799,7 @@ class AgentDefinition:
             stream_timeout_s=_as_float(llm_d, "stream_timeout_s", 10.0),
             filler_timeout_s=_as_float(llm_d, "filler_timeout_s", 1.5),
             intent_classify_timeout_s=_as_float(llm_d, "intent_classify_timeout_s", 1.0),
-            max_response_length=_as_int(llm_d, "max_response_length", 150),
+            max_response_length=_as_int(llm_d, "max_response_length", 400),
             extra_never_rules=[str(x) for x in _as_list(llm_d, "extra_never_rules")],
             extra_always_rules=[str(x) for x in _as_list(llm_d, "extra_always_rules")],
         )

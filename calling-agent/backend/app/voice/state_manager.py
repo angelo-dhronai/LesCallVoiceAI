@@ -58,9 +58,50 @@ class SlotSpec:
     question: dict[str, str] = field(default_factory=dict)   # lang -> question to ask
     summary_known: str = ""                     # template, {value} substituted
     summary_unknown: str = ""                   # sentence used while missing
+    # v2 (mirrors SlotDefinition — all defaults keep legacy behaviour):
+    type: str = ""                              # ''|text|number|money|enum|boolean|phone|date|time|location
+    enum_values: list[str] = field(default_factory=list)
+    enum_synonyms: dict[str, list[str]] = field(default_factory=dict)
+    extract_patterns: list[str] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
+    merge_policy: str = "free"                  # free|correction_gated|confirm
+    confirm_readback: str = ""                  # ''|verbatim|digit_groups_2
+    max_asks: int = 0                           # 0 = unlimited
+    reask_question: dict[str, str] = field(default_factory=dict)
+    # Precompiled at manager init (hot path stays <1 ms):
+    _compiled_patterns: list = field(default_factory=list, repr=False, compare=False)
+    _synonym_lookup: dict = field(default_factory=dict, repr=False, compare=False)
 
     def display(self) -> str:
         return self.label or self.name.replace("_", " ").title()
+
+
+# type: phone — Indian mobile (mirrors memory.py's extraction pattern)
+_SLOT_PHONE_RE = re.compile(
+    r'(?<!\d)'
+    r'(?:(?:\+91|91)[-.\s]?)?'
+    r'([6-9]\d{4}[-.\s]?\d{5})'
+    r'(?!\d)',
+)
+
+# Generic number for type: number
+_SLOT_NUMBER_RE = re.compile(r'(?<![\d.])(\d+(?:\.\d+)?)(?![\d.])')
+
+# Correction markers for merge_policy: correction_gated — the caller is
+# explicitly revising an earlier value, not just mentioning a new one.
+_CORRECTION_MARKER_RE = re.compile(
+    r"\b(actually|nahi|नहीं|nahin|galat|wrong|change|correct|sorry|"
+    r"i meant|make it|instead|update)\b", re.IGNORECASE)
+
+
+def format_readback(value: Any, mode: str) -> str:
+    """Format a captured value for spoken read-back confirmation (D5)."""
+    s = str(value or "")
+    if mode == "digit_groups_2":
+        digits = re.sub(r"\D", "", s)
+        if digits:
+            return " ".join(digits[i:i + 2] for i in range(0, len(digits), 2))
+    return s
 
 
 @dataclass
@@ -196,7 +237,11 @@ class ConversationStateManager:
         default_intent: str = "",
         language: str = "hi",
     ) -> None:
-        self.slots: dict[str, SlotSpec] = {s.name: s for s in slots}
+        # Deep-copy: the fallback slot sets are shared module-level objects,
+        # and v2 hooks (require_now, precompiled patterns) mutate specs —
+        # per-call managers must never leak mutations into each other.
+        import copy as _copy
+        self.slots: dict[str, SlotSpec] = {s.name: _copy.deepcopy(s) for s in slots}
         self.state: dict[str, Any] = {s.name: None for s in slots}
         if default_intent:
             self.state.setdefault("intent", default_intent)
@@ -204,6 +249,28 @@ class ConversationStateManager:
         self.language = language
         self.turn_index = 0
         self._pending_fields: set[str] = set()   # e.g. name awaiting confirmation
+        # v2 bookkeeping — all additive:
+        self.asked_count: dict[str, int] = {}    # slot -> times asked
+        self.skipped: set[str] = set()           # max_asks exhausted
+        self.readback_done: set[str] = set()     # read-back confirmed slots
+        self.extra_flags: dict[str, Any] = {}    # e.g. whatsapp_promised (→ collected_data)
+        # Precompile per-slot patterns/synonyms (hot path stays <1 ms).
+        for s in self.slots.values():
+            s._compiled_patterns = []
+            for p in (s.extract_patterns or [])[:8]:
+                try:
+                    s._compiled_patterns.append(re.compile(str(p)[:200], re.IGNORECASE))
+                except re.error:
+                    logger.warning("[STATE] slot %s pattern %r does not compile — skipped",
+                                   s.name, p)
+            lookup: dict[str, str] = {}
+            for canon in (s.enum_values or []):
+                lookup[str(canon).lower()] = str(canon)
+            for canon, alts in (s.enum_synonyms or {}).items():
+                canon_val = lookup.get(str(canon).lower(), str(canon))
+                for alt in (alts if isinstance(alts, (list, tuple)) else [alts]):
+                    lookup[str(alt).lower()] = canon_val
+            s._synonym_lookup = lookup
         # Location matching material from the agent's knowledge base.
         self._locations = [l for l in (locations or []) if l]
         self._loc_lookup: dict[str, str] = {}
@@ -225,6 +292,65 @@ class ConversationStateManager:
     # ------------------------------------------------------------------
     # 1. extract_entities — pure sync, <1 ms
     # ------------------------------------------------------------------
+    def _untyped(self, name: str) -> bool:
+        spec = self.slots.get(name)
+        return spec is not None and not getattr(spec, "type", "")
+
+    def _extract_typed(self, spec: SlotSpec, text: str, lower: str) -> Any:
+        """v2 type-driven extraction for one slot. None = nothing found."""
+        # Custom regexes win (first capture group, else whole match).
+        for pat in spec._compiled_patterns:
+            m = pat.search(text)
+            if m:
+                return (m.group(1) if m.groups() else m.group(0)).strip()
+        t = spec.type
+        if t in ("enum", "location"):
+            # Latest mention wins (mirrors _match_location correction handling)
+            hit, best_idx = None, -1
+            for alias, canon in spec._synonym_lookup.items():
+                start = 0
+                while True:
+                    idx = lower.find(alias, start)
+                    if idx < 0:
+                        break
+                    before_ok = idx == 0 or not lower[idx - 1].isalnum()
+                    after = idx + len(alias)
+                    after_ok = after >= len(lower) or not lower[after].isalnum()
+                    if before_ok and after_ok and idx > best_idx:
+                        best_idx, hit = idx, canon
+                    start = idx + 1
+            if hit is None and t == "location":
+                return self._match_location(lower)
+            return hit
+        if t == "money":
+            return self._extract_budget(text)
+        if t == "number":
+            matches = _SLOT_NUMBER_RE.findall(lower)
+            return matches[-1] if matches else None
+        if t == "phone":
+            m = _SLOT_PHONE_RE.search(text)
+            if m:
+                raw = re.sub(r"[-.\s]", "", m.group(0))
+                if raw.startswith("+91"):
+                    raw = raw[3:]
+                elif raw.startswith("91") and len(raw) > 10:
+                    raw = raw[2:]
+                if len(raw) == 10 and raw[0] in "6789":
+                    return raw
+            return None
+        if t == "boolean":
+            # Only when this slot is the one being asked — a stray "yes"
+            # anywhere else must not fill it.
+            gaps = self.detect_missing_slots()
+            if gaps["missing"] and gaps["missing"][0] == spec.name:
+                if re.search(r"\b(yes|yeah|haan|ha|ji|bilkul|sure|ok|okay|હા|हां|हाँ)\b", lower):
+                    return "Yes"
+                if re.search(r"\b(no|nahi|nope|नहीं|ના|નહીં)\b", lower):
+                    return "No"
+            return None
+        # text/date/time: deferred to the LLM gap-filler.
+        return None
+
     def extract_entities(self, text: str) -> dict[str, Any]:
         """Extract every recognizable slot value from one utterance."""
         if not text or not text.strip():
@@ -232,45 +358,60 @@ class ConversationStateManager:
         out: dict[str, Any] = {}
         lower = text.lower()
 
-        if "location" in self.slots:
+        # v2: type-driven extraction runs FIRST for typed slots; slots with
+        # an empty type keep the legacy name-keyed dispatch byte-identically.
+        for name, spec in self.slots.items():
+            if not getattr(spec, "type", ""):
+                continue
+            try:
+                val = self._extract_typed(spec, text, lower)
+            except Exception:
+                logger.exception("[STATE] typed extraction failed for %s", name)
+                val = None
+            if val is not None:
+                out[name] = val
+
+        if "location" in self.slots and self._untyped("location"):
             loc = self._match_location(lower)
             if loc:
                 out["location"] = loc
 
-        if "bhk" in self.slots or "configuration" in self.slots:
+        if (("bhk" in self.slots and self._untyped("bhk"))
+                or ("configuration" in self.slots and self._untyped("configuration"))):
             bhk = self._extract_bhk(text)
             if bhk:
                 out["bhk" if "bhk" in self.slots else "configuration"] = bhk
 
-        if "property_type" in self.slots:
+        if "property_type" in self.slots and self._untyped("property_type"):
             for pat, label in _PROPERTY_TYPES:
                 if pat.search(text):
                     out["property_type"] = label
                     break
 
-        if "budget" in self.slots:
+        if "budget" in self.slots and self._untyped("budget"):
             budget = self._extract_budget(text)
             if budget:
                 out["budget"] = budget
 
-        if "timeline" in self.slots:
+        if "timeline" in self.slots and self._untyped("timeline"):
             tl = self._extract_timeline(text)
             if tl:
                 out["timeline"] = tl
 
-        if "loan_required" in self.slots and not _LOAN_QUESTION_RE.search(text):
+        if ("loan_required" in self.slots and self._untyped("loan_required")
+                and not _LOAN_QUESTION_RE.search(text)):
             if _LOAN_NO_RE.search(text):
                 out["loan_required"] = "No"
             elif _LOAN_YES_RE.search(text):
                 out["loan_required"] = "Yes"
 
-        if "purpose" in self.slots:
+        if "purpose" in self.slots and self._untyped("purpose"):
             if _PURPOSE_INVEST_RE.search(text):
                 out["purpose"] = "Investment"
             elif _PURPOSE_SELF_RE.search(text):
                 out["purpose"] = "Self-use"
 
-        if "occupation" in self.slots:
+        if "occupation" in self.slots and self._untyped("occupation"):
             for pat, label in _OCCUPATION_PATTERNS:
                 if pat.search(text):
                     out["occupation"] = label
@@ -384,7 +525,32 @@ class ConversationStateManager:
                 continue
             if fill_only and old is not None:
                 continue
+            # v2 merge policies (default 'free' = current latest-wins). The
+            # literal slot 'name' is hard-excluded — its confirmation flow
+            # (_name_pending in conversation.py) stays untouched.
+            spec = self.slots.get(key)
+            policy = getattr(spec, "merge_policy", "free") if spec else "free"
+            if key != "name" and policy == "correction_gated" and old is not None:
+                if not (_NEGATED_VALUE_RE.search(utterance or "")
+                        or _CORRECTION_MARKER_RE.search(utterance or "")):
+                    # Overwrite rejected — keep the confirmed value, audit it.
+                    self.update_audit_log(
+                        key, old, old, source,
+                        f"REJECTED overwrite to {new!r} (no correction marker): "
+                        f"{(utterance or '')[:80]}")
+                    continue
+            if key != "name" and policy == "confirm" and source != "system":
+                # Captured but held for the caller's explicit confirmation;
+                # conversation.py's generic confirm loop resolves it.
+                self.state[key] = new
+                self._pending_fields.add(key)
+                entry = self.update_audit_log(
+                    key, old, new, source, (utterance or "")[:120])
+                changes.append(entry)
+                continue
             self.state[key] = new
+            if spec is not None and getattr(spec, "confirm_readback", ""):
+                self.readback_done.discard(key)  # new value → read back again
             entry = self.update_audit_log(key, old, new, source, utterance)
             changes.append(entry)
         return changes
@@ -392,14 +558,27 @@ class ConversationStateManager:
     # ------------------------------------------------------------------
     # 3. missing-slot detection
     # ------------------------------------------------------------------
+    def _deps_met(self, name: str) -> bool:
+        """All depends_on slots filled (or the slot has no dependencies)."""
+        spec = self.slots.get(name)
+        deps = getattr(spec, "depends_on", None) or [] if spec else []
+        return all(self.state.get(d) is not None for d in deps if d in self.slots)
+
     def detect_missing_slots(self) -> dict[str, list[str]]:
         filled = [n for n, v in self.state.items()
                   if n in self.slots and v is not None]
-        missing = sorted(
-            (n for n, s in self.slots.items()
-             if s.required and self.state.get(n) is None and n not in self._pending_fields),
-            key=lambda n: self.slots[n].priority,
-        )
+        # v2 dependency gates: a required, unfilled slot whose depends_on are
+        # not yet met is BLOCKED — never asked early, still filled
+        # opportunistically when volunteered (extraction is ungated).
+        # v2 ask fatigue: a slot in `skipped` (max_asks hit) leaves `missing`.
+        unfilled = [n for n, s in self.slots.items()
+                    if s.required and self.state.get(n) is None
+                    and n not in self._pending_fields
+                    and n not in self.skipped]
+        blocked = sorted((n for n in unfilled if not self._deps_met(n)),
+                         key=lambda n: self.slots[n].priority)
+        missing = sorted((n for n in unfilled if self._deps_met(n)),
+                         key=lambda n: self.slots[n].priority)
         # Pending = captured but unconfirmed. Excluded from `missing` (don't
         # re-ask mid-confirmation) but NOT filled — "all collected" logic and
         # stage advancement must treat pending as incomplete.
@@ -407,7 +586,28 @@ class ConversationStateManager:
             (n for n in self._pending_fields if n in self.slots),
             key=lambda n: self.slots[n].priority,
         )
-        return {"filled": filled, "missing": missing, "pending": pending}
+        return {"filled": filled, "missing": missing, "pending": pending,
+                "blocked": blocked, "skipped": sorted(self.skipped)}
+
+    def collect_satisfied(self, names: list[str]) -> bool:
+        """Stage-advancement check: every named slot is filled (pending
+        excluded) or skipped via max_asks (counts as satisfied)."""
+        for n in names or []:
+            if n not in self.slots:
+                continue
+            if n in self._pending_fields:
+                return False
+            if self.state.get(n) is None and n not in self.skipped:
+                return False
+        return True
+
+    def require_now(self, name: str) -> None:
+        """Branch action hook (capture_phone): make an optional slot required
+        so it becomes the next ask."""
+        spec = self.slots.get(name)
+        if spec is not None:
+            spec.required = True
+            self.skipped.discard(name)
 
     def next_missing_slot(self) -> SlotSpec | None:
         missing = self.detect_missing_slots()["missing"]
@@ -421,8 +621,29 @@ class ConversationStateManager:
         if slot is None:
             return None
         lang = language or self.language
+        # v2: second-attempt phrasing after the first ask, when provided.
+        asked = self.asked_count.get(slot.name, 0)
+        if asked >= 1 and slot.reask_question:
+            q = (slot.reask_question.get(lang) or slot.reask_question.get("en")
+                 or next(iter(slot.reask_question.values()), ""))
+            if q:
+                return q
         q = slot.question.get(lang) or slot.question.get("en") or ""
         return q or f"Ask the caller about their {slot.display().lower()}."
+
+    def note_asked(self, name: str) -> None:
+        """Ask-fatigue bookkeeping (v2): called at question-selection time.
+        At max_asks (when >0) the slot moves to `skipped` — excluded from
+        `missing`, satisfied for stage advancement."""
+        spec = self.slots.get(name)
+        if spec is None:
+            return
+        self.asked_count[name] = self.asked_count.get(name, 0) + 1
+        max_asks = getattr(spec, "max_asks", 0) or 0
+        if max_asks > 0 and self.asked_count[name] >= max_asks and \
+                self.state.get(name) is None:
+            self.skipped.add(name)
+            logger.info("[STATE] slot %s hit max_asks=%d — skipped", name, max_asks)
 
     # ------------------------------------------------------------------
     # 5. prompt context — THE single authoritative state block
@@ -453,15 +674,38 @@ class ConversationStateManager:
         lines.append("RULES:")
         lines.append("  • NEVER ask about any ✓ field — the caller already told you. "
                       "Acknowledge ✓ facts naturally when relevant.")
+        # v2: read-back instruction for filled-but-unconfirmed readback slots.
+        readback_due = [
+            n for n, spec in self.slots.items()
+            if getattr(spec, "confirm_readback", "")
+            and self.state.get(n) is not None
+            and n not in self.readback_done
+            and n not in self._pending_fields
+        ]
+        for n in sorted(readback_due, key=lambda x: self.slots[x].priority):
+            spec = self.slots[n]
+            spoken = format_readback(self.state.get(n), spec.confirm_readback)
+            lines.append(f"  • READ BACK the {spec.display().lower()} ONCE to confirm it — "
+                         f"say it as: \"{spoken}\" — then continue.")
+            self.readback_done.add(n)  # instruction is emitted exactly once
         if gaps["pending"]:
             # A confirmation is in flight (e.g. name). That confirmation IS
             # the next action — never stack a second question on top of it.
             pretty_p = ", ".join(self.slots[p].display() for p in gaps["pending"])
+            for p in gaps["pending"]:
+                spec = self.slots[p]
+                if p != "name" and getattr(spec, "merge_policy", "") == "confirm":
+                    spoken = format_readback(self.state.get(p),
+                                             getattr(spec, "confirm_readback", ""))
+                    lines.append(f"  • CONFIRM the {spec.display().lower()} the caller gave "
+                                 f"(\"{spoken}\") — ask if it's correct, nothing else first.")
             lines.append(f"  • Awaiting confirmation of: {pretty_p}. Confirm that FIRST — "
                          "do not ask any other question this turn.")
         elif gaps["missing"] and stage_discovery:
             nq = self.generate_next_question(language)
-            first = self.slots[gaps["missing"][0]].display()
+            first_name = gaps["missing"][0]
+            first = self.slots[first_name].display()
+            self.note_asked(first_name)
             lines.append(f"  • Ask ONLY ONE question next, about: {first}."
                          + (f" Suggested phrasing: {nq}" if nq else ""))
         elif gaps["missing"]:
@@ -563,14 +807,21 @@ class ConversationStateManager:
         return " ".join(parts) if parts else "No details collected yet."
 
     def to_dict(self) -> dict:
-        return {
+        gaps = self.detect_missing_slots()
+        out = {
             "state": dict(self.state),
-            "filled": self.detect_missing_slots()["filled"],
-            "missing": self.detect_missing_slots()["missing"],
+            "filled": gaps["filled"],
+            "missing": gaps["missing"],
             "summary": self.running_summary(),
             "audit_log": [a.to_dict() for a in self.audit_log],
             "turns_observed": self.turn_index,
+            # v2 — additive keys only (snapshot consumers rely on the rest):
+            "skipped": gaps["skipped"],
+            "blocked": gaps["blocked"],
         }
+        if self.extra_flags:
+            out["flags"] = dict(self.extra_flags)
+        return out
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
@@ -629,19 +880,38 @@ def build_state_manager(agent_def, language: str = "hi") -> ConversationStateMan
     """
     slots: list[SlotSpec] = []
     for s in getattr(agent_def, "slots", None) or []:
+        # Copy ALL SlotDefinition fields (summary_known/unknown used to be
+        # dropped here — the plan's L4 finding).
         slots.append(SlotSpec(
             name=s.name, priority=s.priority, required=s.required,
             label=getattr(s, "label", "") or "",
             question=dict(getattr(s, "question", {}) or {}),
+            summary_known=getattr(s, "summary_known", "") or "",
+            summary_unknown=getattr(s, "summary_unknown", "") or "",
+            type=getattr(s, "type", "") or "",
+            enum_values=list(getattr(s, "enum_values", None) or []),
+            enum_synonyms=dict(getattr(s, "enum_synonyms", None) or {}),
+            extract_patterns=list(getattr(s, "extract_patterns", None) or []),
+            depends_on=list(getattr(s, "depends_on", None) or []),
+            merge_policy=getattr(s, "merge_policy", "free") or "free",
+            confirm_readback=getattr(s, "confirm_readback", "") or "",
+            max_asks=int(getattr(s, "max_asks", 0) or 0),
+            reask_question=dict(getattr(s, "reask_question", None) or {}),
         ))
     if not slots:
         qa_keys = set((agent_def.knowledge_base.qa_field_signals or {}).keys())
         stage_ids = {s.id for s in agent_def.call_flow.stages}
+        # v2 role shim: custom-id stages with an explicit scheduling/
+        # confirmation role also count as booking flows (the id-literal set
+        # stays as the fallback for legacy agents).
+        from .stage_roles import stage_role as _stage_role_of
+        stage_roles = {_stage_role_of(s, s.id) for s in agent_def.call_flow.stages}
         if "bhk" in qa_keys:
             # BHK is the real-estate discriminator; location/budget alone
             # appear in clinics and product-sales agents too.
             slots = list(_REAL_ESTATE_SLOTS)
-        elif stage_ids & {"INVITE_VISIT", "SLOT_BOOKING", "CONFIRMATION"}:
+        elif (stage_ids & {"INVITE_VISIT", "SLOT_BOOKING", "CONFIRMATION"}
+              or stage_roles & {"scheduling", "confirmation"}):
             # Books meetings/appointments → track name + agreed time.
             slots = list(_MEETING_SLOTS)
         else:

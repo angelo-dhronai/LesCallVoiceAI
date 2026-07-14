@@ -105,16 +105,18 @@ def main() -> None:
                 stt_corrections=_corrections,
             )
             # Pick TTS voice from agent definition (default language's voice config)
-            _tts_model, _tts_speaker = "bulbul:v3", "shubh"
+            _tts_model, _tts_speaker, _tts_pace = "bulbul:v3", "shubh", 1.0
             if agent_def:
                 _dlang = agent_def.languages.default
                 _vcfg = agent_def.languages.tts_voices.get(_dlang)
                 if _vcfg:
                     _tts_model, _tts_speaker = _vcfg.model, _vcfg.speaker
+                    _tts_pace = getattr(_vcfg, "pace", 1.0) or 1.0
             tts = TrackingSarvamTTS(
                 call_id_provider=call_id_provider,
                 model=_tts_model,
                 speaker=_tts_speaker,
+                pace=_tts_pace,
             )
 
             pipeline = VoicePipeline(

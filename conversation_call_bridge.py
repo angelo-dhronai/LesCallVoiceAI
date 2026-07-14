@@ -199,7 +199,7 @@ def _lookup_recent_outbound_dial(caller_number: str = "") -> dict | None:
             with get_db() as db:
                 entries = [dict(r) for r in db.execute(
                     "SELECT owner, phone, contact_id, name, agent_slug,"
-                    " dialed_at FROM call_links WHERE dialed_at >= ?"
+                    " dialed_at, context_note FROM call_links WHERE dialed_at >= ?"
                     " ORDER BY dialed_at DESC LIMIT 50",
                     (window_start,)).fetchall()]
         except Exception as exc:
@@ -341,6 +341,10 @@ class TelephonySession:
                 )
                 logger.info("[%s] Outbound call context: contact=%r phone=%s",
                             conn_id, dial.get("name"), dial.get("phone"))
+                # Callback context (call_links.context_note): why this call
+                # is being made — WHY-YOU-ARE-CALLING-BACK prompt block.
+                if dial.get("context_note") and hasattr(conversation, "set_callback_context"):
+                    conversation.set_callback_context(str(dial["context_note"]))
             else:
                 conversation.set_call_context(conn_id=conn_id)
         except Exception as exc:
@@ -599,6 +603,49 @@ class TelephonySession:
             logger.warning("[%s] collected-data snapshot failed: %r", self.conn_id, exc)
         return transcript, summary, collected, recording_path
 
+    def _compute_outcome(self):
+        """Deterministic call outcome (plan §4.6) — ONLY when the agent
+        configures post_call.outcomes (else (None, None) = today, including
+        Pramukh until backfilled)."""
+        try:
+            conv = getattr(self.pipeline, "conversation", None)
+            adef = getattr(conv, "_def", None)
+            outcomes = list(getattr(getattr(adef, "post_call", None), "outcomes", None) or [])
+            if not outcomes or conv is None:
+                return None, None
+            sm = getattr(conv, "state_mgr", None)
+            flags = getattr(sm, "extra_flags", {}) if sm is not None else {}
+            booking = getattr(conv, "memory", None)
+            appt = bool(getattr(getattr(booking, "booking", None), "appointment_time", None))
+            signal = getattr(conv, "call_outcome", "") or ""
+            if not signal:
+                if appt:
+                    signal = "booked"
+                elif flags.get("whatsapp_promised"):
+                    signal = "whatsapp_followup"
+                elif flags.get("callback_requested"):
+                    signal = "callback_requested"
+                else:
+                    signal = "no_outcome"
+            by_id = {str(o.get("id") or "").lower(): o for o in outcomes if isinstance(o, dict)}
+            hit = by_id.get(signal.lower())
+            if hit is None:
+                # kind-level fallback: success ← appointment; progress ← any
+                # follow-up promise; failure ← everything else.
+                want_kind = ("success" if appt or signal == "completed" else
+                             "progress" if signal in ("whatsapp_followup",
+                                                      "callback_requested") else
+                             "failure")
+                hit = next((o for o in outcomes
+                            if str(o.get("kind") or "") == want_kind), None)
+            if hit is None:
+                return signal, None
+            return (str(hit.get("id") or signal),
+                    str(hit.get("kind") or "") or None)
+        except Exception as exc:
+            logger.warning("[%s] outcome computation failed: %r", self.conn_id, exc)
+            return None, None
+
     def _resolve_contact_id(self, db, phone: str) -> int | None:
         """Bind this call to the owner's phone-book contact (by the last 10
         significant digits); auto-create a bare contact for unknown callers so
@@ -671,6 +718,7 @@ class TelephonySession:
         # recording folder back to its tenant.
         call_key = self.call_key
         transcript, summary, collected, recording_path = self._collect_call_media(call_key)
+        outcome, outcome_kind = self._compute_outcome()
 
         # Public download link: a fresh 256-bit random token per call. On a
         # reconnect upsert the FIRST segment's token wins (COALESCE on the
@@ -691,8 +739,8 @@ class TelephonySession:
                 "INSERT INTO calls (conn_id, call_key, direction, agent_slug, campaign_id, "
                 "phone, sig_digits, language, started_at, ended_at, duration_s, owner, "
                 "transcript, summary, collected_data, recording_path, "
-                "download_token, recording_url, contact_id) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "download_token, recording_url, contact_id, outcome, outcome_kind) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT (conn_id) DO UPDATE SET "
                 "call_key=COALESCE(excluded.call_key, calls.call_key), "
                 "ended_at=excluded.ended_at, "
@@ -704,13 +752,15 @@ class TelephonySession:
                 "recording_path=COALESCE(excluded.recording_path, calls.recording_path), "
                 "download_token=COALESCE(calls.download_token, excluded.download_token), "
                 "recording_url=COALESCE(calls.recording_url, excluded.recording_url), "
-                "contact_id=COALESCE(calls.contact_id, excluded.contact_id)",
+                "contact_id=COALESCE(calls.contact_id, excluded.contact_id), "
+                "outcome=COALESCE(excluded.outcome, calls.outcome), "
+                "outcome_kind=COALESCE(excluded.outcome_kind, calls.outcome_kind)",
                 (self.conn_id, call_key, self.direction, self.agent_slug, self.campaign_id,
                  phone or None, significant_digits(phone) or None,
                  lang or None, _iso(started), _iso(ended), round(ended - started, 1),
                  self.owner or None,
                  transcript, summary, collected, recording_path,
-                 token, rec_url, contact_id),
+                 token, rec_url, contact_id, outcome, outcome_kind),
             )
 
     async def _event_loop(self):

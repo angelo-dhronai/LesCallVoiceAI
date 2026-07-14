@@ -436,7 +436,7 @@ llm_config:
   stream_timeout_s: 10
   filler_timeout_s: 1.5
   intent_classify_timeout_s: 1
-  max_response_length: 160
+  max_response_length: 400
   extra_never_rules:
   - Never quote pricing without understanding requirements and volume.
   - Never promise delivery timelines without confirmation.

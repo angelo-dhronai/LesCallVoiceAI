@@ -50,6 +50,8 @@ _STAGE_ORDER = {
     STAGE_CLOSING: 5,
 }
 
+from .stage_roles import derive_stage_role as _derive_stage_role
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -505,15 +507,20 @@ _REPEAT_DETECT_PATTERNS = [
 # ---------------------------------------------------------------------------
 
 
-def _validate_response(text: str, expected_lang: str = "en") -> str:
+def _validate_response(text: str, expected_lang: str = "en",
+                       max_len: int = MAX_RESPONSE_LENGTH) -> str:
     if not text or not text.strip():
         return _RESPONSE_FALLBACK
+    # llm_config.max_response_length is finally wired (D8); values below the
+    # historical effective constant are clamped up to it — the sub-400 values
+    # in old YAMLs were never in effect and must not start truncating now.
+    max_len = max(int(max_len or MAX_RESPONSE_LENGTH), MAX_RESPONSE_LENGTH)
     cleaned = _MARKDOWN_RE.sub("", text)
     cleaned = _EMOJI_RE.sub("", cleaned).strip()
-    if len(cleaned) > MAX_RESPONSE_LENGTH:
-        truncated = cleaned[:MAX_RESPONSE_LENGTH]
+    if len(cleaned) > max_len:
+        truncated = cleaned[:max_len]
         last_sentence = max(truncated.rfind("."), truncated.rfind("!"), truncated.rfind("?"))
-        if last_sentence > MAX_RESPONSE_LENGTH // 2:
+        if last_sentence > max_len // 2:
             cleaned = truncated[: last_sentence + 1]
         else:
             cleaned = truncated.rstrip() + "..."
@@ -607,6 +614,17 @@ class ConversationRouter:
         self.outbound_contact_name: str = ""
         self.outbound_contact_phone: str = ""
         self.conn_id: str = ""
+        # Callback context — why this (outbound) call is being made, carried
+        # from the original call's notes (call_links.context_note). Rendered
+        # as a WHY-YOU-ARE-CALLING-BACK prompt block when non-empty.
+        self.callback_context: str = ""
+        # v2 branch bookkeeping: per-call take counters (loop prevention) and
+        # deterministic side effects queued by branch actions.
+        self._branch_takes: dict = {}
+        self._slot_confirm_turn: dict[str, int] = {}
+        self._whatsapp_promised: bool = False
+        self._callback_requested: str = ""
+        self.call_outcome: str = ""
 
         # Conversation State Management layer — per-call structured memory:
         # extraction, merge, audit trail, missing-slot detection, and the
@@ -689,6 +707,26 @@ class ConversationRouter:
         logger.info("[CONTEXT] direction=%s contact=%r", self.call_direction,
                     self.outbound_contact_name or None)
 
+    def set_callback_context(self, context_note: str) -> None:
+        """Context for a scheduled callback (why we're calling back) —
+        rendered as a WHY-YOU-ARE-CALLING-BACK block in the system prompt."""
+        self.callback_context = (context_note or "").strip()
+
+    def _stage_def(self, stage_id: str | None = None):
+        """StageDefinition for a stage id (default: the current stage)."""
+        sid = stage_id if stage_id is not None else self.state.stage
+        return next((s for s in self._def.call_flow.stages if s.id == sid), None)
+
+    def _stage_role(self, stage_id: str | None = None) -> str:
+        """Semantic role of a stage: explicit StageDefinition.role wins,
+        else derived from the legacy id (v2 role shim)."""
+        sd = self._stage_def(stage_id)
+        explicit = (getattr(sd, "role", "") or "") if sd else ""
+        if explicit:
+            return explicit
+        sid = stage_id if stage_id is not None else self.state.stage
+        return _derive_stage_role(sid)
+
     # ------------------------------------------------------------------
     # Calendar availability + booking persistence
     # ------------------------------------------------------------------
@@ -738,6 +776,12 @@ class ConversationRouter:
         """Inbound warm welcome — agent answers the call.
         Bilingual so caller can respond in their preferred language."""
         greeting = self._def.response_bank.opening_greeting
+        # D6: outbound agents may carry a per-language outbound greeting —
+        # preferred when this call is outbound and the field is non-empty.
+        if self.call_direction == "outbound":
+            _ob_greeting = self._lang_response(self._def.outbound.opening_greeting)
+            if _ob_greeting:
+                greeting = _ob_greeting
         # Outbound personalization: greet the dialed contact by name. Canonical
         # form is {contact_name}; also tolerate the template syntaxes LLM
         # editors keep inventing (${contact_name}, {{contact_name}}, [name],
@@ -1061,36 +1105,117 @@ class ConversationRouter:
         if intent == "farewell":
             _cancel_llm()
             self.state.is_closing = True
-            resp = self._localized("closing", "Thank you for your time! We'll be in touch. Have a great day!")
+            # D9: response_bank.closing_responses is the real farewell line
+            # when present ({} = today's localized/hardcoded chain).
+            _closing = self._lang_response(
+                self._def.response_bank.closing_responses)
+            resp = _closing or self._localized(
+                "closing", "Thank you for your time! We'll be in touch. Have a great day!")
             self.memory.add_assistant(resp, language=self.state.language)
             self._store_last_response(resp)
             self.state.stage = STAGE_CLOSING
             yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
             return
 
-        # --- Objection at any stage (except GREETING, which has its own handler) ---
-        if intent == "objection" and self.state.stage != STAGE_GREETING:
-            _cancel_llm()
-            self.state.objection_handled = True
-            self.state.decline_count += 1
-
-            # Second decline: stop pushing and end gracefully.
-            if self.state.decline_count >= 2:
+        # --- v2 wrong-number close (outbound, gated on configured patterns).
+        # Checked BEFORE objections: "wrong number" is also a default
+        # objection pattern and must not burn a decline strike instead. ---
+        if self.call_direction == "outbound":
+            _wn_patterns = [str(p).lower() for p in
+                            (self._def.outbound.wrong_number_patterns or [])]
+            if _wn_patterns and any(p and p in text.lower() for p in _wn_patterns):
+                _cancel_llm()
                 self.state.is_closing = True
                 self.state.stage = STAGE_CLOSING
-                resp = self._def.response_bank.decline_farewell.get(
-                    self.state.language, self._def.response_bank.decline_farewell["en"]
-                )
+                self.call_outcome = self.call_outcome or "wrong_number"
+                self.state_mgr.extra_flags["wrong_number"] = True
+                resp = self._lang_response(self._def.outbound.wrong_number_close) \
+                    or "I'm so sorry — it seems I have the wrong number. Have a great day!"
                 self.memory.add_assistant(resp, language=self.state.language)
                 self._store_last_response(resp)
                 yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
                 return
 
-            resp = self._pick_objection_response()
+        # --- Objection at any stage (except GREETING, which has its own handler) ---
+        if intent == "objection" and self.state.stage != STAGE_GREETING:
+            _cancel_llm()
+            self.state.objection_handled = True
+
+            # v2 callback policy (D10): "call me tomorrow"-style deferrals
+            # capture a callback time WITHOUT booking a calendar slot.
+            cb_policy = self._def.call_flow.callback_policy or {}
+            if cb_policy.get("enabled") and self._detect_callback_request(text):
+                cb_resp = self._handle_callback_request(text, cb_policy)
+                if cb_resp is not None:
+                    if cb_policy.get("counts_as_decline", True):
+                        self.state.decline_count += 1
+                    self.memory.add_assistant(cb_resp, language=self.state.language)
+                    self._store_last_response(cb_resp)
+                    yield EngineResult(text=cb_resp, is_shortcut=True, intent="objection")
+                    return
+
+            self.state.decline_count += 1
+
+            # v2 DND (D10): immediate polite end when the utterance matches a
+            # configured dnd_phrase (default [] = no behaviour change).
+            _dnd = [str(p).lower() for p in
+                    ((self._def.guardrails.compliance or {}).get("dnd_phrases") or [])]
+            _is_dnd = any(p and p in text.lower() for p in _dnd)
+
+            # Nth decline (per call_flow.decline_threshold; all live agents
+            # carry 2 — wiring changes nothing): stop pushing, end gracefully.
+            _threshold = self._def.call_flow.decline_threshold or 2
+            if _is_dnd or self.state.decline_count >= _threshold:
+                self.state.is_closing = True
+                self.state.stage = STAGE_CLOSING
+                # Escalation handoff replaces the farewell only when enabled.
+                esc = self._def.guardrails.escalation or {}
+                resp = ""
+                if esc.get("enabled"):
+                    resp = self._lang_response(esc.get("handoff_message") or {})
+                if not resp:
+                    resp = self._lang_response(
+                        self._def.response_bank.decline_farewell) \
+                        or "Thank you for your time. Have a great day!"
+                if _is_dnd:
+                    self.state_mgr.extra_flags["dnd_requested"] = True
+                    self.call_outcome = self.call_outcome or "dnd"
+                    logger.info("[DND] caller requested do-not-disturb — ending call")
+                self.memory.add_assistant(resp, language=self.state.language)
+                self._store_last_response(resp)
+                yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
+                return
+
+            resp = self._pick_objection_response(text)
             self.memory.add_assistant(resp, language=self.state.language)
             self._store_last_response(resp)
             yield EngineResult(text=resp, is_shortcut=True, intent="objection")
             return
+
+        # --- v2 canned phrases (deterministic, gated on configuration) ---
+        for _cp in (self._def.response_bank.canned_phrases or []):
+            _pats = [str(p).lower() for p in (_cp.get("patterns") or [])]
+            if _pats and any(p and p in text.lower() for p in _pats):
+                resp = self._lang_response(_cp.get("responses") or {})
+                if resp:
+                    _cancel_llm()
+                    self.memory.add_assistant(resp, language=self.state.language)
+                    self._store_last_response(resp)
+                    yield EngineResult(text=resp, is_shortcut=True, intent="canned")
+                    return
+
+        # --- v2 greeting shortcut (opt-in: enable_greeting_shortcut) ---
+        # Default false = today's behaviour (Pramukh's localized hi/gu
+        # "hello" turns keep going through the LLM).
+        if intent == "greeting" and self._def.response_bank.enable_greeting_shortcut \
+                and self.state.stage != STAGE_GREETING:
+            _greet = self._localized("greeting", "")
+            if _greet:
+                _cancel_llm()
+                self.memory.add_assistant(_greet, language=self.state.language)
+                self._store_last_response(_greet)
+                yield EngineResult(text=_greet, is_shortcut=True, intent="greeting")
+                return
 
         # --- Gratitude at any stage ---
         if intent == "gratitude":
@@ -1105,7 +1230,12 @@ class ConversationRouter:
         if intent == "identity_question":
             _cancel_llm()
             lang = self.state.language
-            resp = self._def.response_bank.identity_responses.get(lang, self._def.response_bank.identity_responses["en"])
+            # Chain + generated fallback: copilot-built agents ship {} here —
+            # the old ["en"] access crashed "who is calling?" on those agents.
+            resp = self._lang_response(self._def.response_bank.identity_responses) or (
+                f"This is {self._def.identity.agent_name}"
+                + (f" from {self._def.identity.company_name}" if self._def.identity.company_name else "")
+                + ". How can I help you?")
             self.memory.add_assistant(resp, language=lang)
             self._store_last_response(resp)
             if self.state.stage == STAGE_GREETING:
@@ -1127,7 +1257,9 @@ class ConversationRouter:
             # Explicit caller requests should persist but allow natural switching.
             self.state.language_lock_turns = -7
             self.state.language_history = [new_lang] * 5
-            resp = self._def.response_bank.lang_switch_responses.get(new_lang, self._def.response_bank.lang_switch_responses["hi"])
+            _ls_bank = self._def.response_bank.lang_switch_responses
+            resp = (_ls_bank.get(new_lang) or _ls_bank.get("hi") or _ls_bank.get("en")
+                    or next(iter(_ls_bank.values()), "") or "Sure!")
             self.memory.add_assistant(resp, language=new_lang)
             self._store_last_response(resp)
             logger.info("[LANG-LOCK] explicit_switch lang=%s lock_turns=%d (persists ~17 turns)",
@@ -1176,6 +1308,26 @@ class ConversationRouter:
                 logger.info("[NAME] Auto-accepted name after 2 turns: %r", self._name_pending)
                 self._name_pending = None
 
+        # v2 generic confirmation loop for merge_policy: confirm slots (the
+        # literal 'name' slot is hard-excluded — its flow lives above).
+        _pending_confirm = [p for p in self.state_mgr.detect_missing_slots()["pending"]
+                            if p != "name"]
+        for _slot in _pending_confirm:
+            _since = self._slot_confirm_turn.setdefault(_slot, self.state.turn_count)
+            _val = self.state_mgr.state.get(_slot)
+            if intent == "affirmation" and _val is not None:
+                self.state_mgr.set_externally(_slot, _val, source="system")
+                self._slot_confirm_turn.pop(_slot, None)
+                logger.info("[CONFIRM] Slot %s confirmed: %r", _slot, _val)
+            elif intent == "negation":
+                self.state_mgr.discard_pending(_slot)
+                self._slot_confirm_turn.pop(_slot, None)
+                logger.info("[CONFIRM] Slot %s rejected — discarded", _slot)
+            elif self.state.turn_count - _since >= 2 and _val is not None:
+                self.state_mgr.set_externally(_slot, _val, source="system")
+                self._slot_confirm_turn.pop(_slot, None)
+                logger.info("[CONFIRM] Slot %s auto-accepted after 2 turns: %r", _slot, _val)
+
         # Advance from GREETING on first user response
         if self.state.stage == STAGE_GREETING:
             self.state.stage = self._post_greeting_stage()
@@ -1184,7 +1336,9 @@ class ConversationRouter:
         # =============================================================
         # SOFT STAGE ADVANCEMENT based on collected data
         # =============================================================
-        self._maybe_advance_stage()
+        # v2: declarative branches first (empty = no-op), then advancement.
+        if not self._maybe_branch(intent):
+            self._maybe_advance_stage()
 
         # =============================================================
         # LLM handles all non-shortcut turns with full inbound script context
@@ -1310,6 +1464,114 @@ class ConversationRouter:
             return STAGE_DISCOVERY
         return stages[0].id
 
+    def _completed_when_met(self) -> bool:
+        """call_flow.completed_when — is the call's completion condition met?"""
+        cw = self._def.call_flow.completed_when or {}
+        required = [str(x) for x in (cw.get("required_slots") or [])]
+        if required and not self.state_mgr.collect_satisfied(required):
+            return False
+        if cw.get("require_appointment") and not self.memory.booking.appointment_time:
+            return False
+        return True
+
+    def _advance_when_met(self, stage_def, aw: dict) -> bool:
+        """Declarative advance_when gate (all present conditions AND-ed)."""
+        if aw.get("min_turns"):
+            try:
+                if self.state.discovery_turns < int(aw["min_turns"]):
+                    return False
+            except (TypeError, ValueError):
+                pass
+        if aw.get("all_collect_filled"):
+            if not self.state_mgr.collect_satisfied(
+                    list(getattr(stage_def, "collect", None) or [])):
+                return False
+        if aw.get("slots"):
+            if not self.state_mgr.collect_satisfied([str(s) for s in aw["slots"]]):
+                return False
+        if aw.get("intent"):
+            if self.state.last_intent != str(aw["intent"]):
+                return False
+        if aw.get("appointment_captured"):
+            if not self.memory.booking.appointment_time:
+                return False
+        return True
+
+    def _exec_branch_action(self, action: str) -> None:
+        """Deterministic side effects for branch actions (plan §4.3 item 4).
+        Promises are STORED (→ calls.collected_data), not just spoken."""
+        sm = self.state_mgr
+        if action == "capture_phone":
+            phone_slot = next(
+                (n for n, s in sm.slots.items() if getattr(s, "type", "") == "phone"),
+                "phone" if "phone" in sm.slots else None)
+            if phone_slot:
+                sm.require_now(phone_slot)
+            logger.info("[BRANCH-ACTION] capture_phone (slot=%s)", phone_slot)
+        elif action == "promise_whatsapp_media":
+            self._whatsapp_promised = True
+            sm.extra_flags["whatsapp_promised"] = True
+            wp = self._def.follow_up.whatsapp_promise or {}
+            if wp.get("assets"):
+                sm.extra_flags["whatsapp_assets"] = list(wp["assets"])
+            logger.info("[BRANCH-ACTION] promise_whatsapp_media recorded")
+        elif action == "book_visit":
+            # The goto stage carries the scheduling role; its machinery
+            # (calendar block, bare-affirmation slot matching) takes over.
+            logger.info("[BRANCH-ACTION] book_visit — scheduling machinery engaged")
+        elif action == "schedule_callback":
+            self._callback_requested = "requested"
+            sm.extra_flags["callback_requested"] = True
+            slot_name = str((self._def.call_flow.callback_policy or {})
+                            .get("capture_slot") or "callback_time")
+            if slot_name in sm.slots:
+                sm.require_now(slot_name)
+            logger.info("[BRANCH-ACTION] schedule_callback (slot=%s)", slot_name)
+        else:
+            logger.warning("[BRANCH-ACTION] unknown action %r ignored", action)
+
+    def _maybe_branch(self, intent: str) -> bool:
+        """v2 declarative branching — evaluated just before turn-count
+        advancement. Empty branch lists = no-op (today's behaviour)."""
+        sd = self._stage_def()
+        branches = (getattr(sd, "branches", None) or []) if sd else []
+        for i, br in enumerate(branches):
+            if not isinstance(br, dict):
+                continue
+            matched = False
+            if br.get("when_intent"):
+                matched = intent == str(br["when_intent"])
+            elif isinstance(br.get("when_slot"), dict):
+                ws = br["when_slot"]
+                actual = self.state_mgr.state.get(str(ws.get("name") or ""))
+                matched = (actual is not None
+                           and str(actual).strip().lower()
+                           == str(ws.get("equals") or "").strip().lower())
+            if not matched:
+                continue
+            goto = str(br.get("goto") or "")
+            if not goto or self._stage_def(goto) is None:
+                logger.warning("[STAGE] branch goto %r invalid — skipped", goto)
+                continue
+            key = (self.state.stage, i)
+            try:
+                max_takes = max(1, int(br.get("max_takes", 1) or 1))
+            except (TypeError, ValueError):
+                max_takes = 1
+            if self._branch_takes.get(key, 0) >= max_takes:
+                continue
+            self._branch_takes[key] = self._branch_takes.get(key, 0) + 1
+            for action in (br.get("actions") or []):
+                try:
+                    self._exec_branch_action(str(action))
+                except Exception:
+                    logger.exception("[BRANCH-ACTION] %r failed (continuing)", action)
+            self.state.stage = goto
+            self.state.discovery_turns = 0
+            logger.info("[STAGE] → %s (branch)", goto)
+            return True
+        return False
+
     def _maybe_advance_stage(self) -> None:
         """Domain-agnostic stage advancement driven by turn count and booking events."""
         b = self.memory.booking
@@ -1323,6 +1585,23 @@ class ConversationRouter:
         last_stage_id = stage_list[-1].id
         current_def = stage_list[current_idx]
         dt = self.state.discovery_turns
+
+        # v2 completed-call gate: advancement INTO the final stage is gated
+        # only when completed_when.gate_closing is true (default off = today).
+        _cw = self._def.call_flow.completed_when or {}
+        _gate_closing = bool(_cw.get("gate_closing"))
+
+        def _blocked_into_closing(target: str) -> bool:
+            return _gate_closing and target == last_stage_id and not self._completed_when_met()
+
+        # v2: completion condition met → mark the call complete (gives the
+        # previously-dead booking.confirmed path its first intentional writer).
+        if _cw and not b.confirmed and (
+                _cw.get("required_slots") or _cw.get("require_appointment")) \
+                and self._completed_when_met():
+            b.confirmed = True
+            self.call_outcome = self.call_outcome or "completed"
+            logger.info("[STAGE] completed_when met — call marked complete")
 
         # Booking confirmed → jump to last stage (CLOSING equivalent)
         if b.confirmed and self.state.stage != last_stage_id:
@@ -1338,31 +1617,46 @@ class ConversationRouter:
         # the first time an appointment was ever captured (latent prod bug).
         if b.appointment_time and not getattr(self.state, "appointment_advanced", False):
             self.state.appointment_advanced = True
-            self.state.stage = next_stage_id
-            self.state.discovery_turns = 0
-            logger.info("[STAGE] → %s (appointment_time set)", next_stage_id)
+            if not _blocked_into_closing(next_stage_id):
+                self.state.stage = next_stage_id
+                self.state.discovery_turns = 0
+                logger.info("[STAGE] → %s (appointment_time set)", next_stage_id)
+                return
+
+        # v2 declarative gate: a non-empty advance_when REPLACES the legacy
+        # pacing for this stage (empty = today's exact behaviour).
+        aw = getattr(current_def, "advance_when", None) or {}
+        if aw:
+            if self._advance_when_met(current_def, aw) and \
+                    not _blocked_into_closing(next_stage_id):
+                self.state.stage = next_stage_id
+                self.state.discovery_turns = 0
+                logger.info("[STAGE] → %s (advance_when met)", next_stage_id)
             return
 
         # Slot-aware early advancement: when the caller front-loads their
         # requirements ("3BHK in Vapi under 50 lakhs"), don't hold them in
         # DISCOVERY for the scripted turn count — advance as soon as every
-        # required discovery slot is filled.
-        if self.state.stage == STAGE_DISCOVERY:
+        # required discovery slot is filled. Role check (v2 shim), with the
+        # legacy id literal kept as fallback.
+        if self._stage_role() == "discovery" or self.state.stage == STAGE_DISCOVERY:
             gaps = self.state_mgr.detect_missing_slots()
             _required = sum(1 for s in self.state_mgr.slots.values() if s.required)
             # Guards: pending counts as incomplete, and name-only agents
             # (pitch flows) never early-advance — a captured name is not
             # "discovery complete"; their pacing stays turn-count driven.
-            if _required >= 2 and not gaps["missing"] and not gaps.get("pending"):
-                self.state.stage = next_stage_id
-                self.state.discovery_turns = 0
-                logger.info("[STAGE] → %s (all required slots filled — early advance)",
-                            next_stage_id)
-                return
+            if _required >= 2 and not gaps["missing"] and not gaps.get("pending") \
+                    and not gaps.get("blocked"):
+                if not _blocked_into_closing(next_stage_id):
+                    self.state.stage = next_stage_id
+                    self.state.discovery_turns = 0
+                    logger.info("[STAGE] → %s (all required slots filled — early advance)",
+                                next_stage_id)
+                    return
 
         # Turn-count based advancement
         threshold = current_def.turns_until_advance
-        if dt >= threshold:
+        if dt >= threshold and not _blocked_into_closing(next_stage_id):
             self.state.stage = next_stage_id
             self.state.discovery_turns = 0
             logger.info("[STAGE] → %s (turn threshold %d reached)", next_stage_id, threshold)
@@ -1406,6 +1700,18 @@ class ConversationRouter:
                            source="legacy", fill_only=True)
         if b.user_name and self._name_confirmed:
             sm.set_externally("name", b.user_name, source="legacy")
+        # v2 phone write-through: CallState.customer_phone and a phone-type
+        # slot must never diverge (D5). Sync both directions.
+        _phone_slot = next(
+            (n for n, s in sm.slots.items() if getattr(s, "type", "") == "phone"),
+            None)
+        if _phone_slot:
+            _slot_val = sm.state.get(_phone_slot)
+            if cs.customer_phone and _slot_val is None:
+                sm.merge_state({_phone_slot: cs.customer_phone},
+                               source="legacy", fill_only=True)
+            elif _slot_val and not cs.customer_phone:
+                cs.customer_phone = str(_slot_val)
         # Meeting-booking agents: a booked appointment IS the meeting time —
         # write it through so the state block never re-asks after booking.
         if b.appointment_time and "meeting_time" in sm.state:
@@ -1800,7 +2106,19 @@ class ConversationRouter:
 
         # --- Step 2: extract day ---
         day: str | None = None
-        if re.search(r"\b(today|aaj|aaje)\b", lower) or "आज" in text or "આજે" in text:
+        # v2: calendar.day_synonyms consulted BEFORE the hardcoded map so
+        # 'Monday 4 PM'-style slot labels finally match ({} = today).
+        for canon_day, phrases in (self._def.calendar.day_synonyms or {}).items():
+            for phrase in phrases:
+                p = str(phrase).lower()
+                if p and (p in lower or str(phrase) in text):
+                    day = canon_day
+                    break
+            if day:
+                break
+        if day:
+            pass
+        elif re.search(r"\b(today|aaj|aaje)\b", lower) or "आज" in text or "આજે" in text:
             day = "Today"
         elif (re.search(r"\b(tomorrow|kal|kaale)\b", lower)
               or "कल" in text or "કાલે" in text):
@@ -1859,7 +2177,11 @@ class ConversationRouter:
         # words ("yes", "haan", "ji") are general affirmations — mapping them to a
         # slot would silently pre-book a visit the caller never agreed to schedule.
         _scheduling_stages = (STAGE_INVITE_VISIT, STAGE_CONFIRMATION)
-        if stage is None or stage in _scheduling_stages:
+        # v2 role shim: custom-id stages whose role is scheduling/confirmation
+        # also arm the bare-affirmation matcher (id literals stay as fallback).
+        _role = self._stage_role(stage) if stage is not None else ""
+        if stage is None or stage in _scheduling_stages or \
+                _role in ("scheduling", "confirmation"):
             if re.search(r"\b(yes|yeah|ok|okay|sure|haan|ha|ji|theek|first|pehla)\b", lower):
                 return f"{_slots[0].day} at {_slots[0].time}"
             if any(w in text for w in ("ठीक", "हां", "हाँ", "જી", "હા", "બરાબર", "ઠીક")):
@@ -2142,18 +2464,20 @@ class ConversationRouter:
                             break  # too short to ship alone — wait for more
                         buffer = buffer[match.end():]
                         if sentence:
-                            yield _validate_response(sentence, self.state.language)
+                            yield _validate_response(sentence, self.state.language,
+                                                      self._def.llm_config.max_response_length)
                             _first_emitted = True
 
             if timed_out:
                 if buffer.strip():
-                    yield _validate_response(buffer.strip(), self.state.language)
+                    yield _validate_response(buffer.strip(), self.state.language,
+                                             self._def.llm_config.max_response_length)
                 else:
-                    yield self._def.response_bank.timeout_fallbacks.get(
-                        self.state.language, self._def.response_bank.timeout_fallbacks["en"]
-                    )
+                    yield (self._lang_response(self._def.response_bank.timeout_fallbacks)
+                           or "Let me get back to you on that.")
             elif buffer.strip():
-                yield _validate_response(buffer.strip(), self.state.language)
+                yield _validate_response(buffer.strip(), self.state.language,
+                                             self._def.llm_config.max_response_length)
 
         except asyncio.CancelledError:
             return
@@ -2247,7 +2571,8 @@ class ConversationRouter:
         _personality_lines = pb.personality_block(self._def)
         _direction_lines = pb.direction_block(
             self._def, self.call_direction,
-            self.outbound_contact_name, self.outbound_contact_phone)
+            self.outbound_contact_name, self.outbound_contact_phone,
+            lang=lang, callback_context=self.callback_context)
         _free_slots = [] if b.appointment_time else self._available_calendar_slots()
         _cal_lines = pb.calendar_block(self._def, b.appointment_time, _free_slots)
 
@@ -2256,6 +2581,7 @@ class ConversationRouter:
             lang_header.get(lang, lang_header["en"]),
             *name_confirm_block,
             *pb.identity_block(self._def),
+            *pb.mission_block(self._def),
             *_direction_lines,
             *pb.brand_block(self._def),
             "",
@@ -2292,14 +2618,16 @@ class ConversationRouter:
             "",
             "━━ CURRENT GOAL ━━",
             stage_goal,
+            *pb.match_rules_block(self._def, dict(self.state_mgr.state),
+                                  self._stage_role()),
             *_cal_lines,
-            *pb.portfolio_block(self._def),
+            *pb.portfolio_block(self._def, lang),
             *pb.guidelines_block(self._def),
             *_personality_lines,
             *pb.style_block(self._def),
             *pb.anti_repetition_block(self._def),
             *pb.objection_block(self._def),
-            *pb.firm_rules_block(self._def),
+            *pb.firm_rules_block(self._def, lang),
         ]
 
         # QA tracker block — second layer of anti-repetition enforcement
@@ -2528,13 +2856,97 @@ class ConversationRouter:
             return "en"
         return self.state.language
 
-    def _pick_objection_response(self) -> str:
+    def _lang_response(self, bank: dict) -> str:
+        """Per-language response chain: lang → en → first value → ''.
+        Fixes the ['en'] KeyError traps for Copilot-built agents."""
         lang = self.state.language
-        bank = self._def.response_bank.objection_responses
-        responses = bank.get(lang, bank["en"])
-        resp = responses[self._response_counter % len(responses)]
-        self._response_counter += 1
-        return resp
+        if not isinstance(bank, dict) or not bank:
+            return ""
+        val = bank.get(lang) or bank.get("en") or next(iter(bank.values()), "")
+        if isinstance(val, list):
+            if not val:
+                return ""
+            resp = val[self._response_counter % len(val)]
+            self._response_counter += 1
+            return str(resp)
+        return str(val or "")
+
+    def _match_objection_playbook(self, text: str) -> str | None:
+        """D3: deterministic objection playbook match — a configured pattern
+        hit returns the playbook answer for the caller's language."""
+        playbook = getattr(self._def.response_bank, "objection_playbook", None) or []
+        lower = text.lower()
+        proofs = "; ".join(getattr(self._def.brand, "trust_proofs", []) or [])
+        for item in playbook:
+            patterns = [str(p).lower() for p in (item.get("patterns") or [])]
+            if any(p and p in lower for p in patterns):
+                answer = self._lang_response(item.get("answer") or {})
+                if answer:
+                    return answer.replace("{trust_proofs}", proofs)
+        return None
+
+    def _pick_objection_response(self, text: str = "") -> str:
+        # v2: playbook first (empty playbook = today's rotation).
+        if text:
+            pb = self._match_objection_playbook(text)
+            if pb:
+                return pb
+        resp = self._lang_response(self._def.response_bank.objection_responses)
+        return resp or "I understand. Could I share one quick point before you go?"
+
+    # ── v2 callback policy (D10) ────────────────────────────────────────
+
+    _CALLBACK_TIME_RE = re.compile(
+        r"\b(kal|tomorrow|parso|evening|morning|afternoon|shaam|subah|dopahar|"
+        r"baje|pm|am|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+        r"next week|baad|later)\b", re.IGNORECASE)
+    _CALLBACK_ASK_RE = re.compile(
+        r"\b(call (?:me )?(?:back|later|tomorrow|after)|callback|call karna|"
+        r"phone karna|baad mein (?:call|baat)|baad me (?:call|baat)|"
+        r"phir (?:call|baat)|dobara call)\b", re.IGNORECASE)
+
+    def _detect_callback_request(self, text: str) -> bool:
+        """Deferral WITH a callback flavour (time preference or 'call me back')."""
+        return bool(self._CALLBACK_ASK_RE.search(text)) or (
+            bool(self._CALLBACK_TIME_RE.search(text))
+            and bool(re.search(r"\b(call|baat|phone)\b", text, re.IGNORECASE)))
+
+    def _handle_callback_request(self, text: str, policy: dict) -> str | None:
+        """Capture a callback time preference WITHOUT booking a calendar slot
+        (never _record_calendar_booking) and reply from the policy bank."""
+        lower = text.lower()
+        day = ""
+        if re.search(r"\b(today|aaj)\b", lower) or "आज" in text:
+            day = "Today"
+        elif re.search(r"\b(tomorrow|kal)\b", lower) or "कल" in text:
+            day = "Tomorrow"
+        elif re.search(r"\b(parso|day after)\b", lower):
+            day = "Day after tomorrow"
+        else:
+            m = re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lower)
+            if m:
+                day = m.group(1).capitalize()
+        tm = ""
+        m = re.search(r"\b(\d{1,2})(?::\d{2})?\s*(a\.?m\.?|p\.?m\.?|baje)\b", lower)
+        if m:
+            tm = m.group(0)
+        elif re.search(r"(morning|subah|सुबह)", lower):
+            tm = "morning"
+        elif re.search(r"(afternoon|dopahar|दोपहर)", lower):
+            tm = "afternoon"
+        elif re.search(r"(evening|shaam|शाम)", lower):
+            tm = "evening"
+        preference = " ".join(x for x in (day, tm) if x) or "later"
+        slot_name = str(policy.get("capture_slot") or "callback_time")
+        if slot_name in self.state_mgr.slots:
+            self.state_mgr.set_externally(slot_name, preference, source="system")
+        self.state_mgr.extra_flags["callback_requested"] = True
+        self.state_mgr.extra_flags["callback_time"] = preference
+        self.call_outcome = self.call_outcome or "callback_requested"
+        logger.info("[CALLBACK] captured preference %r (no calendar booking)", preference)
+        resp = self._lang_response(policy.get("responses") or {})
+        return resp or (
+            f"No problem at all — we'll call you back {preference}. Thank you!")
 
     def _pick_filler(self) -> str:
         """Return one filler phrase, chosen by input type.

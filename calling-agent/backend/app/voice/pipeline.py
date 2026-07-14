@@ -1362,7 +1362,19 @@ class VoicePipeline:
                 self._speech_frame_streak = 0
 
                 if hasattr(self.tts, 'set_language') and self.conversation:
-                    self.tts.set_language(self.conversation.state.language)
+                    _lang = self.conversation.state.language
+                    self.tts.set_language(_lang)
+                    # v2: per-language voice on mid-call language switch —
+                    # only when the agent defines a voice for that language
+                    # (absent = today's single-voice behaviour).
+                    try:
+                        _vcfg = self.conversation._def.languages.tts_voices.get(_lang)
+                        if _vcfg is not None and hasattr(self.tts, 'set_voice'):
+                            self.tts.set_voice(model=_vcfg.model,
+                                               speaker=_vcfg.speaker,
+                                               pace=getattr(_vcfg, 'pace', None))
+                    except Exception:
+                        pass
 
                 await self.tts.speak(tts_text)
 

@@ -63,6 +63,17 @@ from backend.app.agent_definition.diff import (                     # noqa: E402
     render_human as _render_diff,
 )
 import agent_builder_api as builder                                 # noqa: E402
+from copilot_interview import (                                     # noqa: E402
+    INTERVIEW_LAYERS, interview_progress, render_interview_state,
+)
+
+_UPLOADS_DIR = Path(__file__).parent / "copilot_uploads"
+
+
+def _interview_state(session: dict) -> dict:
+    """Lazy interview state on a session (old session files unaffected)."""
+    return session.setdefault(
+        "interview", {"draft": {}, "skipped": [], "provenance": {}, "phase": "idle"})
 
 
 async def _copilot_tenancy_dep(request: Request):
@@ -1743,6 +1754,62 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "update_draft",
+            "description": (
+                "Record interview answers into the new-agent DRAFT (server-side, survives any "
+                "context length). Call this IMMEDIATELY whenever the user gives information for "
+                "a new agent — mine info dumps completely. Pass the same partial-definition "
+                "shape as create_agent. Returns which topics are still open and the next "
+                "question to ask. Set source='proposal' when recording defaults YOU proposed "
+                "and the user accepted."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "changes": {"type": "object", "description": "partial agent definition to merge into the draft"},
+                    "source": {"type": "string", "enum": ["user", "proposal"]},
+                },
+                "required": ["changes"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skip_layer",
+            "description": (
+                "Skip ONE interview topic because the USER explicitly declined it ('use defaults', "
+                "'skip that'). Quote their exact words — this is audited. The only way to unblock "
+                "create_agent without answering a compulsory topic."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "layer_id": {"type": "string", "description": "topic id from the INTERVIEW STATE / create refusal"},
+                    "user_words": {"type": "string", "description": "the user's exact words declining this topic"},
+                },
+                "required": ["layer_id", "user_words"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ingest_document",
+            "description": (
+                "Read a document the user attached to this chat (doc_id from the attachment note) "
+                "and pull its facts (products, prices, brand, greeting…) into the new-agent draft."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"doc_id": {"type": "string"}},
+                "required": ["doc_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "propose_update",
             "description": (
                 "Prepare an edit WITHOUT applying it: builds the candidate, validates it, and "
@@ -2019,6 +2086,20 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                 "Ask ONE short clarifying question (persona, voice, greeting, or what "
                 "the agent must know), and only create after they've answered and agreed."
             )
+        # v2 hardened create gate (plan §6.2): every compulsory interview
+        # layer must be complete or EXPLICITLY skipped. Dump-and-done is
+        # mechanically impossible; "just build it" = per-layer skip_layer.
+        _session = guard.get("session") or {}
+        _iv = _interview_state(_session)
+        _progress = interview_progress(_iv.get("draft") or {}, _iv.get("skipped") or [])
+        if not _progress["complete"]:
+            raise ValueError(
+                "Refused: the interview is not finished — these layers are open: "
+                + ", ".join(_progress["open_layers"])
+                + f". Ask the next question now: {_progress['next_question']!r}. "
+                "If the user explicitly said to skip a topic, call skip_layer with "
+                "their words; only then can the agent be created."
+            )
         name = str(args["name"]).strip().lower()
         notes: list[str] = []
         definition = _coerce_obj(args.get("definition") or {})
@@ -2034,7 +2115,13 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         _existing_owner = builder._slug_owner(name)
         if _existing_owner and _existing_owner != owner and not builder._ctx_is_admin():
             raise ValueError(f"Agent '{name}' already exists")
-        merged = _default_definition(name, definition)
+        # v2: create CONSUMES the draft — everything captured during the
+        # interview lands in the YAML even if the final tool call is thin and
+        # the chat history was trimmed (fixes the 48-message context loss).
+        _draft = copy.deepcopy(_iv.get("draft") or {})
+        _draft.pop("_ingested_docs", None)
+        merged = _default_definition(name, _deep_merge(copy.deepcopy(_draft), definition))
+        _normalize_definition(_deep_merge(merged, _draft))
         _normalize_definition(_deep_merge(merged, definition))
         _enforce_invariants(merged, notes)
         agent = AgentDefinition.from_dict(merged)          # validate before any write
@@ -2050,9 +2137,12 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                 agent_registry.invalidate(name)
                 raise ValueError(f"could not register ownership: {exc}")
         logger.info("[copilot] created agent '%s' owner=%s (%d input repairs)", name, owner, len(notes))
+        _iv["phase"] = "built"
         res = {
             "status": "created", "name": name, "agent_id": agent.agent_id,
             "notes": notes, "quality": _quality_warnings(merged),
+            "provenance_confirmed": sum(1 for v in (_iv.get("provenance") or {}).values()
+                                        if v == "confirmed"),
         }
         return res, f"Created {agent.identity.agent_name or name}", True, True
 
@@ -2179,6 +2269,143 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
             yaml.dump(routing, f, allow_unicode=True, default_flow_style=False)
         logger.info("[copilot] updated routing for agent '%s'", name)
         return {"status": "updated"}, f"Updated call routing for {_agent_display_name(name)}", True, True
+
+    # ── v2 interview engine (plan §6.2) ──────────────────────────────────────
+
+    if tool == "update_draft":
+        session = guard.get("session")
+        if session is None:
+            raise ValueError("no session for the draft")
+        iv = _interview_state(session)
+        changes = _coerce_obj(args.get("changes") or {})
+        source = "derived" if str(args.get("source") or "") == "proposal" else "confirmed"
+        notes: list[str] = []
+        _normalize_definition(changes, notes)
+        for k in [k for k, v in changes.items() if isinstance(v, dict) and not v]:
+            changes.pop(k)
+        if not changes:
+            raise ValueError(
+                "None of that mapped to real settings — nothing was recorded. " + " ".join(notes))
+        _deep_merge(iv["draft"], changes)
+        iv["phase"] = "interviewing"
+        for p in sorted(_paths_of_changes(changes)):
+            iv["provenance"][p] = source
+        progress = interview_progress(iv["draft"], iv["skipped"])
+        # Quality moves PRE-create: warn on the merged preview now, so thin
+        # content is challenged during the interview, not after the write.
+        preview = _default_definition("draft_preview", copy.deepcopy(iv["draft"]))
+        _deep_merge(preview, copy.deepcopy(iv["draft"]))
+        preview.pop("_ingested_docs", None)
+        quality = _quality_warnings(preview)
+        res = {
+            "status": "draft_updated",
+            "recorded_paths": sorted(_paths_of_changes(changes)),
+            "notes": notes,
+            "quality": quality,
+            "progress": {
+                "complete": progress["complete"],
+                "open_layers": progress["open_layers"],
+                "layers": [
+                    {"id": l["id"], "title": l["title"], "done": l["done"],
+                     "skipped": l["skipped"]} for l in progress["layers"]],
+            },
+            "next_layer_id": progress["next_layer_id"],
+            "next_question": progress["next_question"],
+        }
+        done_n = sum(1 for l in progress["layers"] if l["done"] or l["skipped"])
+        return (res, f"Noted — {done_n}/{len(progress['layers'])} topics covered",
+                True, False)
+
+    if tool == "skip_layer":
+        session = guard.get("session")
+        if session is None:
+            raise ValueError("no session")
+        iv = _interview_state(session)
+        layer_id = str(args.get("layer_id") or "").strip()
+        user_words = str(args.get("user_words") or "").strip()
+        known = {l.id for l in INTERVIEW_LAYERS}
+        if layer_id not in known:
+            raise ValueError(f"No interview layer '{layer_id}' — layers: {', '.join(sorted(known))}")
+        if not user_words:
+            raise ValueError(
+                "skip_layer needs the user's own words declining this topic "
+                "(quote them) — it is auditable, not a shortcut for you.")
+        if layer_id not in iv["skipped"]:
+            iv["skipped"].append(layer_id)
+        iv["provenance"][f"skip:{layer_id}"] = user_words[:200]
+        iv["phase"] = "interviewing"
+        progress = interview_progress(iv["draft"], iv["skipped"])
+        res = {"status": "skipped", "layer_id": layer_id,
+               "open_layers": progress["open_layers"],
+               "next_question": progress["next_question"]}
+        return res, f"Skipped the {layer_id.replace('_', ' ')} questions (user's call)", True, False
+
+    if tool == "ingest_document":
+        session = guard.get("session")
+        sid = str(guard.get("sid") or "")
+        if session is None or not sid:
+            raise ValueError("no session for document ingestion")
+        doc_id = str(args.get("doc_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_\-.]{1,120}", doc_id):
+            raise ValueError("invalid doc_id")
+        doc_path = _UPLOADS_DIR / sid / doc_id
+        if not doc_path.exists():
+            raise ValueError(f"No uploaded document '{doc_id}' on this conversation")
+        from backend.app.documents.extractor import extract_text
+        content = doc_path.read_bytes()
+        extracted = extract_text(content, doc_id)
+        if not extracted.strip():
+            raise ValueError("No text could be extracted from this document")
+        from backend.app.documents.yaml_filler import extract_fields_from_text
+        result = extract_fields_from_text(extracted)
+        if result.get("status") != "ok":
+            raise ValueError(result.get("error") or "extraction failed")
+        fields = result.get("fields") or {}
+        # Field-name → draft-path mapping (same shape update_draft expects).
+        draft_changes: dict = {}
+        _id_map = {"agent_name": "agent_name", "company_name": "company_name",
+                   "company_tagline": "company_tagline",
+                   "role_description": "role_description", "contact": "contact"}
+        for src_key, id_key in _id_map.items():
+            if fields.get(src_key):
+                draft_changes.setdefault("identity", {})[id_key] = fields[src_key]
+        kb_map = ("portfolio_prompt_text", "known_projects", "locations",
+                  "objection_patterns", "catalog", "match_rules", "pricing_policy")
+        for k in kb_map:
+            if fields.get(k):
+                draft_changes.setdefault("knowledge_base", {})[k] = fields[k]
+        if fields.get("opening_greeting"):
+            draft_changes.setdefault("response_bank", {})["opening_greeting"] = fields["opening_greeting"]
+        if fields.get("call_direction"):
+            draft_changes["call_direction"] = fields["call_direction"]
+        for k in ("extra_always_rules", "extra_never_rules"):
+            if fields.get(k):
+                draft_changes.setdefault("llm_config", {})[k] = fields[k]
+        for k in ("brand", "guardrails"):
+            if isinstance(fields.get(k), dict):
+                draft_changes[k] = fields[k]
+        if fields.get("appointment_slots"):
+            draft_changes.setdefault("calendar", {})["mock_slots"] = fields["appointment_slots"]
+        notes: list[str] = []
+        _normalize_definition(draft_changes, notes)
+        iv = _interview_state(session)
+        _deep_merge(iv["draft"], draft_changes)
+        docs = iv["draft"].setdefault("_ingested_docs", [])
+        if doc_id not in docs:
+            docs.append(doc_id)
+        for p in sorted(_paths_of_changes(draft_changes)):
+            iv["provenance"][p] = "derived"
+        iv["phase"] = "interviewing"
+        progress = interview_progress(iv["draft"], iv["skipped"])
+        res = {
+            "status": "ingested", "doc_id": doc_id,
+            "extracted_fields": sorted(k for k in fields if fields.get(k)),
+            "missing": result.get("missing") or [],
+            "notes": notes,
+            "open_layers": progress["open_layers"],
+            "next_question": progress["next_question"],
+        }
+        return res, f"Read the document and pulled {len(fields)} field(s) into the draft", True, False
 
     # ── v2 surgical edit engine (plan §5.3/§5.5) ─────────────────────────────
 
@@ -2405,23 +2632,23 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
 # ─────────────────────────────────────────────────────────────────────────────
 # System prompt
 # ─────────────────────────────────────────────────────────────────────────────
-def _system_prompt() -> str:
+def _system_prompt(session: dict | None = None) -> str:
     # The global "active" agent is admin infrastructure (the platform-wide
     # inbound fallback) — never disclose it to a tenant, whose calls route by
     # their own DID binding, not this selector.
     active = (_read_active() or "none") if builder._ctx_is_admin() else "your own agents"
-    return f"""You are the LesCall Agent Copilot — an expert voice-agent designer built into the LesCall dashboard. LesCall runs real-time AI phone agents for Indian businesses (Sarvam STT/TTS + an LLM). An agent is a YAML definition: identity, personality, languages (hi/en/gu), TTS voice, a staged call flow (GREETING → DISCOVERY → INVITE_VISIT → CONFIRMATION → CLOSING), a knowledge base, canned responses, and calendar slots. Inbound calls are answered by the agent bound to the dialed number (currently: {active}).
+    # D12: when a new-agent interview is live, the server-computed INTERVIEW
+    # STATE replaces the old static checklist — one owner for prompt budget.
+    interview_block = ""
+    if session is not None:
+        iv = session.get("interview") or {}
+        if iv.get("phase") == "interviewing" or iv.get("draft"):
+            progress = interview_progress(iv.get("draft") or {}, iv.get("skipped") or [])
+            interview_block = "\n\n" + render_interview_state(progress)
+    return f"""You are the LesCall Agent Copilot — an expert voice-agent designer built into the LesCall dashboard. LesCall runs real-time AI phone agents for Indian businesses (Sarvam STT/TTS + an LLM). An agent is a YAML definition: identity, personality, languages (hi/en/gu), TTS voice, a staged call flow with branching, a knowledge base + product catalog, data-capture slots, canned responses, guardrails, and calendar slots. Inbound calls are answered by the agent bound to the dialed number (currently: {active}).
 
 HOW YOU WORK
-1. NEW AGENT: interview the user ONE short question at a time — NEVER call create_agent on the first request, and never ask multiple questions in one reply. You are gathering enough to build a DEEP agent, not a stub, so keep interviewing until you genuinely have the substance below (usually 5-8 answers). Skip anything already answered; propose smart defaults for minor details instead of asking. Cover, in rough order:
-   • What the business is, and — crucially — the ONE thing a call must accomplish (the objective/outcome).
-   • INBOUND (agent answers) or OUTBOUND (agent places the call)? This changes the whole flow — settle it early.
-   • Agent name and persona; languages (Hindi / English / Gujarati); voice (female: simran, anushka, manisha, vidya — male: shubh, abhilash, karun).
-   • The SPECIFIC substance the agent must know and say: for a pitch/sales call, the 3-6 concrete talking points or proof points (with the actual names, numbers, facts); for a support/booking agent, the products/services and key facts. Ask follow-ups until these are concrete, not vague — this is what makes the agent strong. If the user hands you a rich brief, mine it for these points rather than re-asking.
-   • For OUTBOUND: who is being called (the person's name/role), and the exact ask (raise, meeting, purchase, callback…).
-   • The likely objections/push-back and how the agent should answer each.
-   • Opening greeting (offer to draft it).
-   Then summarize the plan in 3-5 short lines — including the objective and the key talking points — and ask "shall I build it?". Only build after the user agrees, or immediately if they say "just build it with defaults".
+1. NEW AGENT — the interview is a MACHINE, not a vibe. The moment the user wants a new agent, start recording EVERY fact they give with update_draft (mine info dumps completely — never let information sit only in chat). An INTERVIEW STATE block appears below when a draft exists: it is the server's truth about which topics are done and the ONE next question to ask — follow it. Ask ONE short question per reply. Propose smart defaults instead of over-asking; after the business + objective are known, PROPOSE a tailored slot set, stage skeleton, and likely objections for that business type and record accepted proposals with update_draft(source='proposal'). Voices — female: simran, anushka, manisha, vidya; male: shubh, abhilash, karun. create_agent is REFUSED by the server until every compulsory topic is complete or the user explicitly declined it (then call skip_layer with their exact words). When all topics close, summarize the plan in 3-5 short lines and ask "shall I build it?".
 2. Draft the copy YOURSELF, and make it DEEP — a thin agent is a failure. Every stage goal is 2-4 full sentences of concrete instructions (what to say, which talking point to use, what to accomplish before advancing) — never a 5-word label. The knowledge paragraph carries the real substance (it is injected on EVERY turn). Write real objection_responses. All copy is natural and phone-appropriate, in the agent's languages (greeting in the default language). For an outbound pitch, the mission and talking points MUST live in the stage goals and the knowledge paragraph — that is the only way they reach the live call.
 3. Call create_agent with the customized fields — always include call_direction, a real knowledge_base.portfolio_prompt_text, substantive call_flow.stages, and (for outbound) objection_responses. The platform fills the rest (calendar, fillers, timeouts, objection patterns). Slug = lowercase with underscores.
 4. RIGHT AFTER create_agent (and after any content edit): read the tool result. If it lists "quality" warnings, the agent is too shallow to run well — fix EVERY warning with update_agent in this SAME turn (richer stage goals, a fuller knowledge paragraph, real objection responses) before you say a word to the user. Only once the result comes back with no quality warnings do you tell the user it's built. Then confirm in one sentence and ASK whether to activate it (activation makes it answer REAL inbound phone calls). CRITICAL: call activate_agent ONLY after the user's explicit yes in their most recent message — never in the same turn as creation, never assumed. If they decline, that's fine — leave the current active agent alone and offer further edits.
@@ -2437,22 +2664,27 @@ HOW YOU WORK
 6. QUESTIONS ("which agent is live?"): use list_agents / get_agent / get_routing. Do NOT call get_agent unless the user asks about that agent or you are about to edit it — during a new-agent interview no tool calls are needed until you create.
 
 DEFINITION FIELDS you may set (all optional — deep-merged onto defaults). SHAPES ARE STRICT — get them right the first time:
-- identity: agent_name, company_name, company_tagline, role_description, contact
-- personality: pronouns (she|he), energy (low|medium|high), tone, style, custom_instructions
+- identity: agent_name, company_name, company_tagline, role_description, contact, role_line (full replacement identity sentence)
+- personality: pronouns (she|he), energy (low|medium|high), tone, style, custom_instructions, traits [str], energy_mirroring (bool), ai_disclosure ("deflect"|"admit"|"admit_if_pressed"), verbosity_max_sentences (int)
 - languages MUST be an OBJECT, never a list: {{"supported": ["hi","en"], "default": "hi", "allow_code_mixing": true, "stt_forced_language": "", "tts_voices": {{"hi": {{"model":"bulbul:v3","speaker":"simran","pace":1.15}}, "en": {{...}}}}}}. tts_voices lives INSIDE languages — never at the top level.
-- call_direction: the STRING "inbound" or "outbound" — never a list. "inbound" = answers calls; "outbound" = places calls (leads the call, pitches, confirms who answered). If the user wants BOTH, use "inbound" — the platform automatically applies the outbound approach whenever it places the call.
-- call_flow: {{"stages": [{{id, order, goal, turns_until_advance}}]}} — keep the 5 default stage ids unless the flow truly differs; write goals in ENGLISH as instructions to the calling agent (it replies in the caller's language). Content the agent must SAY after the greeting (a pitch, talking points) belongs in stage goals — usually DISCOVERY.
-- knowledge_base: portfolio_prompt_text (plain-English paragraph of everything the agent must know), portfolio_section_label (e.g. "SERVICES MENU"), locations, objection_patterns, known_projects {{"lowercase key": ["Canonical Name", "location or price"]}}
-- response_bank: opening_greeting (ONE plain string in the default language — not a per-language object), identity_responses {{lang: str}}, objection_responses {{lang: [str]}}, graceful_close {{lang: str}}. There is NO follow_up field — follow-up talking points go into stage goals.
+- call_direction: the STRING "inbound" or "outbound" — never a list. If the user wants BOTH, use "inbound" — the platform automatically applies the outbound approach whenever it places the call.
+- call_flow: {{"call_goal": "one-sentence mission", "stages": [{{id, order, goal, turns_until_advance, role, collect: [slot names], advance_when: {{all_collect_filled|slots|min_turns|intent|appointment_captured}}, branches: [{{when_intent: affirmation|negation|question, goto: STAGE_ID, max_takes, actions: [capture_phone|promise_whatsapp_media|book_visit|schedule_callback]}}]}}], "scheduling": {{offer_count, style: exact_n|flexible}}, "callback_policy": {{enabled, capture_slot, responses: {{lang: str}}, counts_as_decline}}, "completed_when": {{required_slots, require_appointment}}}}. Stage roles: greeting|confirm_person|discovery|pitch|recommend|scheduling|confirmation|closing. Write goals in ENGLISH as instructions (the agent replies in the caller's language).
+- slots (TOP-LEVEL list — the qualification schema, the heart of data capture): [{{name, priority (lower asked first), required, label, question: {{hi/en/gu: exact wording}}, type: text|number|money|enum|boolean|phone|date|time|location, enum_values, enum_synonyms, depends_on: [slot names never asked before], merge_policy: free|correction_gated|confirm, confirm_readback: ""|verbatim|digit_groups_2 (phone in 2-digit groups), max_asks (2 recommended), reask_question: {{lang}}}}]. EVERY new agent gets slots for what it must collect, with questions in EVERY supported language.
+- knowledge_base: portfolio_prompt_text (plain-English paragraph — injected every turn), portfolio_section_label, locations, objection_patterns, known_projects {{"lowercase key": ["Canonical Name", "location or price"]}}, catalog [{{id, name, location, configurations, price_range, availability, positioning_tag, pitch_points, aliases, facts}}], match_rules [{{when: {{slot: value or "<=40L"}}, recommend: [ids], reason}}], pricing_policy {{mode: on_request|state_freely|defer, defer_line: {{lang}}}}, stt_corrections {{use_builtin_tables: false for non-real-estate agents}}
+- brand: spoken_company_name, positioning_tagline, credibility_markers [str], trust_proofs [top 2-3 — objection ammo], regions_served, contact_phone, whatsapp_number
+- response_bank: opening_greeting (ONE plain string in the default language), identity_responses {{lang: str}}, objection_responses {{lang: [str]}}, objection_playbook [{{id, patterns: [caller phrasings], answer: {{lang: str — may use {{trust_proofs}}}}, prompt_guidance}}], closing_responses {{lang: str}}, canned_phrases [{{patterns, responses: {{lang}}}}], graceful_close {{lang: str}}
+- outbound (for outbound agents): identity_confirm_line/good_time_check_line/pitch/wrong_person_response/busy_response/wrong_number_close (all {{lang: str}}), wrong_number_patterns [str], opening_greeting {{lang}}
+- guardrails: never_rules [str], always_rules [str], honesty {{unknown_answer_policy, forbidden_fabrications}}, compliance {{disclaimers, consent_line, dnd_phrases (["stop calling","remove my number"] recommended for new agents), restricted_topics}}, escalation {{enabled, triggers, handoff_message: {{lang}}}}
+- follow_up: whatsapp_promise {{enabled, assets, promise_line: {{lang}}}}, callback {{enabled, default_delay_hours}}
+- calendar: {{"type": "mock", "mock_slots": [{{"day": "Tomorrow", "time": "10:00 AM"}}], day_synonyms, booking_confirmation_line: {{lang}}}}
+- post_call: outcomes [{{id, label, kind: success|progress|failure}}], success_definition {{mandatory_slots, gate_closing}}, scoring {{enabled, criteria_prompt, score_labels}}
 
 THE OPENING LINE & PLACEHOLDERS (get this right — it burned a real user):
 - The first thing spoken on EVERY call is response_bank.opening_greeting, word-for-word. Stage goals are INSTRUCTIONS to the AI (always written in English), never a script. When the user talks about the greeting / the first line / "as soon as the call connects", edit opening_greeting — editing a stage goal will NOT change what plays at connect.
 - Exactly TWO placeholders exist, both single curly braces and ONLY inside opening_greeting:
   * {{contact_name}} — on outbound calls, replaced with the dialed contact's name from Outbound Calls (fallback "sir/ma'am"). When the user wants the agent to greet whoever it calls by name, write e.g. "Hello, am I speaking with {{contact_name}}?"
   * {{current_time}} — replaced at call time with morning/afternoon/evening (India time). E.g. "Good {{current_time}}, am I speaking with {{contact_name}}?" becomes "Good morning, am I speaking with Rajesh?". If the greeting is written in Hindi or Gujarati script, the word comes out in that language automatically.
-- NEVER invent any other placeholder or syntax — ${{...}}, {{{{...}}}}, [name], <contact>, {{date}} do not exist and would be SPOKEN ALOUD literally. Never put placeholders in stage goals, knowledge text, or canned responses.
-- calendar: {{"type": "mock", "mock_slots": [{{"day": "Tomorrow", "time": "10:00 AM"}}]}} — the bookable appointment slots the agent offers.
-- llm_config: extra_always_rules, extra_never_rules
+- NEVER invent any other placeholder or syntax — ${{...}}, {{{{...}}}}, [name], <contact>, {{date}} do not exist and would be SPOKEN ALOUD literally. Placeholders in stage goals, knowledge text, or canned responses are never substituted (exception: {{trust_proofs}} inside objection_playbook answers).
 If a tool result includes "notes", the platform auto-corrected or DROPPED some of your input — read them; if content was dropped, put it where the note says (usually a stage goal) with update_agent in the SAME turn.
 If a tool result includes non-empty "quality" warnings, the agent is too shallow — you MUST resolve every one with update_agent in the SAME turn before telling the user it's ready. Do not report a hollow agent as done.
 WHEN THE USER SAYS A CHANGE "isn't in the agent" or "wasn't implemented": do not just re-word the same field. get_agent, and translate their intent into the fields the CALL actually reads — the mission/talking points belong in call_flow.stages goals AND knowledge_base.portfolio_prompt_text (both are spoken), the pitch is not "implemented" if it only sits in one thin stage goal. Enrich those, then confirm what specifically changed.
@@ -2470,7 +2702,7 @@ STYLE — PLAIN LANGUAGE ONLY (the user is a business person, not a developer):
 - Describe agents by what callers experience: the greeting, how she speaks, what she knows, when she books meetings.
 - When the user says they're done, close warmly in one sentence — do not claim any additional update happened.
 - NEVER write out an imagined transcript of a future call ("The conversation will proceed as follows: ..."). It reads as fact, goes stale instantly, and hides what actually changed. State in 1-2 sentences WHAT changed; quote at most the exact opening greeting.
-- Never invent agents or facts — check with tools first, silently."""
+- Never invent agents or facts — check with tools first, silently.{interview_block}"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2745,6 +2977,14 @@ async def copilot_chat(request: Request) -> dict:
         raise HTTPException(status_code=400, detail="invalid session_id")
     if not message:
         raise HTTPException(status_code=400, detail="'message' is required")
+    # v2: attached documents ride along as doc ids; the LLM ingests them via
+    # ingest_document (the note is machine-added, not user text).
+    attachments = [str(a) for a in (body.get("attachments") or [])
+                   if re.fullmatch(r"[A-Za-z0-9_\-.]{1,120}", str(a))]
+    if attachments:
+        message += "\n\n[The user attached document(s): " + \
+            ", ".join(f"doc_id={a}" for a in attachments) + \
+            " — call ingest_document on each to read them into the draft.]"
 
     # session_id arrives in the BODY, so the router dependency (which only sees
     # path params) can't gate it — enforce ownership here. Blocks continuing or
@@ -2781,6 +3021,7 @@ async def copilot_chat(request: Request) -> dict:
         # v2 edit engine: pending-change storage + confirmation gating.
         "session": session,
         "user_message": message,
+        "sid": sid,
     }
 
     try:
@@ -2788,7 +3029,7 @@ async def copilot_chat(request: Request) -> dict:
             msg = await _chat_completion(
                 client,
                 model,
-                [{"role": "system", "content": _system_prompt()}]
+                [{"role": "system", "content": _system_prompt(session)}]
                 + _context_window(session["messages"]),
             )
 
@@ -2936,12 +3177,64 @@ async def copilot_chat(request: Request) -> dict:
     meta.setdefault("created_at", _now_iso())
     meta["updated_at"] = _now_iso()
     _save_session(sid)
-    return {
+    # v2 additive API contract (old bundles ignore these):
+    # - interview: server-computed progress for the progress rail + preview
+    # - pending_changes: proposed diffs for Apply/Discard cards
+    out: dict = {
         "reply": reply,
         "actions": visible_actions,
         "agents_changed": agents_changed,
         "session": _session_summary(sid, session),
     }
+    iv = session.get("interview") or {}
+    if iv.get("phase") in ("interviewing", "built") or iv.get("draft"):
+        progress = interview_progress(iv.get("draft") or {}, iv.get("skipped") or [])
+        out["interview"] = {
+            "phase": iv.get("phase") or "idle",
+            "complete": progress["complete"],
+            "layers": [{"id": l["id"], "title": l["title"], "done": l["done"],
+                        "skipped": l["skipped"]} for l in progress["layers"]],
+            "next_layer_id": progress["next_layer_id"],
+            "draft": iv.get("draft") or {},
+        }
+    pend = session.get("pending_changes") or {}
+    if pend:
+        out["pending_changes"] = [
+            {"change_id": cid, "slug": c.get("slug"),
+             "diff": c.get("diff_human"), "reason": c.get("reason")}
+            for cid, c in pend.items()]
+    return out
+
+
+@router.post("/api/copilot/upload")
+async def copilot_upload(request: Request) -> dict:
+    """Attach a document to a Copilot conversation (plan §6.4). Multipart:
+    session_id + file. Returns {doc_id} for the chat body's `attachments`."""
+    form = await request.form()
+    sid = str(form.get("session_id") or "").strip()
+    upload = form.get("file")
+    if not _SESSION_ID_RE.match(sid):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    owner = getattr(request.state, "owner", None)
+    if not _session_owner_ok(sid, owner):
+        sid = _tenant_sid(owner, sid)
+    if upload is None or not hasattr(upload, "read"):
+        raise HTTPException(status_code=400, detail="'file' is required")
+    content = await upload.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="uploaded file is empty")
+    if len(content) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="file too large (15 MB max)")
+    import time as _time
+    safe_name = re.sub(r"[^A-Za-z0-9_.\-]", "_",
+                       getattr(upload, "filename", "") or "document.txt")[-80:]
+    doc_id = f"{int(_time.time())}_{safe_name}"
+    dest = _UPLOADS_DIR / sid
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / doc_id).write_bytes(content)
+    logger.info("[copilot] upload %s/%s (%d bytes)", sid, doc_id, len(content))
+    return {"status": "uploaded", "doc_id": doc_id, "session_id": sid,
+            "note": "pass this doc_id in the chat body's `attachments` list"}
 
 
 @router.get("/api/copilot/sessions")

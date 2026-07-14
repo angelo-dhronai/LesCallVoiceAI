@@ -39,6 +39,11 @@ Extract these fields (use these exact key names):
   appointment_slots     — Bookable visit/appointment time slots if the document lists availability, e.g. [{{"day": "Tomorrow", "time": "10:00 AM"}}] (array of objects with "day" and "time")
   extra_always_rules    — Business-specific rules the agent must always follow (array of strings)
   extra_never_rules     — Business-specific things the agent must never say or do (array of strings)
+  brand                 — {{"credibility_markers": [...], "trust_proofs": [top 2-3 proof points], "regions_served": [...], "whatsapp_number": "..."}} (object; only sub-keys the document supports)
+  catalog               — Structured product/service list: [{{"id": "slug", "name": "...", "location": "...", "configurations": [...], "price_range": "...", "availability": "...", "pitch_points": [...], "aliases": [...]}}] (array of objects)
+  match_rules           — Need→product mappings if the document implies them: [{{"when": {{"budget": "<=40L"}}, "recommend": ["id"], "reason": "..."}}] (array)
+  pricing_policy        — {{"mode": "state_freely"}} ONLY if the document clearly wants prices quoted openly; {{"mode": "defer"}} if pricing must be deferred to the team (object)
+  guardrails            — {{"never_rules": [...], "always_rules": [...], "compliance": {{"disclaimers": [...]}}}} if the document states rules/disclaimers (object)
 
 DOCUMENT:
 {document_text}
@@ -137,6 +142,17 @@ def apply_fields(agent_folder: str, fields: dict) -> dict:
         _set(data, ["knowledge_base", "known_projects"],        fields, "known_projects",        applied)
         _set(data, ["knowledge_base", "locations"],             fields, "locations",             applied)
         _set(data, ["knowledge_base", "objection_patterns"],    fields, "objection_patterns",    applied)
+        _set(data, ["knowledge_base", "catalog"],               fields, "catalog",               applied)
+        _set(data, ["knowledge_base", "match_rules"],           fields, "match_rules",           applied)
+        _set(data, ["knowledge_base", "pricing_policy"],        fields, "pricing_policy",        applied)
+
+        # v2 sections extracted whole (brochures fill brand/guardrails too).
+        for section in ("brand", "guardrails"):
+            if isinstance(fields.get(section), dict) and fields[section]:
+                node = data.setdefault(section, {})
+                if isinstance(node, dict):
+                    node.update(fields[section])
+                    applied.append(section)
 
         _set(data, ["response_bank", "opening_greeting"],       fields, "opening_greeting",      applied)
 

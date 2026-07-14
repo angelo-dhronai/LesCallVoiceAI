@@ -166,15 +166,18 @@ def apply_fields(agent_folder: str, fields: dict) -> dict:
                 cal["slots_text"] = {k: slot_str for k in texts} if texts else {"en": slot_str}
                 applied.append("appointment_slots")
 
-        with open(yaml_path, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        if not applied:
+            return {"status": "ok", "applied": []}
 
-        # Invalidate the registry cache so the next pipeline load picks up the new values
-        try:
-            from ..agent_definition.registry import agent_registry
-            agent_registry.invalidate(agent_folder)
-        except Exception:
-            pass
+        # Route through the store choke point (plan §5.1): revision snapshot,
+        # audit stamps, validation, atomic write, registry invalidation.
+        # No expected_paths scoping: apply_fields maps document fields to a
+        # known-safe fixed path set that the diff proof would only re-derive.
+        from ..agent_definition import store as agent_store
+        agent_store.write_agent(
+            agent_folder, data, actor="docfill",
+            reason="document field extraction: " + ", ".join(applied)[:150],
+            agents_dir=_AGENTS_DIR)
 
         logger.info("[docs/yaml_filler] Applied %d fields to agent '%s'", len(applied), agent_folder)
         return {"status": "ok", "applied": applied}

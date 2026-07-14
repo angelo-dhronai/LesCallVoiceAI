@@ -228,15 +228,20 @@ async def get_active_agent() -> dict:
 
 @router.get("/api/agents/{name}")
 async def get_agent(name: str) -> dict:
-    """Full configuration of a named agent (the editor reads this)."""
+    """Full configuration of a named agent (the editor reads this).
+
+    `_rev` is the optimistic-concurrency token: send it back as If-Match on
+    PUT so an interleaved edit 409s instead of being silently clobbered."""
     yaml_path = _AGENTS_DIR / name / "agent.yaml"
     if not yaml_path.exists():
         raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
     try:
+        from backend.app.agent_definition import store as agent_store
+        _, rev = agent_store.read_agent(name, _AGENTS_DIR)
         agent = AgentDefinition.from_yaml(yaml_path)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-    return dataclasses.asdict(agent)
+    return {**dataclasses.asdict(agent), "_rev": rev}
 
 
 # ── create / update / archive ───────────────────────────────────────────────
@@ -284,20 +289,36 @@ async def create_agent(request: Request) -> dict:
 
 @router.put("/api/agents/{name}")
 async def update_agent(name: str, request: Request) -> dict:
-    """Replace an existing agent's YAML (full agent definition body)."""
+    """Replace an existing agent's YAML (full agent definition body).
+
+    Routes through the store choke point: revision snapshot + audit stamps +
+    atomic write. Optional If-Match (the `_rev` from GET) → 409 on a
+    concurrent edit; absent = legacy last-write-wins (old clients keep working)."""
     yaml_path = _AGENTS_DIR / name / "agent.yaml"
     if not yaml_path.exists():
         raise HTTPException(status_code=404, detail=f"Agent '{name}' not found — POST to create")
     body = await request.json()
     body.pop("name", None)
+    body.pop("_rev", None)
+    base_rev = request.headers.get("If-Match") or None
+    from backend.app.agent_definition import store as agent_store
     try:
-        agent = AgentDefinition.from_dict(body)
+        result = agent_store.write_agent(
+            name, body, actor=f"{_ctx_owner()}:builder", base_rev=base_rev,
+            reason="builder full update", owner=_ctx_owner(),
+            is_admin=_ctx_is_admin(), agents_dir=_AGENTS_DIR)
+    except agent_store.ConflictError as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": "conflict",
+            "message": "This agent changed since you loaded it — reload and reapply.",
+            "current_rev": exc.current_rev})
+    except agent_store.OwnerMismatch as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Schema validation failed: {exc}")
-    agent.to_yaml(yaml_path)
-    agent_registry.invalidate(name)
-    logger.info("[builder] updated agent '%s'", name)
-    return {"status": "updated", "name": name, "agent_id": agent.agent_id}
+    logger.info("[builder] updated agent '%s' rev=%s", name, result["revision"])
+    return {"status": "updated", "name": name, "revision": result["revision"],
+            "rev": result["rev"]}
 
 
 @router.delete("/api/agents/{name}")
@@ -363,13 +384,95 @@ async def update_agent_raw(name: str, request: Request) -> dict:
     text = (await request.body()).decode("utf-8")
     try:
         data = yaml.safe_load(text)
-        agent = AgentDefinition.from_dict(data)
+        AgentDefinition.from_dict(data)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"YAML parse/validation failed: {exc}")
-    yaml_path.write_text(text, encoding="utf-8")
-    agent_registry.invalidate(name)
-    logger.info("[builder] raw-updated agent '%s'", name)
-    return {"status": "updated", "name": name, "agent_id": agent.agent_id}
+    base_rev = request.headers.get("If-Match") or None
+    from backend.app.agent_definition import store as agent_store
+    try:
+        result = agent_store.write_agent(
+            name, data, actor=f"{_ctx_owner()}:builder", base_rev=base_rev,
+            reason="builder raw YAML update", owner=_ctx_owner(),
+            is_admin=_ctx_is_admin(), agents_dir=_AGENTS_DIR)
+    except agent_store.ConflictError as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": "conflict",
+            "message": "This agent changed since you loaded it — reload and reapply.",
+            "current_rev": exc.current_rev})
+    except agent_store.OwnerMismatch as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    logger.info("[builder] raw-updated agent '%s' rev=%s", name, result["revision"])
+    return {"status": "updated", "name": name, "revision": result["revision"],
+            "rev": result["rev"]}
+
+
+@router.get("/api/agents/{name}/revisions")
+async def agent_revisions(name: str) -> dict:
+    """Edit history (agent_revisions snapshots), newest first."""
+    if not (_AGENTS_DIR / name / "agent.yaml").exists():
+        raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
+    from backend.app.agent_definition import store as agent_store
+    revs = agent_store.list_revisions(name)
+    return {"revisions": [
+        {"rev_id": r["id"], "actor": r["actor"], "reason": r["reason"],
+         "sha256": r["sha256"], "created_at": str(r["created_at"])}
+        for r in revs]}
+
+
+@router.post("/api/agents/{name}/rollback/{rev_id}")
+async def agent_rollback(name: str, rev_id: int) -> dict:
+    """Restore a snapshot (itself snapshotted — rollback is undoable)."""
+    from backend.app.agent_definition import store as agent_store
+    try:
+        result = agent_store.rollback_agent(
+            name, rev_id, actor=f"{_ctx_owner()}:rollback",
+            owner=_ctx_owner(), is_admin=_ctx_is_admin(), agents_dir=_AGENTS_DIR)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except agent_store.OwnerMismatch as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"status": "rolled_back", "name": name, "rev_id": rev_id,
+            "revision": result["revision"], "effective": "next_call"}
+
+
+@router.patch("/api/agents/{name}/ops")
+async def agent_ops(name: str, request: Request) -> dict:
+    """Surgical path operations (the same machinery the Copilot uses):
+    body {ops: [{op: set|append|remove_at|move, path, value?, to?}], base_rev?}."""
+    yaml_path = _AGENTS_DIR / name / "agent.yaml"
+    if not yaml_path.exists():
+        raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
+    body = await request.json()
+    ops = body.get("ops") or []
+    if not isinstance(ops, list) or not ops:
+        raise HTTPException(status_code=400, detail="'ops' (non-empty list) is required")
+    from backend.app.agent_definition import store as agent_store
+    from backend.app.agent_definition.diff import apply_ops, compute_diff, render_human
+    current, cur_rev = agent_store.read_agent(name, _AGENTS_DIR)
+    base_rev = body.get("base_rev") or request.headers.get("If-Match") or cur_rev
+    try:
+        candidate = apply_ops(current, ops)
+        AgentDefinition.from_dict(candidate)
+        expected = {str(o.get("path") or "").split("[")[0].rstrip(".")
+                    for o in ops if o.get("path")}
+        result = agent_store.write_agent(
+            name, candidate, actor=f"{_ctx_owner()}:builder", base_rev=base_rev,
+            reason="builder ops: " + ", ".join(str(o.get("op")) for o in ops)[:120],
+            owner=_ctx_owner(), is_admin=_ctx_is_admin(),
+            expected_paths=expected, agents_dir=_AGENTS_DIR)
+    except agent_store.ConflictError as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": "conflict",
+            "message": "This agent changed since you loaded it — reload and reapply.",
+            "current_rev": exc.current_rev})
+    except agent_store.ScopeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    diff = compute_diff(current, candidate)
+    return {"status": "updated", "name": name, "revision": result["revision"],
+            "rev": result["rev"], "diff": render_human(diff),
+            "effective": "next_call"}
 
 
 # ── routing.yaml ────────────────────────────────────────────────────────────

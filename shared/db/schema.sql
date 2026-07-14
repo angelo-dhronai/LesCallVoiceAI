@@ -326,3 +326,19 @@ CREATE TABLE IF NOT EXISTS bookings (
     booked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_bookings_agent ON bookings(agent_slug);
+
+-- Agent revision snapshots (AgentSpec v2 edit engine, plan D11/§5.1).
+-- YAML stays the runtime source of truth; every write through
+-- agent_definition/store.py snapshots the PRE-write YAML text here
+-- (retention 50/slug) so any edit is diffable and reversible.
+CREATE TABLE IF NOT EXISTS agent_revisions (
+    id {PK},
+    slug TEXT NOT NULL,
+    owner TEXT,
+    actor TEXT,
+    reason TEXT,
+    sha256 TEXT,
+    yaml_text TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_agent_revisions_slug ON agent_revisions(slug, id);

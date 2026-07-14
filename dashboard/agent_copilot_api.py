@@ -57,6 +57,11 @@ from backend.app.agent_definition.schema import (                   # noqa: E402
     PostCallConfig,
 )
 from backend.app.agent_definition.registry import agent_registry    # noqa: E402
+from backend.app.agent_definition import store as agent_store       # noqa: E402
+from backend.app.agent_definition.diff import (                     # noqa: E402
+    apply_ops as _apply_ops, compute_diff as _compute_diff,
+    render_human as _render_diff,
+)
 import agent_builder_api as builder                                 # noqa: E402
 
 
@@ -1207,6 +1212,53 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
     return d
 
 
+def _copilot_actor() -> str:
+    return f"{builder._ctx_owner()}:copilot"
+
+
+def _invariant_violations(merged: dict) -> list[str]:
+    """§5.4: the whole-document passes that used to silently MUTATE untouched
+    fields become validation-time CHECKS that fail the proposal instead —
+    otherwise the scoped-diff proof would read the mutations as collateral."""
+    problems: list[str] = []
+    langs = merged.get("languages") or {}
+    sup = langs.get("supported") if isinstance(langs, dict) else None
+    if not (isinstance(sup, list) and any(isinstance(x, str) and x.strip() for x in sup)):
+        problems.append("languages.supported would become empty")
+    elif isinstance(langs, dict) and langs.get("default") not in sup:
+        problems.append("languages.default would not be in supported")
+    cf = merged.get("call_flow") or {}
+    if not (isinstance(cf, dict) and cf.get("stages")):
+        problems.append("call_flow.stages would become empty")
+    rb = merged.get("response_bank") or {}
+    greeting = rb.get("opening_greeting") if isinstance(rb, dict) else None
+    if not (isinstance(greeting, str) and greeting.strip()):
+        problems.append("opening_greeting would become empty")
+    return problems
+
+
+def _paths_of_changes(changes: dict, prefix: str = "") -> set[str]:
+    """Dotted path prefixes a partial-changes dict intends to touch (leaf
+    subtrees; lists are replaced whole so the list path itself is the scope)."""
+    out: set[str] = set()
+    for k, v in (changes or {}).items():
+        p = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict) and v:
+            out |= _paths_of_changes(v, p)
+        else:
+            out.add(p)
+    return out
+
+
+def _read_full_definition(slug: str) -> tuple[dict, str]:
+    """(canonical full definition dict, rev sha). Canonical = through
+    from_dict→asdict so proposals diff against the same form the store's
+    scoping proof uses."""
+    raw, rev = agent_store.read_agent(slug, _AGENTS_DIR)
+    canon = dataclasses.asdict(AgentDefinition.from_dict(raw))
+    return canon, rev
+
+
 def _visible_slug(folder: str) -> bool:
     """Is `folder` an agent the current tenant may see? Multi-tenant guard so
     name-resolution NEVER enumerates or matches another tenant's agents (the
@@ -1310,11 +1362,17 @@ def _resolve_agent_slug(name: str) -> str:
 _TOOLS_WITH_AGENT_NAME = {
     "get_agent", "update_agent", "activate_agent",
     "get_routing", "set_routing", "replace_mentions",
+    "propose_update", "update_stage", "add_stage", "remove_stage",
+    "reorder_stages", "update_slot", "add_slot", "remove_slot",
+    "list_revisions", "rollback_agent",
 }
 
 # Tools that change something real. Used by the truthfulness backstop: if all
 # of these failed in a turn, the reply MUST admit it.
-_MUTATING_TOOLS = {"create_agent", "update_agent", "activate_agent", "set_routing", "replace_mentions"}
+_MUTATING_TOOLS = {"create_agent", "update_agent", "activate_agent", "set_routing",
+                   "replace_mentions", "apply_update", "update_stage", "add_stage",
+                   "remove_stage", "reorder_stages", "update_slot", "add_slot",
+                   "remove_slot", "rollback_agent"}
 
 # Plain-English verbs for action chips ("Couldn't create the agent: ...").
 _TOOL_VERBS = {
@@ -1327,6 +1385,18 @@ _TOOL_VERBS = {
     "activate_agent": "activate the agent",
     "get_routing": "check call routing",
     "set_routing": "update call routing",
+    "propose_update": "prepare the change",
+    "apply_update": "apply the change",
+    "discard_update": "discard the change",
+    "update_stage": "edit the call stage",
+    "add_stage": "add the call stage",
+    "remove_stage": "remove the call stage",
+    "reorder_stages": "reorder the call stages",
+    "update_slot": "edit the question",
+    "add_slot": "add the question",
+    "remove_slot": "remove the question",
+    "list_revisions": "check the edit history",
+    "rollback_agent": "undo the change",
 }
 
 
@@ -1664,8 +1734,191 @@ TOOLS: list[dict] = [
                     "name": {"type": "string", "description": "agent slug or spoken name"},
                     "find": {"type": "string", "description": "exact text to find, e.g. 'Mr. Ben'"},
                     "replace": {"type": "string", "description": "replacement text, e.g. 'Mr. Umang'"},
+                    "dry_run": {"type": "boolean", "description": "true = only count/preview matches, write nothing"},
                 },
                 "required": ["name", "find", "replace"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_update",
+            "description": (
+                "Prepare an edit WITHOUT applying it: builds the candidate, validates it, and "
+                "returns a human-readable diff for the user to confirm. Use for any non-trivial "
+                "edit. Provide either `changes` (partial definition, deep-merged) or `ops` "
+                "(surgical path operations)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "agent slug or spoken name"},
+                    "changes": {"type": "object", "description": "partial definition to merge"},
+                    "ops": {"type": "array", "items": {"type": "object"},
+                            "description": "surgical ops: [{op: set|append|remove_at|move, path, value?, to?}]"},
+                    "reason": {"type": "string", "description": "one-line reason for the change"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_update",
+            "description": "Apply a previously proposed change AFTER the user confirms. Commits with concurrency protection (409 if the agent changed since the proposal).",
+            "parameters": {
+                "type": "object",
+                "properties": {"change_id": {"type": "string"}},
+                "required": ["change_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "discard_update",
+            "description": "Discard a previously proposed change the user rejected.",
+            "parameters": {
+                "type": "object",
+                "properties": {"change_id": {"type": "string"}},
+                "required": ["change_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_stage",
+            "description": "Surgically edit ONE call-flow stage by id (goal, turns_until_advance, role, collect, advance_when, branches, label) — never resend the whole stage list.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "stage_id": {"type": "string"},
+                    "fields": {"type": "object", "description": "only the stage fields to change"},
+                },
+                "required": ["name", "stage_id", "fields"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_stage",
+            "description": "Insert one new call-flow stage (after `after_id`, or at the end). Orders are renumbered automatically.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "stage": {"type": "object", "description": "the new stage {id, goal, ...}"},
+                    "after_id": {"type": "string", "description": "existing stage id to insert after"},
+                },
+                "required": ["name", "stage"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_stage",
+            "description": "Remove one call-flow stage by id. Orders are renumbered automatically.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "stage_id": {"type": "string"},
+                },
+                "required": ["name", "stage_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reorder_stages",
+            "description": "Reorder the call-flow stages. Pass the COMPLETE list of existing stage ids in the new order.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "ordered_ids": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["name", "ordered_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_slot",
+            "description": "Surgically edit ONE data-capture slot by name (question wording, type, priority, depends_on, merge_policy, confirm_readback, max_asks, ...).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "slot_name": {"type": "string"},
+                    "fields": {"type": "object"},
+                },
+                "required": ["name", "slot_name", "fields"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_slot",
+            "description": "Add one data-capture slot (a piece of information the agent must collect).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "slot": {"type": "object", "description": "the new slot {name, question: {lang: str}, ...}"},
+                },
+                "required": ["name", "slot"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_slot",
+            "description": "Remove one data-capture slot by name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "slot_name": {"type": "string"},
+                },
+                "required": ["name", "slot_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_revisions",
+            "description": "List an agent's saved edit history (who changed it, when, why) — every change is reversible.",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rollback_agent",
+            "description": "Restore an agent to an earlier revision from list_revisions. Only after the user explicitly asks to undo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "rev_id": {"type": "integer"},
+                },
+                "required": ["name", "rev_id"],
             },
         },
     },
@@ -1824,18 +2077,29 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         yaml_path = _AGENTS_DIR / name / "agent.yaml"
         if not yaml_path.exists():
             raise ValueError(f"Agent '{name}' not found")
-        # GET current full definition → deep-merge partial changes → validate → write.
-        # Never replace-from-scratch: preserves calendar/slots/qa_field_signals/etc.
-        current = dataclasses.asdict(AgentDefinition.from_yaml(yaml_path))
-        _normalize_definition(_deep_merge(current, changes))
-        _enforce_invariants(current, notes)
-        agent = AgentDefinition.from_dict(current)
-        agent.to_yaml(yaml_path)
-        agent_registry.invalidate(name)
-        logger.info("[copilot] updated agent '%s' (%s)", name, ", ".join(changes.keys()))
+        # GET current full definition → deep-merge partial changes → check →
+        # write through the store (§5.1). §5.4: normalization ran on the
+        # CHANGES subtree only; whole-doc invariants are CHECKS that fail the
+        # update (silent whole-doc mutation would read as collateral to the
+        # store's scoped-diff proof).
+        current, base_rev = _read_full_definition(name)
+        merged = _deep_merge(copy.deepcopy(current), changes)
+        violations = _invariant_violations(merged)
+        if violations:
+            raise ValueError("Refused — this change would break the agent: "
+                             + "; ".join(violations))
+        expected = _paths_of_changes(changes)
+        result = agent_store.write_agent(
+            name, merged, actor=_copilot_actor(), base_rev=base_rev,
+            reason="copilot update: " + ", ".join(sorted(changes.keys()))[:180],
+            owner=builder._ctx_owner(), is_admin=builder._ctx_is_admin(),
+            expected_paths=expected, agents_dir=_AGENTS_DIR)
+        logger.info("[copilot] updated agent '%s' (%s) rev=%s",
+                    name, ", ".join(changes.keys()), result["revision"])
         res = {
             "status": "updated", "name": name, "changed_sections": sorted(changes.keys()),
-            "notes": notes, "quality": _quality_warnings(current),
+            "notes": notes, "quality": _quality_warnings(merged),
+            "revision": result["revision"], "effective": "next_call",
         }
         return res, f"Updated {_agent_display_name(name)} — {_friendly_sections(sorted(changes.keys()))}", True, True
 
@@ -1843,26 +2107,46 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         name = str(args["name"]).strip()
         find = str(args.get("find") or "")
         replacement = str(args.get("replace") or "")
+        dry_run = bool(args.get("dry_run", False))
         if not find.strip():
             raise ValueError("'find' text is required")
         yaml_path = _AGENTS_DIR / name / "agent.yaml"
         if not yaml_path.exists():
             raise ValueError(f"Agent '{name}' not found")
-        current = dataclasses.asdict(AgentDefinition.from_yaml(yaml_path))
+        current, base_rev = _read_full_definition(name)
         pattern = re.compile(re.escape(find), re.IGNORECASE)
         # agent_id/version are internal identifiers — a persona rename must
         # never mutate them (they key the registry and document lookups).
-        preserved = {k: current.pop(k) for k in ("agent_id", "version") if k in current}
-        replaced_tree, count = _replace_in_tree(current, pattern, replacement)
+        # revision/updated_* are server-managed.
+        work = copy.deepcopy(current)
+        preserved = {k: work.pop(k)
+                     for k in ("agent_id", "version", "revision",
+                               "updated_at", "updated_by") if k in work}
+        replaced_tree, count = _replace_in_tree(work, pattern, replacement)
         replaced_tree.update(preserved)
         if count == 0:
             res = {"status": "no_matches", "name": name, "find": find, "replaced": 0}
             return res, f"'{find}' does not appear anywhere in {_agent_display_name(name)}", True, False
-        agent = AgentDefinition.from_dict(replaced_tree)   # validate before any write
-        agent.to_yaml(yaml_path)
-        agent_registry.invalidate(name)
+        match_paths = [
+            d["path"] for d in _compute_diff(current, replaced_tree)
+            if d["path"] not in ("revision", "updated_at", "updated_by")
+        ]
+        if dry_run:
+            res = {"status": "dry_run", "name": name, "find": find,
+                   "replace": replacement, "would_replace": count,
+                   "paths": match_paths[:40]}
+            return res, (f"'{find}' appears in {count} places in "
+                         f"{_agent_display_name(name)} — not applied yet"), True, False
+        AgentDefinition.from_dict(replaced_tree)   # validate before any write
+        result = agent_store.write_agent(
+            name, replaced_tree, actor=_copilot_actor(), base_rev=base_rev,
+            reason=f"replace '{find[:60]}' -> '{replacement[:60]}'",
+            owner=builder._ctx_owner(), is_admin=builder._ctx_is_admin(),
+            agents_dir=_AGENTS_DIR)
         logger.info("[copilot] replace_mentions '%s': %r -> %r (%d)", name, find, replacement, count)
-        res = {"status": "replaced", "name": name, "find": find, "replace": replacement, "replaced": count}
+        res = {"status": "replaced", "name": name, "find": find,
+               "replace": replacement, "replaced": count,
+               "revision": result["revision"], "effective": "next_call"}
         return res, f"Replaced '{find}' with '{replacement}' in {count} places in {_agent_display_name(name)}", True, True
 
     if tool == "activate_agent":
@@ -1896,6 +2180,225 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         logger.info("[copilot] updated routing for agent '%s'", name)
         return {"status": "updated"}, f"Updated call routing for {_agent_display_name(name)}", True, True
 
+    # ── v2 surgical edit engine (plan §5.3/§5.5) ─────────────────────────────
+
+    def _write_scoped(name: str, merged: dict, base_rev: str, reason: str,
+                      expected: set[str] | None) -> dict:
+        return agent_store.write_agent(
+            name, merged, actor=_copilot_actor(), base_rev=base_rev,
+            reason=reason, owner=builder._ctx_owner(),
+            is_admin=builder._ctx_is_admin(), expected_paths=expected,
+            agents_dir=_AGENTS_DIR)
+
+    if tool == "propose_update":
+        name = str(args["name"]).strip()
+        reason = str(args.get("reason") or "")
+        notes: list[str] = []
+        current, base_rev = _read_full_definition(name)
+        ops = args.get("ops")
+        if ops:
+            if not isinstance(ops, list):
+                raise ValueError("'ops' must be a list of operations")
+            candidate = _apply_ops(current, ops)
+            expected = sorted({str(o.get("path") or "").split("[")[0].rstrip(".")
+                               for o in ops if o.get("path")})
+        else:
+            changes = _coerce_obj(args.get("changes") or {})
+            changes.pop("name", None)
+            for k in _SERVER_MANAGED_KEYS:
+                changes.pop(k, None)
+            _normalize_definition(changes, notes)
+            for k in [k for k, v in changes.items() if isinstance(v, dict) and not v]:
+                changes.pop(k)
+            if not changes:
+                raise ValueError("None of those changes map to real settings. " + " ".join(notes))
+            candidate = _deep_merge(copy.deepcopy(current), changes)
+            expected = sorted(_paths_of_changes(changes))
+        violations = _invariant_violations(candidate)
+        if violations:
+            raise ValueError("Refused — this change would break the agent: "
+                             + "; ".join(violations))
+        AgentDefinition.from_dict(candidate)  # dry validation, no write
+        diff = [d for d in _compute_diff(current, candidate)
+                if d["path"] not in ("revision", "updated_at", "updated_by")]
+        session = guard.get("session") or {}
+        pending = session.setdefault("pending_changes", {})
+        change_id = f"chg_{len(pending) + 1}_{abs(hash(name)) % 9999}"
+        pending[change_id] = {
+            "slug": name, "base_rev": base_rev, "candidate": candidate,
+            "expected_paths": list(expected), "reason": reason,
+            "diff_human": _render_diff(diff),
+            "proposed_at_turn": guard.get("user_turns", 0),
+        }
+        res = {"status": "proposed", "change_id": change_id, "name": name,
+               "diff": _render_diff(diff), "paths": expected,
+               "notes": notes,
+               "next": "Show the diff to the user; call apply_update after they confirm."}
+        return res, f"Proposed a change to {_agent_display_name(name)} (awaiting confirmation)", True, False
+
+    if tool == "apply_update":
+        change_id = str(args.get("change_id") or "").strip()
+        session = guard.get("session") or {}
+        pending = session.get("pending_changes") or {}
+        chg = pending.get(change_id)
+        if not chg:
+            raise ValueError(f"No pending change '{change_id}' — propose it first")
+        # Server-side confirmation gate: proposed in a PRIOR turn, or the
+        # triggering user message carries an explicit confirmation.
+        msg = str(guard.get("user_message") or "").lower()
+        confirmed_words = bool(re.search(
+            r"\b(yes|yeah|apply|confirm|go ahead|do it|approve|haan|ok|okay|sure|ha)\b", msg))
+        if guard.get("user_turns", 0) <= chg.get("proposed_at_turn", 0) and not confirmed_words:
+            raise ValueError(
+                "Refused: apply_update needs the user's confirmation — show the "
+                "diff and apply only after they say yes.")
+        name = chg["slug"]
+        builder._assert_slug_access(name, owner)
+        result = _write_scoped(name, chg["candidate"], chg["base_rev"],
+                               chg.get("reason") or "copilot proposed change",
+                               set(chg.get("expected_paths") or []) or None)
+        pending.pop(change_id, None)
+        res = {"status": "updated", "name": name, "change_id": change_id,
+               "revision": result["revision"], "effective": "next_call"}
+        return res, (f"Applied the change to {_agent_display_name(name)} — "
+                     f"revision {result['revision']}, applies from the next call"), True, True
+
+    if tool == "discard_update":
+        change_id = str(args.get("change_id") or "").strip()
+        session = guard.get("session") or {}
+        pending = session.get("pending_changes") or {}
+        if pending.pop(change_id, None) is None:
+            raise ValueError(f"No pending change '{change_id}'")
+        return ({"status": "discarded", "change_id": change_id},
+                "Discarded the proposed change", True, False)
+
+    if tool in ("update_stage", "add_stage", "remove_stage", "reorder_stages"):
+        name = str(args["name"]).strip()
+        current, base_rev = _read_full_definition(name)
+        stages = list((current.get("call_flow") or {}).get("stages") or [])
+        ids = [str(s.get("id") or "") for s in stages]
+        if tool == "update_stage":
+            sid = str(args.get("stage_id") or "").strip()
+            if sid not in ids:
+                raise ValueError(f"No stage '{sid}' — stages are: {', '.join(ids)}")
+            fields = _coerce_obj(args.get("fields") or {})
+            fields.pop("id", None)
+            stage_keys = _fields_of(StageDefinition)
+            fields = {k: v for k, v in fields.items() if k in stage_keys}
+            if not fields:
+                raise ValueError("No real stage fields to update")
+            stages[ids.index(sid)] = {**stages[ids.index(sid)], **fields}
+            reason = f"update stage {sid}: {', '.join(fields)}"
+        elif tool == "add_stage":
+            stage = _coerce_obj(args.get("stage") or {})
+            sid = str(stage.get("id") or "").strip().upper().replace(" ", "_")
+            if not sid:
+                raise ValueError("stage.id is required")
+            if sid in ids:
+                raise ValueError(f"Stage '{sid}' already exists")
+            stage["id"] = sid
+            after_id = str(args.get("after_id") or "").strip()
+            idx = ids.index(after_id) + 1 if after_id in ids else len(stages)
+            stages.insert(idx, stage)
+            reason = f"add stage {sid}"
+        elif tool == "remove_stage":
+            sid = str(args.get("stage_id") or "").strip()
+            if sid not in ids:
+                raise ValueError(f"No stage '{sid}' — stages are: {', '.join(ids)}")
+            if len(stages) <= 1:
+                raise ValueError("Cannot remove the last stage")
+            stages.pop(ids.index(sid))
+            reason = f"remove stage {sid}"
+        else:  # reorder_stages
+            ordered = [str(x) for x in (args.get("ordered_ids") or [])]
+            if sorted(ordered) != sorted(ids):
+                raise ValueError(
+                    f"ordered_ids must contain exactly the existing stages: {', '.join(ids)}")
+            by_id = {str(s.get("id")): s for s in stages}
+            stages = [by_id[i] for i in ordered]
+            reason = "reorder stages: " + " → ".join(ordered)
+        for i, s in enumerate(stages):  # renumber order ints
+            s["order"] = i
+        candidate = copy.deepcopy(current)
+        candidate.setdefault("call_flow", {})["stages"] = stages
+        violations = _invariant_violations(candidate)
+        if violations:
+            raise ValueError("Refused: " + "; ".join(violations))
+        diff = [d for d in _compute_diff(current, candidate)
+                if d["path"] not in ("revision", "updated_at", "updated_by")]
+        result = _write_scoped(name, candidate, base_rev, reason,
+                               {"call_flow.stages"})
+        res = {"status": "updated", "name": name, "diff": _render_diff(diff),
+               "stages": [str(s.get("id")) for s in stages],
+               "revision": result["revision"], "effective": "next_call"}
+        return res, f"{reason} in {_agent_display_name(name)}", True, True
+
+    if tool in ("update_slot", "add_slot", "remove_slot"):
+        name = str(args["name"]).strip()
+        current, base_rev = _read_full_definition(name)
+        slots = list(current.get("slots") or [])
+        names_l = [str(s.get("name") or "") for s in slots]
+        if tool == "update_slot":
+            sn = str(args.get("slot_name") or "").strip().lower()
+            if sn not in names_l:
+                raise ValueError(f"No slot '{sn}' — slots are: {', '.join(names_l) or 'none'}")
+            fields = _coerce_obj(args.get("fields") or {})
+            fields.pop("name", None)
+            slot_keys = _fields_of(SlotDefinition)
+            fields = {k: v for k, v in fields.items() if k in slot_keys}
+            if not fields:
+                raise ValueError("No real slot fields to update")
+            slots[names_l.index(sn)] = {**slots[names_l.index(sn)], **fields}
+            reason = f"update slot {sn}: {', '.join(fields)}"
+        elif tool == "add_slot":
+            slot = _coerce_obj(args.get("slot") or {})
+            sn = str(slot.get("name") or "").strip().lower().replace(" ", "_")
+            if not sn:
+                raise ValueError("slot.name is required")
+            if sn in names_l:
+                raise ValueError(f"Slot '{sn}' already exists")
+            slot["name"] = sn
+            slots.append(slot)
+            reason = f"add slot {sn}"
+        else:
+            sn = str(args.get("slot_name") or "").strip().lower()
+            if sn not in names_l:
+                raise ValueError(f"No slot '{sn}' — slots are: {', '.join(names_l) or 'none'}")
+            slots.pop(names_l.index(sn))
+            reason = f"remove slot {sn}"
+        candidate = copy.deepcopy(current)
+        candidate["slots"] = slots
+        # Run slot-level value validation from the sanitizer on the subtree.
+        notes: list[str] = []
+        _normalize_definition({"slots": candidate["slots"]}, notes)
+        AgentDefinition.from_dict(candidate)
+        diff = [d for d in _compute_diff(current, candidate)
+                if d["path"] not in ("revision", "updated_at", "updated_by")]
+        result = _write_scoped(name, candidate, base_rev, reason, {"slots"})
+        res = {"status": "updated", "name": name, "diff": _render_diff(diff),
+               "slots": [str(s.get("name")) for s in slots], "notes": notes,
+               "revision": result["revision"], "effective": "next_call"}
+        return res, f"{reason} in {_agent_display_name(name)}", True, True
+
+    if tool == "list_revisions":
+        name = str(args["name"]).strip()
+        revs = agent_store.list_revisions(name)
+        res = {"revisions": [
+            {"rev_id": r["id"], "actor": r["actor"], "reason": r["reason"],
+             "created_at": str(r["created_at"])} for r in revs]}
+        return res, f"Checked {_agent_display_name(name)}'s edit history", True, False
+
+    if tool == "rollback_agent":
+        name = str(args["name"]).strip()
+        rev_id = int(args.get("rev_id") or 0)
+        result = agent_store.rollback_agent(
+            name, rev_id, actor=f"{owner}:rollback", owner=owner,
+            is_admin=builder._ctx_is_admin(), agents_dir=_AGENTS_DIR)
+        res = {"status": "rolled_back", "name": name, "rev_id": rev_id,
+               "revision": result["revision"], "effective": "next_call"}
+        return res, (f"Rolled {_agent_display_name(name)} back to revision "
+                     f"{rev_id} — applies from the next call"), True, True
+
     raise ValueError(f"Unknown tool '{tool}'")
 
 
@@ -1927,8 +2430,9 @@ HOW YOU WORK
    b. Call get_agent first if you haven't read that agent THIS conversation, and re-read it before any edit you're not 100% sure about.
    c. RENAMES/SWAPS: when the user changes something that can appear in more than one place — a person (boss, owner, CEO), the company, a product, a city, a price, a phone number, or the agent's own name — you MUST use replace_mentions (find/replace across the whole agent), NOT update_agent. Example: "assistant for Mr. Ben → Mr. Umang" = replace_mentions(find="Mr. Ben", replace="Mr. Umang"). A partial edit that leaves old mentions in the greeting or responses is a FAILURE.
    d. After replace_mentions, if the replaced count seems low for how prominent the thing is, get_agent and check for other spellings/variants of the old text (e.g. "Ben", "Mr Ben", "बेन") and replace those too.
-   e. Other edits: update_agent with the MINIMAL partial change (server-side merge keeps everything else; lists are replaced whole, so send the complete list when editing one item).
-   f. After every successful edit, tell the user in one plain sentence WHAT is different now and that it applies from the next call. If nothing was changed in a turn, never claim it was.
+   e. Other edits: update_agent with the MINIMAL partial change (server-side merge keeps everything else). NEVER resend a whole list to edit one item: for one call stage use update_stage/add_stage/remove_stage/reorder_stages; for one collected-info question use update_slot/add_slot/remove_slot — these edit exactly that item on the server.
+   e2. For bigger or riskier edits, prefer the two-step flow: propose_update (returns a diff — show it to the user in plain words) → apply_update after they confirm, or discard_update if they decline. Every change is versioned: list_revisions shows history and rollback_agent undoes a change when the user asks.
+   f. After every successful edit, tell the user in one plain sentence WHAT is different now and that it applies from the next call (quote the revision number when the tool returns one). If nothing was changed in a turn, never claim it was.
    g. If the user says a change didn't take effect on a real call: do NOT speculate about caching or internal mechanisms. First list_agents to confirm the agent you've been editing IS the live one — if a different agent is live, say so plainly and ask whether to activate the right one. Then get_agent, hunt for the old wording, and fix every remaining mention. Special case: if the OLD OPENING LINE still played at connect, the greeting lives ONLY in response_bank.opening_greeting — check and fix THAT field; editing stage goals never changes what plays at connect.
 6. QUESTIONS ("which agent is live?"): use list_agents / get_agent / get_routing. Do NOT call get_agent unless the user asks about that agent or you are about to edit it — during a new-agent interview no tool calls are needed until you create.
 
@@ -1977,7 +2481,10 @@ _SESSIONS: dict[str, dict] = {}  # sid -> {"messages": [...], "transcript": [...
 # Tools that tie a conversation to a specific agent. Mutating tools always
 # re-point the session's agent; read tools only set it when none is known yet
 # (so "also show me pramukh" mid-edit doesn't rename the chat).
-_AGENT_MUTATING_TOOLS = {"create_agent", "update_agent", "activate_agent", "set_routing", "replace_mentions"}
+_AGENT_MUTATING_TOOLS = {"create_agent", "update_agent", "activate_agent", "set_routing",
+                         "replace_mentions", "apply_update", "update_stage", "add_stage",
+                         "remove_stage", "reorder_stages", "update_slot", "add_slot",
+                         "remove_slot", "rollback_agent"}
 _AGENT_READING_TOOLS = {"get_agent", "get_routing"}
 
 
@@ -2042,6 +2549,10 @@ def _load_session(sid: str) -> dict:
             session["messages"] = data.get("messages", [])
             session["transcript"] = data.get("transcript", [])
             session["meta"] = data.get("meta", {})
+            if data.get("pending_changes"):
+                session["pending_changes"] = data["pending_changes"]
+            if data.get("interview"):
+                session["interview"] = data["interview"]
             if data.get("owner"):
                 session["owner"] = data["owner"]
         except Exception as exc:  # pragma: no cover - corrupt file: start fresh
@@ -2267,6 +2778,9 @@ async def copilot_chat(request: Request) -> dict:
     guard = {
         "user_turns": sum(1 for m in session["messages"] if m.get("role") == "user"),
         "created_this_turn": False,
+        # v2 edit engine: pending-change storage + confirmation gating.
+        "session": session,
+        "user_message": message,
     }
 
     try:

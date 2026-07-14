@@ -78,20 +78,59 @@ export const listDocs = (name: string) =>
 
 /* ───────────────────────── writes ───────────────────────── */
 export const createAgent = (payload: any) => post('/agents', payload)
-export const updateAgent = (name: string, payload: any) =>
-  api<{ status: string; agent_id: string }>(`/agents/${name}`, {
+
+/** rev = the `_rev` from getAgent(). When sent, a concurrent edit (e.g. by
+ *  the Copilot) 409s instead of being silently clobbered. */
+export const updateAgent = (name: string, payload: any, rev?: string) =>
+  api<{ status: string; revision?: number; rev?: string }>(`/agents/${name}`, {
     method: 'PUT',
     body: JSON.stringify(payload),
+    headers: rev ? { 'If-Match': rev } : undefined,
   })
 export const activateAgent = (name: string) => post(`/agents/${name}/activate`)
 export const archiveAgent = (name: string) => del(`/agents/${name}`)
 
-export const putRawYaml = (name: string, yamlText: string) =>
-  api<{ status: string; agent_id: string }>(`/agents/${name}/raw`, {
+export const putRawYaml = (name: string, yamlText: string, rev?: string) =>
+  api<{ status: string; revision?: number; rev?: string }>(`/agents/${name}/raw`, {
     method: 'PUT',
     body: yamlText,
-    headers: { 'Content-Type': 'text/plain' },
+    headers: { 'Content-Type': 'text/plain', ...(rev ? { 'If-Match': rev } : {}) },
   })
+
+/* ─────────────────── revisions / surgical ops (v2) ─────────────────── */
+export type AgentRevision = {
+  rev_id: number
+  actor: string | null
+  reason: string | null
+  sha256?: string
+  created_at: string
+}
+
+export const listRevisions = (name: string) =>
+  api<{ revisions: AgentRevision[] }>(`/agents/${name}/revisions`)
+
+export const rollbackAgent = (name: string, revId: number) =>
+  post<{ status: string; revision: number }>(`/agents/${name}/rollback/${revId}`)
+
+export type AgentOp = {
+  op: 'set' | 'append' | 'remove_at' | 'move'
+  path: string
+  value?: any
+  to?: number
+}
+
+/** Surgical path ops — the same server machinery the Copilot uses. */
+export const patchAgentOps = (name: string, ops: AgentOp[], baseRev?: string) =>
+  api<{ status: string; revision: number; rev: string; diff: string }>(
+    `/agents/${name}/ops`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(baseRev ? { ops, base_rev: baseRev } : { ops }),
+    },
+  )
+
+export const isConflictError = (e: unknown) =>
+  String((e as any)?.message || e).startsWith('409')
 
 // validate against an existing agent endpoint slug — the server only schema-
 // checks the posted YAML body and ignores {name}, so any existing agent works

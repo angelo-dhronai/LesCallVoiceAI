@@ -2,12 +2,15 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useRefresh } from '../api/hooks/useApi'
 import {
   copilotChat, copilotSession, copilotSessions, copilotDeleteSession,
+  copilotUpload, applyPendingChange, discardPendingChange,
   type CopilotAction, type TranscriptMsg, type SessionSummary,
+  type InterviewProgress, type PendingChange,
 } from '../api/copilot'
 import { cx, Button, Spinner } from '../components/ui'
 import {
   Sparkles, SendHorizontal, RotateCcw, Check, X, ArrowDown,
   Plus, Pencil, Radio, Bot, Trash2, MessagesSquare, SquarePen, Lightbulb,
+  Paperclip, FileText, ClipboardList, Eye, EyeOff,
 } from 'lucide-react'
 
 /* ─────────────────────────── session id ─────────────────────────── */
@@ -282,6 +285,146 @@ function TypingBubble() {
   )
 }
 
+/* ─────────────── interview progress rail + spec preview (v2) ─────────────── */
+
+function InterviewRail({ progress }: { progress: InterviewProgress }) {
+  const done = progress.layers.filter((l) => l.done || l.skipped).length
+  return (
+    <div className="mb-2 rounded-xl bg-[var(--surface-2)] px-3 py-2 ring-1 ring-[var(--border)]">
+      <div className="flex items-center gap-2">
+        <ClipboardList size={13} className="shrink-0 text-mint-600 dark:text-mint-300" />
+        <span className="text-[11.5px] font-semibold text-soft">
+          Building your agent — {done}/{progress.layers.length} topics covered
+        </span>
+      </div>
+      <div className="mt-1.5 flex flex-wrap gap-1">
+        {progress.layers.map((l) => (
+          <span
+            key={l.id}
+            title={l.skipped ? 'Skipped at your request' : l.done ? 'Covered' : 'Still to cover'}
+            className={cx(
+              'inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10.5px] font-semibold ring-1',
+              l.done
+                ? 'bg-mint-400/12 text-mint-700 ring-mint-400/25 dark:text-mint-300'
+                : l.skipped
+                  ? 'bg-[var(--bg-2)] text-dim ring-[var(--border)] line-through'
+                  : l.id === progress.next_layer_id
+                    ? 'bg-amber-400/15 text-amber-600 ring-amber-400/30 dark:text-amber-300'
+                    : 'bg-transparent text-dim ring-[var(--border)]',
+            )}
+          >
+            {l.done ? <Check size={10} /> : null}
+            {l.title}
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function previewSections(draft: Record<string, any>): { title: string; rows: string[] }[] {
+  const out: { title: string; rows: string[] }[] = []
+  const id = draft.identity || {}
+  const who: string[] = []
+  if (id.agent_name) who.push(`Name: ${id.agent_name}`)
+  if (id.company_name) who.push(`Company: ${id.company_name}`)
+  if (id.role_description) who.push(`Role: ${id.role_description}`)
+  if (draft.call_direction) who.push(`Direction: ${draft.call_direction}`)
+  if (who.length) out.push({ title: 'Who it is', rows: who })
+  const langs = draft.languages || {}
+  const speak: string[] = []
+  if (langs.supported?.length) speak.push(`Languages: ${langs.supported.join(', ')}`)
+  if (langs.default) speak.push(`Opens in: ${langs.default}`)
+  const voices = langs.tts_voices ? Object.values(langs.tts_voices) as any[] : []
+  if (voices[0]?.speaker) speak.push(`Voice: ${voices[0].speaker}`)
+  const pers = draft.personality || {}
+  if (pers.tone || pers.energy) speak.push(`Style: ${[pers.tone, pers.energy].filter(Boolean).join(', ')}`)
+  if (speak.length) out.push({ title: 'How it speaks', rows: speak })
+  if (draft.call_flow?.call_goal) {
+    out.push({ title: 'Mission', rows: [draft.call_flow.call_goal] })
+  }
+  const stages = draft.call_flow?.stages
+  if (stages?.length) {
+    out.push({ title: 'Call flow', rows: stages.map((s: any) => s.id).filter(Boolean) })
+  }
+  if (draft.slots?.length) {
+    out.push({
+      title: 'What it collects',
+      rows: draft.slots.map((s: any) => s.name).filter(Boolean),
+    })
+  }
+  const kbText = draft.knowledge_base?.portfolio_prompt_text
+  const catalog = draft.knowledge_base?.catalog
+  if (kbText || catalog?.length) {
+    const rows: string[] = []
+    if (catalog?.length) rows.push(`${catalog.length} catalog item(s): ${catalog.map((c: any) => c.name).filter(Boolean).join(', ')}`)
+    if (kbText) rows.push(String(kbText).slice(0, 160) + (String(kbText).length > 160 ? '…' : ''))
+    out.push({ title: 'What it knows', rows })
+  }
+  const gr = draft.guardrails || {}
+  const rules = [...(gr.never_rules || []).map((r: string) => `Never: ${r}`),
+                 ...(gr.always_rules || []).map((r: string) => `Always: ${r}`)]
+  if (rules.length) out.push({ title: 'Rules', rows: rules.slice(0, 6) })
+  const greeting = draft.response_bank?.opening_greeting
+  if (greeting) out.push({ title: 'Opening line', rows: [String(greeting)] })
+  return out
+}
+
+function SpecPreview({ progress }: { progress: InterviewProgress }) {
+  const sections = previewSections(progress.draft || {})
+  if (!sections.length) return null
+  return (
+    <div className="space-y-3">
+      <div className="eyebrow px-1">Agent so far</div>
+      {sections.map((s) => (
+        <div key={s.title} className="rounded-xl bg-[var(--surface-2)] p-2.5 ring-1 ring-[var(--border)]">
+          <div className="text-[11px] font-semibold text-mint-700 dark:text-mint-300">{s.title}</div>
+          <ul className="mt-1 space-y-0.5">
+            {s.rows.map((r, i) => (
+              <li key={i} className="break-words text-[11.5px] leading-snug text-soft">{r}</li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/* ───────────────────── pending-change diff cards (v2) ───────────────────── */
+
+function DiffCards({ changes, busy, onApply, onDiscard }: {
+  changes: PendingChange[]
+  busy: boolean
+  onApply: (id: string) => void
+  onDiscard: (id: string) => void
+}) {
+  if (!changes.length) return null
+  return (
+    <div className="space-y-2">
+      {changes.map((c) => (
+        <div key={c.change_id} className="rounded-xl bg-amber-400/8 p-3 ring-1 ring-amber-400/25">
+          <div className="flex items-center gap-2 text-[12px] font-semibold text-soft">
+            <Pencil size={13} className="text-amber-500" />
+            Proposed change{c.slug ? ` to ${c.slug}` : ''}
+            {c.reason ? <span className="font-normal text-dim">— {c.reason}</span> : null}
+          </div>
+          <pre className="mt-2 max-h-48 overflow-auto rounded-lg bg-[var(--bg-2)] px-3 py-2 font-mono text-[11px] leading-relaxed ring-1 ring-[var(--border)]">
+            {c.diff}
+          </pre>
+          <div className="mt-2 flex gap-2">
+            <Button size="sm" disabled={busy} onClick={() => onApply(c.change_id)} title="Apply this change">
+              <Check size={13} /> Apply
+            </Button>
+            <Button size="sm" variant="ghost" disabled={busy} onClick={() => onDiscard(c.change_id)} title="Discard this change">
+              <X size={13} /> Discard
+            </Button>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 const SUGGESTIONS = [
   {
     icon: Plus,
@@ -381,6 +524,13 @@ export default function CopilotChat() {
   const [mobileChatsOpen, setMobileChatsOpen] = useState(false)
   const [showJump, setShowJump] = useState(false)
   const [tipDismissed, setTipDismissed] = useState(() => localStorage.getItem(TIP_KEY) === '1')
+  // v2: interview progress rail + live spec preview + pending diff cards
+  const [interview, setInterview] = useState<InterviewProgress | null>(null)
+  const [pendingChanges, setPendingChanges] = useState<PendingChange[]>([])
+  const [showPreview, setShowPreview] = useState(true)
+  const [attachments, setAttachments] = useState<{ doc_id: string; name: string }[]>([])
+  const [uploading, setUploading] = useState(false)
+  const fileRef = useRef<HTMLInputElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const nearBottomRef = useRef(true)
@@ -456,10 +606,12 @@ export default function CopilotChat() {
       setMessages((m) => [...m, { role: 'user', content }])
     }
     setBusy(true)
+    const docIds = attachments.map((a) => a.doc_id)
+    setAttachments([])
     try {
       let res
       try {
-        res = await copilotChat(sid, content)
+        res = await copilotChat(sid, content, docIds)
       } catch (e: any) {
         // A stored session id can point at a chat we don't own (a legacy chat,
         // or one from another account on a shared browser); the backend 404s
@@ -469,7 +621,7 @@ export default function CopilotChat() {
           const fresh = newSessionId()
           localStorage.setItem(SID_KEY, fresh)
           setSid(fresh)
-          res = await copilotChat(fresh, content)
+          res = await copilotChat(fresh, content, docIds)
         } else {
           throw e
         }
@@ -482,6 +634,8 @@ export default function CopilotChat() {
         setSid(realSid)
       }
       setMessages((m) => [...m, { role: 'assistant', content: res.reply, actions: res.actions }])
+      setInterview(res.interview ?? null)
+      setPendingChanges(res.pending_changes ?? [])
       if (res.agents_changed) refresh(['agents'])
       loadHistory() // title/agent may have changed — keep the sidebar in sync
     } catch (e: any) {
@@ -512,8 +666,59 @@ export default function CopilotChat() {
     setSid(fresh)
     setMessages([])
     setInput('')
+    setInterview(null)
+    setPendingChanges([])
+    setAttachments([])
     setLoadingTranscript(false)
     inputRef.current?.focus()
+  }
+
+  const attachFile = async (file: File) => {
+    setUploading(true)
+    try {
+      const res = await copilotUpload(sid, file)
+      // The upload may have remapped a stale session id — adopt it.
+      if (res.session_id && res.session_id !== sid) {
+        localStorage.setItem(SID_KEY, res.session_id)
+        setSid(res.session_id)
+      }
+      setAttachments((a) => [...a, { doc_id: res.doc_id, name: file.name }])
+    } catch (e: any) {
+      setMessages((m) => [...m, {
+        role: 'assistant', isError: true, actions: [],
+        content: `Couldn't upload "${file.name}" (${e?.message || e}).`,
+      }])
+    } finally {
+      setUploading(false)
+      if (fileRef.current) fileRef.current.value = ''
+    }
+  }
+
+  const applyChange = async (changeId: string) => {
+    setBusy(true)
+    try {
+      const res = await applyPendingChange(sid, changeId)
+      setPendingChanges((p) => p.filter((c) => c.change_id !== changeId))
+      setMessages((m) => [...m, {
+        role: 'assistant', actions: [],
+        content: `Applied — revision ${res.revision}. It takes effect from the next call.`,
+      }])
+      refresh(['agents'])
+    } catch (e: any) {
+      setMessages((m) => [...m, {
+        role: 'assistant', isError: true, actions: [],
+        content: `Couldn't apply the change (${e?.message || e}).`,
+      }])
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const discardChange = async (changeId: string) => {
+    try {
+      await discardPendingChange(sid, changeId)
+    } catch { /* best-effort */ }
+    setPendingChanges((p) => p.filter((c) => c.change_id !== changeId))
   }
 
   const selectChat = (id: string) => {
@@ -547,7 +752,7 @@ export default function CopilotChat() {
   }
 
   return (
-    <div className="mx-auto flex h-[calc(100dvh-140px)] min-h-[420px] w-full max-w-5xl gap-5">
+    <div className="mx-auto flex h-[calc(100dvh-140px)] min-h-[420px] w-full max-w-6xl gap-5">
       <HistorySidebar
         sessions={sessions}
         activeSid={sid}
@@ -610,6 +815,11 @@ export default function CopilotChat() {
         </div>
       </div>
 
+      {/* interview progress rail (v2) */}
+      {interview && interview.phase !== 'idle' && messages.length > 0 && (
+        <InterviewRail progress={interview} />
+      )}
+
       {/* messages */}
       <div className="relative flex min-h-0 flex-1 flex-col">
         <div ref={scrollRef} onScroll={onMessagesScroll} className="flex flex-1 flex-col overflow-y-auto pr-1">
@@ -630,6 +840,14 @@ export default function CopilotChat() {
                   onRetry={m.isError && i === messages.length - 1 && !busy ? retryLast : undefined}
                 />
               ))}
+              {pendingChanges.length > 0 && !busy && (
+                <DiffCards
+                  changes={pendingChanges}
+                  busy={busy}
+                  onApply={applyChange}
+                  onDiscard={discardChange}
+                />
+              )}
               {busy && <TypingBubble />}
             </div>
           )}
@@ -653,7 +871,46 @@ export default function CopilotChat() {
             />
           </div>
         )}
+        {attachments.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {attachments.map((a) => (
+              <span
+                key={a.doc_id}
+                className="inline-flex items-center gap-1.5 rounded-md bg-indigo-400/10 px-2 py-1 text-[11px] font-semibold text-indigo-600 ring-1 ring-indigo-400/25 dark:text-indigo-300"
+              >
+                <FileText size={12} /> {a.name}
+                <button
+                  onClick={() => setAttachments((x) => x.filter((y) => y.doc_id !== a.doc_id))}
+                  title="Remove attachment"
+                  aria-label={`Remove ${a.name}`}
+                  className="rounded p-0.5 hover:bg-indigo-400/20"
+                >
+                  <X size={11} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
         <div className="card flex items-end gap-2 p-2.5 transition-shadow focus-within:shadow-glow-mint focus-within:ring-1 focus-within:ring-mint-400/40">
+          <input
+            ref={fileRef}
+            type="file"
+            className="hidden"
+            accept=".pdf,.txt,.md,.csv,.docx,.doc"
+            onChange={(e) => {
+              const f = e.target.files?.[0]
+              if (f) void attachFile(f)
+            }}
+          />
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={busy || uploading}
+            onClick={() => fileRef.current?.click()}
+            title="Attach a brochure / price sheet — the copilot reads it into the agent"
+          >
+            {uploading ? <Spinner /> : <Paperclip size={15} />}
+          </Button>
           <textarea
             ref={inputRef}
             rows={1}
@@ -675,6 +932,26 @@ export default function CopilotChat() {
         </p>
       </div>
       </div>
+
+      {/* live spec preview pane (v2) — xl screens, while an interview is live */}
+      {interview && interview.phase !== 'idle' &&
+        Object.keys(interview.draft || {}).length > 0 && (
+        <aside className="hidden w-64 shrink-0 flex-col gap-2 xl:flex">
+          <button
+            onClick={() => setShowPreview((v) => !v)}
+            className="flex items-center gap-2 rounded-xl bg-[var(--surface-2)] px-3 py-2 text-[12px] font-semibold ring-1 ring-[var(--border)] transition hover:ring-mint-400/40"
+            title={showPreview ? 'Hide the live preview' : 'Show the live preview'}
+          >
+            {showPreview ? <EyeOff size={13} /> : <Eye size={13} />}
+            {showPreview ? 'Hide preview' : 'Show preview'}
+          </button>
+          {showPreview && (
+            <div className="flex-1 overflow-y-auto pr-0.5">
+              <SpecPreview progress={interview} />
+            </div>
+          )}
+        </aside>
+      )}
     </div>
   )
 }

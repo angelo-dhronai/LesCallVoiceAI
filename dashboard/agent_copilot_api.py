@@ -3206,6 +3206,55 @@ async def copilot_chat(request: Request) -> dict:
     return out
 
 
+@router.post("/api/copilot/sessions/{session_id}/changes/{change_id}/apply")
+async def copilot_apply_change(session_id: str, change_id: str, request: Request) -> dict:
+    """Diff-card Apply button: the click IS the user's confirmation (§7.3)."""
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    session = _load_session(session_id)
+    pending = session.get("pending_changes") or {}
+    chg = pending.get(change_id)
+    if not chg:
+        raise HTTPException(status_code=404, detail="no such pending change")
+    slug = chg["slug"]
+    builder._assert_slug_access(slug, builder._ctx_owner())
+    try:
+        result = agent_store.write_agent(
+            slug, chg["candidate"], actor=_copilot_actor(),
+            base_rev=chg.get("base_rev"),
+            reason=chg.get("reason") or "diff-card apply",
+            owner=builder._ctx_owner(), is_admin=builder._ctx_is_admin(),
+            expected_paths=set(chg.get("expected_paths") or []) or None,
+            agents_dir=_AGENTS_DIR)
+    except agent_store.ConflictError:
+        raise HTTPException(status_code=409, detail=
+                            "This agent changed since the proposal — ask the "
+                            "copilot to re-propose the change.")
+    pending.pop(change_id, None)
+    session["transcript"].append({
+        "role": "assistant",
+        "content": f"Applied the proposed change — revision {result['revision']}, "
+                   "applies from the next call.",
+        "actions": [{"tool": "apply_update", "ok": True,
+                     "summary": f"Applied change to {_agent_display_name(slug)}",
+                     "agent": slug}]})
+    _save_session(session_id)
+    return {"status": "updated", "name": slug, "revision": result["revision"],
+            "effective": "next_call"}
+
+
+@router.post("/api/copilot/sessions/{session_id}/changes/{change_id}/discard")
+async def copilot_discard_change(session_id: str, change_id: str) -> dict:
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    session = _load_session(session_id)
+    pending = session.get("pending_changes") or {}
+    if pending.pop(change_id, None) is None:
+        raise HTTPException(status_code=404, detail="no such pending change")
+    _save_session(session_id)
+    return {"status": "discarded", "change_id": change_id}
+
+
 @router.post("/api/copilot/upload")
 async def copilot_upload(request: Request) -> dict:
     """Attach a document to a Copilot conversation (plan §6.4). Multipart:

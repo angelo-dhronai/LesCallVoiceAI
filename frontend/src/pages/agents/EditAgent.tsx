@@ -6,7 +6,9 @@ import {
   getRawYaml, putRawYaml, validateRaw, getRouting, putRouting,
   uploadDoc, deleteDoc, extractYaml, applyYaml, deleteBooking,
   activateAgent, archiveAgent, ttsPreviewUrl,
+  listRevisions, rollbackAgent, patchAgentOps,
   type Routing, type AgentDoc, type WizardData, type MissingField, type Booking,
+  type AgentRevision, type AgentOp,
 } from '../../api/agents'
 import { Card, Button, Badge, Spinner, cx, EmptyState } from '../../components/ui'
 import { PageHeader, Field, Input, Select, Textarea, AsyncState } from '../../components/kit'
@@ -19,10 +21,10 @@ import {
 import {
   Radio, Archive, ArrowLeft, Save, CheckCircle2, AlertTriangle, Volume2,
   Upload, Trash2, FileText, Sparkles, Code2, Network, Files, SlidersHorizontal,
-  CalendarDays,
+  CalendarDays, History, ListOrdered, ArrowUp, ArrowDown, Plus, RotateCcw,
 } from 'lucide-react'
 
-type Tab = 'settings' | 'yaml' | 'routing' | 'documents' | 'voice'
+type Tab = 'settings' | 'stages' | 'yaml' | 'routing' | 'documents' | 'voice' | 'history'
 const BCP47: Record<string, string> = { en: 'en-IN', hi: 'hi-IN', gu: 'gu-IN', mr: 'hi-IN' }
 
 export default function EditAgent() {
@@ -67,10 +69,12 @@ export default function EditAgent() {
 
   const tabs: { id: Tab; label: string; icon: any }[] = [
     { id: 'settings', label: 'Settings', icon: SlidersHorizontal },
+    { id: 'stages', label: 'Stages', icon: ListOrdered },
     { id: 'yaml', label: 'Advanced (YAML)', icon: Code2 },
     { id: 'routing', label: 'Routing', icon: Network },
     { id: 'documents', label: 'Documents · RAG', icon: Files },
     { id: 'voice', label: 'Voice', icon: Volume2 },
+    { id: 'history', label: 'History', icon: History },
   ]
 
   return (
@@ -103,10 +107,12 @@ export default function EditAgent() {
         </div>
 
         {tab === 'settings' && <SettingsTab name={name} onSaved={() => refresh(['agent', name], ['agents'])} onDirtyChange={setDirty} />}
+        {tab === 'stages' && <StagesTab name={name} onSaved={() => refresh(['agent', name], ['agents'])} />}
         {tab === 'yaml' && <YamlTab name={name} onSaved={() => refresh(['agent', name], ['agents'])} onDirtyChange={setDirty} />}
         {tab === 'routing' && <RoutingTab name={name} />}
         {tab === 'documents' && <DocumentsTab name={name} />}
         {tab === 'voice' && <VoiceTab agent={agent} />}
+        {tab === 'history' && <HistoryTab name={name} onChanged={() => refresh(['agent', name], ['agents'])} />}
       </AsyncState>
     </div>
   )
@@ -178,8 +184,11 @@ function SettingsTab({ name, onSaved, onDirtyChange }: { name: string; onSaved: 
     setSaving(true)
     try {
       const fresh = await getAgent(name) // merge onto the LATEST definition, not a stale copy
+      const rev: string | undefined = fresh?._rev
+      delete fresh._rev
       const merged = mergeWizardIntoDefinition(fresh, d, initRef.current)
-      await updateAgent(name, merged)
+      delete merged._rev
+      await updateAgent(name, merged, rev)
       initRef.current = JSON.parse(JSON.stringify(d))
       setD((p) => (p ? { ...p } : p)) // re-render so dirty recomputes against the new snapshot
       setShowErrors(false)
@@ -189,7 +198,12 @@ function SettingsTab({ name, onSaved, onDirtyChange }: { name: string; onSaved: 
       toast('Settings saved — effective on the next call', 'success')
       onSaved()
     } catch (e: any) {
-      toast(`Save failed: ${e.message || e}`, 'error')
+      if (String(e?.message || e).startsWith('409')) {
+        toast('This agent changed while you were editing (e.g. by the Copilot). '
+          + 'Your form is untouched — press Save again to merge onto the latest version.', 'error')
+      } else {
+        toast(`Save failed: ${e.message || e}`, 'error')
+      }
     } finally {
       setSaving(false)
     }
@@ -330,11 +344,22 @@ function YamlTab({ name, onSaved, onDirtyChange }: { name: string; onSaved: () =
       setResult(v)
       setValidatedText(text)
       if (!v.valid) { toast('Fix validation errors before saving', 'error'); return }
-      await putRawYaml(name, text)
+      // If-Match: the current on-disk rev, so a concurrent Copilot edit 409s
+      // instead of being silently clobbered.
+      let rev: string | undefined
+      try { rev = (await getAgent(name))?._rev } catch { /* legacy last-write-wins */ }
+      await putRawYaml(name, text, rev)
       loadedTextRef.current = text
       toast('Saved — effective on the next call', 'success')
       onSaved()
-    } catch (e: any) { toast(`Save failed: ${e.message || e}`, 'error') }
+    } catch (e: any) {
+      if (String(e?.message || e).startsWith('409')) {
+        toast('This agent changed since you loaded it (edited by the Copilot?). '
+          + 'Reload the YAML tab and reapply your edit.', 'error')
+      } else {
+        toast(`Save failed: ${e.message || e}`, 'error')
+      }
+    }
     finally { setSaving(false) }
   }
 
@@ -716,5 +741,209 @@ function VoiceTab({ agent }: { agent: any }) {
         </Card>
       ))}
     </div>
+  )
+}
+
+/* ───────────────────────── Stages tab (v2 surgical ops) ─────────────────────
+ * Visual stage list wired to PATCH /api/agents/{name}/ops — the SAME surgical
+ * machinery the Copilot uses, so both paths converge on the server store
+ * (revisioned, concurrency-safe, scope-proven). */
+type StageRow = {
+  id: string
+  goal: string
+  turns_until_advance?: number
+  role?: string
+  [k: string]: any
+}
+
+function StagesTab({ name, onSaved }: { name: string; onSaved: () => void }) {
+  const toast = useToast()
+  const [stages, setStages] = useState<StageRow[] | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [editing, setEditing] = useState<number | null>(null)
+  const [goalDraft, setGoalDraft] = useState('')
+
+  const load = () => {
+    getAgent(name)
+      .then((def) => setStages(def?.call_flow?.stages ?? []))
+      .catch((e) => toast(`Load failed: ${e.message || e}`, 'error'))
+  }
+  useEffect(load, [name]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const runOps = async (ops: AgentOp[], what: string) => {
+    setBusy(true)
+    try {
+      const res = await patchAgentOps(name, ops)
+      toast(`${what} — revision ${res.revision}, effective on the next call`, 'success')
+      onSaved()
+      load()
+    } catch (e: any) {
+      if (String(e?.message || e).startsWith('409')) {
+        toast('The agent changed underneath this view — reloading.', 'error')
+        load()
+      } else {
+        toast(`${what} failed: ${e.message || e}`, 'error')
+      }
+    } finally {
+      setBusy(false)
+      setEditing(null)
+    }
+  }
+
+  const move = (i: number, dir: -1 | 1) => {
+    const to = i + dir
+    if (!stages || to < 0 || to >= stages.length) return
+    void runOps(
+      [{ op: 'move', path: `call_flow.stages[${i}]`, to },
+       // renumber order ints server-side too (set both swapped orders)
+       { op: 'set', path: `call_flow.stages[${to}].order`, value: to },
+       { op: 'set', path: `call_flow.stages[${i}].order`, value: i }],
+      `Moved ${stages[i].id}`)
+  }
+
+  const remove = (i: number) => {
+    if (!stages || stages.length <= 1) return
+    if (!confirm(`Remove stage ${stages[i].id}?`)) return
+    const renumber: AgentOp[] = stages
+      .filter((_, j) => j !== i)
+      .map((_, j) => ({ op: 'set' as const, path: `call_flow.stages[${j}].order`, value: j }))
+    void runOps(
+      [{ op: 'remove_at', path: `call_flow.stages[${i}]` }, ...renumber],
+      `Removed ${stages[i].id}`)
+  }
+
+  const saveGoal = (i: number) => {
+    if (!stages) return
+    void runOps(
+      [{ op: 'set', path: `call_flow.stages[${i}].goal`, value: goalDraft }],
+      `Updated ${stages[i].id}`)
+  }
+
+  const addStage = () => {
+    if (!stages) return
+    const id = prompt('New stage id (e.g. HANDLE_REJECTION):')?.trim().toUpperCase().replace(/\s+/g, '_')
+    if (!id) return
+    if (stages.some((s) => s.id === id)) { toast(`Stage ${id} already exists`, 'error'); return }
+    void runOps(
+      [{ op: 'append', path: 'call_flow.stages',
+         value: { id, order: stages.length, goal: 'Describe what this stage must accomplish.', turns_until_advance: 8 } }],
+      `Added ${id}`)
+  }
+
+  return (
+    <Card className="space-y-3 p-5">
+      <div className="flex items-center gap-2">
+        <span className="eyebrow">Call stages — surgical edits, versioned</span>
+        <div className="ml-auto">
+          <Button variant="ghost" size="sm" disabled={busy || !stages} onClick={addStage}>
+            <Plus size={13} /> Add stage
+          </Button>
+        </div>
+      </div>
+      {!stages ? <Spinner /> : stages.length === 0 ? (
+        <EmptyState title="No stages" hint="Add the first stage of the call flow." />
+      ) : (
+        <div className="space-y-2">
+          {stages.map((s, i) => (
+            <div key={`${s.id}-${i}`} className="rounded-xl bg-[var(--surface-2)] p-3 ring-1 ring-[var(--border)]">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge tone="mint" soft>{i + 1}</Badge>
+                <span className="font-mono text-[12.5px] font-semibold">{s.id}</span>
+                {s.role && <Badge soft>{s.role}</Badge>}
+                {s.turns_until_advance != null && (
+                  <span className="text-[11px] text-dim">advance after {s.turns_until_advance} turns</span>
+                )}
+                <div className="ml-auto flex items-center gap-1">
+                  <Button variant="ghost" size="sm" disabled={busy || i === 0} onClick={() => move(i, -1)} title="Move up"><ArrowUp size={13} /></Button>
+                  <Button variant="ghost" size="sm" disabled={busy || i === stages.length - 1} onClick={() => move(i, 1)} title="Move down"><ArrowDown size={13} /></Button>
+                  <Button variant="ghost" size="sm" disabled={busy}
+                    onClick={() => { setEditing(editing === i ? null : i); setGoalDraft(s.goal || '') }}
+                    title="Edit the stage goal">
+                    <Code2 size={13} />
+                  </Button>
+                  <Button variant="ghost" size="sm" disabled={busy || stages.length <= 1} onClick={() => remove(i)} title="Remove stage"><Trash2 size={13} /></Button>
+                </div>
+              </div>
+              {editing === i ? (
+                <div className="mt-2 space-y-2">
+                  <Textarea rows={3} value={goalDraft} onChange={(e) => setGoalDraft(e.target.value)} className="text-[12.5px]" />
+                  <div className="flex gap-2">
+                    <Button size="sm" disabled={busy || !goalDraft.trim()} onClick={() => saveGoal(i)}><Save size={13} /> Save goal</Button>
+                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => setEditing(null)}>Cancel</Button>
+                  </div>
+                </div>
+              ) : (
+                <p className="mt-1.5 text-[12px] leading-relaxed text-soft">{s.goal}</p>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      <p className="text-[11px] text-dim">
+        Each edit lands as a single surgical operation — versioned in History and provably touching nothing else.
+      </p>
+    </Card>
+  )
+}
+
+/* ───────────────────────── History tab (v2 revisions) ───────────────────── */
+function HistoryTab({ name, onChanged }: { name: string; onChanged: () => void }) {
+  const toast = useToast()
+  const [revs, setRevs] = useState<AgentRevision[] | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const load = () => {
+    listRevisions(name)
+      .then((r) => setRevs(r.revisions ?? []))
+      .catch((e) => toast(`Load failed: ${e.message || e}`, 'error'))
+  }
+  useEffect(load, [name]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const onRollback = async (rev: AgentRevision) => {
+    if (!confirm(`Restore the agent to how it was BEFORE this change?\n\n${rev.reason || rev.actor || `revision ${rev.rev_id}`}`)) return
+    setBusy(true)
+    try {
+      const res = await rollbackAgent(name, rev.rev_id)
+      toast(`Rolled back — now revision ${res.revision}, effective on the next call`, 'success')
+      onChanged()
+      load()
+    } catch (e: any) {
+      toast(`Rollback failed: ${e.message || e}`, 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Card className="space-y-3 p-5">
+      <span className="eyebrow">Edit history — every change is reversible</span>
+      {!revs ? <Spinner /> : revs.length === 0 ? (
+        <EmptyState
+          title="No revisions yet"
+          hint="Every save (Copilot, Settings, YAML, Stages) snapshots the agent here first."
+        />
+      ) : (
+        <div className="space-y-2">
+          {revs.map((r) => (
+            <div key={r.rev_id} className="flex flex-wrap items-center gap-3 rounded-lg bg-[var(--surface-2)] px-3 py-2 ring-1 ring-[var(--border)]">
+              <Badge soft>#{r.rev_id}</Badge>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-[12.5px] font-semibold">{r.reason || 'edit'}</div>
+                <div className="text-[11px] text-dim">
+                  {r.actor || 'unknown'} · {String(r.created_at).slice(0, 16).replace('T', ' ')}
+                </div>
+              </div>
+              <Button variant="ghost" size="sm" disabled={busy} onClick={() => onRollback(r)}
+                title="Restore the agent to the state saved in this snapshot">
+                <RotateCcw size={13} /> Restore
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
+      <p className="text-[11px] text-dim">
+        Snapshots are taken BEFORE each write (last 50 kept). Restoring is itself snapshotted, so a rollback can be undone.
+      </p>
+    </Card>
   )
 }

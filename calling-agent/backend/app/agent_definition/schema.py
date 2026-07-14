@@ -1,8 +1,15 @@
 """
 AgentDefinition — the complete configuration contract for a voice agent.
 
-Phase 0: Python dataclasses only. Pramukh Group's values live in
-pramukh_agent.py. Phase 1 will add JSON/YAML serialization and a loader.
+AgentSpec v2: every behaviour that was once platform-hardcoded Pramukh
+doctrine has exactly one data home here. IRON RULES (see
+deploy/PLAN-copilot-agent-builder.md §3):
+
+1. Every new field/section is optional with a default that reproduces the
+   pre-v2 behaviour byte-for-byte (defaults ledger in the plan's §12).
+2. All parsing is tolerant `.get()` reads — an unknown YAML key can never
+   TypeError an agent load (that failure used to answer the call as the
+   fallback agent).
 
 Nothing in this module has any dependency on the voice pipeline or
 conversation engine — it is pure data.
@@ -14,6 +21,59 @@ import logging
 
 from dataclasses import dataclass, field
 from typing import Any
+
+from .voice_catalog import (  # single source of truth — re-exported here
+    DEFAULT_TTS_MODEL,
+    DEFAULT_TTS_SPEAKER,
+    PLATFORM_LANGUAGES,
+    VALID_TTS_MODELS,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tolerant field readers — the iron-rule helpers
+# ---------------------------------------------------------------------------
+
+def _as_str(d: dict, key: str, default: str = "") -> str:
+    v = d.get(key, default)
+    if v is None:
+        return default
+    return v if isinstance(v, str) else str(v)
+
+
+def _as_int(d: dict, key: str, default: int) -> int:
+    try:
+        return int(d.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(d: dict, key: str, default: float) -> float:
+    try:
+        return float(d.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_bool(d: dict, key: str, default: bool) -> bool:
+    v = d.get(key, default)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return default
+
+
+def _as_list(d: dict, key: str) -> list:
+    v = d.get(key)
+    return list(v) if isinstance(v, (list, tuple)) else []
+
+
+def _as_dict(d: dict, key: str) -> dict:
+    v = d.get(key)
+    return dict(v) if isinstance(v, dict) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +89,9 @@ class AgentIdentity:
     role_description: str     # e.g. "inbound property sales consultant"
     contact: str              # phone / WhatsApp shown to callers, e.g. "+91 87583 70000"
     pronouns: str = "she"     # legacy field — prefer personality.pronouns; kept for backward compat
+    # Full replacement for the hardcoded "warm, genuine, experienced
+    # {role_description}" identity framing. '' = today's exact f-string.
+    role_line: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -44,24 +107,42 @@ class PersonalityConfig:
     style: str = "natural"             # "concise" | "natural" | "detailed"
     lingo: str = ""                    # vocabulary/jargon preferences
     custom_instructions: str = ""      # extra vibe or persona notes
+    traits: list[str] = field(default_factory=list)   # e.g. ["patient", "witty"]
+    energy_mirroring: bool = True      # mirror the caller's energy (today's behaviour)
+    # deflect | admit | admit_if_pressed — 'deflect' = today's hardcoded
+    # "You are NOT reading a script" line, no disclosure behaviour change.
+    ai_disclosure: str = "deflect"
+    verbosity_max_sentences: int = 3   # "N sentences max per response" prompt rule
+
+
+# ---------------------------------------------------------------------------
+# Brand (NEW — AgentSpec v2)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BrandConfig:
+    """Structured brand identity. All-empty = the exact legacy BRAND lines
+    rendered from identity/knowledge_base via the effective_* resolvers."""
+    spoken_company_name: str = ""      # fallback identity.company_name
+    positioning_tagline: str = ""      # fallback identity.company_tagline
+    credibility_markers: list[str] = field(default_factory=list)
+    trust_proofs: list[str] = field(default_factory=list)   # top 2-3, objection ammo
+    regions_served: list[str] = field(default_factory=list)  # fallback kb.locations
+    contact_phone: str = ""            # fallback identity.contact
+    whatsapp_number: str = ""          # fallback contact_phone
 
 
 # ---------------------------------------------------------------------------
 # Language
 # ---------------------------------------------------------------------------
 
-# The only TTS models Sarvam accepts; anything else 400s every utterance and
-# the call goes silent. Platform default is bulbul:v3 unless explicitly set.
-VALID_TTS_MODELS = ("bulbul:v2", "bulbul:v3-beta", "bulbul:v3")
-DEFAULT_TTS_MODEL = "bulbul:v3"
-
-
 @dataclass
 class TTSVoiceConfig:
     """TTS model + speaker for one language."""
     model: str = DEFAULT_TTS_MODEL   # must be one of VALID_TTS_MODELS
-    speaker: str = "shubh"           # e.g. "shubh"
+    speaker: str = DEFAULT_TTS_SPEAKER
     pace: float = 1.0  # speaking rate; >1.0 = faster (snappier phone delivery)
+    gender: str = ""   # informational only (warn-only validation)
 
     def __post_init__(self) -> None:
         model = (self.model or "").strip()
@@ -77,13 +158,15 @@ class TTSVoiceConfig:
                     self.model, DEFAULT_TTS_MODEL)
             self.model = DEFAULT_TTS_MODEL
         if not (self.speaker or "").strip():
-            self.speaker = "shubh"
+            self.speaker = DEFAULT_TTS_SPEAKER
         try:
             self.pace = float(self.pace)
         except (TypeError, ValueError):
             self.pace = 1.0
         if not (0.5 <= self.pace <= 2.0):
             self.pace = 1.0
+        if not isinstance(self.gender, str):
+            self.gender = ""
 
 
 @dataclass
@@ -105,6 +188,10 @@ class LanguageConfig:
     # single pure language. Makes phone conversations sound human. Default
     # False preserves the strict single-language behaviour for other agents.
     allow_code_mixing: bool = False
+    # Language of the opening greeting ('' = languages.default — today).
+    greeting_language: str = ""
+    # Hint that the greeting should be bilingual (informational for now).
+    bilingual_greeting: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +212,12 @@ class CalendarConfig:
     mock_slots: list[AppointmentSlot]   # used when type == "mock"
     # Localised slot-list strings for injection into the system prompt.
     # Keyed by the same short lang codes used in LanguageConfig.supported.
-    # Phase 2 will auto-generate these from mock_slots.
     slots_text: dict[str, str]
+    # Canonical slot-day label -> caller phrases, consulted BEFORE the
+    # hardcoded Today/Tomorrow map. {} = today's exact behaviour.
+    day_synonyms: dict[str, list[str]] = field(default_factory=dict)
+    timezone: str = "Asia/Kolkata"
+    booking_confirmation_line: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +226,7 @@ class CalendarConfig:
 
 @dataclass
 class StageDefinition:
-    """One stage in the linear conversation flow."""
+    """One stage in the conversation flow."""
     id: str     # matches the STAGE_* constants in conversation.py
     order: int  # position in the linear sequence (0-indexed)
     # LLM stage goal — what the agent must accomplish before advancing.
@@ -144,6 +235,18 @@ class StageDefinition:
     # After this many turns in this stage, auto-advance to the next stage.
     # Override 99 to block automatic advancement (use booking events only).
     turns_until_advance: int = 8
+    # v2 — all defaults reproduce the legacy linear turn-count machine:
+    # greeting|confirm_person|discovery|pitch|recommend|scheduling|
+    # confirmation|closing|custom. '' = derived from the legacy id.
+    role: str = ""
+    label: str = ""                     # human display label
+    collect: list[str] = field(default_factory=list)   # slot names captured here
+    # {all_collect_filled: bool, slots: [...], min_turns: int, intent: str,
+    #  appointment_captured: bool} — {} = turn-count-only advancement.
+    advance_when: dict = field(default_factory=dict)
+    # [{when_intent: ..., when_slot: {name, equals}, goto: STAGE_ID,
+    #   max_takes: 1, actions: [...]}] — [] = no branching.
+    branches: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -160,6 +263,19 @@ class SlotDefinition:
     required: bool = True                       # counts toward missing-slot list
     label: str = ""                             # display label ("Configuration")
     question: dict[str, str] = field(default_factory=dict)  # lang -> question
+    # v2 — '' / empty defaults keep the legacy name-keyed extractors:
+    # ''|text|number|money|enum|boolean|phone|date|time|location
+    type: str = ""
+    enum_values: list[str] = field(default_factory=list)
+    enum_synonyms: dict[str, list[str]] = field(default_factory=dict)
+    extract_patterns: list[str] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)   # never ASKED before these fill
+    merge_policy: str = "free"                  # free|correction_gated|confirm
+    confirm_readback: str = ""                  # ''|verbatim|digit_groups_2
+    max_asks: int = 0                           # 0 = unlimited (legacy)
+    reask_question: dict[str, str] = field(default_factory=dict)
+    summary_known: str = ""                     # '{value}' template for the lead summary
+    summary_unknown: str = ""
 
 
 @dataclass
@@ -168,6 +284,15 @@ class CallFlowConfig:
     stages: list[StageDefinition]
     # Number of objections / deferrals before ending the call graciously.
     decline_threshold: int = 2
+    # v2 — one-sentence mission rendered as ━━ CALL MISSION ━━ ('' = no block)
+    call_goal: str = ""
+    # {required_slots: [...], require_appointment: bool, gate_closing: bool}
+    completed_when: dict = field(default_factory=dict)
+    # {offer_count: 2, style: exact_n|flexible, allow_caller_proposed: bool}
+    scheduling: dict = field(default_factory=dict)
+    # {enabled: false, capture_slot: callback_time, responses: {lang: str},
+    #  counts_as_decline: true}
+    callback_policy: dict = field(default_factory=dict)
 
     # Convenience accessors -------------------------------------------------
 
@@ -237,6 +362,24 @@ class ResponseBank:
     # Optional: template for presenting appointment slots ("Available: {slots}")
     slots_prompt: dict[str, str] = field(default_factory=dict)  # lang -> template
 
+    # v2 — D3: objection playbook feeds BOTH the deterministic shortcut and
+    # the prompt block. [{id, patterns: [...], answer: {lang: str},
+    # prompt_guidance: str}]. [] = today's 4 hardcoded prompt lines.
+    objection_playbook: list[dict] = field(default_factory=list)
+
+    # v2 — D9: real farewell-path closing line. {} = today's farewell chain.
+    closing_responses: dict[str, str] = field(default_factory=dict)
+
+    # v2 — deterministic canned phrases: [{patterns: [...], responses: {lang}}]
+    canned_phrases: list[dict] = field(default_factory=list)
+
+    # v2 — spoken when personality.ai_disclosure is admit/admit_if_pressed
+    ai_disclosure_responses: dict[str, str] = field(default_factory=dict)
+
+    # v2 — off = today's behaviour (Pramukh has localized greeting entries;
+    # a default-on shortcut would change its live hi/gu "hello" turns).
+    enable_greeting_shortcut: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Knowledge Base
@@ -255,6 +398,9 @@ class STTCorrections:
     phonetic_corrections: dict[str, str] = field(default_factory=dict)
     real_estate_corrections: dict[str, str] = field(default_factory=dict)
     project_name_corrections: dict[str, str] = field(default_factory=dict)
+    # v2 — false disables the unconditional built-in Pramukh tables in
+    # post_processor.py. true = today's behaviour for every existing agent.
+    use_builtin_tables: bool = True
 
 
 @dataclass
@@ -290,6 +436,19 @@ class KnowledgeBase:
 
     stt_corrections:
         Domain-specific STT post-processing substitution tables.
+
+    catalog (v2 — D16):
+        Structured product list: [{id, name, location, configurations,
+        price_range, availability, positioning_tag, pitch_points, aliases,
+        facts}]. [] = portfolio_prompt_text is rendered verbatim (today).
+
+    match_rules (v2):
+        [{when: {budget: '<=40L', location: Vapi}, recommend: [ids],
+          reason: '...'}] — deterministic recommendation candidates.
+
+    pricing_policy / fact_policy / product_lock (v2):
+        {} = today's exact behaviour (pricing on request; no fact lines;
+        set-once product lock).
     """
     known_projects: dict[str, tuple[str, str]]  # key -> (canonical_name, location)
     locations: list[str]                         # e.g. ["Surat", "Vapi", "Silvassa"]
@@ -302,6 +461,80 @@ class KnowledgeBase:
     time_patterns: list[str] = field(default_factory=list)
     qa_field_signals: dict[str, list[str]] = field(default_factory=dict)
     stt_corrections: STTCorrections = field(default_factory=STTCorrections)
+    catalog: list[dict] = field(default_factory=list)
+    match_rules: list[dict] = field(default_factory=list)
+    pricing_policy: dict = field(default_factory=dict)
+    fact_policy: dict = field(default_factory=dict)
+    product_lock: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Outbound scripts (NEW — AgentSpec v2, D6)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OutboundConfig:
+    """Owns ALL outbound-call scripting (steps 1-2 of an outbound flow plus
+    wrong-number/wrong-person/busy handling). All-empty = today's exact
+    direction-block prose."""
+    identity_confirm_line: dict[str, str] = field(default_factory=dict)
+    good_time_check_line: dict[str, str] = field(default_factory=dict)
+    pitch: dict[str, str] = field(default_factory=dict)
+    wrong_person_response: dict[str, str] = field(default_factory=dict)
+    busy_response: dict[str, str] = field(default_factory=dict)
+    wrong_number_close: dict[str, str] = field(default_factory=dict)
+    wrong_number_patterns: list[str] = field(default_factory=list)
+    opening_greeting: dict[str, str] = field(default_factory=dict)  # outbound variant
+    direction_brief: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Guardrails (NEW — AgentSpec v2, D4)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GuardrailsConfig:
+    """NEVER/ALWAYS rules + honesty/compliance/escalation policy.
+    Defaults = today's FIRM RULES band byte-for-byte."""
+    use_builtin_rules: bool = True
+    never_rules: list[str] = field(default_factory=list)   # '✗ NEVER <rule>'
+    always_rules: list[str] = field(default_factory=list)  # '✓ <rule>'
+    # {unknown_answer_policy: '', forbidden_fabrications: [prices, dates]}
+    honesty: dict = field(default_factory=dict)
+    # {disclaimers: [], consent_line: '', dnd_phrases: [], restricted_topics: []}
+    compliance: dict = field(default_factory=dict)
+    # {enabled: false, action: offer_callback, triggers: [], handoff_message: {}}
+    escalation: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Follow-up (NEW — AgentSpec v2, D7)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FollowUpConfig:
+    """Post-call promises the agent may make (WhatsApp media, callbacks)."""
+    # {enabled: false, assets: [], promise_line: {lang: str}}
+    whatsapp_promise: dict = field(default_factory=dict)
+    # {enabled: false, default_delay_hours: 24}
+    callback: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Post-call (NEW — AgentSpec v2, D15)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PostCallConfig:
+    """Success definition, outcome taxonomy, scoring, lead profile."""
+    # {mandatory_slots: [], success_outcome: '', gate_closing: false}
+    success_definition: dict = field(default_factory=dict)
+    # [{id, label, kind: success|progress|failure, description}]
+    outcomes: list[dict] = field(default_factory=list)
+    # {enabled: false, auto_run: false, criteria_prompt: '', score_labels: []}
+    scoring: dict = field(default_factory=dict)
+    # {summary_template: {}, include_slots: []}
+    lead_profile: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +555,9 @@ class LLMConfig:
     intent_classify_timeout_s: float
     max_response_length: int        # character cap before truncation
     # Additional domain-specific NEVER/ALWAYS rules appended to the
-    # platform's built-in rules in the system prompt.
+    # platform's built-in rules in the system prompt. (D4: from_dict aliases
+    # these into guardrails when guardrails carries no rules of its own —
+    # see the aliasing note in from_dict; activation is a P7 flagged change.)
     extra_never_rules: list[str] = field(default_factory=list)
     extra_always_rules: list[str] = field(default_factory=list)
 
@@ -339,9 +574,6 @@ class AgentDefinition:
     The platform runtime (ConversationRouter, VoicePipeline) reads this
     object at startup and operates entirely from it — no domain knowledge
     is embedded in the runtime code itself.
-
-    Phase 0: instantiated as a Python object (see pramukh_agent.py).
-    Phase 1: loaded from a YAML/JSON file via AgentDefinition.from_file().
     """
     agent_id: str       # unique slug, e.g. "pramukh-v1"
     version: str        # semver string, e.g. "1.0.0"
@@ -361,6 +593,39 @@ class AgentDefinition:
     # "outbound" — the agent places calls: confirm who answered, state the
     #              purpose, pitch products/services, and lead the conversation.
     call_direction: str = "inbound"
+    # v2 sections — all-default instances reproduce pre-v2 behaviour exactly.
+    brand: BrandConfig = field(default_factory=BrandConfig)
+    outbound: OutboundConfig = field(default_factory=OutboundConfig)
+    guardrails: GuardrailsConfig = field(default_factory=GuardrailsConfig)
+    follow_up: FollowUpConfig = field(default_factory=FollowUpConfig)
+    post_call: PostCallConfig = field(default_factory=PostCallConfig)
+    # Server-managed audit fields — stamped by agent_definition/store.py,
+    # stripped from LLM input by the Copilot normalizer, never read by the
+    # runtime.
+    revision: int = 0
+    updated_at: str = ""
+    updated_by: str = ""
+
+    # ------------------------------------------------------------------
+    # Brand resolvers — runtime reads ONLY these, guaranteeing old YAMLs
+    # (empty brand) behave identically to pre-v2.
+    # ------------------------------------------------------------------
+
+    def effective_spoken_name(self) -> str:
+        return self.brand.spoken_company_name or self.identity.company_name
+
+    def effective_tagline(self) -> str:
+        return self.brand.positioning_tagline or self.identity.company_tagline
+
+    def effective_regions(self) -> list[str]:
+        return self.brand.regions_served or list(self.knowledge_base.locations or [])
+
+    def effective_contact_phone(self) -> str:
+        return self.brand.contact_phone or self.identity.contact
+
+    def effective_whatsapp_number(self) -> str:
+        return (self.brand.whatsapp_number or self.brand.contact_phone
+                or self.identity.contact)
 
     # ------------------------------------------------------------------
     # Serialization
@@ -368,96 +633,292 @@ class AgentDefinition:
 
     @classmethod
     def from_dict(cls, d: dict) -> "AgentDefinition":
-        """Reconstruct an AgentDefinition from a plain nested dict (e.g. from YAML)."""
-        identity = AgentIdentity(**d["identity"])
+        """Reconstruct an AgentDefinition from a plain nested dict (e.g. from YAML).
 
-        lang_d = d["languages"]
-        tts_voices = {k: TTSVoiceConfig(**v) for k, v in lang_d["tts_voices"].items()}
+        Tolerant by contract: unknown keys are ignored, missing optional keys
+        get defaults, wrong-typed values are coerced or dropped — a YAML that
+        was ever valid keeps loading forever.
+        """
+        id_d = _as_dict(d, "identity") or dict(d.get("identity") or {})
+        identity = AgentIdentity(
+            agent_name=_as_str(id_d, "agent_name"),
+            company_name=_as_str(id_d, "company_name"),
+            company_tagline=_as_str(id_d, "company_tagline"),
+            role_description=_as_str(id_d, "role_description"),
+            contact=_as_str(id_d, "contact"),
+            pronouns=_as_str(id_d, "pronouns", "she") or "she",
+            role_line=_as_str(id_d, "role_line"),
+        )
+
+        lang_d = _as_dict(d, "languages")
+        raw_supported = [str(x).strip() for x in _as_list(lang_d, "supported") if str(x).strip()]
+        supported = []
+        for code in raw_supported:
+            if code in PLATFORM_LANGUAGES:
+                supported.append(code)
+            else:
+                logger.warning(
+                    "[schema] agent %r lists unsupported language %r — dropped",
+                    d.get("agent_id"), code)
+        if not supported:
+            supported = raw_supported or ["en"]
+        default_lang = _as_str(lang_d, "default") or supported[0]
+        if default_lang not in supported:
+            logger.warning(
+                "[schema] agent %r default language %r not in supported %s — "
+                "clamped to %r", d.get("agent_id"), default_lang, supported,
+                supported[0])
+            default_lang = supported[0]
+        tts_voices = {}
+        for k, v in _as_dict(lang_d, "tts_voices").items():
+            if not isinstance(v, dict):
+                v = {"speaker": str(v)} if isinstance(v, str) else {}
+            tts_voices[k] = TTSVoiceConfig(
+                model=_as_str(v, "model", DEFAULT_TTS_MODEL),
+                speaker=_as_str(v, "speaker", DEFAULT_TTS_SPEAKER),
+                pace=_as_float(v, "pace", 1.0),
+                gender=_as_str(v, "gender"),
+            )
         languages = LanguageConfig(
-            supported=lang_d["supported"],
-            default=lang_d["default"],
+            supported=supported,
+            default=default_lang,
             tts_voices=tts_voices,
-            register_notes=lang_d["register_notes"],
-            stt_forced_language=lang_d.get("stt_forced_language", ""),
-            allow_code_mixing=lang_d.get("allow_code_mixing", False),
+            register_notes=_as_dict(lang_d, "register_notes"),
+            stt_forced_language=_as_str(lang_d, "stt_forced_language"),
+            allow_code_mixing=_as_bool(lang_d, "allow_code_mixing", False),
+            greeting_language=_as_str(lang_d, "greeting_language"),
+            bilingual_greeting=_as_bool(lang_d, "bilingual_greeting", False),
         )
 
-        cal_d = d["calendar"]
-        mock_slots = [AppointmentSlot(**s) for s in cal_d["mock_slots"]]
+        cal_d = _as_dict(d, "calendar")
+        mock_slots = [
+            AppointmentSlot(day=_as_str(s, "day"), time=_as_str(s, "time"))
+            for s in _as_list(cal_d, "mock_slots") if isinstance(s, dict)
+        ]
+        day_synonyms = {
+            str(k): [str(x) for x in v] if isinstance(v, (list, tuple)) else [str(v)]
+            for k, v in _as_dict(cal_d, "day_synonyms").items()
+        }
         calendar = CalendarConfig(
-            type=cal_d["type"],
+            type=_as_str(cal_d, "type", "mock") or "mock",
             mock_slots=mock_slots,
-            slots_text=cal_d["slots_text"],
+            slots_text=_as_dict(cal_d, "slots_text"),
+            day_synonyms=day_synonyms,
+            timezone=_as_str(cal_d, "timezone", "Asia/Kolkata") or "Asia/Kolkata",
+            booking_confirmation_line=_as_dict(cal_d, "booking_confirmation_line"),
         )
 
-        cf_d = d["call_flow"]
-        stages = [StageDefinition(**s) for s in cf_d["stages"]]
+        cf_d = _as_dict(d, "call_flow")
+        stages = []
+        for s in _as_list(cf_d, "stages"):
+            if not isinstance(s, dict):
+                continue
+            stages.append(StageDefinition(
+                id=_as_str(s, "id"),
+                order=_as_int(s, "order", len(stages)),
+                goal=_as_str(s, "goal"),
+                turns_until_advance=_as_int(s, "turns_until_advance", 8),
+                role=_as_str(s, "role"),
+                label=_as_str(s, "label"),
+                collect=[str(x) for x in _as_list(s, "collect")],
+                advance_when=_as_dict(s, "advance_when"),
+                branches=[b for b in _as_list(s, "branches") if isinstance(b, dict)],
+            ))
         call_flow = CallFlowConfig(
             stages=stages,
-            decline_threshold=cf_d.get("decline_threshold", 2),
+            decline_threshold=_as_int(cf_d, "decline_threshold", 2),
+            call_goal=_as_str(cf_d, "call_goal"),
+            completed_when=_as_dict(cf_d, "completed_when"),
+            scheduling=_as_dict(cf_d, "scheduling"),
+            callback_policy=_as_dict(cf_d, "callback_policy"),
         )
 
-        kb_d = d["knowledge_base"]
+        kb_d = _as_dict(d, "knowledge_base")
         # YAML loads tuple values as lists — convert back to tuples.
-        known_projects = {k: tuple(v) for k, v in kb_d["known_projects"].items()}
-        stt_d = kb_d.get("stt_corrections", {})
+        known_projects = {}
+        for k, v in _as_dict(kb_d, "known_projects").items():
+            if isinstance(v, (list, tuple)):
+                known_projects[k] = tuple(v)
+        stt_d = _as_dict(kb_d, "stt_corrections")
         stt_corrections = STTCorrections(
-            city_corrections=stt_d.get("city_corrections", {}),
-            phonetic_corrections=stt_d.get("phonetic_corrections", {}),
-            real_estate_corrections=stt_d.get("real_estate_corrections", {}),
-            project_name_corrections=stt_d.get("project_name_corrections", {}),
+            city_corrections=_as_dict(stt_d, "city_corrections"),
+            phonetic_corrections=_as_dict(stt_d, "phonetic_corrections"),
+            real_estate_corrections=_as_dict(stt_d, "real_estate_corrections"),
+            project_name_corrections=_as_dict(stt_d, "project_name_corrections"),
+            use_builtin_tables=_as_bool(stt_d, "use_builtin_tables", True),
         )
         knowledge_base = KnowledgeBase(
             known_projects=known_projects,
-            locations=kb_d["locations"],
-            portfolio_prompt_text=kb_d["portfolio_prompt_text"],
-            portfolio_section_label=kb_d.get("portfolio_section_label", "KNOWLEDGE BASE"),
-            location_aliases=kb_d.get("location_aliases", []),
-            objection_patterns=kb_d.get("objection_patterns", []),
-            time_patterns=kb_d.get("time_patterns", []),
-            qa_field_signals=kb_d.get("qa_field_signals", {}),
+            locations=[str(x) for x in _as_list(kb_d, "locations")],
+            portfolio_prompt_text=_as_str(kb_d, "portfolio_prompt_text"),
+            portfolio_section_label=_as_str(kb_d, "portfolio_section_label",
+                                            "KNOWLEDGE BASE") or "KNOWLEDGE BASE",
+            location_aliases=[str(x) for x in _as_list(kb_d, "location_aliases")],
+            objection_patterns=[str(x) for x in _as_list(kb_d, "objection_patterns")],
+            time_patterns=[str(x) for x in _as_list(kb_d, "time_patterns")],
+            qa_field_signals=_as_dict(kb_d, "qa_field_signals"),
             stt_corrections=stt_corrections,
+            catalog=[c for c in _as_list(kb_d, "catalog") if isinstance(c, dict)],
+            match_rules=[m for m in _as_list(kb_d, "match_rules") if isinstance(m, dict)],
+            pricing_policy=_as_dict(kb_d, "pricing_policy"),
+            fact_policy=_as_dict(kb_d, "fact_policy"),
+            product_lock=_as_dict(kb_d, "product_lock"),
         )
 
-        response_bank = ResponseBank(**d["response_bank"])
+        rb_d = _as_dict(d, "response_bank")
+        response_bank = ResponseBank(
+            opening_greeting=_as_str(rb_d, "opening_greeting"),
+            filler_responses=_as_dict(rb_d, "filler_responses"),
+            identity_responses=_as_dict(rb_d, "identity_responses"),
+            objection_responses=_as_dict(rb_d, "objection_responses"),
+            decline_farewell=_as_dict(rb_d, "decline_farewell"),
+            lang_switch_responses=_as_dict(rb_d, "lang_switch_responses"),
+            lang_fallbacks=_as_dict(rb_d, "lang_fallbacks"),
+            timeout_fallbacks=_as_dict(rb_d, "timeout_fallbacks"),
+            response_fallback=_as_str(rb_d, "response_fallback"),
+            graceful_close=_as_dict(rb_d, "graceful_close"),
+            localized_responses=_as_dict(rb_d, "localized_responses"),
+            proactive_prompts=_as_dict(rb_d, "proactive_prompts"),
+            decline_responses=_as_dict(rb_d, "decline_responses"),
+            slots_prompt=_as_dict(rb_d, "slots_prompt"),
+            objection_playbook=[o for o in _as_list(rb_d, "objection_playbook")
+                                if isinstance(o, dict)],
+            closing_responses=_as_dict(rb_d, "closing_responses"),
+            canned_phrases=[c for c in _as_list(rb_d, "canned_phrases")
+                            if isinstance(c, dict)],
+            ai_disclosure_responses=_as_dict(rb_d, "ai_disclosure_responses"),
+            enable_greeting_shortcut=_as_bool(rb_d, "enable_greeting_shortcut", False),
+        )
 
-        llm_d = d.get("llm_config", {})
+        llm_d = _as_dict(d, "llm_config")
         llm_config = LLMConfig(
-            model=llm_d.get("model", "gpt-4o-mini"),
-            max_tokens=llm_d.get("max_tokens", 120),
-            timeout_s=llm_d.get("timeout_s", llm_d.get("timeout_seconds", 8.0)),
-            stream_timeout_s=llm_d.get("stream_timeout_s", 10.0),
-            filler_timeout_s=llm_d.get("filler_timeout_s", 1.5),
-            intent_classify_timeout_s=llm_d.get("intent_classify_timeout_s", 1.0),
-            max_response_length=llm_d.get("max_response_length", 150),
-            extra_never_rules=llm_d.get("extra_never_rules", []),
-            extra_always_rules=llm_d.get("extra_always_rules", []),
+            model=_as_str(llm_d, "model", "gpt-4o-mini") or "gpt-4o-mini",
+            max_tokens=_as_int(llm_d, "max_tokens", 120),
+            timeout_s=_as_float(llm_d, "timeout_s",
+                                _as_float(llm_d, "timeout_seconds", 8.0)),
+            stream_timeout_s=_as_float(llm_d, "stream_timeout_s", 10.0),
+            filler_timeout_s=_as_float(llm_d, "filler_timeout_s", 1.5),
+            intent_classify_timeout_s=_as_float(llm_d, "intent_classify_timeout_s", 1.0),
+            max_response_length=_as_int(llm_d, "max_response_length", 150),
+            extra_never_rules=[str(x) for x in _as_list(llm_d, "extra_never_rules")],
+            extra_always_rules=[str(x) for x in _as_list(llm_d, "extra_always_rules")],
         )
 
-        slots = [
-            SlotDefinition(
-                name=s["name"],
-                priority=s.get("priority", 100),
-                required=s.get("required", True),
-                label=s.get("label", ""),
-                question=s.get("question", {}) or {},
-            )
-            for s in (d.get("slots") or [])
-        ]
+        _MERGE_POLICIES = ("free", "correction_gated", "confirm")
+        _READBACKS = ("", "verbatim", "digit_groups_2")
+        _SLOT_TYPES = ("", "text", "number", "money", "enum", "boolean",
+                       "phone", "date", "time", "location")
+        slots = []
+        for s in (d.get("slots") or []):
+            if not isinstance(s, dict) or not s.get("name"):
+                continue
+            merge_policy = _as_str(s, "merge_policy", "free")
+            if merge_policy not in _MERGE_POLICIES:
+                merge_policy = "free"
+            readback = _as_str(s, "confirm_readback")
+            if readback not in _READBACKS:
+                readback = ""
+            slot_type = _as_str(s, "type")
+            if slot_type not in _SLOT_TYPES:
+                slot_type = ""
+            enum_synonyms = {
+                str(k): [str(x) for x in v] if isinstance(v, (list, tuple)) else [str(v)]
+                for k, v in _as_dict(s, "enum_synonyms").items()
+            }
+            slots.append(SlotDefinition(
+                name=str(s["name"]),
+                priority=_as_int(s, "priority", 100),
+                required=_as_bool(s, "required", True),
+                label=_as_str(s, "label"),
+                question=_as_dict(s, "question"),
+                type=slot_type,
+                enum_values=[str(x) for x in _as_list(s, "enum_values")],
+                enum_synonyms=enum_synonyms,
+                extract_patterns=[str(x) for x in _as_list(s, "extract_patterns")],
+                depends_on=[str(x) for x in _as_list(s, "depends_on")],
+                merge_policy=merge_policy,
+                confirm_readback=readback,
+                max_asks=_as_int(s, "max_asks", 0),
+                reask_question=_as_dict(s, "reask_question"),
+                summary_known=_as_str(s, "summary_known"),
+                summary_unknown=_as_str(s, "summary_unknown"),
+            ))
 
-        pers_d = d.get("personality", {})
+        pers_d = _as_dict(d, "personality")
+        _ai_disc = _as_str(pers_d, "ai_disclosure", "deflect") or "deflect"
+        if _ai_disc not in ("deflect", "admit", "admit_if_pressed"):
+            _ai_disc = "deflect"
         personality = PersonalityConfig(
-            pronouns=pers_d.get("pronouns", d.get("identity", {}).get("pronouns", "she")),
-            energy=pers_d.get("energy", "medium"),
-            tone=pers_d.get("tone", "conversational"),
-            style=pers_d.get("style", "natural"),
-            lingo=pers_d.get("lingo", ""),
-            custom_instructions=pers_d.get("custom_instructions", ""),
+            pronouns=_as_str(pers_d, "pronouns",
+                             _as_str(id_d, "pronouns", "she") or "she") or "she",
+            energy=_as_str(pers_d, "energy", "medium") or "medium",
+            tone=_as_str(pers_d, "tone", "conversational") or "conversational",
+            style=_as_str(pers_d, "style", "natural") or "natural",
+            lingo=_as_str(pers_d, "lingo"),
+            custom_instructions=_as_str(pers_d, "custom_instructions"),
+            traits=[str(x) for x in _as_list(pers_d, "traits")],
+            energy_mirroring=_as_bool(pers_d, "energy_mirroring", True),
+            ai_disclosure=_ai_disc,
+            verbosity_max_sentences=_as_int(pers_d, "verbosity_max_sentences", 3),
+        )
+
+        brand_d = _as_dict(d, "brand")
+        brand = BrandConfig(
+            spoken_company_name=_as_str(brand_d, "spoken_company_name"),
+            positioning_tagline=_as_str(brand_d, "positioning_tagline"),
+            credibility_markers=[str(x) for x in _as_list(brand_d, "credibility_markers")],
+            trust_proofs=[str(x) for x in _as_list(brand_d, "trust_proofs")],
+            regions_served=[str(x) for x in _as_list(brand_d, "regions_served")],
+            contact_phone=_as_str(brand_d, "contact_phone"),
+            whatsapp_number=_as_str(brand_d, "whatsapp_number"),
+        )
+
+        ob_d = _as_dict(d, "outbound")
+        outbound = OutboundConfig(
+            identity_confirm_line=_as_dict(ob_d, "identity_confirm_line"),
+            good_time_check_line=_as_dict(ob_d, "good_time_check_line"),
+            pitch=_as_dict(ob_d, "pitch"),
+            wrong_person_response=_as_dict(ob_d, "wrong_person_response"),
+            busy_response=_as_dict(ob_d, "busy_response"),
+            wrong_number_close=_as_dict(ob_d, "wrong_number_close"),
+            wrong_number_patterns=[str(x) for x in _as_list(ob_d, "wrong_number_patterns")],
+            opening_greeting=_as_dict(ob_d, "opening_greeting"),
+            direction_brief=_as_str(ob_d, "direction_brief"),
+        )
+
+        gr_d = _as_dict(d, "guardrails")
+        guardrails = GuardrailsConfig(
+            use_builtin_rules=_as_bool(gr_d, "use_builtin_rules", True),
+            never_rules=[str(x) for x in _as_list(gr_d, "never_rules")],
+            always_rules=[str(x) for x in _as_list(gr_d, "always_rules")],
+            honesty=_as_dict(gr_d, "honesty"),
+            compliance=_as_dict(gr_d, "compliance"),
+            escalation=_as_dict(gr_d, "escalation"),
+        )
+        # D4 aliasing — llm_config.extra_*_rules into guardrails when
+        # guardrails carries no rules of its own — ships in P7 behind a
+        # per-agent audit (agents like angelobot carry extra rules that have
+        # NEVER run live; auto-activating them here would change live calls).
+        # Until then guardrails.never/always_rules render only when written
+        # explicitly.
+
+        fu_d = _as_dict(d, "follow_up")
+        follow_up = FollowUpConfig(
+            whatsapp_promise=_as_dict(fu_d, "whatsapp_promise"),
+            callback=_as_dict(fu_d, "callback"),
+        )
+
+        pc_d = _as_dict(d, "post_call")
+        post_call = PostCallConfig(
+            success_definition=_as_dict(pc_d, "success_definition"),
+            outcomes=[o for o in _as_list(pc_d, "outcomes") if isinstance(o, dict)],
+            scoring=_as_dict(pc_d, "scoring"),
+            lead_profile=_as_dict(pc_d, "lead_profile"),
         )
 
         return cls(
-            agent_id=d["agent_id"],
-            version=d["version"],
+            agent_id=_as_str(d, "agent_id"),
+            version=_as_str(d, "version", "1.0.0") or "1.0.0",
             identity=identity,
             languages=languages,
             call_flow=call_flow,
@@ -467,7 +928,15 @@ class AgentDefinition:
             llm_config=llm_config,
             personality=personality,
             slots=slots,
-            call_direction=(d.get("call_direction") or "inbound").strip().lower(),
+            call_direction=(_as_str(d, "call_direction", "inbound") or "inbound").strip().lower(),
+            brand=brand,
+            outbound=outbound,
+            guardrails=guardrails,
+            follow_up=follow_up,
+            post_call=post_call,
+            revision=_as_int(d, "revision", 0),
+            updated_at=_as_str(d, "updated_at"),
+            updated_by=_as_str(d, "updated_by"),
         )
 
     @classmethod
@@ -480,7 +949,7 @@ class AgentDefinition:
         return cls.from_dict(data)
 
     def to_yaml(self, path: "str | Path") -> None:
-        """Persist this AgentDefinition to a YAML file."""
+        """Persist this AgentDefinition to a YAML file (atomically)."""
         import dataclasses
         import yaml
         from pathlib import Path as _Path

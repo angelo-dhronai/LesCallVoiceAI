@@ -53,6 +53,8 @@ from backend.app.agent_definition.schema import (                   # noqa: E402
     AgentDefinition, AgentIdentity, PersonalityConfig, LanguageConfig,
     TTSVoiceConfig, CallFlowConfig, StageDefinition, SlotDefinition,
     KnowledgeBase, ResponseBank, CalendarConfig, LLMConfig,
+    BrandConfig, OutboundConfig, GuardrailsConfig, FollowUpConfig,
+    PostCallConfig,
 )
 from backend.app.agent_definition.registry import agent_registry    # noqa: E402
 import agent_builder_api as builder                                 # noqa: E402
@@ -388,6 +390,13 @@ def _default_definition(name: str, provided: dict) -> dict:
             "extra_never_rules": [],
             "extra_always_rules": ["Always keep replies to 1-2 short spoken sentences."],
         },
+        # AgentSpec v2 sections — all-empty defaults (plan §12 ledger):
+        # empty = exactly today's engine behaviour.
+        "brand": {},
+        "outbound": {},
+        "guardrails": {"use_builtin_rules": True},
+        "follow_up": {},
+        "post_call": {},
     }
 
 
@@ -422,8 +431,19 @@ _SECTION_DATACLASSES: dict[str, type] = {
     "response_bank": ResponseBank,
     "calendar": CalendarConfig,
     "llm_config": LLMConfig,
+    # AgentSpec v2 sections
+    "brand": BrandConfig,
+    "outbound": OutboundConfig,
+    "guardrails": GuardrailsConfig,
+    "follow_up": FollowUpConfig,
+    "post_call": PostCallConfig,
 }
-_TOP_LEVEL_KEYS = {"agent_id", "version", "call_direction", "slots", *_SECTION_DATACLASSES}
+# revision/updated_at/updated_by are server-managed audit fields: they must
+# survive the whole-document normalize on update (the current definition
+# carries them), but LLM-provided input is stripped of them in create/update.
+_SERVER_MANAGED_KEYS = {"revision", "updated_at", "updated_by"}
+_TOP_LEVEL_KEYS = {"agent_id", "version", "call_direction", "slots",
+                   *_SERVER_MANAGED_KEYS, *_SECTION_DATACLASSES}
 
 # ResponseBank fields that must be per-language dicts. The LLM often sends a
 # bare string — wrap it under the default language instead of crashing.
@@ -816,23 +836,348 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
                 rb.pop(key)
 
     # ── identity / personality: every field is a plain string ───────────────
+    # (except the v2 typed personality fields, validated separately below)
+    _PERS_TYPED = {"traits", "energy_mirroring", "verbosity_max_sentences"}
     for section in ("identity", "personality"):
         val = d.get(section)
         if isinstance(val, dict):
             for k, v in list(val.items()):
+                if section == "personality" and k in _PERS_TYPED:
+                    continue
                 if isinstance(v, (dict, list)):
                     val.pop(k)
                     notes.append(f"{section}.{k} had an unusable shape — ignored")
                 elif not isinstance(v, str):
                     val[k] = str(v)
+    pers = d.get("personality")
+    if isinstance(pers, dict):
+        if "ai_disclosure" in pers and str(pers.get("ai_disclosure")).strip().lower() \
+                not in ("deflect", "admit", "admit_if_pressed"):
+            notes.append(f"personality.ai_disclosure {pers['ai_disclosure']!r} invalid — reset to 'deflect'")
+            pers["ai_disclosure"] = "deflect"
+        elif isinstance(pers.get("ai_disclosure"), str):
+            pers["ai_disclosure"] = pers["ai_disclosure"].strip().lower()
+        if "traits" in pers:
+            t = pers["traits"]
+            pers["traits"] = ([str(x) for x in t] if isinstance(t, list)
+                              else [str(t)] if isinstance(t, str) and t.strip() else [])
+        if "energy_mirroring" in pers and not isinstance(pers["energy_mirroring"], bool):
+            v = str(pers["energy_mirroring"]).strip().lower()
+            pers["energy_mirroring"] = v in ("1", "true", "yes", "on")
+        if "verbosity_max_sentences" in pers:
+            try:
+                pers["verbosity_max_sentences"] = max(1, min(8, int(pers["verbosity_max_sentences"])))
+            except (TypeError, ValueError):
+                pers.pop("verbosity_max_sentences")
 
-    # ── slots rows ───────────────────────────────────────────────────────────
+    # ── slots rows — shape filter + v2 value validation ─────────────────────
     if isinstance(d.get("slots"), list):
         slot_fields = _fields_of(SlotDefinition)
-        d["slots"] = [
-            {k: v for k, v in s.items() if k in slot_fields}
-            for s in d["slots"] if isinstance(s, dict) and s.get("name")
-        ]
+        fixed_slots = []
+        for s in d["slots"]:
+            if not (isinstance(s, dict) and s.get("name")):
+                continue
+            s = {k: v for k, v in s.items() if k in slot_fields}
+            s["name"] = str(s["name"]).strip().lower().replace(" ", "_")
+            # enum-ish fields: coerce invalid values to their defaults —
+            # a hallucinated value must never abort a save that would
+            # otherwise succeed.
+            if "type" in s and str(s.get("type")).strip().lower() not in (
+                    "", "text", "number", "money", "enum", "boolean",
+                    "phone", "date", "time", "location"):
+                notes.append(f"slot '{s['name']}' type {s['type']!r} invalid — cleared")
+                s["type"] = ""
+            elif isinstance(s.get("type"), str):
+                s["type"] = s["type"].strip().lower()
+            if "merge_policy" in s and str(s.get("merge_policy")).strip().lower() not in (
+                    "free", "correction_gated", "confirm"):
+                notes.append(f"slot '{s['name']}' merge_policy {s['merge_policy']!r} invalid — reset to 'free'")
+                s["merge_policy"] = "free"
+            elif isinstance(s.get("merge_policy"), str):
+                s["merge_policy"] = s["merge_policy"].strip().lower()
+            if "confirm_readback" in s and str(s.get("confirm_readback")).strip().lower() not in (
+                    "", "verbatim", "digit_groups_2"):
+                notes.append(f"slot '{s['name']}' confirm_readback {s['confirm_readback']!r} invalid — cleared")
+                s["confirm_readback"] = ""
+            elif isinstance(s.get("confirm_readback"), str):
+                s["confirm_readback"] = s["confirm_readback"].strip().lower()
+            for int_key, default in (("priority", 100), ("max_asks", 0)):
+                if int_key in s:
+                    try:
+                        s[int_key] = int(s[int_key])
+                    except (TypeError, ValueError):
+                        s[int_key] = default
+            # extract_patterns: cap count and per-pattern length; drop
+            # patterns that don't compile (they'd be rejected at load).
+            if "extract_patterns" in s:
+                pats = s["extract_patterns"] if isinstance(s["extract_patterns"], list) else []
+                good = []
+                for p in pats[:8]:
+                    p = str(p)[:200]
+                    try:
+                        re.compile(p)
+                        good.append(p)
+                    except re.error:
+                        notes.append(f"slot '{s['name']}' extract pattern {p!r} does not compile — dropped")
+                s["extract_patterns"] = good
+            if "depends_on" in s and not isinstance(s["depends_on"], list):
+                s["depends_on"] = [str(s["depends_on"])] if isinstance(s["depends_on"], str) else []
+            fixed_slots.append(s)
+        # depends_on: names must exist in the slot set; cycles are dropped.
+        names = {s["name"] for s in fixed_slots}
+        for s in fixed_slots:
+            deps = [str(x).strip().lower().replace(" ", "_") for x in (s.get("depends_on") or [])]
+            valid = [x for x in deps if x in names and x != s["name"]]
+            if len(valid) != len(deps):
+                notes.append(f"slot '{s['name']}' depends_on entries not in the slot set were dropped")
+            if valid:
+                s["depends_on"] = valid
+            elif "depends_on" in s:
+                s["depends_on"] = []
+        # cycle detection (DFS); on a cycle, clear depends_on for its members
+        graph = {s["name"]: set(s.get("depends_on") or []) for s in fixed_slots}
+        def _cyclic(node, stack):
+            if node in stack:
+                return True
+            stack = stack | {node}
+            return any(_cyclic(n, stack) for n in graph.get(node, ()))
+        cyclic_nodes = {n for n in graph if _cyclic(n, frozenset())}
+        if cyclic_nodes:
+            notes.append(f"slot dependency cycle among {sorted(cyclic_nodes)} — dependencies cleared")
+            for s in fixed_slots:
+                if s["name"] in cyclic_nodes:
+                    s["depends_on"] = []
+        d["slots"] = fixed_slots
+
+    # ── v2 sections: shape coercions ─────────────────────────────────────────
+    default_lang_v2 = _default_lang_of(d)
+
+    def _lang_dict(val):
+        """str → {default_lang: str}; dict of str kept; anything else None."""
+        if isinstance(val, str):
+            return {default_lang_v2: val} if val.strip() else None
+        if isinstance(val, dict):
+            return {str(k): str(v) for k, v in val.items() if isinstance(v, (str, int, float))}
+        return None
+
+    br = d.get("brand")
+    if isinstance(br, str):
+        d["brand"] = br = {"spoken_company_name": br}
+    if isinstance(br, dict):
+        for k in ("credibility_markers", "trust_proofs", "regions_served"):
+            if k in br:
+                v = br[k]
+                br[k] = ([str(x) for x in v] if isinstance(v, list)
+                         else [str(v)] if isinstance(v, str) and v.strip() else [])
+        for k in ("spoken_company_name", "positioning_tagline", "contact_phone", "whatsapp_number"):
+            if k in br and not isinstance(br[k], str):
+                br[k] = str(br[k])
+    elif br is not None:
+        d.pop("brand", None)
+        notes.append("brand had an unusable shape — ignored")
+
+    ob = d.get("outbound")
+    if isinstance(ob, dict):
+        for k in ("identity_confirm_line", "good_time_check_line", "pitch",
+                  "wrong_person_response", "busy_response", "wrong_number_close",
+                  "opening_greeting"):
+            if k in ob:
+                fixed = _lang_dict(ob[k])
+                if fixed is None:
+                    ob.pop(k)
+                    notes.append(f"outbound.{k} had an unusable shape — ignored")
+                else:
+                    ob[k] = fixed
+        if "wrong_number_patterns" in ob:
+            v = ob["wrong_number_patterns"]
+            ob["wrong_number_patterns"] = ([str(x) for x in v] if isinstance(v, list)
+                                           else [str(v)] if isinstance(v, str) else [])
+        if "direction_brief" in ob and not isinstance(ob["direction_brief"], str):
+            ob["direction_brief"] = str(ob["direction_brief"])
+    elif ob is not None:
+        d.pop("outbound", None)
+        notes.append("outbound had an unusable shape — ignored")
+
+    gr = d.get("guardrails")
+    if isinstance(gr, dict):
+        for k in ("never_rules", "always_rules"):
+            if k in gr:
+                v = gr[k]
+                gr[k] = ([str(x) for x in v] if isinstance(v, list)
+                         else [str(v)] if isinstance(v, str) and v.strip() else [])
+        if "use_builtin_rules" in gr and not isinstance(gr["use_builtin_rules"], bool):
+            gr["use_builtin_rules"] = str(gr["use_builtin_rules"]).strip().lower() in ("1", "true", "yes", "on")
+        for k in ("honesty", "compliance", "escalation"):
+            if k in gr and not isinstance(gr[k], dict):
+                gr.pop(k)
+                notes.append(f"guardrails.{k} had an unusable shape — ignored")
+        comp = gr.get("compliance")
+        if isinstance(comp, dict):
+            for k in ("disclaimers", "dnd_phrases", "restricted_topics"):
+                if k in comp and not isinstance(comp[k], list):
+                    comp[k] = [str(comp[k])] if isinstance(comp[k], str) and comp[k].strip() else []
+        esc = gr.get("escalation")
+        if isinstance(esc, dict):
+            hm = esc.get("handoff_message")
+            if hm is not None:
+                fixed = _lang_dict(hm)
+                if fixed is None:
+                    esc.pop("handoff_message")
+                else:
+                    esc["handoff_message"] = fixed
+    elif gr is not None:
+        d.pop("guardrails", None)
+        notes.append("guardrails had an unusable shape — ignored")
+
+    fu = d.get("follow_up")
+    if isinstance(fu, dict):
+        wp = fu.get("whatsapp_promise")
+        if wp is not None and not isinstance(wp, dict):
+            fu.pop("whatsapp_promise")
+            notes.append("follow_up.whatsapp_promise had an unusable shape — ignored")
+        elif isinstance(wp, dict):
+            pl = wp.get("promise_line")
+            if pl is not None:
+                fixed = _lang_dict(pl)
+                if fixed is None:
+                    wp.pop("promise_line")
+                else:
+                    wp["promise_line"] = fixed
+            if "assets" in wp and not isinstance(wp["assets"], list):
+                wp["assets"] = [str(wp["assets"])] if isinstance(wp["assets"], str) else []
+        cb = fu.get("callback")
+        if cb is not None and not isinstance(cb, dict):
+            fu.pop("callback")
+    elif fu is not None:
+        d.pop("follow_up", None)
+        notes.append("follow_up had an unusable shape — ignored")
+
+    pc = d.get("post_call")
+    if isinstance(pc, dict):
+        for k in ("success_definition", "scoring", "lead_profile"):
+            if k in pc and not isinstance(pc[k], dict):
+                pc.pop(k)
+                notes.append(f"post_call.{k} had an unusable shape — ignored")
+        if "outcomes" in pc:
+            oc = pc["outcomes"]
+            pc["outcomes"] = [o for o in oc if isinstance(o, dict)] if isinstance(oc, list) else []
+    elif pc is not None:
+        d.pop("post_call", None)
+        notes.append("post_call had an unusable shape — ignored")
+
+    # ── stage v2 fields: role/advance_when/branches validation ──────────────
+    cf2 = d.get("call_flow")
+    if isinstance(cf2, dict) and isinstance(cf2.get("stages"), list):
+        stage_ids = {str(s.get("id") or "") for s in cf2["stages"] if isinstance(s, dict)}
+        _ROLES = ("", "greeting", "confirm_person", "discovery", "pitch",
+                  "recommend", "scheduling", "confirmation", "closing", "custom")
+        for s in cf2["stages"]:
+            if not isinstance(s, dict):
+                continue
+            if "role" in s:
+                role = str(s.get("role") or "").strip().lower()
+                if role not in _ROLES:
+                    notes.append(f"stage {s.get('id')} role {s['role']!r} invalid — cleared")
+                    role = ""
+                s["role"] = role
+            if "collect" in s and not isinstance(s["collect"], list):
+                s["collect"] = [str(s["collect"])] if isinstance(s["collect"], str) else []
+            if "advance_when" in s and not isinstance(s["advance_when"], dict):
+                s.pop("advance_when")
+                notes.append(f"stage {s.get('id')} advance_when had an unusable shape — ignored")
+            if "branches" in s:
+                brs = s["branches"] if isinstance(s["branches"], list) else []
+                good_brs = []
+                for b in brs:
+                    if not isinstance(b, dict):
+                        continue
+                    goto = str(b.get("goto") or "").upper().replace(" ", "_")
+                    if goto and goto not in stage_ids:
+                        notes.append(f"branch goto {b.get('goto')!r} names a stage that "
+                                     "does not exist — branch dropped")
+                        continue
+                    b["goto"] = goto
+                    if "max_takes" in b:
+                        try:
+                            b["max_takes"] = max(1, int(b["max_takes"]))
+                        except (TypeError, ValueError):
+                            b["max_takes"] = 1
+                    if "actions" in b:
+                        acts = b["actions"] if isinstance(b["actions"], list) else [b["actions"]]
+                        b["actions"] = [str(a) for a in acts if str(a) in (
+                            "capture_phone", "promise_whatsapp_media",
+                            "book_visit", "schedule_callback")]
+                    good_brs.append(b)
+                s["branches"] = good_brs
+
+    # ── knowledge_base v2 fields ─────────────────────────────────────────────
+    kb2 = d.get("knowledge_base")
+    if isinstance(kb2, dict):
+        if "catalog" in kb2:
+            cat = kb2["catalog"]
+            kb2["catalog"] = ([c for c in cat if isinstance(c, dict) and c.get("name")]
+                              if isinstance(cat, list) else [])
+        if "match_rules" in kb2:
+            mr = kb2["match_rules"]
+            kb2["match_rules"] = ([m for m in mr if isinstance(m, dict)]
+                                  if isinstance(mr, list) else [])
+        for k in ("pricing_policy", "fact_policy", "product_lock"):
+            if k in kb2 and not isinstance(kb2[k], dict):
+                kb2.pop(k)
+                notes.append(f"knowledge_base.{k} had an unusable shape — ignored")
+
+    # ── response_bank v2 fields ──────────────────────────────────────────────
+    rb2 = d.get("response_bank")
+    if isinstance(rb2, dict):
+        if "objection_playbook" in rb2:
+            pb = rb2["objection_playbook"]
+            good_pb = []
+            for o in (pb if isinstance(pb, list) else []):
+                if not isinstance(o, dict):
+                    continue
+                if "patterns" in o and not isinstance(o["patterns"], list):
+                    o["patterns"] = [str(o["patterns"])] if isinstance(o["patterns"], str) else []
+                ans = o.get("answer")
+                if ans is not None:
+                    fixed = _lang_dict(ans)
+                    if fixed is None:
+                        o.pop("answer")
+                    else:
+                        o["answer"] = fixed
+                good_pb.append(o)
+            rb2["objection_playbook"] = good_pb
+        if "closing_responses" in rb2:
+            fixed = _lang_dict(rb2["closing_responses"])
+            if fixed is None:
+                rb2.pop("closing_responses")
+            else:
+                rb2["closing_responses"] = fixed
+        if "ai_disclosure_responses" in rb2:
+            fixed = _lang_dict(rb2["ai_disclosure_responses"])
+            if fixed is None:
+                rb2.pop("ai_disclosure_responses")
+            else:
+                rb2["ai_disclosure_responses"] = fixed
+        if "canned_phrases" in rb2:
+            cp = rb2["canned_phrases"]
+            good_cp = []
+            for c in (cp if isinstance(cp, list) else []):
+                if not isinstance(c, dict):
+                    continue
+                if "patterns" in c and not isinstance(c["patterns"], list):
+                    c["patterns"] = [str(c["patterns"])] if isinstance(c["patterns"], str) else []
+                resp = c.get("responses")
+                if resp is not None:
+                    fixed = _lang_dict(resp)
+                    if fixed is None:
+                        c.pop("responses")
+                    else:
+                        c["responses"] = fixed
+                good_cp.append(c)
+            rb2["canned_phrases"] = good_cp
+        if "enable_greeting_shortcut" in rb2 and not isinstance(rb2["enable_greeting_shortcut"], bool):
+            rb2["enable_greeting_shortcut"] = str(rb2["enable_greeting_shortcut"]).strip().lower() in (
+                "1", "true", "yes", "on")
 
     # ── drop invented keys (with notes so the LLM relocates the content) ────
     for section, cls in _SECTION_DATACLASSES.items():
@@ -1012,6 +1357,11 @@ _SECTION_LABELS = {
     "llm_config": "rules",
     "call_direction": "call type",
     "slots": "questions asked",
+    "brand": "brand & trust",
+    "outbound": "outbound scripts",
+    "guardrails": "rules & compliance",
+    "follow_up": "follow-ups",
+    "post_call": "call outcomes",
 }
 
 
@@ -1420,6 +1770,8 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         notes: list[str] = []
         definition = _coerce_obj(args.get("definition") or {})
         definition.pop("name", None)
+        for k in _SERVER_MANAGED_KEYS:  # audit fields are server-stamped only
+            definition.pop(k, None)
         _normalize_definition(definition, notes)
         if not _SLUG_RE.match(name):
             raise ValueError("slug must be lowercase letters/digits with _ or - (2-61 chars)")
@@ -1456,6 +1808,8 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         notes: list[str] = []
         changes = _coerce_obj(args.get("changes") or {})
         changes.pop("name", None)
+        for k in _SERVER_MANAGED_KEYS:  # audit fields are server-stamped only
+            changes.pop(k, None)
         _normalize_definition(changes, notes)
         # Sections that filtering emptied out carry no change — strip them so
         # a "nothing real left" update fails loudly instead of reporting

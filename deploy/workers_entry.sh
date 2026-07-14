@@ -5,7 +5,7 @@
 #   every 15 min — recording sync (GCS upload catch-up + local retention)
 #   every 60 min — log shipper (rotated/idle logs -> gs://lescall-logs)
 set -uo pipefail
-cd /app
+cd /home/angelo/lescall
 
 TICK=300
 i=0

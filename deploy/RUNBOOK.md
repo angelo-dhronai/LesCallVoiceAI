@@ -342,3 +342,37 @@ lescall-recsync.timer`. Units are left installed for exactly this.
 - Semantic actions → audit_events table (shared/audit.py).
 - Hourly shipper → gs://lescall-logs (90-day lifecycle), state in
   shipped_logs table. Config: GCS_LOGS_BUCKET in deploy/.pg_env.
+
+## 9. Sentinel — 24/7 self-healing watchdog (2026-07-14)
+
+`lescall-sentinel.service` (host systemd, NOT in Docker) runs
+`shared/sentinel.py` every 30s: checks containers/ports/FreeSWITCH(SIP
+OPTIONS probe)/nginx/edge/DB/live-state freshness/workers/inbound-CDR
+silence/stuck ledger rows/disk/memory/GCS auth. Auto-repairs by restarting
+the owning container or unit — with 10-min cooldown and 3-per-hour cap per
+target (then alert-only), and NEVER restarts runtime/FreeSWITCH while a call
+is live on :9001. Alerts → sentinel.log + audit_events (owner='sentinel') +
+email via sendmail to SENTINEL_ALERT_EMAIL (default tech@dhronai.com,
+rate-limited 1/6h per key; exim delivery is best-effort). Status snapshot:
+data/sentinel_status.json. Logs: phase14_runtime/logs/sentinel.log.
+Verified 2026-07-14: killed SPA container → detected+repaired in 18s.
+Tunables (deploy/.pg_env): SENTINEL_INTERVAL, SENTINEL_INBOUND_ALERT_H,
+SENTINEL_DISK_ALERT_PCT, SENTINEL_MEM_MIN_MB, SENTINEL_ALERT_EMAIL.
+
+KNOWN LIMIT: carrier-side failures (Plivo not delivering inbound) can only
+be DETECTED (inbound-silence alert), not fixed locally — check Plivo console:
+account credit, inbound zentrunk 68928093167632317 status, DID origination
+URI must be sip:35.207.225.237:5080.
+
+### 9b. Inbound loopback probe (provider-agnostic, 2026-07-14)
+The sentinel actively verifies each tenant DID's INBOUND delivery daily at
+SENTINEL_PROBE_HOUR_UTC (default 03:xx UTC) — no carrier API needed, works
+for any SIP provider: it originates a short parked self-call through the
+tenant's OWN trunk to their own DID; the call must come back as a genuine
+inbound leg. +OK answer = loop proven; NO_ANSWER = carrier-side failure →
+alert naming the owner. Probe legs are killed within seconds and their
+usage_ledger rows are marked billable=0 ('sentinel loopback probe').
+Manual run: `python -m shared.sentinel --probe`. Disable: SENTINEL_PROBE=off.
+Inbound-silence alerts are per-DID (CDR public-context rows by destination).
+First live run (2026-07-14): caught +912264231897 (alwynantonyben@) inbound
+DEAD (NO_ANSWER via their own trunk) while +918065953160 verified OK.

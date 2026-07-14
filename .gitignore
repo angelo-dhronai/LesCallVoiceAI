@@ -56,3 +56,7 @@ dashboard/api_key_pool.json
 dashboard/api_key_state.json
 dashboard/sarvam_dead_keys.json
 dashboard/sarvam_key_master.json
+
+# Sentinel runtime state (watchdog cooldowns + status snapshot)
+data/sentinel_state.json
+data/sentinel_status.json

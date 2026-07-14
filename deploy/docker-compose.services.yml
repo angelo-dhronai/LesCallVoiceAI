@@ -22,14 +22,14 @@ services:
     container_name: lescall-api
     network_mode: host
     user: "1000:1000"
-    working_dir: /app/dashboard
+    working_dir: /home/angelo/lescall/dashboard
     command: ["python", "server.py"]
     env_file: [.pg_env]
     environment:
       GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
       GOOGLE_CLOUD_PROJECT: lescall
     volumes:
-      - ..:/app
+      - /home/angelo/lescall:/home/angelo/lescall
       - /home/angelo/.config/gcloud:/gcloud:ro
     restart: unless-stopped
     healthcheck:
@@ -48,6 +48,7 @@ services:
     container_name: lescall-runtime
     network_mode: host
     user: "1000:1000"
+    working_dir: /home/angelo/lescall
     command: ["bash", "deploy/runtime_entry.sh"]
     env_file: [.pg_env]
     environment:
@@ -55,12 +56,19 @@ services:
       GOOGLE_CLOUD_PROJECT: lescall
       TELEPHONY_MODE: "true"
     volumes:
-      - ..:/app
+      - /home/angelo/lescall:/home/angelo/lescall
       - /home/angelo/.config/gcloud:/gcloud:ro
       - /tmp/esl_recordings:/tmp/esl_recordings
+      # TTS playback WAVs: the bridge writes them, socket_server passes the
+      # path to FreeSWITCH on the HOST — must be the same directory or every
+      # call is silent (FILE NOT FOUND). Learned the hard way 2026-07-14.
+      - /tmp/ai_telephony_playback:/tmp/ai_telephony_playback
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && exec 4<>/dev/tcp/127.0.0.1/9001"]
+      # Process liveness via pidfiles — NEVER a TCP probe: raw connects to
+      # 9000/9001 trip socket_server's per-connection ESL logic and the WS
+      # server's handshake-error logging every 30s (learned the hard way).
+      test: ["CMD", "bash", "-c", "kill -0 $(cat /tmp/socket_server.pid) && kill -0 $(cat /tmp/ws_audio_receiver.pid)"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -74,13 +82,14 @@ services:
     network_mode: host
     user: "1000:1000"
     group_add: ["994"]   # freeswitch — read CDR csv for billing reconciliation
+    working_dir: /home/angelo/lescall
     command: ["bash", "deploy/workers_entry.sh"]
     env_file: [.pg_env]
     environment:
       GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
       GOOGLE_CLOUD_PROJECT: lescall
     volumes:
-      - ..:/app
+      - /home/angelo/lescall:/home/angelo/lescall
       - /home/angelo/.config/gcloud:/gcloud:ro
       - /var/log/freeswitch/cdr-csv:/var/log/freeswitch/cdr-csv:ro
     restart: unless-stopped

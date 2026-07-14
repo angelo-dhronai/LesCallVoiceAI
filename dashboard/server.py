@@ -3331,14 +3331,10 @@ async def _dial_automation_entry(automation_id: str) -> None:
                  owner=_auth.DEFAULT_OWNER)
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "fs_cli", "-x", _fs_originate_cmd(
+        fs_out = await _fs_esl_exec(_fs_originate_cmd(
                 phone, agent_slug=_dial_slug,
-                caller_id=_ident["caller_id"], gateway_name=_ident["gateway_name"]),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=55)
-        cs = _parse_fs_result(stdout.decode(), stderr.decode())
+                caller_id=_ident["caller_id"], gateway_name=_ident["gateway_name"]), timeout=55)
+        cs = _parse_fs_result(fs_out, "")
     except Exception as exc:
         logger.error("automation dial %s error: %r", phone, exc)
         cs = "failed"
@@ -3537,6 +3533,19 @@ def _outbound_identity(owner: str) -> dict:
     raise OutboundIdentityError("Cannot place the call yet — " + "; ".join(reasons[:3]))
 
 
+async def _fs_esl_exec(cmd: str, timeout: float = 55.0) -> str:
+    """Run an FS api command over the event socket. fs_cli does not exist in
+    the containerized api; ESL on 127.0.0.1:8021 is the same control plane.
+    Returns the response body; transport failures come back as '-ERR ...' so
+    _parse_fs_result sees exactly what fs_cli would have printed."""
+    from shared.fs_esl import fs_api
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(fs_api, cmd, timeout), timeout=timeout + 5)
+    except Exception as exc:
+        return f"-ERR esl transport failure: {exc!r}"
+
+
 def _fs_originate_cmd(phone: str, agent_slug: str = "", campaign_id: str = "",
                       caller_id: str = "", gateway_name: str = "") -> str:
     """Build the fs_cli originate. Egress is ALWAYS through a named gateway
@@ -3641,14 +3650,10 @@ async def outbound_dial(contact_id: str, request: Request) -> JSONResponse:
 
     async def _do_dial():
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "fs_cli", "-x", _fs_originate_cmd(
+            fs_out = await _fs_esl_exec(_fs_originate_cmd(
                     phone, agent_slug=_dial_slug,
-                    caller_id=ident["caller_id"], gateway_name=ident["gateway_name"]),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=55)
-            cs = _parse_fs_result(stdout.decode(), stderr.decode())
+                    caller_id=ident["caller_id"], gateway_name=ident["gateway_name"]), timeout=55)
+            cs = _parse_fs_result(fs_out, "")
         except Exception as e:
             logger.error("dial %s error: %r", phone, e)
             cs = "failed"
@@ -3711,14 +3716,10 @@ async def number_test_call(number_id: int, request: Request) -> JSONResponse:
 
     async def _do_test():
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "fs_cli", "-x", _fs_originate_cmd(
+            fs_out = await _fs_esl_exec(_fs_originate_cmd(
                     dest, agent_slug=slug,
-                    caller_id=caller, gateway_name=row["trunk_name"]),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=55)
-            cs = _parse_fs_result(stdout.decode(), stderr.decode())
+                    caller_id=caller, gateway_name=row["trunk_name"]), timeout=55)
+            cs = _parse_fs_result(fs_out, "")
         except Exception as e:
             logger.error("test-call %s error: %r", dest, e)
             cs = "failed"
@@ -3814,16 +3815,11 @@ async def campaign_start(request: Request) -> JSONResponse:
                 _record_dial(phone, contact_id, contact.get("name", ""),
                              agent_slug=_dial_slug, owner=camp_owner)
                 try:
-                    proc = await asyncio.create_subprocess_exec(
-                        "fs_cli", "-x", _fs_originate_cmd(
+                    fs_out = await _fs_esl_exec(_fs_originate_cmd(
                             phone, agent_slug=_dial_slug,
                             caller_id=camp_ident["caller_id"],
-                            gateway_name=camp_ident["gateway_name"]),
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=55)
-                    cs = _parse_fs_result(stdout.decode(), stderr.decode())
+                            gateway_name=camp_ident["gateway_name"]), timeout=55)
+                    cs = _parse_fs_result(fs_out, "")
                 except asyncio.TimeoutError:
                     cs = "no_answer"
                 except Exception as e:

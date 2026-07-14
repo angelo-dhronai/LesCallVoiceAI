@@ -6,7 +6,7 @@
 # and Docker's restart policy brings the pair back (they are a unit — the
 # bridge dials socket_server's playback port).
 set -euo pipefail
-cd /app
+cd /home/angelo/lescall
 
 mkdir -p phase14_runtime/logs/docker
 LOG_DIR=phase14_runtime/logs/docker
@@ -18,10 +18,12 @@ set +a
 
 python socket_server.py >>"$LOG_DIR/socket_server.log" 2>&1 &
 SOCK_PID=$!
+echo "$SOCK_PID" > /tmp/socket_server.pid
 
 python ws_audio_receiver.py --sample-rate "${TELEPHONY_SAMPLE_RATE:-8000}" \
     >>"$LOG_DIR/ws_audio_receiver.log" 2>&1 &
 WS_PID=$!
+echo "$WS_PID" > /tmp/ws_audio_receiver.pid
 
 echo "runtime up: socket_server=$SOCK_PID ws_audio_receiver=$WS_PID"
 trap 'kill $SOCK_PID $WS_PID 2>/dev/null || true' TERM INT

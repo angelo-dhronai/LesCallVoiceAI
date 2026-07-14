@@ -76,16 +76,7 @@ if ! wait_for_port 9001 "ws_audio_receiver"; then
     exit 1
 fi
 
-# 4. Optional: Start stt_stream_worker.py
-if [ "$ENABLE_STT_WORKER" == "1" ]; then
-    echo "[OPTIONAL] Starting STT Stream Worker..."
-    nohup python3 /home/angelo/lescall/stt_stream_worker.py >> "$RUN_DIR/stt_worker.log" 2>&1 &
-    STT_PID=$!
-    echo $STT_PID > "$RUN_DIR/stt_worker.pid"
-    wait_for_port 9002 "stt_stream_worker"
-fi
-
-# 5. Create a filtered view for call_bridge logs (they go to ws_audio_receiver.log)
+# 4. Create a filtered view for call_bridge logs (they go to ws_audio_receiver.log)
 # Wrapped in `bash -c` so the redirect below applies to tail's stderr too —
 # otherwise tail -f's stderr inherits the caller's stdout/stderr pipe (e.g. the
 # dashboard's subprocess pipe) and, since tail -f never exits, that pipe never

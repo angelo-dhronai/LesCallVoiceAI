@@ -28,6 +28,10 @@ from ..audio_transport.local_speaker_sink import LocalSpeakerSink
 logger = logging.getLogger(__name__)
 
 SARVAM_TTS_STREAM_URL = "https://api.sarvam.ai/text-to-speech/stream"
+# Anything outside this set gets HTTP 400 from Sarvam on every utterance —
+# the call connects but is silent. Guarded here as the last line of defense;
+# agent configs are also validated at load time (agent_definition/schema.py).
+VALID_MODELS = ("bulbul:v2", "bulbul:v3-beta", "bulbul:v3")
 DEFAULT_MODEL = "bulbul:v3"
 DEFAULT_SPEAKER = "shubh"
 DEFAULT_SAMPLE_RATE = 16_000
@@ -114,6 +118,11 @@ class SarvamTTS(StreamingTTS):
             output_device=output_device
         ))
         self._api_key = api_key or os.environ.get("SARVAM_API_KEY", "")
+        if model not in VALID_MODELS:
+            logger.warning("[TTS:Sarvam] invalid model %r — using %s "
+                           "(valid: %s)", model, DEFAULT_MODEL,
+                           ", ".join(VALID_MODELS))
+            model = DEFAULT_MODEL
         self._model = model
         self._speaker = speaker
         self._sample_rate = sample_rate

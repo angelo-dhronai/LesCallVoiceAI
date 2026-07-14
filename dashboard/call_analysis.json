@@ -115,5 +115,113 @@
     "recommended_follow_up_date": "2023-10-06",
     "_analyzed_at": "2026-06-19T08:39:04.546Z",
     "_model": "gpt-4o-mini"
+  },
+  "917042340227_20260710_054911": {
+    "summary": "The sales agent, Adit Shah, called to discuss academic support options for the caller's children. The conversation included a mix-up initially, but the caller expressed interest in the fee structure of Motion Classes and was receptive to the information provided.",
+    "customer_intent": "inquire about fee structure",
+    "key_points": [
+      "Agent introduced academic programs for students in classes 6-12",
+      "Caller requested information in Hindi about the fee structure"
+    ],
+    "customer_questions": [
+      "\u092e\u094b\u0936\u0928 \u0915\u094d\u0932\u093e\u0938\u0947\u0938 \u0915\u0940 \u092b\u0940\u0938 \u0915\u094d\u092f\u093e \u0930\u0939\u0924\u0940 \u0939\u0948 \u0909\u0928\u0915\u093e \u092b\u0940 \u0938\u094d\u091f\u094d\u0930\u0915\u094d\u091a\u0930 \u0915\u094d\u092f\u093e \u0930\u0939\u0924\u093e \u0939\u0948"
+    ],
+    "suggested_next_action": "Provide detailed fee structure information and schedule a follow-up call if needed.",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "academic support programs",
+      "fee structure"
+    ],
+    "products_mentioned": [
+      "Motion Classes"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "To provide detailed fee structure information and address any further questions.",
+    "follow_up_priority": "medium",
+    "recommended_follow_up_date": "2023-10-30",
+    "_analyzed_at": "2026-07-10T10:35:19.487Z",
+    "_model": "gpt-4o-mini"
+  },
+  "917042340227_20260706_070122": {
+    "summary": "The call involved a sales agent discussing a salary increase for an employee named Angelo with a prospect who initially had confusion about his name. After clarifying the name, they discussed the proposed salary increase of 30,000, which the prospect seemed to agree with.",
+    "customer_intent": "discuss salary increase for Angelo",
+    "key_points": [
+      "Confusion about the customer's name",
+      "Proposal for Angelo's salary increase to 30,000"
+    ],
+    "customer_questions": [
+      "\u0939\u0947\u0932\u094b \u0906\u092a \u092c\u093e\u0924 \u0915\u0930\u094b \u0928\u093e \u092e\u0941\u091d\u0938\u0947 \u0906\u092a \u0938\u0935\u093e\u0932 \u0915\u094d\u092f\u094b\u0902 \u0915\u0930 \u0930\u0939\u0947 \u0939\u094b \u0906\u092a \u092c\u0924\u093e\u0913 \u0906\u092a\u0915\u094b \u091a\u093e\u0939\u093f\u090f \u0915\u094d\u092f\u093e",
+      "\u0905\u0902\u091c\u0932\u0947 \u0915\u094d\u092f\u093e \u20b930000 \u092e\u0947\u0902 \u0916\u0941\u0936 \u0939\u094b\u0917\u093e?"
+    ],
+    "suggested_next_action": "Confirm the salary increase proposal with the customer.",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "salary discussion",
+      "employee contributions"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "The customer agreed to the salary proposal during the call.",
+    "follow_up_priority": "low",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-10T10:47:28.018Z",
+    "_model": "gpt-4o-mini"
+  },
+  "917042340227_20260712_192028": {
+    "summary": "The call begins with the agent introducing themselves and asking how they can assist. The caller, Alwyn, points out that the agent initiated the call and should provide information.",
+    "customer_intent": "Clarification on the purpose of the call",
+    "key_points": [
+      "Agent initiated the call",
+      "Caller expects the agent to provide information"
+    ],
+    "customer_questions": [],
+    "suggested_next_action": "Agent should clarify the purpose of the call and provide relevant information.",
+    "sentiment": "neutral",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "call purpose",
+      "customer engagement"
+    ],
+    "products_mentioned": [],
+    "follow_up_needed": false,
+    "follow_up_reason": "The call is still ongoing and requires immediate clarification.",
+    "follow_up_priority": "null",
+    "recommended_follow_up_date": null,
+    "_analyzed_at": "2026-07-13T03:38:23.842Z",
+    "_model": "gpt-4o-mini"
+  },
+  "917042340227_20260712_185327": {
+    "summary": "The call was about Alwyn's need for cold calling services to promote his biryani business to companies. The agent confirmed that a human agent would follow up with Alwyn to discuss the details further.",
+    "customer_intent": "to find cold calling services",
+    "key_points": [
+      "Alwyn wants to offer free biryani trials to companies",
+      "A follow-up call was scheduled for Saturday at 12:00 PM"
+    ],
+    "customer_questions": [
+      "will i be talking to an ai agent or will it be an actual question?",
+      "will i be talking to a calling agent, ai calling agent or an actual person?"
+    ],
+    "suggested_next_action": "Prepare for the follow-up call on Saturday",
+    "sentiment": "positive",
+    "lead_quality": "warm",
+    "objections": [],
+    "topics": [
+      "cold calling services",
+      "business partnerships"
+    ],
+    "products_mentioned": [
+      "biryani"
+    ],
+    "follow_up_needed": true,
+    "follow_up_reason": "To discuss the cold calling services in detail",
+    "follow_up_priority": "high",
+    "recommended_follow_up_date": "2023-10-07",
+    "_analyzed_at": "2026-07-13T03:38:27.966Z",
+    "_model": "gpt-4o-mini"
   }
 }

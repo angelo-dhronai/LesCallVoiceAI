@@ -26,7 +26,6 @@ for pid_file in "$LATEST_RUN"/*.pid; do
 done
 
 # Cleanup any remaining processes just in case
-pkill -f "stt_stream_worker.py"
 pkill -f "ws_audio_receiver.py"
 pkill -f "socket_server.py"
 

@@ -4,14 +4,14 @@
 echo "--- Resetting Phase 14 Runtime ---"
 
 # 1. Kill by script name
-SCRIPTS=("ws_audio_receiver.py" "socket_server.py" "stt_stream_worker.py" "conversation_call_bridge.py")
+SCRIPTS=("ws_audio_receiver.py" "socket_server.py" "conversation_call_bridge.py")
 for script in "${SCRIPTS[@]}"; do
     echo "Killing processes matching: $script"
     pkill -9 -f "$script"
 done
 
-# 2. Kill by port (9000, 9001, 9002, 9004)
-PORTS=(9000 9001 9002 9004)
+# 2. Kill by port (9000, 9001, 9004)
+PORTS=(9000 9001 9004)
 for port in "${PORTS[@]}"; do
     echo "Checking port $port..."
     # Find PIDs using ss -ltnp

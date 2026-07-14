@@ -383,6 +383,9 @@ async def handle_connection(websocket, path: str, args):
 
     fs_uuid = ""
     caller_number = ""
+    dialed_did = ""
+    campaign_id = None
+    agent_slug = ""
 
     try:
 
@@ -404,15 +407,41 @@ async def handle_connection(websocket, path: str, args):
         ):
             fs_uuid = seg
 
+        # Positional path segments set by socket_server.py's
+        # build_audio_stream_payload: /<uuid>/<caller>/<did>/<campaign>/<slug>.
+        # "-" is the explicit empty placeholder (positions never shift);
+        # anything failing its charset check is treated as absent.
+
         # Second segment carries the caller number (digits only, set by
         # socket_server.py from Caller-Caller-ID-Number header).
         if len(parts) > 1 and parts[1].strip().isdigit():
             caller_number = parts[1].strip()
 
+        # Third segment: the dialed DID (digits only) — drives per-DID
+        # agent routing in conversation_call_bridge.resolve_agent_slug.
+        if len(parts) > 2 and parts[2].strip().isdigit():
+            dialed_did = parts[2].strip()
+
+        # Fourth segment: outbound campaign id (digits only).
+        if len(parts) > 3 and parts[3].strip().isdigit():
+            campaign_id = int(parts[3].strip())
+
+        # Fifth segment: explicit agent slug from the lescall_agent_slug
+        # channel variable (outbound binds the agent at dial time).
+        if len(parts) > 4:
+            s = parts[4].strip()
+            if s and s != "-" and all(
+                (c.isalnum() or c in "-_") for c in s
+            ):
+                agent_slug = s
+
     except Exception:
 
         fs_uuid = ""
         caller_number = ""
+        dialed_did = ""
+        campaign_id = None
+        agent_slug = ""
 
     conn_id = fs_uuid if fs_uuid else uuidlib.uuid4().hex[:8]
 
@@ -445,6 +474,9 @@ async def handle_connection(websocket, path: str, args):
             conn_id,
             TARGET_SR,
             caller_number=caller_number,
+            did=dialed_did,
+            campaign_id=campaign_id,
+            agent_slug=agent_slug,
         )
 
         log.info(
@@ -853,6 +885,11 @@ def _snapshot_live_calls() -> dict:
                 "stage": stage,
                 "speaking": speaking,
                 "transcript_tail": list(getattr(session, "transcript_tail", []) or []),
+                # Tenant that owns this call (from the resolved agent) so the
+                # dashboard can show each tenant only their own live calls.
+                "owner": getattr(session, "owner", "") or "",
+                "agent_slug": getattr(session, "agent_slug", "") or "",
+                "direction": getattr(session, "direction", "") or "",
             })
         except Exception as exc:
             log.warning("[LIVE-STATE] Skipped snapshot for %s: %r", conn_id, exc, exc_info=True)

@@ -1,17 +1,18 @@
-q
-
 # Python
 __pycache__/
 *.pyc
 venv/
 .venv/
+.pytest_cache/
 
-# Logs
+# Logs / runtime artifacts
 *.log
 logs/
+*.pid
 
 # Runtime data
 build/
+credit_log/
 
 # Audio
 recordings/
@@ -42,3 +43,16 @@ dashboard/copilot_sessions/
 
 dashboard/sarvam_key_status.json
 
+# Multi-tenant DB + secrets (never commit)
+shared/db/lescall.db
+shared/db/lescall.db-wal
+shared/db/lescall.db-shm
+dashboard/.session_secret
+data/kamailio_reload
+deploy/.pg_env
+
+# Sarvam key pool (live API keys — platform infra, never in git)
+dashboard/api_key_pool.json
+dashboard/api_key_state.json
+dashboard/sarvam_dead_keys.json
+dashboard/sarvam_key_master.json

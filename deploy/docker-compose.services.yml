@@ -1,0 +1,96 @@
+# LesCall application services — production containers.
+#   docker compose -f deploy/docker-compose.services.yml up -d --build
+#
+# Design notes:
+# - api / runtime / workers share ONE image (deploy/Dockerfile.app) and run on
+#   the HOST network: FreeSWITCH dials 127.0.0.1:9000/9001 and nginx proxies
+#   127.0.0.1:8080, exactly as before containerization — zero telephony or
+#   nginx config changes. Postgres stays in its own compose
+#   (docker-compose.postgres.yml) — never recreate the DB container casually.
+# - The repo is bind-mounted at /app (code + mutable state: recordings/,
+#   agents/, json stores). Deploying code = `docker compose restart <svc>`;
+#   rebuilding the image is only needed when requirements.txt changes.
+# - Containers run as uid 1000 (angelo) so files keep host ownership; workers
+#   join gid 994 (freeswitch) to read CDRs for billing reconciliation.
+# - FreeSWITCH, Kamailio, host nginx, and the Sarvam key-rotation scripts
+#   intentionally stay on the host (out of scope per plan).
+
+services:
+  api:
+    image: lescall-app:latest
+    build: { context: .., dockerfile: deploy/Dockerfile.app }
+    container_name: lescall-api
+    network_mode: host
+    user: "1000:1000"
+    working_dir: /app/dashboard
+    command: ["python", "server.py"]
+    env_file: [.pg_env]
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
+      GOOGLE_CLOUD_PROJECT: lescall
+    volumes:
+      - ..:/app
+      - /home/angelo/.config/gcloud:/gcloud:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/login"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: &log
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  runtime:
+    image: lescall-app:latest
+    build: { context: .., dockerfile: deploy/Dockerfile.app }
+    container_name: lescall-runtime
+    network_mode: host
+    user: "1000:1000"
+    command: ["bash", "deploy/runtime_entry.sh"]
+    env_file: [.pg_env]
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
+      GOOGLE_CLOUD_PROJECT: lescall
+      TELEPHONY_MODE: "true"
+    volumes:
+      - ..:/app
+      - /home/angelo/.config/gcloud:/gcloud:ro
+      - /tmp/esl_recordings:/tmp/esl_recordings
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && exec 4<>/dev/tcp/127.0.0.1/9001"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+    logging: *log
+
+  workers:
+    image: lescall-app:latest
+    build: { context: .., dockerfile: deploy/Dockerfile.app }
+    container_name: lescall-workers
+    network_mode: host
+    user: "1000:1000"
+    group_add: ["994"]   # freeswitch — read CDR csv for billing reconciliation
+    command: ["bash", "deploy/workers_entry.sh"]
+    env_file: [.pg_env]
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
+      GOOGLE_CLOUD_PROJECT: lescall
+    volumes:
+      - ..:/app
+      - /home/angelo/.config/gcloud:/gcloud:ro
+      - /var/log/freeswitch/cdr-csv:/var/log/freeswitch/cdr-csv:ro
+    restart: unless-stopped
+    logging: *log
+
+  spa:
+    image: lescall-dashboard:latest
+    build: { context: ../frontend }
+    container_name: lescall-dashboard
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["127.0.0.1:8081:80"]
+    restart: unless-stopped
+    logging: *log

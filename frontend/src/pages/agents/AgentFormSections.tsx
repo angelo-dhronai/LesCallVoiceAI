@@ -1,7 +1,7 @@
 import { Card, Button, cx } from '../../components/ui'
 import { Field, Input, Textarea, Select } from '../../components/kit'
 import type { Routing, WizardData } from '../../api/agents'
-import { CalendarDays, PhoneIncoming, PhoneOutgoing, Plus, Trash2 } from 'lucide-react'
+import { CalendarDays, ChevronDown, ChevronUp, PhoneIncoming, PhoneOutgoing, Plus, Trash2 } from 'lucide-react'
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Shared agent form sections.
@@ -27,21 +27,42 @@ export type SectionProps = {
 }
 
 /* ───────────────────────── Basics ───────────────────────── */
-export function BasicsSection({ d, set, showSlug = true }: SectionProps & { showSlug?: boolean }) {
+export function BasicsSection({ d, set, showSlug = true, showErrors = false }: SectionProps & { showSlug?: boolean; showErrors?: boolean }) {
   const slugOk = SLUG_RE.test(d.name)
   return (
     <div className="grid gap-4 sm:grid-cols-2">
       {showSlug && (
         <Field label="Slug (folder name) *">
-          <Input value={d.name} placeholder="acme_realty" onChange={(e) => set({ name: e.target.value.trim() })} />
+          <Input
+            value={d.name}
+            placeholder="acme_realty"
+            aria-invalid={showErrors && (!d.name || !slugOk) ? true : undefined}
+            className={cx(showErrors && (!d.name || !slugOk) && 'ring-rose-400/50')}
+            onChange={(e) => set({ name: e.target.value.trim() })}
+          />
           {!slugOk && d.name && <span className="mt-1 block text-[11px] text-rose-500">Use letters, digits, _ or - only.</span>}
+          {showErrors && !d.name && <span className="mt-1 block text-[11px] text-rose-500">Required</span>}
         </Field>
       )}
       <Field label="Agent display name *">
-        <Input value={d.agent_name} placeholder="Priya Shah" onChange={(e) => set({ agent_name: e.target.value })} />
+        <Input
+          value={d.agent_name}
+          placeholder="Priya Shah"
+          aria-invalid={showErrors && !d.agent_name ? true : undefined}
+          className={cx(showErrors && !d.agent_name && 'ring-rose-400/50')}
+          onChange={(e) => set({ agent_name: e.target.value })}
+        />
+        {showErrors && !d.agent_name && <span className="mt-1 block text-[11px] text-rose-500">Required</span>}
       </Field>
       <Field label="Company name *">
-        <Input value={d.company_name} placeholder="Acme Realty" onChange={(e) => set({ company_name: e.target.value })} />
+        <Input
+          value={d.company_name}
+          placeholder="Acme Realty"
+          aria-invalid={showErrors && !d.company_name ? true : undefined}
+          className={cx(showErrors && !d.company_name && 'ring-rose-400/50')}
+          onChange={(e) => set({ company_name: e.target.value })}
+        />
+        {showErrors && !d.company_name && <span className="mt-1 block text-[11px] text-rose-500">Required</span>}
       </Field>
       <Field label="Company tagline">
         <Input value={d.company_tagline} placeholder="Homes you'll love" onChange={(e) => set({ company_tagline: e.target.value })} />
@@ -170,7 +191,7 @@ export function CalendarSection({ d, set }: SectionProps) {
                 <Field label="Time">
                   <Input value={s.time} placeholder="10:00 AM" onChange={(e) => setSlot(i, { time: e.target.value })} />
                 </Field>
-                <Button variant="ghost" onClick={() => set({ calendar_slots: d.calendar_slots.filter((_, j) => j !== i) })}>
+                <Button variant="ghost" title={`Remove slot ${i + 1}`} onClick={() => set({ calendar_slots: d.calendar_slots.filter((_, j) => j !== i) })}>
                   <Trash2 size={14} />
                 </Button>
               </Card>
@@ -291,15 +312,35 @@ export function KnowledgeSection({ d, set }: SectionProps) {
         <div className="space-y-3">
           {d.products.map((p, i) => (
             <Card key={i} className="grid gap-3 p-4 sm:grid-cols-2">
+              <div className="sm:col-span-2 flex items-center gap-2">
+                <span className="grid h-5 w-5 place-items-center rounded-full bg-indigo-500/12 text-[11px] font-bold text-indigo-500 dark:text-indigo-300">{i + 1}</span>
+                <span className="text-[11px] font-semibold text-dim">Product {i + 1}</span>
+              </div>
               <Field label="Name"><Input value={p.name} onChange={(e) => { const x = [...d.products]; x[i] = { ...x[i], name: e.target.value }; set({ products: x }) }} /></Field>
               <Field label="Price / tier"><Input value={p.price} onChange={(e) => { const x = [...d.products]; x[i] = { ...x[i], price: e.target.value }; set({ products: x }) }} /></Field>
               <div className="sm:col-span-2"><Field label="Description"><Input value={p.description} onChange={(e) => { const x = [...d.products]; x[i] = { ...x[i], description: e.target.value }; set({ products: x }) }} /></Field></div>
               <div className="sm:col-span-2"><Field label="Key features"><Input value={p.features} onChange={(e) => { const x = [...d.products]; x[i] = { ...x[i], features: e.target.value }; set({ products: x }) }} /></Field></div>
               <div className="sm:col-span-2 flex justify-end">
-                <Button variant="ghost" onClick={() => set({ products: d.products.filter((_, j) => j !== i) })}><Trash2 size={14} /> Remove</Button>
+                <Button variant="ghost" title={`Remove product ${i + 1}`} onClick={() => set({ products: d.products.filter((_, j) => j !== i) })}><Trash2 size={14} /> Remove</Button>
               </div>
             </Card>
           ))}
+          {d.products.length === 0 && (
+            <div className="rounded-xl bg-[var(--surface-2)] p-4 ring-1 ring-[var(--border)]">
+              <p className="text-[12px] text-dim">
+                No products yet — each product's name, price and features become talking points the agent
+                can quote on calls. Add at least one so it has something concrete to pitch.
+              </p>
+              <Button
+                variant="soft"
+                size="sm"
+                className="mt-3"
+                onClick={() => set({ products: [...d.products, { name: '', price: '', description: '', features: '' }] })}
+              >
+                <Plus size={13} /> Add first product
+              </Button>
+            </div>
+          )}
         </div>
       </div>
       <Field label="Objection trigger phrases (comma-separated)">
@@ -324,9 +365,16 @@ export function KnowledgeSection({ d, set }: SectionProps) {
 // nag when a variant form (${contact_name}, [name], …) is already present.
 const PLACEHOLDER_RE = /(?:\$\{|\{\{|\{|\[|<)\s*(?:contact[ _-]?name|customer[ _-]?name|person[ _-]?name|callee[ _-]?name|contact|name)\s*(?:\}\}|\}|\]|>)|\$contact[ _-]?name\b/i
 
-export function CallFlowSection({ d, set }: SectionProps) {
+export function CallFlowSection({ d, set, showErrors = false }: SectionProps & { showErrors?: boolean }) {
   const outbound = d.call_direction === 'outbound'
   const hasToken = PLACEHOLDER_RE.test(d.opening_greeting)
+  const moveStage = (i: number, dir: -1 | 1) => {
+    const j = i + dir
+    if (j < 0 || j >= d.stages.length) return
+    const x = [...d.stages]
+    ;[x[i], x[j]] = [x[j], x[i]]
+    set({ stages: x })
+  }
   return (
     <div className="space-y-6">
       <div>
@@ -335,9 +383,12 @@ export function CallFlowSection({ d, set }: SectionProps) {
             rows={2}
             value={d.opening_greeting}
             placeholder={outbound ? 'Hello, am I speaking with {contact_name}?' : 'Namaste! Thank you for calling Acme Realty…'}
+            aria-invalid={showErrors && !d.opening_greeting ? true : undefined}
+            className={cx(showErrors && !d.opening_greeting && 'ring-rose-400/50')}
             onChange={(e) => set({ opening_greeting: e.target.value })}
           />
         </Field>
+        {showErrors && !d.opening_greeting && <span className="mt-1 block text-[11px] text-rose-500">Required</span>}
         <span className="mt-1 block text-[11px] text-dim">
           This exact sentence opens every call — the AI does not rephrase it.
           {outbound && (
@@ -370,7 +421,8 @@ export function CallFlowSection({ d, set }: SectionProps) {
           above; placeholders like {'{contact_name}'} only work there.
         </p>
         {d.stages.map((s, i) => (
-          <Card key={i} className="grid gap-3 p-4 sm:grid-cols-[150px_1fr_100px_auto] sm:items-start">
+          <Card key={i} className="grid gap-3 p-4 lg:grid-cols-[auto_150px_1fr_100px_auto] lg:items-start">
+            <span className="grid h-5 w-5 place-items-center rounded-full bg-indigo-500/12 text-[11px] font-bold text-indigo-500 dark:text-indigo-300 lg:mt-7">{i + 1}</span>
             <Field label="Stage ID"><Input value={s.id} onChange={(e) => { const x = [...d.stages]; x[i] = { ...x[i], id: e.target.value }; set({ stages: x }) }} /></Field>
             <Field label="Goal — instructions for this part of the call">
               <Textarea
@@ -380,10 +432,22 @@ export function CallFlowSection({ d, set }: SectionProps) {
                 onChange={(e) => { const x = [...d.stages]; x[i] = { ...x[i], goal: e.target.value }; set({ stages: x }) }}
               />
             </Field>
-            <Field label="Turns (99=manual)"><Input value={s.turns} onChange={(e) => { const x = [...d.stages]; x[i] = { ...x[i], turns: e.target.value }; set({ stages: x }) }} /></Field>
-            <Button variant="ghost" className="sm:mt-6" onClick={() => set({ stages: d.stages.filter((_, j) => j !== i) })}><Trash2 size={14} /></Button>
+            <div>
+              <Field label="Max turns"><Input value={s.turns} onChange={(e) => { const x = [...d.stages]; x[i] = { ...x[i], turns: e.target.value }; set({ stages: x }) }} /></Field>
+              <span className="mt-1 block text-[11px] text-dim">99 = stay until the goal is met</span>
+            </div>
+            <div className="flex items-center gap-1.5 lg:mt-6 lg:gap-1">
+              <Button variant="ghost" size="sm" className="h-9 w-9 lg:h-auto lg:w-auto" title={`Move stage ${i + 1} up`} disabled={i === 0} onClick={() => moveStage(i, -1)}><ChevronUp size={13} /></Button>
+              <Button variant="ghost" size="sm" className="h-9 w-9 lg:h-auto lg:w-auto" title={`Move stage ${i + 1} down`} disabled={i === d.stages.length - 1} onClick={() => moveStage(i, 1)}><ChevronDown size={13} /></Button>
+              <Button variant="ghost" size="sm" className="h-9 w-9 lg:h-auto lg:w-auto" title={`Remove stage ${i + 1}`} onClick={() => set({ stages: d.stages.filter((_, j) => j !== i) })}><Trash2 size={13} /></Button>
+            </div>
           </Card>
         ))}
+        {showErrors && d.stages.length === 0 && (
+          <div className="rounded-lg bg-rose-500/10 px-3 py-2 text-[12px] text-rose-600 ring-1 ring-rose-500/20 dark:text-rose-300">
+            At least one call stage is required.
+          </div>
+        )}
       </div>
     </div>
   )
@@ -441,9 +505,9 @@ export function RoutingFields({
       </Field>
       <Field label="Active hours (start–end, 0–23)">
         <div className="flex items-center gap-2">
-          <Input type="number" value={win.start} placeholder="9" onChange={(e) => setWin({ ...win, start: e.target.value })} disabled={disabled} />
+          <Input type="number" className="min-w-0 flex-1" value={win.start} placeholder="9" onChange={(e) => setWin({ ...win, start: e.target.value })} disabled={disabled} />
           <span className="text-dim">–</span>
-          <Input type="number" value={win.end} placeholder="21" onChange={(e) => setWin({ ...win, end: e.target.value })} disabled={disabled} />
+          <Input type="number" className="min-w-0 flex-1" value={win.end} placeholder="21" onChange={(e) => setWin({ ...win, end: e.target.value })} disabled={disabled} />
         </div>
       </Field>
     </div>

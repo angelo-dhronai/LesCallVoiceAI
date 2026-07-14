@@ -1,12 +1,12 @@
-import { useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Phone, Radio, Bot, User, Mic, Languages, MessageSquare, Clock,
+  Phone, Radio, Bot, User, Mic, Languages, MessageSquare, Clock, ArrowDown,
 } from 'lucide-react'
 import { useGet } from '../api/hooks/useApi'
 import { useSSE } from '../api/useSSE'
-import { Card, Badge, Button, EmptyState, cx } from '../components/ui'
+import { Card, Badge, Button, EmptyState, SkeletonBlock, Spinner, cx } from '../components/ui'
 import { PageHeader } from '../components/kit'
-import { SlideOver } from '../components/Modal'
+import { FullscreenModal } from '../components/Modal'
 import { dur, clockTime } from '../lib/format'
 
 /* ------------------------------------------------------------------ types */
@@ -41,7 +41,7 @@ function callId(c: AnyCall): string {
   return v != null ? String(v) : ''
 }
 function callPhone(c: AnyCall): string {
-  const v = pick(c, ['phone', 'caller', 'from', 'caller_id', 'number'])
+  const v = pick(c, ['phone', 'caller', 'caller_number', 'from', 'caller_id', 'number'])
   return v != null ? String(v) : 'Unknown caller'
 }
 function callDuration(c: AnyCall): number {
@@ -110,12 +110,24 @@ function useTick(activeMs: number): number {
 
 /* ------------------------------------------------------------------ pieces */
 
+/** Tiny 3-bar equalizer shown only while someone is actively speaking. */
+function EqBars() {
+  return (
+    <span aria-hidden="true" className="inline-flex h-2.5 items-end gap-[2px]">
+      <span className="h-1.5 w-[2px] animate-pulse-soft rounded-full bg-current" />
+      <span className="h-2.5 w-[2px] animate-pulse-soft rounded-full bg-current [animation-delay:150ms]" />
+      <span className="h-1.5 w-[2px] animate-pulse-soft rounded-full bg-current [animation-delay:300ms]" />
+    </span>
+  )
+}
+
 function SpeakingBadge({ speaking }: { speaking: string }) {
   if (speaking === 'ai') {
-    return <Badge tone="indigo"><Bot size={11} className="mr-1 inline" />AI Speaking</Badge>
+    return <Badge tone="indigo"><EqBars /><Bot size={11} className="mr-1 inline" />AI Speaking</Badge>
   }
-  if (speaking === 'caller') {
-    return <Badge tone="mint"><User size={11} className="mr-1 inline" />Caller Speaking</Badge>
+  // The live snapshot reports the human turn as "user"; older payloads said "caller".
+  if (speaking === 'caller' || speaking === 'user') {
+    return <Badge tone="mint"><EqBars /><User size={11} className="mr-1 inline" />Caller Speaking</Badge>
   }
   return <Badge tone="neutral"><Mic size={11} className="mr-1 inline" />Listening</Badge>
 }
@@ -124,29 +136,37 @@ function StageStrip({ stage }: { stage: string }) {
   const s = stage.toLowerCase()
   const activeIdx = STAGES.findIndex((st) => st.toLowerCase() === s || s.startsWith(st.toLowerCase()))
   return (
-    <div className="flex items-center gap-1.5">
-      {STAGES.map((st, i) => {
-        const done = activeIdx >= 0 && i < activeIdx
-        const active = i === activeIdx
-        return (
-          <div key={st} className="flex-1" title={st}>
-            <div
-              className={cx(
-                'h-1.5 rounded-full transition-colors',
-                active ? 'bg-[var(--accent)]' : done ? 'bg-[var(--accent-2)]' : 'bg-[var(--surface-2)]',
-              )}
-            />
-            <div
-              className={cx(
-                'mt-1 truncate text-center text-[9px] font-semibold uppercase tracking-wide',
-                active ? 'text-[var(--text)]' : 'text-dim',
-              )}
-            >
-              {st}
+    <div>
+      {activeIdx < 0 && stage !== '' && (
+        <div className="mb-1.5 flex items-center gap-1.5">
+          <span className="eyebrow">Stage</span>
+          <Badge tone="indigo">{stage.replace(/_/g, ' ')}</Badge>
+        </div>
+      )}
+      <div className="flex items-center gap-1.5">
+        {STAGES.map((st, i) => {
+          const done = activeIdx >= 0 && i < activeIdx
+          const active = i === activeIdx
+          return (
+            <div key={st} className="flex-1" title={st}>
+              <div
+                className={cx(
+                  'h-1.5 rounded-full transition-colors',
+                  active ? 'bg-[var(--accent)]' : done ? 'bg-[var(--accent-2)]' : 'bg-[var(--surface-2)]',
+                )}
+              />
+              <div
+                className={cx(
+                  'mt-1 truncate text-center text-[9px] font-semibold uppercase tracking-wide',
+                  active ? 'text-[var(--text)]' : 'text-dim',
+                )}
+              >
+                {st}
+              </div>
             </div>
-          </div>
-        )
-      })}
+          )
+        })}
+      </div>
     </div>
   )
 }
@@ -161,81 +181,161 @@ function CallCard({ call, now, onView }: { call: AnyCall; now: number; onView: (
   const tail = msgs.length ? msgs[msgs.length - 1].text : snippet
 
   return (
-    <Card hover glow="mint" className="flex flex-col gap-3 p-5">
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <div className="flex items-center gap-1.5 font-semibold">
-            <Phone size={14} className="shrink-0 text-mint-500" />
-            <span className="truncate">{callPhone(call)}</span>
+    <Card hover glow="mint" className="flex animate-fade-up">
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={onView}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onView() } }}
+        aria-label={`View conversation with ${callPhone(call)}`}
+        className="flex flex-1 cursor-pointer flex-col gap-3 rounded-2xl p-5 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-mint-400/50"
+      >
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5 font-semibold">
+              <Phone size={14} className="shrink-0 text-mint-500" />
+              <span className="truncate">{callPhone(call)}</span>
+            </div>
+            {id && <div className="mt-0.5 truncate font-mono text-[10px] text-dim">{id}</div>}
           </div>
-          {id && <div className="mt-0.5 truncate font-mono text-[10px] text-dim">{id}</div>}
+          <div className="flex shrink-0 items-center gap-1 tabular-nums text-[13px] text-soft">
+            <Clock size={12} className="text-dim" />
+            {dur(seconds)}
+          </div>
         </div>
-        <div className="flex shrink-0 items-center gap-1 tabular-nums text-[13px] text-soft">
-          <Clock size={12} className="text-dim" />
-          {dur(seconds)}
+
+        <div className="flex flex-wrap items-center gap-2">
+          <SpeakingBadge speaking={callSpeaking(call)} />
+          {lang && (
+            <Badge tone="amber"><Languages size={11} className="mr-1 inline" />{lang}</Badge>
+          )}
         </div>
-      </div>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <SpeakingBadge speaking={callSpeaking(call)} />
-        {lang && (
-          <Badge tone="amber"><Languages size={11} className="mr-1 inline" />{lang}</Badge>
-        )}
-      </div>
+        <StageStrip stage={callStage(call)} />
 
-      <StageStrip stage={callStage(call)} />
-
-      {tail && (
-        <div className="line-clamp-2 rounded-xl surface-2 px-3 py-2 text-[12px] text-soft">
-          {tail}
+        <div>
+          <div className="eyebrow mb-1">Latest</div>
+          {tail ? (
+            <div key={tail} className="line-clamp-2 animate-fade-up rounded-xl surface-2 px-3 py-2 text-[12px] text-soft">
+              {tail}
+            </div>
+          ) : (
+            <div className="rounded-xl surface-2 px-3 py-2 text-[12px] italic text-dim">
+              Waiting for first words…
+            </div>
+          )}
         </div>
-      )}
 
-      <div className="mt-auto pt-1">
-        <Button variant="soft" size="sm" onClick={onView}>
-          <MessageSquare size={13} className="mr-1 inline" />View Conversation
-        </Button>
+        <div className="mt-auto pt-1" onClick={(e) => e.stopPropagation()}>
+          <Button variant="soft" size="sm" onClick={onView}>
+            <MessageSquare size={13} className="mr-1 inline" />View Conversation
+          </Button>
+        </div>
       </div>
     </Card>
   )
 }
 
-function Transcript({ call }: { call: AnyCall }) {
+/**
+ * One transcript bubble. Memoized so the once-per-second live-state pushes
+ * only re-render the line that actually changed — with minute-long calls the
+ * transcript can hold hundreds of bubbles, and re-painting all of them every
+ * second is exactly the lag this page used to have.
+ */
+const Bubble = memo(function Bubble({ speaker, text, animate }: {
+  speaker: string; text: string; animate: boolean
+}) {
+  const agent = isAgent(speaker)
+  return (
+    <div className={cx('flex', agent ? 'justify-start' : 'justify-end', animate && 'animate-fade-up')}>
+      <div
+        className={cx(
+          'max-w-[88%] rounded-2xl px-3.5 py-2.5 text-[13.5px] leading-relaxed sm:max-w-[42rem] sm:text-[15px]',
+          agent
+            ? 'bg-[var(--surface-2)] text-soft'
+            : 'bg-mint-400/15 text-[var(--text)] ring-1 ring-mint-400/25',
+        )}
+      >
+        <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-dim">
+          {agent ? 'Agent' : 'Caller'}
+        </div>
+        {text}
+      </div>
+    </div>
+  )
+})
+
+/**
+ * The scrollable live transcript. Owns its scroll container: new turns pin
+ * the view to the bottom with an INSTANT scroll (never scrollIntoView, which
+ * smooth-scrolls every scrollable ancestor — including the page behind the
+ * dialog — once per SSE push and made the whole UI feel like it lagged).
+ * Scrolling up unpins; a "jump to latest" chip brings you back.
+ */
+function TranscriptPanel({ call }: { call: AnyCall }) {
   const msgs = callMessages(call)
   const snippet = callSnippet(call)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [pinned, setPinned] = useState(true)
+  const pinnedRef = useRef(true)
+  // Lines that existed when the dialog opened render statically; only turns
+  // that arrive while you watch play the entrance animation.
+  const animateFromRef = useRef<number | null>(null)
+  if (animateFromRef.current === null) animateFromRef.current = msgs.length
 
-  if (!msgs.length && !snippet) {
-    return <div className="py-8 text-center text-[13px] text-dim">No transcript yet.</div>
+  useEffect(() => {
+    const el = scrollRef.current
+    if (el && pinnedRef.current) el.scrollTop = el.scrollHeight
+  }, [msgs.length])
+
+  const onScroll = () => {
+    const el = scrollRef.current
+    if (!el) return
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    pinnedRef.current = nearBottom
+    setPinned(nearBottom)
   }
 
-  if (!msgs.length) {
-    return (
-      <div className="rounded-xl surface-2 px-3 py-2.5 text-[13px] text-soft">{snippet}</div>
-    )
+  const jumpToLatest = () => {
+    const el = scrollRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    pinnedRef.current = true
+    setPinned(true)
   }
 
   return (
-    <div className="space-y-2.5">
-      {msgs.map((m, i) => {
-        const agent = isAgent(m.speaker)
-        return (
-          <div key={i} className={cx('flex', agent ? 'justify-start' : 'justify-end')}>
-            <div
-              className={cx(
-                'max-w-[80%] rounded-2xl px-3 py-2 text-[13px]',
-                agent
-                  ? 'bg-[var(--surface-2)] text-soft'
-                  : 'bg-mint-400/15 text-[var(--text)] ring-1 ring-mint-400/25',
-              )}
-            >
-              <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-dim">
-                {agent ? 'Agent' : 'Caller'}
-              </div>
-              {m.text}
-            </div>
+    <div className="relative flex min-h-0 flex-1 flex-col">
+      <div
+        ref={scrollRef}
+        onScroll={onScroll}
+        className="min-h-0 flex-1 space-y-2.5 overflow-y-auto overscroll-contain px-4 py-4 sm:px-8 sm:py-5"
+      >
+        {msgs.length === 0 && !snippet && (
+          <div className="grid h-full place-items-center text-[13.5px] text-dim">
+            Listening — the conversation will appear here as it happens.
           </div>
-        )
-      })}
+        )}
+        {msgs.length === 0 && snippet && (
+          <div className="rounded-xl surface-2 px-3.5 py-2.5 text-[13.5px] text-soft sm:text-[15px]">{snippet}</div>
+        )}
+        {msgs.map((m, i) => (
+          <Bubble
+            key={i}
+            speaker={m.speaker}
+            text={m.text}
+            animate={i >= (animateFromRef.current ?? 0)}
+          />
+        ))}
+      </div>
+      {!pinned && (
+        <button
+          onClick={jumpToLatest}
+          className="absolute bottom-4 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full bg-[var(--surface-solid)] px-3.5 py-2 text-[12px] font-semibold text-soft shadow-glass-lg ring-1 ring-[var(--border)] transition hover:text-[var(--text)]"
+        >
+          <ArrowDown size={13} /> Jump to latest
+        </button>
+      )}
     </div>
   )
 }
@@ -243,17 +343,19 @@ function Transcript({ call }: { call: AnyCall }) {
 /* ------------------------------------------------------------------ page */
 
 export default function Live() {
-  const { data } = useGet<LiveState>(['calls', 'live-state'], '/calls/live-state')
+  const { data, isLoading } = useGet<LiveState>(['calls', 'live-state'], '/calls/live-state')
 
   const [calls, setCalls] = useState<AnyCall[]>([])
   const [updatedAt, setUpdatedAt] = useState<string | null>(null)
   const [openId, setOpenId] = useState<string | null>(null)
+  const [seeded, setSeeded] = useState(false)
 
   // Seed from initial fetch.
   useEffect(() => {
     if (!data) return
     setCalls(Array.isArray(data.calls) ? data.calls : [])
     setUpdatedAt(data.updated_at ?? null)
+    setSeeded(true)
   }, [data])
 
   const status = useSSE('/calls/live-state/stream', (evt: any) => {
@@ -262,10 +364,12 @@ export default function Live() {
     if (evt.type === 'live_state') {
       setCalls(Array.isArray(evt.calls) ? evt.calls : [])
       setUpdatedAt(evt.updated_at ?? null)
+      setSeeded(true)
     }
   }, [])
 
   const live = status === 'open'
+  const booting = isLoading && !seeded
 
   // Tick only while there are active calls (cheap when idle).
   const now = useTick(calls.length)
@@ -274,6 +378,11 @@ export default function Live() {
     () => calls.find((c) => callId(c) === openId) ?? null,
     [calls, openId],
   )
+
+  const openStartMs = openCall ? callStartMs(openCall) : null
+  const openSeconds = openCall
+    ? (openStartMs != null ? Math.max(0, Math.floor((now - openStartMs) / 1000)) : callDuration(openCall))
+    : 0
 
   const updatedLabel = useMemo(() => {
     if (!updatedAt) return null
@@ -288,6 +397,10 @@ export default function Live() {
         sub="Real-time monitoring of in-progress phone calls"
         actions={
           <div className="flex items-center gap-3 text-[13px]">
+            <span className="flex items-baseline gap-1.5">
+              <span className="metric text-xl tabular-nums">{calls.length}</span>
+              <span className="text-[12px] text-dim">active</span>
+            </span>
             <span className="inline-flex items-center gap-2 font-semibold">
               <span className="relative flex h-2.5 w-2.5">
                 {live && (
@@ -302,8 +415,40 @@ export default function Live() {
         }
       />
 
-      {calls.length === 0 ? (
-        <EmptyState icon={<Radio size={22} />} title="No active calls right now" hint="Calls appear here the moment they connect." />
+      {status === 'error' && calls.length > 0 && (
+        <div role="alert" className="flex items-center gap-2 rounded-xl bg-amber-400/10 px-4 py-2.5 text-[13px] font-medium text-amber-600 ring-1 ring-amber-400/30 dark:text-amber-300">
+          <Spinner className="!h-3.5 !w-3.5 shrink-0" />
+          <span>
+            Live stream interrupted — showing last update{updatedLabel ? ` from ${updatedLabel}` : ''}. Reconnecting…
+          </span>
+        </div>
+      )}
+
+      {booting ? (
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {[0, 1, 2].map((i) => (
+            <SkeletonBlock key={i} h={230} className="rounded-2xl" />
+          ))}
+        </div>
+      ) : calls.length === 0 ? (
+        // Fill the viewport so the panel doesn't look like a stub floating in dead space.
+        <Card className="grid min-h-[calc(100dvh-240px)] place-items-center p-2">
+          <EmptyState
+            icon={
+              <span className="relative grid place-items-center">
+                {live && <span aria-hidden="true" className="absolute inset-0 animate-ping rounded-full bg-mint-400/30" />}
+                <Radio size={22} className={cx('relative', live && 'animate-pulse-soft')} />
+              </span>
+            }
+            title="No active calls right now"
+            hint="Calls appear here the moment they connect. Finished calls move to Recordings."
+            action={
+              live
+                ? <Badge tone="mint">Stream connected — listening for calls</Badge>
+                : <Badge tone="amber">{status === 'error' ? 'Reconnecting to stream…' : 'Connecting to stream…'}</Badge>
+            }
+          />
+        </Card>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {calls.map((c, i) => {
@@ -320,14 +465,40 @@ export default function Live() {
         </div>
       )}
 
-      <SlideOver
+      {/* The live conversation gets the whole browser: near-fullscreen popup
+          on desktop, edge-to-edge on phones. */}
+      <FullscreenModal
         open={openCall != null}
         onClose={() => setOpenId(null)}
-        title={openCall ? `Conversation — ${callPhone(openCall)}` : 'Conversation'}
-        headerExtra={openCall ? <SpeakingBadge speaking={callSpeaking(openCall)} /> : undefined}
+        title={openCall ? (
+          <span className="flex min-w-0 items-center gap-2">
+            <Phone size={15} className="shrink-0 text-mint-500" />
+            <span className="truncate">{callPhone(openCall)}</span>
+          </span>
+        ) : 'Conversation'}
+        headerExtra={openCall ? (
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            <span className="flex items-center gap-1 tabular-nums text-[13px] text-soft">
+              <Clock size={12} className="text-dim" />{dur(openSeconds)}
+            </span>
+            {callLanguage(openCall) && (
+              <Badge tone="amber"><Languages size={11} className="mr-1 inline" />{callLanguage(openCall)}</Badge>
+            )}
+            <SpeakingBadge speaking={callSpeaking(openCall)} />
+          </div>
+        ) : undefined}
       >
-        {openCall ? <Transcript call={openCall} /> : null}
-      </SlideOver>
+        {openCall && (
+          <>
+            {callStage(openCall) && (
+              <div className="shrink-0 border-b border-[var(--border)] px-4 py-3 sm:px-8">
+                <StageStrip stage={callStage(openCall)} />
+              </div>
+            )}
+            <TranscriptPanel call={openCall} />
+          </>
+        )}
+      </FullscreenModal>
     </div>
   )
 }

@@ -1,11 +1,11 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   buildAgentPayload, createAgent, putRouting, activateAgent,
   extractFromDocument, extractedFieldsToWizardPatch,
   type WizardData, type Routing, type MissingField,
 } from '../../api/agents'
-import { Card, Button, Badge, Spinner, cx } from '../../components/ui'
+import { Card, Button, Badge, Spinner, SectionHead, cx } from '../../components/ui'
 import { PageHeader } from '../../components/kit'
 import { useToast } from '../../components/Toast'
 import {
@@ -16,6 +16,19 @@ import {
 import { ChevronLeft, ChevronRight, FileUp, Wand2, Check, AlertTriangle } from 'lucide-react'
 
 const STEPS = ['Basics', 'Languages', 'Personality', 'Knowledge', 'Call Script', 'Calendar', 'Objections & Rules', 'Routing', 'Review']
+
+// One-line purpose per step, shown as the in-card heading subtitle.
+const STEP_SUBS: Record<string, string> = {
+  'Basics': 'Who the agent is and which company it speaks for',
+  'Languages': 'Which languages it speaks and which voice it uses',
+  'Personality': 'Energy, tone and speaking style',
+  'Knowledge': 'Locations, products and objection triggers it can draw on',
+  'Call Script': 'The exact opening line plus stage-by-stage instructions',
+  'Calendar': 'Optional — availability the agent can offer and book',
+  'Objections & Rules': 'Canned responses plus always / never rules',
+  'Routing': 'Optional — which inbound number reaches this agent',
+  'Review': 'Check everything before creating the agent',
+}
 
 const DEFAULT_STAGES = [
   { id: 'GREETING', goal: 'Greet the caller warmly, introduce yourself, and ask how you can help.', turns: '2' },
@@ -99,9 +112,37 @@ export default function CreateAgent() {
   const [activateNow, setActivateNow] = useState(false)
   const [saving, setSaving] = useState(false)
   const [extracting, setExtracting] = useState(false)
+  const [extractingName, setExtractingName] = useState('')
+  const [dragging, setDragging] = useState(false)
   const [missing, setMissing] = useState<MissingField[] | null>(null)
   const [extractedFrom, setExtractedFrom] = useState('')
+  const [attemptedNext, setAttemptedNext] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+  const headingRef = useRef<HTMLDivElement>(null)
+  const railRef = useRef<HTMLDivElement>(null)
+  const createdRef = useRef(false)
+
+  // Unsaved-draft guard: warn on tab close / refresh once anything was typed.
+  const dirty = JSON.stringify(d) !== JSON.stringify(initial) || !!r.did
+  useEffect(() => {
+    if (!dirty) return
+    const h = (e: BeforeUnloadEvent) => {
+      if (createdRef.current) return
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', h)
+    return () => window.removeEventListener('beforeunload', h)
+  }, [dirty])
+
+  // On step change: scroll to top, move focus to the step heading, and keep
+  // the active rail pill in view on small screens.
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+    headingRef.current?.focus({ preventScroll: true })
+    railRef.current?.querySelector('[data-active="true"]')?.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' })
+    setAttemptedNext(false)
+  }, [step])
 
   const set = (patch: Partial<WizardData>) => setD((p) => {
     const next = { ...p, ...patch }
@@ -119,6 +160,7 @@ export default function CreateAgent() {
 
   const onDocument = async (file: File) => {
     setExtracting(true)
+    setExtractingName(file.name)
     try {
       const res = await extractFromDocument(file)
       const patch = extractedFieldsToWizardPatch(res.fields || {})
@@ -136,6 +178,7 @@ export default function CreateAgent() {
       toast(`Document extraction failed: ${e.message || e}`, 'error')
     } finally {
       setExtracting(false)
+      setExtractingName('')
       if (fileRef.current) fileRef.current.value = ''
     }
   }
@@ -153,6 +196,31 @@ export default function CreateAgent() {
     if (s === 1) return d.supported.length > 0
     if (s === 4) return !!d.opening_greeting && d.stages.length > 0 // Call Script: opening line + at least one stage
     if (s === 5) return calendarOk
+    return true
+  }
+
+  // Human-readable list of what still blocks the Next button on this step —
+  // mirrors stepValid exactly so the disabled state is never a mystery.
+  const blockers = (s: number): string[] => {
+    if (s === 0) return [
+      !d.name ? 'Slug' : !slugOk ? 'Valid slug (letters, digits, _ or -)' : '',
+      !d.agent_name ? 'Agent display name' : '',
+      !d.company_name ? 'Company name' : '',
+    ].filter(Boolean)
+    if (s === 1) return d.supported.length === 0 ? ['At least one language'] : []
+    if (s === 4) return [
+      !d.opening_greeting ? 'Opening line' : '',
+      d.stages.length === 0 ? 'At least one call stage' : '',
+    ].filter(Boolean)
+    if (s === 5) return calendarOk ? [] : ['One complete slot (day + time), or disable the calendar']
+    return []
+  }
+
+  // A rail pill ahead of the current step is reachable when every step in
+  // between passes validation.
+  const canJumpTo = (target: number): boolean => {
+    if (target <= step) return true
+    for (let j = step; j < target; j++) if (!stepValid(j)) return false
     return true
   }
 
@@ -193,6 +261,7 @@ export default function CreateAgent() {
       } else {
         toast(`Agent "${d.name}" created`, 'success')
       }
+      createdRef.current = true
       nav(`/build/agents/${d.name}`)
     } catch (e: any) {
       toast(`Create failed: ${e.message || e}`, 'error')
@@ -223,14 +292,24 @@ export default function CreateAgent() {
     <div className="space-y-6">
       <PageHeader title="Create Agent" sub="Define a new voice agent step by step" />
 
-      {/* Start from a document */}
-      <Card className="flex flex-wrap items-center gap-3 p-4">
+      {/* Start from a document — also a drop target */}
+      <div
+        className={cx('card flex flex-wrap items-center gap-3 p-4 transition', dragging && 'ring-2 ring-mint-400/40')}
+        onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault()
+          setDragging(false)
+          const f = e.dataTransfer.files?.[0]
+          if (f && !extracting) onDocument(f)
+        }}
+      >
         <div className="flex items-center gap-2 text-[13px] font-semibold">
           <FileUp size={16} className="text-mint-500" /> Start from a document
         </div>
         <div className="text-[12px] text-dim">
-          Upload a company profile / brochure (PDF, DOCX or TXT) — every field it contains is extracted
-          and prefilled; anything it lacks, you'll be asked for below.
+          Upload or drop a company profile / brochure (PDF, DOCX or TXT) — every field it contains is
+          extracted and prefilled; anything it lacks, you'll be asked for below.
         </div>
         <input
           ref={fileRef}
@@ -242,22 +321,47 @@ export default function CreateAgent() {
         <Button variant="soft" size="sm" onClick={() => fileRef.current?.click()} disabled={extracting}>
           {extracting ? <><Spinner /> Extracting…</> : 'Upload document'}
         </Button>
-      </Card>
+        {extracting && (
+          <div className="flex w-full items-center gap-2">
+            <div className="skeleton h-2 w-40" />
+            <span className="min-w-0 flex-1 truncate text-[12px] text-dim">Reading {extractingName}…</span>
+          </div>
+        )}
+        {!extracting && extractedFrom && (
+          <Badge tone="mint" soft><Check size={12} /> <span className="max-w-[60vw] truncate">Prefilled from {extractedFrom}</span></Badge>
+        )}
+      </div>
 
       {/* Missing-info panel — the "ask the user for the rest" half of extraction */}
       {missing !== null && stillMissing.length > 0 && (
         <div className="rounded-xl bg-amber-500/10 p-4 ring-1 ring-amber-500/20">
-          <div className="mb-2 flex items-center gap-2 text-[13px] font-semibold text-amber-700 dark:text-amber-300">
-            <AlertTriangle size={15} /> {extractedFrom} didn't contain everything — please provide:
+          <div className="mb-2 flex items-start gap-2 text-[13px] font-semibold text-amber-700 sm:items-center dark:text-amber-300">
+            <AlertTriangle size={15} className="shrink-0" /> <span className="min-w-0 break-words">{extractedFrom} didn't contain everything — please provide:</span>
           </div>
           <ul className="space-y-1">
-            {stillMissing.map((m) => (
-              <li key={m.key} className="text-[12px] text-amber-700/90 dark:text-amber-300/90">
-                <span className="font-semibold">{m.label}</span>
-                {MISSING_STEP[m.key] ? <span className="opacity-70"> · {MISSING_STEP[m.key]} step</span> : null}
-                <span className="opacity-70"> — {m.hint}</span>
-              </li>
-            ))}
+            {stillMissing.map((m) => {
+              const target = MISSING_STEP[m.key] ? STEPS.indexOf(MISSING_STEP[m.key]) : -1
+              const body = (
+                <>
+                  <span className="font-semibold">{m.label}</span>
+                  {MISSING_STEP[m.key] ? <span className="opacity-70"> · {MISSING_STEP[m.key]} step</span> : null}
+                  <span className="opacity-70"> — {m.hint}</span>
+                </>
+              )
+              return (
+                <li key={m.key} className="text-[12px] text-amber-700/90 dark:text-amber-300/90">
+                  {target >= 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => setStep(target)}
+                      className="block w-full py-1 text-left underline decoration-dotted underline-offset-2 hover:text-amber-800 sm:inline-block sm:w-auto sm:py-0 dark:hover:text-amber-200"
+                    >
+                      {body}
+                    </button>
+                  ) : body}
+                </li>
+              )
+            })}
           </ul>
         </div>
       )}
@@ -267,33 +371,45 @@ export default function CreateAgent() {
         </div>
       )}
 
-      {/* Step rail */}
-      <div className="flex flex-wrap items-center gap-2">
-        {STEPS.map((s, i) => (
-          <button
-            key={s}
-            onClick={() => i < step && setStep(i)}
-            className={cx(
-              'flex items-center gap-1.5 rounded-full px-3 py-1 text-[12px] font-semibold ring-1 transition',
-              i === step
-                ? 'bg-mint-400/15 text-mint-700 ring-mint-400/30 dark:text-mint-300'
-                : i < step
-                ? 'bg-[var(--surface-2)] text-soft ring-[var(--border)] hover:text-[var(--text)]'
-                : 'bg-[var(--surface-2)] text-dim ring-[var(--border)] cursor-default',
-            )}
-          >
-            <span className={cx('grid h-4 w-4 place-items-center rounded-full text-[10px]', i < step ? 'bg-mint-500 text-white' : 'bg-[var(--surface-solid)] ring-1 ring-[var(--border)]')}>
-              {i < step ? <Check size={10} /> : i + 1}
-            </span>
-            {s}
-          </button>
-        ))}
+      {/* Step rail — wraps on desktop, horizontal snap rail on phones */}
+      <div ref={railRef} className="flex snap-x items-center gap-2 overflow-x-auto pb-1 [-webkit-overflow-scrolling:touch] sm:flex-wrap sm:overflow-visible">
+        {STEPS.map((s, i) => {
+          const reachable = canJumpTo(i)
+          return (
+            <button
+              key={s}
+              type="button"
+              data-active={i === step ? 'true' : undefined}
+              aria-current={i === step ? 'step' : undefined}
+              disabled={i > step && !reachable}
+              onClick={() => i !== step && reachable && setStep(i)}
+              className={cx(
+                'flex min-h-[34px] shrink-0 snap-start items-center gap-1.5 rounded-full px-3 py-1.5 text-[12px] font-semibold ring-1 transition sm:min-h-0 sm:py-1',
+                i === step
+                  ? 'bg-mint-400/15 text-mint-700 ring-mint-400/30 dark:text-mint-300'
+                  : i < step || reachable
+                  ? 'bg-[var(--surface-2)] text-soft ring-[var(--border)] hover:text-[var(--text)]'
+                  : 'bg-[var(--surface-2)] text-dim ring-[var(--border)] cursor-default',
+              )}
+            >
+              <span className={cx('grid h-4 w-4 place-items-center rounded-full text-[10px]', i < step ? 'bg-mint-500 text-white' : 'bg-[var(--surface-solid)] ring-1 ring-[var(--border)]')}>
+                {i < step ? <Check size={10} /> : i + 1}
+              </span>
+              {s}
+            </button>
+          )
+        })}
       </div>
 
-      <Card className="p-6">
+      <Card className="p-4 sm:p-6">
+        <div key={step} className="animate-fade-up">
+        <div ref={headingRef} tabIndex={-1} className="mb-1 outline-none">
+          <div className="eyebrow mb-1">Step {step + 1} of {STEPS.length}</div>
+          <SectionHead title={STEPS[step]} sub={STEP_SUBS[STEPS[step]]} />
+        </div>
         {step === 0 && (
           <div className="space-y-6">
-            <BasicsSection d={d} set={set} />
+            <BasicsSection d={d} set={set} showErrors={attemptedNext} />
             <div>
               <div className="eyebrow mb-2">Call type *</div>
               <CallDirectionSection d={d} set={set} />
@@ -303,7 +419,7 @@ export default function CreateAgent() {
         {step === 1 && <LanguagesSection d={d} set={set} />}
         {step === 2 && <PersonalitySection d={d} set={set} />}
         {step === 3 && <KnowledgeSection d={d} set={set} />}
-        {step === 4 && <CallFlowSection d={d} set={set} />}
+        {step === 4 && <CallFlowSection d={d} set={set} showErrors={attemptedNext} />}
         {step === 5 && <CalendarSection d={d} set={set} />}
         {step === 6 && <ResponsesSection d={d} set={set} />}
 
@@ -320,8 +436,8 @@ export default function CreateAgent() {
         {step === 8 && (
           <div className="space-y-4">
             <div className="flex flex-wrap items-center gap-2">
-              <Badge tone="indigo" soft>{d.name}</Badge>
-              <Badge tone="mint" soft>{d.agent_name}</Badge>
+              <Badge tone="indigo" soft><span className="max-w-[60vw] truncate">{d.name}</span></Badge>
+              <Badge tone="mint" soft><span className="max-w-[60vw] truncate">{d.agent_name}</span></Badge>
               <Badge tone={d.call_direction === 'outbound' ? 'amber' : 'mint'} soft>{d.call_direction}</Badge>
               <span className="text-[13px] text-soft">{d.company_name}</span>
               <span className="ml-auto text-[12px] text-dim">
@@ -329,11 +445,44 @@ export default function CreateAgent() {
                 {d.calendar_enabled ? ` · ${d.calendar_slots.filter((s) => s.day && s.time).length} slots` : ' · no calendar'}
               </span>
             </div>
-            {!canCreate && <div className="rounded-lg bg-amber-500/10 px-3 py-2 text-[12px] text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">Fill in slug, agent name, company, opening line and at least one call stage before creating.</div>}
+
+            {/* Per-section summary tiles with Edit jump links */}
+            <div className="grid gap-3 sm:grid-cols-2">
+              {([
+                { title: 'Basics', target: 0, body: `${d.agent_name || '—'} · ${d.company_name || '—'} · ${d.model}` },
+                { title: 'Languages', target: 1, body: `${d.supported.join(', ') || '—'} · default ${d.default_lang} · voice ${d.tts_speaker}` },
+                { title: 'Personality', target: 2, body: `${d.personality_energy} energy · ${d.personality_tone || '—'} · ${d.personality_style}` },
+                { title: 'Knowledge', target: 3, body: `${d.locations.length} locations · ${d.products.filter((p) => p.name.trim()).length} products · ${d.objection_patterns.length} objection triggers` },
+                { title: 'Call Script', target: 4, body: d.opening_greeting ? `"${d.opening_greeting}" · ${d.stages.length} stages` : `No opening line yet · ${d.stages.length} stages` },
+                { title: 'Calendar', target: 5, body: d.calendar_enabled ? `${d.calendar_slots.filter((s) => s.day.trim() && s.time.trim()).length} slots` : 'disabled' },
+                { title: 'Objections & Rules', target: 6, body: `${d.always_rules.length} always · ${d.never_rules.length} never rules` },
+                { title: 'Routing', target: 7, body: r.did || 'catch-all' },
+              ] as { title: string; target: number; body: string }[]).map((t) => (
+                <div key={t.title} className="rounded-xl bg-[var(--surface-2)] p-3 ring-1 ring-[var(--border)]">
+                  <div className="flex items-center justify-between">
+                    <span className="eyebrow">{t.title}</span>
+                    <Button variant="ghost" size="sm" onClick={() => setStep(t.target)}>Edit</Button>
+                  </div>
+                  <p className="mt-1 text-[12px] leading-relaxed text-soft line-clamp-2">{t.body}</p>
+                </div>
+              ))}
+            </div>
+
+            {!canCreate && (
+              <div className="rounded-lg bg-amber-500/10 px-3 py-2 text-[12px] text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">
+                Fill in{' '}
+                <button type="button" className="font-semibold underline underline-offset-2" onClick={() => setStep(0)}>slug, agent name, company</button>
+                {' '}and an{' '}
+                <button type="button" className="font-semibold underline underline-offset-2" onClick={() => setStep(4)}>opening line with at least one call stage</button>
+                {' '}before creating.
+              </div>
+            )}
             {!d.calendar_enabled && (
               <div className="rounded-lg bg-amber-500/10 px-3 py-2 text-[12px] text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">
                 No calendar configured — the agent won't be able to offer or book visit slots. Recommended:
-                go back to the Calendar step and add availability.
+                go back to the{' '}
+                <button type="button" className="font-semibold underline underline-offset-2" onClick={() => setStep(5)}>Calendar step</button>
+                {' '}and add availability.
               </div>
             )}
             <label className="flex items-center gap-2 rounded-lg bg-[var(--surface-2)] px-3 py-2.5 text-[13px] font-medium text-soft ring-1 ring-[var(--border)]">
@@ -343,7 +492,9 @@ export default function CreateAgent() {
                 onChange={(e) => setActivateNow(e.target.checked)}
                 className="h-4 w-4 accent-[var(--accent)]"
               />
-              Activate immediately — this agent starts answering inbound calls right after creation
+              {d.call_direction === 'outbound'
+                ? 'Activate immediately — this agent becomes the one used for outbound campaigns right after creation'
+                : 'Activate immediately — this agent starts answering inbound calls right after creation'}
             </label>
             <details className="rounded-xl bg-[var(--surface-2)] p-4 ring-1 ring-[var(--border)]">
               <summary className="cursor-pointer text-[12px] font-semibold text-soft">Preview generated definition (JSON)</summary>
@@ -352,15 +503,26 @@ export default function CreateAgent() {
           </div>
         )}
 
+        </div>
+
         {/* Footer nav */}
-        <div className="mt-6 flex items-center justify-between border-t border-[var(--border)] pt-4">
+        <div className="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-[var(--border)] pt-4">
           <Button variant="ghost" onClick={() => setStep((s) => Math.max(0, s - 1))} disabled={step === 0}>
             <ChevronLeft size={15} /> Back
           </Button>
           {step < STEPS.length - 1 ? (
-            <Button variant="primary" onClick={() => setStep((s) => s + 1)} disabled={!stepValid(step)}>
-              Next <ChevronRight size={15} />
-            </Button>
+            <div className="flex flex-wrap items-center justify-end gap-3">
+              {!stepValid(step) && (
+                <span className="text-[12px] font-medium text-amber-600 dark:text-amber-300">
+                  Required to continue: {blockers(step).join(', ')}
+                </span>
+              )}
+              <span onClick={() => { if (!stepValid(step)) setAttemptedNext(true) }}>
+                <Button variant="primary" onClick={() => setStep((s) => s + 1)} disabled={!stepValid(step)}>
+                  Next: {STEPS[step + 1]} <ChevronRight size={15} />
+                </Button>
+              </span>
+            </div>
           ) : (
             <Button variant="primary" onClick={submit} disabled={!canCreate || saving}>
               <Wand2 size={15} /> {saving ? 'Creating…' : 'Create Agent'}

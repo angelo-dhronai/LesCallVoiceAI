@@ -31,10 +31,11 @@ export function StatCard({ label, value, sub, icon, iconTone = 'indigo', spark, 
         <div className="min-w-0">
           <div className="eyebrow truncate">{label}</div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className={cx('metric leading-none', size === 'lg' ? 'text-[40px]' : 'text-[30px]')}>{value}</span>
+            <span className={cx('metric leading-none', size === 'lg' ? 'text-[32px] sm:text-[40px]' : 'text-[24px] sm:text-[30px]')}>{value}</span>
             {trend != null && (
-              <span className={cx('inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[11px] font-bold',
-                trend >= 0 ? 'text-mint-600 bg-mint-400/15' : 'text-rose-500 bg-rose-500/12')}>
+              <span title={`${trend >= 0 ? 'Up' : 'Down'} ${Math.abs(trend)}%`}
+                className={cx('inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[11px] font-bold',
+                  trend >= 0 ? 'text-mint-600 dark:text-mint-300 bg-mint-400/15' : 'text-rose-500 dark:text-rose-300 bg-rose-500/12')}>
                 {trend >= 0 ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}{Math.abs(trend)}%
               </span>
             )}

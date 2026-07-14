@@ -10,6 +10,8 @@ conversation engine — it is pure data.
 
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -48,12 +50,40 @@ class PersonalityConfig:
 # Language
 # ---------------------------------------------------------------------------
 
+# The only TTS models Sarvam accepts; anything else 400s every utterance and
+# the call goes silent. Platform default is bulbul:v3 unless explicitly set.
+VALID_TTS_MODELS = ("bulbul:v2", "bulbul:v3-beta", "bulbul:v3")
+DEFAULT_TTS_MODEL = "bulbul:v3"
+
+
 @dataclass
 class TTSVoiceConfig:
     """TTS model + speaker for one language."""
-    model: str      # e.g. "bulbul:v3"
-    speaker: str    # e.g. "shubh"
+    model: str = DEFAULT_TTS_MODEL   # must be one of VALID_TTS_MODELS
+    speaker: str = "shubh"           # e.g. "shubh"
     pace: float = 1.0  # speaking rate; >1.0 = faster (snappier phone delivery)
+
+    def __post_init__(self) -> None:
+        model = (self.model or "").strip()
+        if model not in VALID_TTS_MODELS:
+            # A speaker name sometimes lands in the model field (e.g.
+            # model: shubh). Salvage it as the speaker if that slot is empty,
+            # then fall back to the platform default model.
+            if model and not (self.speaker or "").strip():
+                self.speaker = model.lower()
+            if model:
+                logging.getLogger(__name__).warning(
+                    "[TTSVoiceConfig] invalid tts model %r — using %s",
+                    self.model, DEFAULT_TTS_MODEL)
+            self.model = DEFAULT_TTS_MODEL
+        if not (self.speaker or "").strip():
+            self.speaker = "shubh"
+        try:
+            self.pace = float(self.pace)
+        except (TypeError, ValueError):
+            self.pace = 1.0
+        if not (0.5 <= self.pace <= 2.0):
+            self.pace = 1.0
 
 
 @dataclass

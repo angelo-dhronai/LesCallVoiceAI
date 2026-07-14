@@ -201,7 +201,7 @@ export default function AgentSettings() {
                   </div>
                   <div className="min-w-0">
                     <div className="eyebrow text-mint-600 dark:text-mint-300">AI voice agent</div>
-                    <h2 className="font-display text-[26px] font-extrabold leading-tight tracking-tight">{name}</h2>
+                    <h2 className="break-words font-display text-[26px] font-extrabold leading-tight tracking-tight">{name}</h2>
                     <div className="truncate text-[13px] text-dim">{company || 'Inbound sales consultant'}</div>
                     {tone.length > 0 && (
                       <div className="mt-2 flex flex-wrap gap-1.5">

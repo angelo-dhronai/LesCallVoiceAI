@@ -10,42 +10,43 @@ export default {
         display: ['"Plus Jakarta Sans Variable"', '"Plus Jakarta Sans"', 'Inter', 'sans-serif'],
       },
       colors: {
+        // "mint" kept as the legacy name — values are now a refined emerald
+        // so every existing mint-* usage inherits the calmer palette.
         mint: {
-          DEFAULT: '#00F5A0',
-          50: '#e9fff7', 100: '#c9ffec', 200: '#8fffd6', 300: '#4dffbe',
-          400: '#13f4a3', 500: '#00d98c', 600: '#00b073', 700: '#00895b', 800: '#066b49', 900: '#08573d',
+          DEFAULT: '#10b981',
+          50: '#ecfdf5', 100: '#d1fae5', 200: '#a7f3d0', 300: '#6ee7b7',
+          400: '#34d399', 500: '#10b981', 600: '#059669', 700: '#047857', 800: '#065f46', 900: '#064e3b',
         },
         indigo: {
           DEFAULT: '#4F46E5',
-          50: '#eef0ff', 100: '#e0e3ff', 200: '#c6cbff', 300: '#a3a8ff',
-          400: '#817fff', 500: '#4F46E5', 600: '#4a3fd4', 700: '#3f33b3', 800: '#342c90', 900: '#2d2873',
+          50: '#eef2ff', 100: '#e0e7ff', 200: '#c7d2fe', 300: '#a5b4fc',
+          400: '#818cf8', 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca', 800: '#3730a3', 900: '#312e81',
         },
         ink: {
-          DEFAULT: '#0b1220',
-          soft: '#3a4256',
-          dim: '#6b7488',
+          DEFAULT: '#101014',
+          soft: '#3f3f46',
+          dim: '#6f7180',
         },
       },
       borderRadius: {
-        xl: '12px', '2xl': '16px', '3xl': '22px',
+        xl: '12px', '2xl': '14px', '3xl': '18px',
       },
       boxShadow: {
-        glass: '0 4px 30px rgba(15,23,42,0.05), 0 1px 2px rgba(15,23,42,0.04)',
-        'glass-lg': '0 18px 50px -12px rgba(15,23,42,0.16), 0 2px 8px rgba(15,23,42,0.05)',
-        'glow-mint': '0 0 0 1px rgba(0,245,160,0.25), 0 8px 30px -8px rgba(0,217,140,0.35)',
-        'glow-indigo': '0 0 0 1px rgba(79,70,229,0.25), 0 8px 30px -8px rgba(79,70,229,0.4)',
-      },
-      backgroundImage: {
-        'mesh-light': 'radial-gradient(1200px 600px at 10% -10%, rgba(0,245,160,0.10), transparent 55%), radial-gradient(1000px 500px at 100% 0%, rgba(79,70,229,0.10), transparent 50%)',
-        'mesh-dark': 'radial-gradient(1200px 600px at 10% -10%, rgba(0,245,160,0.12), transparent 55%), radial-gradient(1000px 500px at 100% 0%, rgba(79,70,229,0.18), transparent 50%)',
+        glass: '0 1px 2px rgba(16,16,20,0.04)',
+        'glass-lg': '0 1px 2px rgba(16,16,20,0.04), 0 12px 32px -12px rgba(16,16,20,0.18)',
+        // Legacy names, subdued: a hairline tinted ring + soft ambient.
+        'glow-mint': '0 0 0 1px rgba(16,185,129,0.18), 0 1px 2px rgba(16,16,20,0.05)',
+        'glow-indigo': '0 0 0 1px rgba(79,70,229,0.18), 0 1px 2px rgba(16,16,20,0.05)',
       },
       keyframes: {
-        'fade-up': { '0%': { opacity: '0', transform: 'translateY(8px)' }, '100%': { opacity: '1', transform: 'translateY(0)' } },
+        'fade-up': { '0%': { opacity: '0', transform: 'translateY(6px)' }, '100%': { opacity: '1', transform: 'translateY(0)' } },
+        'slide-in-right': { '0%': { opacity: '0', transform: 'translateX(24px)' }, '100%': { opacity: '1', transform: 'translateX(0)' } },
         'pulse-soft': { '0%,100%': { opacity: '1' }, '50%': { opacity: '0.45' } },
         shimmer: { '100%': { transform: 'translateX(100%)' } },
       },
       animation: {
-        'fade-up': 'fade-up .5s cubic-bezier(.22,1,.36,1) both',
+        'fade-up': 'fade-up .35s cubic-bezier(.22,1,.36,1) both',
+        'slide-in-right': 'slide-in-right .3s cubic-bezier(.22,1,.36,1) both',
         'pulse-soft': 'pulse-soft 2s ease-in-out infinite',
       },
     },

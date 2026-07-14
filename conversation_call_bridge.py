@@ -13,6 +13,12 @@ import os
 # Add calling-agent to Python path to allow imports
 sys.path.insert(0, os.path.abspath('calling-agent'))
 
+# Repo root on sys.path so `shared.*` (multi-tenant routing DB) imports work
+# regardless of the launcher's cwd.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from pathlib import Path
 
 from call_audit import audit_manager
@@ -60,9 +66,20 @@ except Exception as _exc:  # pragma: no cover - watcher is best-effort
 def _resolve_active_agent_slug() -> str:
     """Slug of the agent that should answer inbound calls.
 
-    Reads agents/active_agent.json; falls back to DEFAULT_AGENT, then to the
-    first agent folder that has an agent.yaml. Never raises.
+    Reads agents.is_active from the shared DB first (the Activate button
+    writes it); falls back to agents/active_agent.json, then DEFAULT_AGENT,
+    then the first agent folder that has an agent.yaml. Never raises.
     """
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            row = db.execute(
+                "SELECT slug FROM agents WHERE is_active=1 "
+                "ORDER BY updated_at DESC LIMIT 1").fetchone()
+        if row and _agent_yaml_exists(row["slug"] or ""):
+            return row["slug"]
+    except Exception as exc:
+        logger.warning("[BRIDGE] DB active-agent lookup unavailable: %r", exc)
     try:
         if ACTIVE_AGENT_FILE.exists():
             data = json.loads(ACTIVE_AGENT_FILE.read_text(encoding="utf-8")) or {}
@@ -80,6 +97,75 @@ def _resolve_active_agent_slug() -> str:
     except Exception:
         pass
     return DEFAULT_AGENT
+
+
+def _agent_yaml_exists(slug: str) -> bool:
+    return bool(slug) and (AGENTS_DIR / slug / "agent.yaml").exists()
+
+
+def resolve_agent_slug(did: str = "", campaign_id: int | None = None,
+                       agent_slug: str = "", dial_meta: dict | None = None) -> str:
+    """Resolve WHICH agent answers this call (multi-tenant routing, plan §2).
+
+    Precedence:
+      1. explicit agent_slug   — set as a channel variable at originate time
+      2. campaign.agent_slug   — outbound campaign binding (shared DB)
+      3. phone_numbers lookup  — inbound: the dialed DID's bound agent (shared DB)
+      4. dial_meta agent_slug  — the call_link.json dial record (fallback link)
+      5. active_agent.json     — legacy single-active-agent behavior
+
+    NEVER raises: if the shared DB is absent/unseeded or a bound slug has no
+    agent.yaml on disk, resolution falls through to the legacy path so a live
+    call can never be dropped by routing.
+    """
+    if _agent_yaml_exists(agent_slug):
+        return agent_slug
+    if agent_slug:
+        logger.warning("[BRIDGE] explicit agent slug %r has no agent.yaml — falling through",
+                       agent_slug)
+    try:
+        from shared.db.database import get_db
+        from shared.phone import significant_digits
+        with get_db() as db:
+            if campaign_id is not None:
+                row = db.execute("SELECT agent_slug FROM campaigns WHERE id=?",
+                                 (campaign_id,)).fetchone()
+                if row and _agent_yaml_exists(row["agent_slug"] or ""):
+                    return row["agent_slug"]
+            if did:
+                sig = significant_digits(did)
+                if sig:
+                    row = db.execute(
+                        "SELECT inbound_agent_slug FROM phone_numbers WHERE sig_digits=?",
+                        (sig,)).fetchone()
+                    if row and _agent_yaml_exists(row["inbound_agent_slug"] or ""):
+                        return row["inbound_agent_slug"]
+    except Exception as exc:
+        logger.warning("[BRIDGE] DB agent routing unavailable (%r) — legacy resolution", exc)
+    if dial_meta and _agent_yaml_exists(dial_meta.get("agent_slug", "")):
+        return dial_meta["agent_slug"]
+    return _resolve_active_agent_slug()
+
+
+def _dial_matches_phone(caller_number: str, dial: dict | None) -> bool:
+    """True only when the dial record's phone exactly suffix-matches the
+    caller — the bar for letting a dial record steer agent selection."""
+    if not dial:
+        return False
+    a = "".join(c for c in (caller_number or "") if c.isdigit())[-10:]
+    b = "".join(c for c in dial.get("phone", "") if c.isdigit())[-10:]
+    return bool(a) and a == b
+
+
+def _lookup_agent_owner(slug: str) -> str:
+    """Tenant email for a slug from the agents index. Best-effort, never raises."""
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            row = db.execute("SELECT owner FROM agents WHERE slug=?", (slug,)).fetchone()
+            return (row["owner"] or "") if row else ""
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -102,17 +188,34 @@ def _lookup_recent_outbound_dial(caller_number: str = "") -> dict | None:
     never mislabeled outbound.
     """
     try:
-        if not CALL_LINK_FILE.exists():
-            return None
-        entries = json.loads(CALL_LINK_FILE.read_text(encoding="utf-8")) or []
         import datetime
         now = datetime.datetime.now(datetime.timezone.utc)
+        entries: list[dict] = []
+        try:
+            from shared.db.database import get_db
+            window_start = (now - datetime.timedelta(
+                seconds=OUTBOUND_DIAL_MATCH_WINDOW_S)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            with get_db() as db:
+                entries = [dict(r) for r in db.execute(
+                    "SELECT owner, phone, contact_id, name, agent_slug,"
+                    " dialed_at FROM call_links WHERE dialed_at >= ?"
+                    " ORDER BY dialed_at DESC LIMIT 50",
+                    (window_start,)).fetchall()]
+        except Exception as exc:
+            logger.warning("[BRIDGE] call_links DB lookup failed (%r) — "
+                           "using legacy file", exc)
+        if not entries and CALL_LINK_FILE.exists():
+            entries = (json.loads(CALL_LINK_FILE.read_text(encoding="utf-8"))
+                       or [])[-50:]
         digits = "".join(c for c in (caller_number or "") if c.isdigit())[-10:]
         best, best_age = None, None
-        for entry in entries[-50:]:
+        for entry in entries:
             try:
                 dial_dt = datetime.datetime.fromisoformat(
-                    entry.get("dialed_at", "").replace("Z", "+00:00"))
+                    str(entry.get("dialed_at", "")).replace("Z", "+00:00"))
+                if dial_dt.tzinfo is None:  # DB timestamps come back naive-UTC
+                    dial_dt = dial_dt.replace(tzinfo=datetime.timezone.utc)
             except Exception:
                 continue
             age = (now - dial_dt).total_seconds()
@@ -129,15 +232,17 @@ def _lookup_recent_outbound_dial(caller_number: str = "") -> dict | None:
         return None
 
 
-def _build_agent_stack(conn_id: str):
-    """Resolve the active agent and build (slug, conversation, stt, tts) for a call.
+def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = None,
+                       agent_slug: str = "", dial_meta: dict | None = None):
+    """Resolve this call's agent and build (slug, conversation, stt, tts).
 
     Mirrors backend/run.py so telephony runs the data-driven agent identically
     to the CLI/web pipeline: STT corrections + TTS voice come from the agent's
     YAML. A load failure degrades to the default ConversationRouter rather than
     dropping the call.
     """
-    slug = _resolve_active_agent_slug()
+    slug = resolve_agent_slug(did=did, campaign_id=campaign_id,
+                              agent_slug=agent_slug, dial_meta=dial_meta)
     agent_def = None
     try:
         agent_def = agent_registry.get(slug)
@@ -171,24 +276,55 @@ def _build_agent_stack(conn_id: str):
 class TelephonySession:
     """Manages one AI pipeline per phone call."""
     def __init__(self, conn_id: str, sample_rate: int, caller_number: str = "",
-                 skip_greeting: bool = False):
+                 skip_greeting: bool = False, did: str = "", campaign_id: int | None = None,
+                 agent_slug: str = ""):
         self.conn_id = conn_id
         self.sample_rate = sample_rate
         self.caller_number = caller_number
+        self.did = did
+        self.campaign_id = campaign_id
+        self.call_key = None  # recording folder basename; set in start()
         self.source = TelephonySource(sample_rate=sample_rate)
         self.sink = TelephonySink(sample_rate=sample_rate, conn_id=conn_id)
         self.hub = EventHub()
 
-        # Resolve the operator-selected active agent and build its STT/TTS the
-        # same way run.py does, then run it through the telephony endpoints.
-        self.agent_slug, conversation, stt, tts = _build_agent_stack(conn_id)
-        logger.info("[%s] Active agent: %s", conn_id, self.agent_slug)
+        # Outbound dial linkage BEFORE agent resolution: the dial record can
+        # carry the agent slug bound at dial time (call_link.json fallback when
+        # the channel variable didn't survive the leg).
+        dial = None
+        try:
+            dial = _lookup_recent_outbound_dial(caller_number)
+        except Exception as exc:
+            logger.warning("[%s] outbound dial lookup failed: %r", conn_id, exc)
+        self._dial = dial
+
+        # Routing guard rails:
+        # - The loose most-recent dial match is fine for LABELING a call
+        #   outbound, but may only steer AGENT selection on an exact phone
+        #   match — otherwise an unrelated inbound call arriving during a
+        #   dial burst could inherit the dial's agent.
+        # - On a confident outbound leg, Caller-Destination-Number is the
+        #   CUSTOMER's number, not one of our DIDs — never DID-route on it.
+        dial_phone_match = _dial_matches_phone(caller_number, dial)
+        confident_outbound = campaign_id is not None or dial_phone_match
+        routing_did = "" if confident_outbound else did
+        routing_dial_meta = dial if dial_phone_match else None
+
+        # Resolve this call's agent (DID / campaign / explicit slug) and build
+        # its STT/TTS the same way run.py does.
+        self.agent_slug, conversation, stt, tts = _build_agent_stack(
+            conn_id, did=routing_did, campaign_id=campaign_id,
+            agent_slug=agent_slug, dial_meta=routing_dial_meta)
+        self.direction = "outbound" if (campaign_id is not None or dial) else "inbound"
+        self.owner = _lookup_agent_owner(self.agent_slug)
+        logger.info("[%s] Active agent: %s (direction=%s did=%s campaign=%s owner=%s)",
+                    conn_id, self.agent_slug, self.direction, did or "-",
+                    campaign_id if campaign_id is not None else "-", self.owner or "-")
 
         # Call context: was this session started by an outbound dial? If so,
         # hand the dialed contact's name/number to the agent so it opens by
         # confirming identity instead of asking who it's speaking with.
         try:
-            dial = _lookup_recent_outbound_dial(caller_number)
             if dial:
                 conversation.set_call_context(
                     direction="outbound",
@@ -217,12 +353,16 @@ class TelephonySession:
         self.pipeline_task = None
         self.playback_task = None
         self.event_task = None
+        self._metering_task = None
         self._running = False
 
         # Rolling tail of recent transcript turns, for the dashboard's live
         # snapshot writer (see ws_audio_receiver.py). Purely additive — fed
         # from the same hub events already consumed for call-audit logging.
-        self.transcript_tail: deque = deque(maxlen=6)
+        # 200 turns ≈ the whole call for the dashboard's fullscreen live
+        # transcript (6 was only enough for the old card snippet); still a
+        # few KB of JSON per snapshot write.
+        self.transcript_tail: deque = deque(maxlen=200)
 
         # Diagnostics
         self.stats = {
@@ -241,8 +381,27 @@ class TelephonySession:
         self.pipeline_task = asyncio.create_task(self.pipeline.run_until_shutdown())
         self.playback_task = asyncio.create_task(self._playback_loop())
         self.event_task = asyncio.create_task(self._event_loop())
-        await audit_manager.create(self.conn_id, caller_number=self.caller_number)
-        logger.info(f"[{self.conn_id}] Session started (Phase 14)")
+        _audit_session = await audit_manager.create(self.conn_id, caller_number=self.caller_number)
+        # Capture the recording folder name NOW — it IS the call_key the
+        # dashboard history/recordings/analysis are keyed by. The audit session
+        # is popped from the manager at close(), so we can't fetch it later in
+        # _persist_call_row; stash it on the session here.
+        try:
+            _cd = getattr(_audit_session, "_call_dir", "") if _audit_session else ""
+            if _cd:
+                self.call_key = os.path.basename(str(_cd).rstrip("/"))
+        except Exception as exc:
+            logger.warning("[%s] could not capture call_key: %r", self.conn_id, exc)
+        logger.info(f"[{self.conn_id}] Session started (Phase 14) call_key=%s", self.call_key)
+
+        # BILLING: open this call's usage-ledger row and start the 15s
+        # heartbeat. Metering must never affect call handling — every touch
+        # is wrapped and off the event loop. (shared/usage_metering.py)
+        try:
+            await asyncio.to_thread(self._metering_open)
+            self._metering_task = asyncio.create_task(self._metering_beat_loop())
+        except Exception as exc:
+            logger.error("[%s] METERING open failed: %r", self.conn_id, exc)
         
     async def stop(self):
         """Stops and cleans up the session."""
@@ -325,7 +484,227 @@ class TelephonySession:
         except Exception as exc:
             logger.warning("[%s] Credit end_call failed: %r", self.conn_id, exc)
 
+        # BILLING: stop the heartbeat and close the usage-ledger row. If this
+        # ever fails, the reconciler crash-closes the row from its last beat —
+        # usage is never lost, at most ~15s under-counted.
+        task = getattr(self, "_metering_task", None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        try:
+            from shared.usage_metering import close_call
+            await asyncio.to_thread(close_call, self.conn_id)
+        except Exception as exc:
+            logger.error("[%s] METERING close failed (reconciler will "
+                         "recover): %r", self.conn_id, exc)
+
+        # Owner-tagged calls row for the multi-tenant dashboard (plan §2).
+        # Off the event loop: a contended sqlite write (busy_timeout 5s) must
+        # never stall audio for other live calls sharing this loop.
+        try:
+            await asyncio.to_thread(self._persist_call_row)
+        except Exception as exc:
+            logger.warning("[%s] Call row persistence failed: %r", self.conn_id, exc)
+
+        # Push the finished WAV to GCS (best-effort, off the loop). Failures
+        # are retried by the recording-sync pass (shared/recording_storage.py
+        # CLI); until then the local file remains the serving copy.
+        try:
+            from shared.recording_storage import gcs_enabled, upload_recording
+            if self.call_key and gcs_enabled():
+                await asyncio.to_thread(upload_recording, self.call_key)
+        except Exception as exc:
+            logger.warning("[%s] Recording upload failed: %r", self.conn_id, exc)
+
         logger.info(f"[{self.conn_id}] Session stopped")
+
+    # ------------------------------------------------------------------
+    # BILLING metering hooks (shared/usage_metering.py). The ledger is the
+    # basis for charging users; these must be correct AND must never take
+    # a call down. All DB writes run in worker threads.
+    # ------------------------------------------------------------------
+
+    def _metering_owner(self) -> str:
+        return self.owner or os.environ.get("LESCALL_DEFAULT_OWNER",
+                                            "tech@dhronai.com")
+
+    def _metering_open(self):
+        from shared.usage_metering import open_call
+        phone = self.caller_number
+        dial = getattr(self, "_dial", None)
+        if self.direction == "outbound" and dial and dial.get("phone"):
+            phone = dial["phone"]
+        open_call(self.conn_id, self._metering_owner(),
+                  agent_slug=self.agent_slug, direction=self.direction,
+                  phone=phone or None)
+
+    async def _metering_beat_loop(self):
+        from shared.usage_metering import heartbeat
+        try:
+            while self._running:
+                await asyncio.sleep(15)
+                if not self._running:
+                    break
+                try:
+                    await asyncio.to_thread(heartbeat, self.conn_id)
+                except Exception as exc:
+                    logger.warning("[%s] METERING heartbeat failed: %r",
+                                   self.conn_id, exc)
+        except asyncio.CancelledError:
+            pass
+
+    def _collect_call_media(self, call_key):
+        """Gather transcript/summary/collected-data for the calls row.
+
+        Everything is best-effort: a missing transcript file or an agent
+        without a state manager must never block the row write."""
+        import json
+        from shared.recording_storage import RECORDINGS_DIR
+
+        transcript = None
+        recording_path = None
+        if call_key:
+            base = str(RECORDINGS_DIR / call_key)
+            t_path = os.path.join(base, "transcript.txt")
+            try:
+                if os.path.exists(t_path):
+                    with open(t_path, "r", encoding="utf-8", errors="replace") as f:
+                        transcript = f.read().strip() or None
+            except Exception as exc:
+                logger.warning("[%s] transcript read failed: %r", self.conn_id, exc)
+            wav = os.path.join(base, "caller_audio.wav")
+            if os.path.exists(wav):
+                recording_path = wav
+
+        summary = None
+        collected = None
+        try:
+            conv = getattr(self.pipeline, "conversation", None)
+            sm = getattr(conv, "state_mgr", None)
+            if sm is not None:
+                data = sm.to_dict()
+                summary = data.get("summary") or None
+                collected = json.dumps(data, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning("[%s] collected-data snapshot failed: %r", self.conn_id, exc)
+        return transcript, summary, collected, recording_path
+
+    def _resolve_contact_id(self, db, phone: str) -> int | None:
+        """Bind this call to the owner's phone-book contact (by the last 10
+        significant digits); auto-create a bare contact for unknown callers so
+        EVERY call carries a contact_id. Same number under a different owner
+        is a different contact — lookup is always owner-scoped."""
+        from shared.phone import significant_digits
+
+        sig = significant_digits(phone)
+        if not sig:
+            return None
+        owner = self.owner or os.environ.get("LESCALL_DEFAULT_OWNER", "tech@dhronai.com")
+        row = db.execute(
+            "SELECT id FROM contacts WHERE owner=? AND sig_digits=?",
+            (owner, sig)).fetchone()
+        if row:
+            return row["id"]
+        # Unknown caller — create a minimal contact (implicit "No group").
+        name = ""
+        dial = getattr(self, "_dial", None)
+        if dial and dial.get("name"):
+            name = dial["name"]
+        else:
+            try:
+                name = getattr(self.pipeline.conversation.state, "customer_name", "") or ""
+            except Exception:
+                pass
+        legacy_id = str(int(time.time() * 1000)) + "_" + phone[-4:]
+        db.execute(
+            "INSERT INTO contacts (legacy_id, owner, phone, sig_digits, name, "
+            "notes, call_status, disposition, call_count, extra, added_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) "
+            "ON CONFLICT (owner, sig_digits) DO NOTHING",
+            (legacy_id, owner, phone, sig, name,
+             "auto-created from call", "not_called", "not_classified", 0,
+             '{"call_history": []}'))
+        row = db.execute(
+            "SELECT id FROM contacts WHERE owner=? AND sig_digits=?",
+            (owner, sig)).fetchone()
+        return row["id"] if row else None
+
+    def _persist_call_row(self):
+        """Best-effort INSERT into shared DB `calls`; must never block teardown."""
+        import datetime
+        from shared.db.database import get_db
+        from shared.phone import significant_digits
+        from shared.recording_storage import new_download_token, public_download_url
+
+        lang = ""
+        try:
+            lang = getattr(self.pipeline.conversation.state, "language", "") or ""
+        except Exception:
+            pass
+        started = self.stats.get("start_time") or time.time()
+        ended = time.time()
+
+        # On outbound legs the channel's caller id is OUR origination number;
+        # the customer's number lives in the dial record.
+        phone = self.caller_number
+        dial = getattr(self, "_dial", None)
+        if self.direction == "outbound" and dial and dial.get("phone"):
+            phone = dial["phone"]
+
+        def _iso(t: float) -> str:
+            return datetime.datetime.fromtimestamp(
+                t, datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        # Recording folder basename == the call_key the dashboard history/
+        # analysis/recordings are all keyed by. Captured in start() (the audit
+        # session is gone by now), it's what lets the owner-scoped history map a
+        # recording folder back to its tenant.
+        call_key = self.call_key
+        transcript, summary, collected, recording_path = self._collect_call_media(call_key)
+
+        # Public download link: a fresh 256-bit random token per call. On a
+        # reconnect upsert the FIRST segment's token wins (COALESCE on the
+        # existing row) so an already-shared link keeps working.
+        token = new_download_token()
+        rec_url = public_download_url(token)
+
+        # A mid-call WS reconnect produces two sessions with one conn_id; the
+        # upsert extends the first row instead of dropping the second segment.
+        with get_db() as db:
+            contact_id = None
+            try:
+                if phone:
+                    contact_id = self._resolve_contact_id(db, phone)
+            except Exception as exc:
+                logger.warning("[%s] contact binding failed: %r", self.conn_id, exc)
+            db.execute(
+                "INSERT INTO calls (conn_id, call_key, direction, agent_slug, campaign_id, "
+                "phone, sig_digits, language, started_at, ended_at, duration_s, owner, "
+                "transcript, summary, collected_data, recording_path, "
+                "download_token, recording_url, contact_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT (conn_id) DO UPDATE SET "
+                "call_key=COALESCE(excluded.call_key, calls.call_key), "
+                "ended_at=excluded.ended_at, "
+                "duration_s=COALESCE(calls.duration_s,0)+excluded.duration_s, "
+                "language=COALESCE(NULLIF(excluded.language,''), calls.language), "
+                "transcript=COALESCE(excluded.transcript, calls.transcript), "
+                "summary=COALESCE(excluded.summary, calls.summary), "
+                "collected_data=COALESCE(excluded.collected_data, calls.collected_data), "
+                "recording_path=COALESCE(excluded.recording_path, calls.recording_path), "
+                "download_token=COALESCE(calls.download_token, excluded.download_token), "
+                "recording_url=COALESCE(calls.recording_url, excluded.recording_url), "
+                "contact_id=COALESCE(calls.contact_id, excluded.contact_id)",
+                (self.conn_id, call_key, self.direction, self.agent_slug, self.campaign_id,
+                 phone or None, significant_digits(phone) or None,
+                 lang or None, _iso(started), _iso(ended), round(ended - started, 1),
+                 self.owner or None,
+                 transcript, summary, collected, recording_path,
+                 token, rec_url, contact_id),
+            )
 
     async def _event_loop(self):
         """Listens for AI pipeline events to capture first_transcript_t."""
@@ -473,7 +852,9 @@ class SessionManager:
     def __init__(self):
         self.sessions: Dict[str, TelephonySession] = {}
 
-    async def get_or_create(self, conn_id: str, sample_rate: int, caller_number: str = "") -> TelephonySession:
+    async def get_or_create(self, conn_id: str, sample_rate: int, caller_number: str = "",
+                            did: str = "", campaign_id: int | None = None,
+                            agent_slug: str = "") -> TelephonySession:
         if conn_id not in self.sessions:
             now = time.time()
             # Prune stale greeted entries to avoid unbounded growth
@@ -491,7 +872,8 @@ class SessionManager:
                 logger.info("[BRIDGE] Reconnect detected for conn_id=%s — greeting suppressed", conn_id)
 
             session = TelephonySession(conn_id, sample_rate, caller_number=caller_number,
-                                       skip_greeting=skip_greeting)
+                                       skip_greeting=skip_greeting, did=did,
+                                       campaign_id=campaign_id, agent_slug=agent_slug)
             self.sessions[conn_id] = session
 
             # Mark as greeted on first creation (before start so no race)

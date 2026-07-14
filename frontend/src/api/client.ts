@@ -9,7 +9,8 @@ export async function api<T>(path: string, opts?: RequestInit): Promise<T> {
     let detail = ''
     try {
       const body = await res.clone().json()
-      detail = typeof body?.detail === 'string' ? body.detail : ''
+      detail = typeof body?.detail === 'string' ? body.detail
+        : typeof body?.reason === 'string' ? body.reason : ''
     } catch { /* non-JSON error body */ }
     throw new Error(detail ? `${res.status}: ${detail}` : `${res.status} ${res.statusText}`)
   }

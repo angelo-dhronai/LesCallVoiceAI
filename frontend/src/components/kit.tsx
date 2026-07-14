@@ -8,9 +8,9 @@ export function PageHeader({
   title, sub, actions,
 }: { title: string; sub?: string; actions?: ReactNode }) {
   return (
-    <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
+    <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
       <div>
-        <h1 className="font-display text-[22px] font-bold tracking-tight">{title}</h1>
+        <h1 className="font-display text-[20px] font-bold tracking-tight">{title}</h1>
         {sub && <p className="mt-1 text-[13px] text-dim">{sub}</p>}
       </div>
       {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
@@ -44,7 +44,10 @@ export function TH({ children, className }: { children?: ReactNode; className?: 
 export function TR({ children, className, onClick }: { children: ReactNode; className?: string; onClick?: () => void }) {
   return (
     <tr onClick={onClick}
-      className={cx('border-b border-[var(--border)] transition-colors hover:bg-[var(--surface-2)]', onClick && 'cursor-pointer', className)}>
+      tabIndex={onClick ? 0 : undefined}
+      onKeyDown={onClick ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick() } } : undefined}
+      className={cx('border-b border-[var(--border)] transition-colors hover:bg-[var(--surface-2)]',
+        onClick && 'cursor-pointer focus-within:bg-[var(--surface-2)]', className)}>
       {children}
     </tr>
   )
@@ -64,12 +67,12 @@ export function Pagination({
       <div>{total != null ? `${total.toLocaleString('en-IN')} total` : ''}</div>
       <div className="flex items-center gap-2">
         <button disabled={page <= 1} onClick={() => onPage(page - 1)}
-          className="rounded-lg px-3 py-1.5 font-semibold ring-1 ring-[var(--border)] transition hover:bg-[var(--surface-2)] disabled:opacity-40">
+          className="min-h-[36px] rounded-lg px-3 py-1.5 font-semibold ring-1 ring-[var(--border)] transition hover:bg-[var(--surface-2)] disabled:opacity-40 sm:min-h-0">
           Prev
         </button>
         <span className="tabular-nums">Page {page} / {Math.max(1, pages)}</span>
         <button disabled={page >= pages} onClick={() => onPage(page + 1)}
-          className="rounded-lg px-3 py-1.5 font-semibold ring-1 ring-[var(--border)] transition hover:bg-[var(--surface-2)] disabled:opacity-40">
+          className="min-h-[36px] rounded-lg px-3 py-1.5 font-semibold ring-1 ring-[var(--border)] transition hover:bg-[var(--surface-2)] disabled:opacity-40 sm:min-h-0">
           Next
         </button>
       </div>
@@ -88,6 +91,8 @@ const STATUS_TONE: Record<string, Tone> = {
   to_contact_later: 'amber', in_doubt: 'amber', inquiry: 'indigo', calling: 'indigo', dialing: 'indigo',
   failed: 'rose', declined: 'rose', rejected: 'rose', cancelled: 'rose', down: 'rose', dismissed: 'neutral',
   not_called: 'neutral', not_classified: 'neutral',
+  // call direction + runtime states
+  inbound: 'indigo', outbound: 'mint', up: 'mint', live: 'mint', running: 'mint', error: 'rose', stopped: 'neutral',
   // priority
   high: 'rose', medium: 'amber', low: 'indigo',
   // sentiment / lead
@@ -105,8 +110,8 @@ export function StatusBadge({ value }: { value?: string | null }) {
 /* ------------------------------------------------------------------ Search input */
 
 export function SearchInput({
-  value, onChange, placeholder = 'Search…', className,
-}: { value: string; onChange: (v: string) => void; placeholder?: string; className?: string }) {
+  value, onChange, placeholder = 'Search…', className, ariaLabel,
+}: { value: string; onChange: (v: string) => void; placeholder?: string; className?: string; ariaLabel?: string }) {
   return (
     <div className={cx('relative', className)}>
       <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-dim" />
@@ -114,6 +119,7 @@ export function SearchInput({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
+        aria-label={ariaLabel ?? placeholder}
         className="w-full rounded-xl bg-[var(--surface-2)] py-2 pl-9 pr-3 text-[13px] text-[var(--text)] outline-none ring-1 ring-[var(--border)] transition placeholder:text-dim focus:ring-mint-400/40"
       />
     </div>
@@ -155,10 +161,10 @@ export function Segmented<T extends string>({
   options, value, onChange,
 }: { options: { value: T; label: string }[]; value: T; onChange: (v: T) => void }) {
   return (
-    <div className="inline-flex rounded-xl bg-[var(--surface-2)] p-1 ring-1 ring-[var(--border)]">
+    <div className="inline-flex max-w-full overflow-x-auto rounded-xl bg-[var(--surface-2)] p-1 ring-1 ring-[var(--border)]">
       {options.map((o) => (
-        <button key={o.value} onClick={() => onChange(o.value)}
-          className={cx('rounded-lg px-3 py-1.5 text-[12px] font-semibold transition',
+        <button key={o.value} onClick={() => onChange(o.value)} aria-pressed={value === o.value}
+          className={cx('min-h-[36px] shrink-0 whitespace-nowrap rounded-lg px-3 py-1.5 text-[12px] font-semibold transition sm:min-h-0',
             value === o.value ? 'bg-[var(--surface-solid)] text-[var(--text)] shadow-sm' : 'text-dim hover:text-soft')}>
           {o.label}
         </button>
@@ -179,7 +185,7 @@ export function BarList({
       {items.map((it, i) => (
         <div key={i}>
           <div className="mb-1 flex items-center justify-between gap-2 text-[12px]">
-            <span className="truncate text-soft">{it.label}</span>
+            <span title={it.label} className="truncate text-soft">{it.label}</span>
             <span className="shrink-0 font-semibold tabular-nums text-dim">{it.value.toLocaleString('en-IN')}</span>
           </div>
           <div className="h-2 overflow-hidden rounded-full bg-[var(--surface-2)]">

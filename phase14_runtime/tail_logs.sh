@@ -24,7 +24,6 @@ NC='\033[0m' # No Color
 
 # Files to tail
 FILES=("$LATEST_RUN/socket_server.log" "$LATEST_RUN/ws_audio_receiver.log")
-[ -f "$LATEST_RUN/stt_worker.log" ] && FILES+=("$LATEST_RUN/stt_worker.log")
 
 tail -qf "${FILES[@]}" | awk -v red="$RED" -v green="$GREEN" -v yellow="$YELLOW" -v blue="$BLUE" -v magenta="$MAGENTA" -v cyan="$CYAN" -v nc="$NC" '
 {
@@ -42,7 +41,7 @@ tail -qf "${FILES[@]}" | awk -v red="$RED" -v green="$GREEN" -v yellow="$YELLOW"
     } else if (line ~ /call_bridge|PIPELINE|Session started/) {
         p = "[CALL]"
         color = green
-    } else if (line ~ /STT|stt_stream_worker|transcript/) {
+    } else if (line ~ /STT|transcript/) {
         p = "[STT]"
         color = magenta
     }

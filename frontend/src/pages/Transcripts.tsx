@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react'
-import { MessageSquare, Search, User, Bot } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import type { ReactNode } from 'react'
+import { MessageSquare, Search, User, Bot, Phone, Copy, Check, RefreshCw } from 'lucide-react'
 import { api } from '../api/client'
-import { useGet } from '../api/hooks/useApi'
-import { Card, Badge, Spinner, EmptyState, cx } from '../components/ui'
+import { useGet, useRefresh } from '../api/hooks/useApi'
+import { Card, Badge, Button, Spinner, EmptyState, cx } from '../components/ui'
 import { PageHeader, SearchInput, AsyncState } from '../components/kit'
 import { dur } from '../lib/format'
 
@@ -40,17 +41,67 @@ function fmtDate(s: string | undefined | null): string {
   })
 }
 
+/** Message timestamps arrive in whatever shape the backend logged — show a clean time when parseable. */
+function fmtMsgTime(s: string): string {
+  const d = new Date(s)
+  if (isNaN(d.getTime())) return s
+  return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
 function isAgent(speaker: string | undefined): boolean {
   const s = (speaker || '').toLowerCase()
   return s.includes('agent') || s.includes('bot') || s.includes('assistant') || s.includes('ai')
 }
 
+/** Client-side script detection for bilingual calls (en / hi / gu). */
+function scriptOf(text: string | undefined): 'hi' | 'gu' | null {
+  const t = text || ''
+  if (/[\u0900-\u097f]/.test(t)) return 'hi'
+  if (/[\u0a80-\u0aff]/.test(t)) return 'gu'
+  return null
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** Wrap case-insensitive keyword matches in <mark> so search intent survives into the thread. */
+function highlightText(text: string, keyword: string): ReactNode {
+  if (!keyword) return text
+  const parts = text.split(new RegExp(`(${escapeRegExp(keyword)})`, 'gi'))
+  if (parts.length === 1) return text
+  return parts.map((part, i) =>
+    i % 2 === 1 ? (
+      <mark key={i} className="rounded-[4px] bg-amber-400/30 px-0.5 text-[var(--text)]">{part}</mark>
+    ) : (
+      part
+    ),
+  )
+}
+
+function fmtMetaValue(key: string, value: unknown): string {
+  if (/duration/i.test(key) && Number.isFinite(Number(value))) return dur(Number(value))
+  const s = String(value)
+  // Raw ISO datetimes (start_time, end_time, …) read as machine noise — humanize them.
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
+    const d = new Date(s)
+    if (!isNaN(d.getTime())) {
+      return d.toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    }
+  }
+  return s.length > 48 ? `${s.slice(0, 48)}…` : s
+}
+
 /* ------------------------------------------------------------------ Transcript panel */
 
-function TranscriptPanel({ folder }: { folder: string | null }) {
+function TranscriptPanel({ recording, highlight }: { recording: Recording | null; highlight?: string }) {
+  const folder = recording?.folder ?? null
   const [data, setData] = useState<TranscriptResp | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<unknown>(null)
+  const [copied, setCopied] = useState(false)
+  const firstMatchRef = useRef<HTMLDivElement | null>(null)
+  const hl = (highlight || '').trim()
 
   useEffect(() => {
     if (!folder) {
@@ -68,61 +119,161 @@ function TranscriptPanel({ folder }: { folder: string | null }) {
     return () => { cancelled = true }
   }, [folder])
 
+  useEffect(() => { setCopied(false) }, [folder])
+
+  // Once a searched transcript loads, jump to the first keyword hit.
+  useEffect(() => {
+    if (loading || !data || !hl) return
+    firstMatchRef.current?.scrollIntoView({ block: 'center' })
+  }, [loading, data, hl])
+
   if (!folder) {
     return (
-      <EmptyState
-        icon={<MessageSquare size={20} />}
-        title="Select a call to view its transcript"
-        hint="Pick a recording from the list on the left."
-      />
+      <div className="grid flex-1 place-items-center">
+        <EmptyState
+          icon={<MessageSquare size={20} />}
+          title="Select a call to view its transcript"
+          hint="Pick a recording from the list on the left."
+        />
+      </div>
     )
+  }
+
+  if (loading) {
+    // Chat-shaped skeleton: mirrors the loaded thread so switching calls doesn't jolt the layout.
+    return (
+      <div className="space-y-3">
+        {[0, 1, 2, 3, 4].map((i) => (
+          <div key={i} className={cx('flex items-start gap-2.5', i % 2 === 1 && 'flex-row-reverse')}>
+            <div className="skeleton h-8 w-8 shrink-0 rounded-xl" />
+            <div className={cx('skeleton h-14 rounded-2xl', ['w-3/5', 'w-2/5', 'w-4/5', 'w-1/2', 'w-3/5'][i])} />
+          </div>
+        ))}
+      </div>
+    )
+  }
+
+  if (error) {
+    return <AsyncState error={error}>{null}</AsyncState>
   }
 
   const messages = Array.isArray(data?.messages) ? (data?.messages ?? []) : []
 
-  return (
-    <AsyncState loading={loading} error={error}>
-      {messages.length === 0 ? (
+  if (messages.length === 0) {
+    return (
+      <div className="grid flex-1 place-items-center">
         <EmptyState
           icon={<MessageSquare size={20} />}
           title="No transcript for this call"
         />
-      ) : (
-        <div className="space-y-3">
-          {messages.map((m, i) => {
-            const agent = isAgent(m?.speaker)
-            return (
-              <div key={i} className="flex items-start gap-2.5">
-                <div className={cx(
-                  'grid h-8 w-8 shrink-0 place-items-center rounded-xl ring-1',
-                  agent
-                    ? 'bg-mint-400/15 text-mint-700 ring-mint-400/30 dark:text-mint-300'
-                    : 'bg-indigo-500/12 text-indigo-600 ring-indigo-500/30 dark:text-indigo-300',
-                )}>
-                  {agent ? <Bot size={15} /> : <User size={15} />}
-                </div>
-                <div className={cx(
-                  'min-w-0 flex-1 rounded-2xl px-3.5 py-2.5 ring-1',
-                  agent
-                    ? 'bg-mint-400/10 ring-mint-400/20'
-                    : 'bg-[var(--surface-2)] ring-[var(--border)]',
-                )}>
-                  <div className="mb-1 flex items-center justify-between gap-2">
+      </div>
+    )
+  }
+
+  const firstMatchIdx = hl
+    ? messages.findIndex((m) => (m?.text || '').toLowerCase().includes(hl.toLowerCase()))
+    : -1
+
+  const meta = Object.entries(data?.metadata ?? {}).filter(
+    ([, v]) => (typeof v === 'string' && v !== '') || typeof v === 'number' || typeof v === 'boolean',
+  )
+
+  const copyTranscript = () => {
+    const text = messages
+      .map((m) => `${m?.speaker || (isAgent(m?.speaker) ? 'Agent' : 'Caller')}: ${m?.text ?? ''}`)
+      .join('\n')
+    navigator.clipboard?.writeText(text)
+      .then(() => {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1500)
+      })
+      .catch(() => {})
+  }
+
+  return (
+    <div className="flex min-h-0 flex-col lg:flex-1">
+      {/* Call context header */}
+      <div className="-mx-4 -mt-4 mb-3 shrink-0 border-b border-[var(--border)] px-4 py-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="min-w-0">
+            <div className="truncate font-display text-[15px] font-bold">
+              {recording?.caller || recording?.call_id || folder}
+            </div>
+            <div className="text-[12px] tabular-nums text-dim">{fmtDate(recording?.folder_dt)}</div>
+          </div>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <Badge>{messages.length} turns</Badge>
+            <Button variant="ghost" size="sm" className="min-h-9 lg:min-h-0" onClick={copyTranscript} title="Copy full transcript to clipboard">
+              {copied ? <><Check size={13} /> Copied</> : <><Copy size={13} /> Copy transcript</>}
+            </Button>
+          </div>
+        </div>
+        {meta.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {meta.map(([k, v]) => (
+              <span key={k} title={`${k}: ${String(v)}`}>
+                <Badge tone="neutral"><span className="max-w-[70vw] truncate sm:max-w-none">{k}: {fmtMetaValue(k, v)}</span></Badge>
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Thread — scrolls internally on desktop so the header stays put.
+          Content column is capped: ~1000px chat bubbles are unreadable on wide screens. */}
+      <div className="mx-auto min-h-0 w-full max-w-4xl flex-1 space-y-3 overflow-y-auto pr-1">
+        {messages.map((m, i) => {
+          const agent = isAgent(m?.speaker)
+          const lang = scriptOf(m?.text)
+          const rawSpeaker = (m?.speaker || '').trim()
+          const showRaw = rawSpeaker !== '' && !['agent', 'caller', 'user'].includes(rawSpeaker.toLowerCase())
+          return (
+            <div
+              key={i}
+              ref={i === firstMatchIdx ? firstMatchRef : undefined}
+              className={cx('flex items-start gap-2.5', !agent && 'flex-row-reverse')}
+            >
+              <div className={cx(
+                'grid h-8 w-8 shrink-0 place-items-center rounded-xl ring-1',
+                agent
+                  ? 'bg-mint-400/15 text-mint-700 ring-mint-400/30 dark:text-mint-300'
+                  : 'bg-indigo-500/12 text-indigo-600 ring-indigo-500/30 dark:text-indigo-300',
+              )}>
+                {agent ? <Bot size={15} /> : <User size={15} />}
+              </div>
+              <div className={cx(
+                'w-fit min-w-0 max-w-[85%] rounded-2xl px-3.5 py-2.5 ring-1',
+                agent
+                  ? 'mr-auto rounded-tl-md bg-mint-400/10 ring-mint-400/20'
+                  : 'ml-auto rounded-tr-md bg-indigo-500/10 ring-indigo-500/20',
+              )}>
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <span className="flex min-w-0 items-center gap-1.5" title={rawSpeaker || undefined}>
                     <Badge tone={agent ? 'mint' : 'indigo'}>{agent ? 'Agent' : 'Caller'}</Badge>
-                    {m?.timestamp && (
-                      <span className="text-[11px] tabular-nums text-dim">{m.timestamp}</span>
-                    )}
-                  </div>
-                  <div className="whitespace-pre-wrap break-words text-[13px] text-soft">
-                    {m?.text ?? ''}
-                  </div>
+                    {showRaw && <span className="min-w-0 truncate text-[10px] text-dim">· {rawSpeaker}</span>}
+                    {lang && <Badge tone="neutral">{lang.toUpperCase()}</Badge>}
+                  </span>
+                  {m?.timestamp && (
+                    <span className="shrink-0 text-[11px] tabular-nums text-dim" title={m.timestamp}>
+                      {fmtMsgTime(m.timestamp)}
+                    </span>
+                  )}
+                </div>
+                <div
+                  lang={lang ?? undefined}
+                  className={cx(
+                    'whitespace-pre-wrap break-words text-soft',
+                    lang ? 'text-[14px] leading-6' : 'text-[13px]',
+                  )}
+                >
+                  {hl ? highlightText(m?.text ?? '', hl) : (m?.text ?? '')}
                 </div>
               </div>
-            )
-          })}
-        </div>
-      )}
-    </AsyncState>
+            </div>
+          )
+        })}
+      </div>
+    </div>
   )
 }
 
@@ -133,6 +284,9 @@ export default function Transcripts() {
   const [keyword, setKeyword] = useState('')
   const [debouncedKeyword, setDebouncedKeyword] = useState('')
   const [selected, setSelected] = useState<string | null>(null)
+  const refresh = useRefresh()
+  const transcriptRef = useRef<HTMLDivElement | null>(null)
+  const selectedRowRef = useRef<HTMLButtonElement | null>(null)
 
   // Debounce keyword for search endpoint
   useEffect(() => {
@@ -174,69 +328,122 @@ export default function Transcripts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recordings])
 
+  // Keep the highlighted row visible inside the list's own scroll area
+  useEffect(() => {
+    selectedRowRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [selected])
+
+  const selectedRec: Recording | null =
+    recordings.find((r) => r?.folder === selected) ?? (selected ? { folder: selected } : null)
+
   return (
     <div className="space-y-6">
-      <PageHeader title="Call Transcripts" sub="Browse & search conversation transcripts" />
+      <PageHeader
+        title="Call Transcripts"
+        sub="Browse & search conversation transcripts"
+        actions={
+          <Button variant="ghost" onClick={() => refresh(['recordings'], ['transcripts'])}>
+            <RefreshCw size={14} /> Refresh
+          </Button>
+        }
+      />
 
       <div className="grid gap-4 lg:grid-cols-[320px_1fr]">
         {/* LEFT — list + filters */}
-        <Card className="flex flex-col gap-3 p-4">
-          <SearchInput
-            value={callerFilter}
-            onChange={setCallerFilter}
-            placeholder="Filter by phone / name…"
-          />
-          <SearchInput
-            value={keyword}
-            onChange={setKeyword}
-            placeholder="Search words in transcripts"
-          />
+        <Card className="flex flex-col gap-3 p-4 lg:sticky lg:top-4 lg:self-start">
+          <div>
+            <div className="eyebrow mb-1.5">Filter list</div>
+            <SearchInput
+              value={callerFilter}
+              onChange={setCallerFilter}
+              placeholder="Filter by phone / name…"
+            />
+          </div>
+          <div>
+            <div className="eyebrow mb-1.5">Search inside calls</div>
+            <SearchInput
+              value={keyword}
+              onChange={setKeyword}
+              placeholder="Search words in transcripts"
+            />
+          </div>
 
           <div className="flex items-center justify-between text-[11px] text-dim">
-            <span>{searchActive ? `Results for "${debouncedKeyword}"` : 'Recent recordings'}</span>
+            <span aria-live="polite">
+              {searchActive
+                ? `${recordings.length} matches for "${debouncedKeyword}"`
+                : `${recordings.length} recent recordings`}
+            </span>
             {activeQ.isFetching && <Spinner className="h-3.5 w-3.5" />}
           </div>
 
-          <div className="-mr-1 max-h-[60vh] space-y-1 overflow-y-auto pr-1">
-            <AsyncState
-              loading={activeQ.isLoading}
-              error={activeQ.error}
-              empty={recordings.length === 0}
-              emptyLabel={searchActive ? 'No matching transcripts' : 'No recordings'}
-            >
-              {recordings.map((r, i) => {
-                const isSel = selected === r?.folder
-                return (
-                  <button
-                    key={r?.folder ?? i}
-                    onClick={() => setSelected(r?.folder ?? null)}
-                    className={cx(
-                      'w-full rounded-xl px-3 py-2.5 text-left transition ring-1',
-                      isSel
-                        ? 'bg-mint-400/12 ring-mint-400/40'
-                        : 'bg-[var(--surface-2)] ring-[var(--border)] hover:bg-[var(--border)]',
-                    )}
-                  >
-                    <div className="flex items-center gap-2">
-                      <Search size={13} className="shrink-0 text-dim" />
-                      <span className="truncate text-[13px] font-semibold text-soft">
-                        {r?.caller || r?.call_id || r?.folder || 'Unknown'}
-                      </span>
-                    </div>
-                    <div className="mt-0.5 pl-5 text-[11px] tabular-nums text-dim">
-                      {fmtDate(r?.folder_dt)}
-                    </div>
-                  </button>
+          <div className="-mr-1 max-h-[40vh] space-y-1 overflow-y-auto pr-1 lg:max-h-[calc(100vh-330px)]">
+            <AsyncState loading={activeQ.isLoading} error={activeQ.error}>
+              {recordings.length === 0 ? (
+                searchActive ? (
+                  <EmptyState
+                    icon={<Search size={20} />}
+                    title={`No transcripts mention "${debouncedKeyword}"`}
+                    hint="Search looks inside the spoken conversation — try a shorter or different word."
+                  />
+                ) : filter ? (
+                  <EmptyState
+                    icon={<Search size={20} />}
+                    title={`No recordings match "${callerFilter.trim()}"`}
+                    hint="Try clearing the caller filter above."
+                  />
+                ) : (
+                  <EmptyState
+                    icon={<MessageSquare size={20} />}
+                    title="No recordings yet"
+                    hint="Transcripts appear here automatically after your agent takes its first call."
+                  />
                 )
-              })}
+              ) : (
+                recordings.map((r, i) => {
+                  const isSel = selected === r?.folder
+                  return (
+                    <button
+                      key={r?.folder ?? i}
+                      ref={isSel ? selectedRowRef : undefined}
+                      aria-current={isSel ? 'true' : undefined}
+                      onClick={() => {
+                        setSelected(r?.folder ?? null)
+                        if (window.innerWidth < 1024) {
+                          transcriptRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                        }
+                      }}
+                      className={cx(
+                        'w-full rounded-xl px-3 py-2.5 text-left transition ring-1',
+                        isSel
+                          ? 'bg-mint-400/12 ring-mint-400/40 shadow-[inset_2px_0_0_0_theme(colors.mint.400)]'
+                          : 'bg-[var(--surface-2)] ring-[var(--border)] hover:bg-[var(--border)]',
+                      )}
+                    >
+                      <div className="flex items-center gap-2">
+                        <Phone size={13} className="shrink-0 text-dim" />
+                        <span className="truncate text-[13px] font-semibold text-soft">
+                          {r?.caller || r?.call_id || r?.folder || 'Unknown'}
+                        </span>
+                      </div>
+                      <div className="mt-0.5 pl-5 text-[11px] tabular-nums text-dim">
+                        {fmtDate(r?.folder_dt)}
+                      </div>
+                    </button>
+                  )
+                })
+              )}
             </AsyncState>
           </div>
         </Card>
 
         {/* RIGHT — transcript thread */}
-        <Card className="p-4">
-          <TranscriptPanel folder={selected} />
-        </Card>
+        <div ref={transcriptRef} className="min-w-0">
+          {/* min-h keeps this column visually balanced with the tall list beside it */}
+          <Card className="p-4 lg:flex lg:min-h-[calc(100vh-170px)] lg:max-h-[calc(100vh-170px)] lg:flex-col">
+            <TranscriptPanel recording={selectedRec} highlight={searchActive ? debouncedKeyword : ''} />
+          </Card>
+        </div>
       </div>
     </div>
   )

@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 import yaml
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import PlainTextResponse, Response
 
 logger = logging.getLogger("agent_builder_api")
@@ -56,18 +56,127 @@ from backend.app.agent_definition.registry import agent_registry  # noqa: E402
 _AGENTS_DIR = _CALLING_AGENT / "agents"
 _ACTIVE_FILE = _AGENTS_DIR / "active_agent.json"
 
-router = APIRouter()
+
+# ── multi-tenant boundary ────────────────────────────────────────────────────
+# Every /api/agents route runs _tenancy_dep (router-level dependency): it
+# resolves the caller's owner email, stashes it in a ContextVar (so the
+# Copilot's in-process calls to these handlers inherit the same tenant), and
+# 404s any {name} the caller doesn't own. Admins (auth.admin_emails) see all.
+# Unclaimed slugs (no agents-index row) are hidden from tenants — creation
+# claims the slug for its creator.
+from contextvars import ContextVar  # noqa: E402
+
+_REQ_OWNER: ContextVar[str | None] = ContextVar("lescall_req_owner", default=None)
+
+
+def _ctx_owner() -> str:
+    """Owner for the current request context (builder or copilot)."""
+    owner = _REQ_OWNER.get()
+    if owner:
+        return owner
+    import auth
+    return auth.DEFAULT_OWNER  # non-HTTP/internal callers act as the admin
+
+
+def _ctx_is_admin() -> bool:
+    import auth
+    return auth.is_admin(_ctx_owner())
+
+
+def _slug_owner(slug: str) -> str | None:
+    """agents-index owner for a slug; None if no row. Fails CLOSED: a DB error
+    raises, it never silently grants access."""
+    from shared.db.database import get_db
+    with get_db() as db:
+        row = db.execute("SELECT owner FROM agents WHERE slug=?", (slug,)).fetchone()
+        return (row["owner"] or None) if row else None
+
+
+def _claim_slug(slug: str, owner: str, display_name: str = "") -> None:
+    from shared.db.database import get_db
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO agents (slug, owner, display_name) VALUES (?,?,?) "
+            "ON CONFLICT (slug) DO NOTHING", (slug, owner, display_name or None))
+        db.execute("UPDATE agents SET owner=? WHERE slug=? AND owner IS NULL",
+                   (owner, slug))
+
+
+def _visible_slugs(owner: str) -> set[str] | None:
+    """Slugs this owner may see; None = unrestricted (admin)."""
+    import auth
+    if auth.is_admin(owner):
+        return None
+    from shared.db.database import get_db
+    with get_db() as db:
+        rows = db.execute("SELECT slug FROM agents WHERE owner=?", (owner,)).fetchall()
+    return {r["slug"] for r in rows}
+
+
+def _assert_slug_access(slug: str, owner: str) -> None:
+    import auth
+    if auth.is_admin(owner):
+        return
+    if _slug_owner(slug) != owner:
+        # 404 (not 403): don't confirm a foreign agent's existence
+        raise HTTPException(status_code=404, detail=f"Agent '{slug}' not found")
+
+
+async def _tenancy_dep(request: Request):
+    """MUST stay async: a sync dependency runs in a threadpool and its
+    ContextVar assignment would not reach the handler's task."""
+    import auth
+    owner = auth.current_owner(request)  # 401 when OAuth is on and no session
+    _REQ_OWNER.set(owner)
+    request.state.owner = owner
+    name = request.path_params.get("name")
+    if name:
+        _assert_slug_access(name, owner)
+
+
+router = APIRouter(dependencies=[Depends(_tenancy_dep)])
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 def _read_active() -> str | None:
     try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            row = db.execute(
+                "SELECT slug FROM agents WHERE is_active=1 "
+                "ORDER BY updated_at DESC LIMIT 1").fetchone()
+        if row and row["slug"]:
+            return row["slug"]
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("[builder] DB active-agent lookup failed: %r", exc)
+    try:  # legacy fallback while active_agent.json is still dual-written
         if _ACTIVE_FILE.exists():
             data = json.loads(_ACTIVE_FILE.read_text(encoding="utf-8")) or {}
             return data.get("active")
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("[builder] could not read active_agent.json: %r", exc)
     return None
+
+
+def _write_active(slug: str | None) -> None:
+    """Single-active-agent selector: exactly one agents row has is_active=1
+    (or none, when slug is None). Dual-writes the legacy JSON until every
+    reader has soaked on the DB path."""
+    from shared.db.database import get_db
+    with get_db() as db:
+        db.execute("UPDATE agents SET is_active=0 WHERE is_active=1")
+        if slug:
+            db.execute(
+                "UPDATE agents SET is_active=1, updated_at=CURRENT_TIMESTAMP "
+                "WHERE slug=?", (slug,))
+    try:
+        if slug:
+            _ACTIVE_FILE.write_text(json.dumps({"active": slug}, indent=2),
+                                    encoding="utf-8")
+        elif _ACTIVE_FILE.exists():
+            _ACTIVE_FILE.unlink()
+    except Exception as exc:  # pragma: no cover - legacy mirror only
+        logger.warning("[builder] could not mirror active_agent.json: %r", exc)
 
 
 def _agent_summary(name: str, agent: AgentDefinition) -> dict:
@@ -88,11 +197,19 @@ def _agent_summary(name: str, agent: AgentDefinition) -> dict:
 # ── list / read ─────────────────────────────────────────────────────────────
 @router.get("/api/agents")
 async def list_agents() -> dict:
-    """List every agent definition available in agents/, plus which is active."""
-    active = _read_active()
+    """List the caller's agent definitions, plus which is globally active.
+
+    Tenants see only slugs they own (agents index); admins see everything.
+    The global-active slug is admin infrastructure — hidden from tenants.
+    """
+    visible = _visible_slugs(_ctx_owner())
+    is_admin = visible is None
+    active = _read_active() if is_admin else None
     result = []
     for yaml_path in sorted(_AGENTS_DIR.glob("*/agent.yaml")):
         name = yaml_path.parent.name
+        if visible is not None and name not in visible:
+            continue
         try:
             agent = AgentDefinition.from_yaml(yaml_path)
             summary = _agent_summary(name, agent)
@@ -105,8 +222,8 @@ async def list_agents() -> dict:
 
 @router.get("/api/agents/active")
 async def get_active_agent() -> dict:
-    """Return the slug of the agent that answers inbound calls (or null)."""
-    return {"active": _read_active()}
+    """Slug of the global-fallback agent (admin infrastructure; null for tenants)."""
+    return {"active": _read_active() if _ctx_is_admin() else None}
 
 
 @router.get("/api/agents/{name}")
@@ -135,6 +252,12 @@ async def create_agent(request: Request) -> dict:
     target_dir = _AGENTS_DIR / name
     if target_dir.exists():
         raise HTTPException(status_code=409, detail=f"Agent '{name}' already exists — use PUT to update")
+    # Never write into a slug the DB already assigns to another tenant (guards
+    # the narrow orphaned-row case where the folder was removed but the owner
+    # row survived).
+    _existing_owner = _slug_owner(name)
+    if _existing_owner and _existing_owner != _ctx_owner() and not _ctx_is_admin():
+        raise HTTPException(status_code=409, detail=f"Agent '{name}' already exists")
     try:
         agent = AgentDefinition.from_dict(body)
     except Exception as exc:
@@ -142,7 +265,20 @@ async def create_agent(request: Request) -> dict:
     target_dir.mkdir(parents=True, exist_ok=True)
     agent.to_yaml(target_dir / "agent.yaml")
     agent_registry.put(name, agent)
-    logger.info("[builder] created agent '%s'", name)
+    # Multi-tenant: creation claims the slug for its creator (agents index).
+    owner = _ctx_owner()
+    try:
+        _claim_slug(name, owner, agent.identity.agent_name)
+    except Exception as exc:
+        # Fail CLOSED: an unclaimed agent would be invisible/unusable for a
+        # tenant and grabbable later — undo the create instead.
+        if not _ctx_is_admin():
+            shutil.rmtree(target_dir, ignore_errors=True)
+            agent_registry.invalidate(name)
+            raise HTTPException(status_code=500,
+                                detail=f"could not register ownership: {exc}")
+        logger.warning("[builder] ownership claim failed for %s: %r", name, exc)
+    logger.info("[builder] created agent '%s' (owner=%s)", name, owner)
     return {"status": "created", "name": name, "agent_id": agent.agent_id}
 
 
@@ -180,7 +316,7 @@ async def archive_agent(name: str) -> dict:
     # If the archived agent was active, clear the selection.
     if _read_active() == name:
         try:
-            _ACTIVE_FILE.unlink()
+            _write_active(None)
         except Exception:
             pass
     logger.info("[builder] archived agent '%s'", name)
@@ -446,12 +582,18 @@ async def preview_intent(request: Request) -> dict:
     language = body.get("language", "auto")
 
     req_agent = (body.get("agent") or "").strip()
-    agent_name = req_agent or _read_active()
+    agent_name = req_agent or (_read_active() if _ctx_is_admin() else "")
     if not agent_name:
-        yamls = sorted(_AGENTS_DIR.glob("*/agent.yaml"))
+        # Default to one of the CALLER's own agents, never another tenant's.
+        visible = _visible_slugs(_ctx_owner())
+        yamls = [p for p in sorted(_AGENTS_DIR.glob("*/agent.yaml"))
+                 if visible is None or p.parent.name in visible]
         if not yamls:
             raise HTTPException(status_code=503, detail="No agents found — create one first")
         agent_name = yamls[0].parent.name
+    # Owner boundary: this route has no {name} path param so the router
+    # dependency never ran _assert_slug_access — enforce it explicitly.
+    _assert_slug_access(agent_name, _ctx_owner())
     try:
         agent_def = agent_registry.get(agent_name, _AGENTS_DIR)
     except Exception as exc:
@@ -499,7 +641,16 @@ async def activate_agent(name: str) -> dict:
     Writes agents/active_agent.json — the single-active-agent selector that
     conversation_call_bridge.py reads when each call starts. The next call will
     run this agent; calls already in progress are unaffected.
+
+    ADMIN ONLY: this is the platform-wide FALLBACK for calls that don't match
+    a DID binding — letting a tenant flip it would re-route other tenants'
+    calls. Tenants route their own numbers via the Telephony panel instead.
     """
+    if not _ctx_is_admin():
+        raise HTTPException(
+            status_code=403,
+            detail="Activation is platform-admin only — bind your number to "
+                   "this agent in the Telephony panel instead")
     yaml_path = _AGENTS_DIR / name / "agent.yaml"
     if not yaml_path.exists():
         raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
@@ -507,7 +658,7 @@ async def activate_agent(name: str) -> dict:
         agent = AgentDefinition.from_yaml(yaml_path)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Failed to load agent: {exc}")
-    _ACTIVE_FILE.write_text(json.dumps({"active": name}, indent=2), encoding="utf-8")
+    _write_active(name)
     agent_registry.invalidate(name)
     logger.info("[builder] activated agent '%s' (%s) for inbound calls", name, agent.agent_id)
     return {

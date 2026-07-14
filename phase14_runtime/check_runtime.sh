@@ -28,14 +28,11 @@ done
 
 # 2. Check Listening Ports
 echo "--- Listening Ports ---"
-ss -ltnp | grep -E '9000|9001|9002|9004'
+ss -ltnp | grep -E '9000|9001|9004'
 
 # 3. Verify exactly one listener per port
 echo "--- Port Ownership Verification ---"
 PORTS=(9000 9001 9004)
-if [ -f "$LATEST_LOGS/stt_worker.pid" ]; then
-    PORTS+=(9002)
-fi
 
 for port in "${PORTS[@]}"; do
     COUNT=$(ss -ltn | grep -c ":$port ")

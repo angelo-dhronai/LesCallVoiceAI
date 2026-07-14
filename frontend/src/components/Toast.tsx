@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useRef, useState, type ReactNode } from 'react'
-import { CheckCircle2, AlertTriangle, Info, XCircle } from 'lucide-react'
+import { CheckCircle2, AlertTriangle, Info, XCircle, X } from 'lucide-react'
 import { cx } from './ui'
 
 type ToastType = 'success' | 'error' | 'info' | 'warn'
@@ -22,24 +22,46 @@ const TONES: Record<ToastType, string> = {
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([])
   const seq = useRef(0)
+  const timers = useRef(new Map<number, ReturnType<typeof setTimeout>>())
+
+  const dismissLater = useCallback((id: number, ms: number) => {
+    timers.current.set(id, setTimeout(() => {
+      timers.current.delete(id)
+      setToasts((t) => t.filter((x) => x.id !== id))
+    }, ms))
+  }, [])
 
   const push = useCallback((text: string, type: ToastType = 'info') => {
     const id = ++seq.current
     setToasts((t) => [...t, { id, text, type }])
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 5000)
+    // Errors deserve more reading time than confirmations.
+    dismissLater(id, type === 'error' ? 8000 : 5000)
+  }, [dismissLater])
+
+  // Hovering pauses auto-dismiss; leaving restarts a short countdown.
+  const pause = useCallback((id: number) => {
+    const t = timers.current.get(id)
+    if (t) { clearTimeout(t); timers.current.delete(id) }
   }, [])
+  const resume = useCallback((id: number) => { dismissLater(id, 2000) }, [dismissLater])
 
   return (
     <ToastCtx.Provider value={push}>
       {children}
-      <div className="pointer-events-none fixed bottom-4 right-4 z-[100] flex w-[min(92vw,360px)] flex-col gap-2">
+      <div role="status" aria-live="polite" className="pointer-events-none fixed bottom-4 right-4 z-[100] flex w-[min(92vw,360px)] flex-col gap-2">
         {toasts.map((t) => {
           const Icon = ICONS[t.type]
           return (
             <div key={t.id}
+              onMouseEnter={() => pause(t.id)}
+              onMouseLeave={() => resume(t.id)}
               className={cx('glass pointer-events-auto flex items-start gap-2.5 rounded-xl px-3.5 py-3 text-[13px] font-medium shadow-glass-lg ring-1 animate-fade-up', TONES[t.type])}>
               <Icon size={16} className="mt-0.5 shrink-0" />
-              <span className="text-[var(--text)]">{t.text}</span>
+              <span className="flex-1 text-[var(--text)]">{t.text}</span>
+              <button onClick={() => setToasts((all) => all.filter((x) => x.id !== t.id))} aria-label="Dismiss"
+                className="grid h-5 w-5 shrink-0 place-items-center rounded-md text-dim transition hover:bg-[var(--surface-2)] hover:text-[var(--text)]">
+                <X size={13} />
+              </button>
             </div>
           )
         })}

@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · LesCall</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Anton&family=Sora:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  /* Brand tokens from lescall.dhronai.com */
+  :root {
+    --radius: .25rem;
+    --background: #eef6f1;
+    --foreground: #0b1e12;
+    --card: #fff;
+    --primary: #1dbf67;
+    --primary-foreground: #fff;
+    --secondary: #d4eddf;
+    --muted: #e2f0e9;
+    --muted-foreground: #4a7359;
+    --border: #b8d9c5;
+    --dark: #070d09;
+    --dark-2: #0d1a10;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    min-height: 100vh; display: flex;
+    background: var(--background); color: var(--foreground);
+    font-family: "Sora", system-ui, sans-serif; font-size: 15px; line-height: 1.6;
+  }
+
+  /* Left brand panel */
+  .brand {
+    flex: 1.1; background: var(--dark); color: #f7f9f8;
+    display: flex; flex-direction: column; justify-content: space-between;
+    padding: 48px; position: relative; overflow: hidden;
+  }
+  .brand::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background:
+      radial-gradient(600px 300px at 20% 110%, rgba(29,191,103,.18), transparent 70%),
+      radial-gradient(400px 240px at 90% -10%, rgba(29,191,103,.10), transparent 70%);
+  }
+  .wordmark {
+    font-family: "Anton", sans-serif; font-size: 28px; letter-spacing: .04em;
+    text-transform: uppercase; color: #fff;
+  }
+  .wordmark span { color: var(--primary); }
+  .hero h1 {
+    font-family: "Anton", sans-serif; font-weight: 400; text-transform: uppercase;
+    font-size: clamp(34px, 4.5vw, 56px); line-height: 1.05; letter-spacing: .01em;
+  }
+  .hero h1 em { font-style: normal; color: var(--primary); }
+  .hero p { margin-top: 18px; color: #b8d9c5; max-width: 46ch; }
+  .term {
+    font-family: "JetBrains Mono", monospace; font-size: 12.5px; color: var(--primary);
+    background: var(--dark-2); border: 1px solid rgba(29,191,103,.25);
+    border-radius: var(--radius); padding: 10px 14px; display: inline-block;
+  }
+  .term::before { content: "$ "; opacity: .6; }
+  .brand footer { font-size: 12.5px; color: #6d8a79; position: relative; }
+
+  /* Right login panel */
+  .panel {
+    flex: 1; display: flex; align-items: center; justify-content: center; padding: 32px;
+  }
+  .card {
+    width: 100%; max-width: 400px; background: var(--card);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 36px 32px; box-shadow: 0 1px 2px rgba(11,30,18,.06);
+  }
+  .card h2 {
+    font-family: "Anton", sans-serif; font-weight: 400; text-transform: uppercase;
+    font-size: 24px; letter-spacing: .02em;
+  }
+  .card .sub { color: var(--muted-foreground); font-size: 13.5px; margin: 8px 0 26px; }
+  .gbtn {
+    display: flex; align-items: center; justify-content: center; gap: 12px;
+    width: 100%; padding: 12px 16px; cursor: pointer; text-decoration: none;
+    background: #fff; color: var(--foreground);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    font: 600 14.5px "Sora", sans-serif; transition: all .15s ease;
+  }
+  .gbtn:hover { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(29,191,103,.15); }
+  .divider { display: flex; align-items: center; gap: 10px; margin: 22px 0;
+             color: var(--muted-foreground); font-size: 12px; }
+  .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--muted); }
+  .note {
+    font-size: 12.5px; color: var(--muted-foreground);
+    background: var(--muted); border-radius: var(--radius); padding: 10px 12px;
+  }
+  .note code { font-family: "JetBrains Mono", monospace; font-size: 11.5px; }
+  #error {
+    display: none; margin-bottom: 18px; padding: 11px 13px; font-size: 13px;
+    color: #7a2222; background: #fbeaea; border: 1px solid #eec7c7;
+    border-radius: var(--radius);
+  }
+  .card footer { margin-top: 26px; font-size: 12px; color: var(--muted-foreground); text-align: center; }
+  .card footer a { color: var(--primary); text-decoration: none; }
+
+  @media (max-width: 880px) {
+    body { flex-direction: column; }
+    .brand { padding: 28px; gap: 22px; }
+    .hero p, .term { display: none; }
+    .panel { padding: 24px 16px 48px; }
+  }
+</style>
+</head>
+<body>
+
+<aside class="brand">
+  <div class="wordmark">Les<span>Call</span></div>
+  <div class="hero">
+    <h1>Voice AI for<br><em>Real Conversations</em></h1>
+    <p>Answers every call. Qualifies every lead. Books every meeting — 24/7.
+       Strong on 8+ languages.</p>
+    <div class="term" style="margin-top:26px">agent --answer inbound --lang auto</div>
+  </div>
+  <footer>Powered by DhronAI Foundry · KLV 1.0 &amp; BOLV 1.0 speech models</footer>
+</aside>
+
+<main class="panel">
+  <div class="card">
+    <h2>Sign in</h2>
+    <p class="sub">Access your LesCall agent dashboard</p>
+
+    <div id="error"></div>
+
+    <a class="gbtn" href="/auth/login" id="gbtn">
+      <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true">
+        <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+        <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+        <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+        <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+      </svg>
+      Continue with Google
+    </a>
+
+    <footer>LesCall · <a href="https://lescall.dhronai.com">lescall.dhronai.com</a></footer>
+  </div>
+</main>
+
+<script>
+  const ERRORS = {
+    not_authorized: "This Google account isn't authorized for this dashboard. Ask the administrator to add your email to the allow-list.",
+    state: "Your sign-in session expired — please try again.",
+    exchange: "Google sign-in failed — please try again.",
+    unverified: "This Google account's email address is unverified.",
+  };
+  const err = new URLSearchParams(location.search).get("error");
+  if (err) {
+    const box = document.getElementById("error");
+    box.textContent = ERRORS[err] || "Sign-in failed — please try again.";
+    box.style.display = "block";
+  }
+  // Already signed in (or single-tenant mode)? Go straight to the dashboard.
+  fetch("/api/auth/me").then(r => r.ok ? r.json() : null).then(me => {
+    if (me && !me.login_required) location.replace("/");
+  }).catch(() => {});
+</script>
+
+</body>
+</html>

@@ -1,0 +1,20 @@
+[
+  {
+    "slot_day": "This Saturday",
+    "slot_time": "12:00 PM",
+    "appointment_time": "This Saturday at 12:00 PM",
+    "caller_name": "Angelo P",
+    "caller_phone": "918076562864",
+    "conn_id": "dd7546c3-8db3-4c3a-ab04-6a57d650edf9",
+    "booked_at": "2026-07-13T06:11:35Z"
+  },
+  {
+    "slot_day": "Tomorrow",
+    "slot_time": "11:00 AM",
+    "appointment_time": "Tomorrow at 11:00 AM",
+    "caller_name": "Alwyn",
+    "caller_phone": "917042340227",
+    "conn_id": "188ca2d2-0437-47c5-9865-54870b9e84b3",
+    "booked_at": "2026-07-13T06:28:40Z"
+  }
+]

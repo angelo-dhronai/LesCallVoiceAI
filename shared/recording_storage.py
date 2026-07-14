@@ -1,0 +1,273 @@
+"""Call-recording storage: GCS sync + unguessable public download links.
+
+Every finished call gets a `download_token` — 32 bytes from `secrets`
+(256-bit, URL-safe). The public link is
+    {PUBLIC_BASE_URL}/api/recordings/dl/{token}
+and the token is the ONLY credential: it is never derived from the call key,
+phone number, or date, so one leaked link cannot be edited into another
+call's link.
+
+The WAV is uploaded to a private GCS bucket after the call ends (and again by
+the `sync_pending` catch-up pass for anything the inline attempt missed).
+Once uploaded, the local copy is only kept for RECORDING_LOCAL_RETENTION_DAYS
+and then deleted by `cleanup_local`; downloads transparently fall back to the
+GCS object when the local file is gone.
+
+Config (deploy/.pg_env — shared by lescall-runtime and lescall-dashboard):
+    GCS_RECORDINGS_BUCKET=lescall-recordings     # empty → uploads disabled
+    GCS_RECORDINGS_PREFIX=recordings
+    GOOGLE_APPLICATION_CREDENTIALS=/path/sa.json # or VM default credentials
+    PUBLIC_BASE_URL=https://agent.lescall.dhronai.com
+    RECORDING_LOCAL_RETENTION_DAYS=3
+
+CLI (catch-up sync + retention cleanup, cron/systemd-timer friendly):
+    python -m shared.recording_storage --once
+    python -m shared.recording_storage --interval 900
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import secrets
+import time
+from pathlib import Path
+
+logger = logging.getLogger("recording_storage")
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+RECORDINGS_DIR = Path(os.environ.get("CALL_AUDIT_DIR", _REPO_ROOT / "recordings"))
+
+AUDIO_FILENAME = "caller_audio.wav"
+# Small sidecar files sync too so the bucket holds the complete call artifact.
+SIDECAR_FILENAMES = ("transcript.txt", "metadata.json")
+
+
+def bucket_name() -> str:
+    return os.environ.get("GCS_RECORDINGS_BUCKET", "").strip()
+
+
+def gcs_enabled() -> bool:
+    return bool(bucket_name())
+
+
+def public_base_url() -> str:
+    return os.environ.get(
+        "PUBLIC_BASE_URL", "https://agent.lescall.dhronai.com").rstrip("/")
+
+
+def retention_days() -> float:
+    try:
+        return float(os.environ.get("RECORDING_LOCAL_RETENTION_DAYS", "3"))
+    except ValueError:
+        return 3.0
+
+
+def new_download_token() -> str:
+    """256-bit URL-safe random token (43 chars). Collision/guess-proof."""
+    return secrets.token_urlsafe(32)
+
+
+def public_download_url(token: str) -> str:
+    return f"{public_base_url()}/api/recordings/dl/{token}"
+
+
+def local_audio_path(call_key: str) -> Path:
+    return RECORDINGS_DIR / call_key / AUDIO_FILENAME
+
+
+# ---------------------------------------------------------------------------
+# GCS client (lazy; ADC or GOOGLE_APPLICATION_CREDENTIALS)
+# ---------------------------------------------------------------------------
+
+_bucket_cache = None
+
+
+def _bucket():
+    global _bucket_cache
+    if _bucket_cache is not None:
+        return _bucket_cache
+    from google.cloud import storage  # deferred: optional dependency
+
+    client = storage.Client()
+    _bucket_cache = client.bucket(bucket_name())
+    return _bucket_cache
+
+
+def _object_name(call_key: str, filename: str) -> str:
+    prefix = os.environ.get("GCS_RECORDINGS_PREFIX", "recordings").strip("/")
+    return f"{prefix}/{call_key}/{filename}"
+
+
+def open_gcs_stream(gcs_object: str):
+    """Readable binary file-like over a bucket object (for download fallback)."""
+    return _bucket().blob(gcs_object).open("rb")
+
+
+# ---------------------------------------------------------------------------
+# Upload + DB bookkeeping
+# ---------------------------------------------------------------------------
+
+def upload_recording(call_key: str) -> bool:
+    """Upload one call's artifacts to GCS and stamp the calls row.
+
+    Returns True when the audio object is in the bucket (now or already).
+    Never raises — the call path treats upload as best-effort; the sync CLI
+    retries anything unstamped.
+    """
+    if not call_key:
+        return False
+    if not gcs_enabled():
+        logger.debug("GCS_RECORDINGS_BUCKET unset; skipping upload of %s", call_key)
+        return False
+    wav = local_audio_path(call_key)
+    if not wav.exists():
+        logger.warning("no local audio for %s; nothing to upload", call_key)
+        return False
+    try:
+        bucket = _bucket()
+        audio_obj = _object_name(call_key, AUDIO_FILENAME)
+        blob = bucket.blob(audio_obj)
+        if not blob.exists():
+            blob.upload_from_filename(str(wav), content_type="audio/wav")
+        for name in SIDECAR_FILENAMES:
+            side = RECORDINGS_DIR / call_key / name
+            if side.exists():
+                sblob = bucket.blob(_object_name(call_key, name))
+                if not sblob.exists():
+                    sblob.upload_from_filename(str(side))
+        _stamp_uploaded(call_key, audio_obj)
+        logger.info("uploaded %s -> gs://%s/%s", call_key, bucket_name(), audio_obj)
+        return True
+    except Exception as exc:
+        logger.warning("GCS upload failed for %s: %r", call_key, exc)
+        return False
+
+
+def _stamp_uploaded(call_key: str, audio_obj: str) -> None:
+    import datetime
+
+    from shared.db.database import get_db
+
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="seconds").replace("+00:00", "Z")
+    with get_db() as db:
+        db.execute(
+            "UPDATE calls SET gcs_object=?, gcs_uploaded_at=? WHERE call_key=?",
+            (audio_obj, now, call_key))
+
+
+def ensure_download_token(call_key: str) -> str | None:
+    """Assign (or return) the row's download token; None if no row exists."""
+    from shared.db.database import get_db
+
+    with get_db() as db:
+        row = db.execute(
+            "SELECT download_token FROM calls WHERE call_key=?",
+            (call_key,)).fetchone()
+        if row is None:
+            return None
+        if row["download_token"]:
+            return row["download_token"]
+        token = new_download_token()
+        db.execute(
+            "UPDATE calls SET download_token=?, recording_url=? WHERE call_key=?",
+            (token, public_download_url(token), call_key))
+        return token
+
+
+# ---------------------------------------------------------------------------
+# Catch-up sync + local retention cleanup
+# ---------------------------------------------------------------------------
+
+def sync_pending(limit: int = 200) -> int:
+    """Upload every call row that has local audio but no GCS stamp; also
+    backfill missing download tokens. Returns the number uploaded."""
+    from shared.db.database import get_db
+
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT call_key, download_token FROM calls "
+            "WHERE call_key IS NOT NULL AND gcs_uploaded_at IS NULL "
+            "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    uploaded = 0
+    for r in rows:
+        call_key = r["call_key"]
+        if not r["download_token"]:
+            ensure_download_token(call_key)
+        if local_audio_path(call_key).exists() and upload_recording(call_key):
+            uploaded += 1
+    return uploaded
+
+
+def cleanup_local(max_age_days: float | None = None) -> int:
+    """Delete local WAVs that are safely in GCS and older than the retention
+    window. Transcript/metadata sidecars stay local (tiny, and the dashboard
+    reads them). Returns number of files deleted."""
+    from shared.db.database import get_db
+
+    max_age_days = retention_days() if max_age_days is None else max_age_days
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        with get_db() as db:
+            rows = db.execute(
+                "SELECT call_key FROM calls "
+                "WHERE gcs_uploaded_at IS NOT NULL AND call_key IS NOT NULL"
+            ).fetchall()
+    except Exception as exc:
+        logger.warning("cleanup: DB read failed: %r", exc)
+        return 0
+    deleted = 0
+    for r in rows:
+        wav = local_audio_path(r["call_key"])
+        try:
+            if wav.exists() and wav.stat().st_mtime < cutoff:
+                wav.unlink()
+                deleted += 1
+                logger.info("cleanup: removed local %s", wav)
+        except Exception as exc:
+            logger.warning("cleanup: could not remove %s: %r", wav, exc)
+    return deleted
+
+
+def _run_once() -> None:
+    if not gcs_enabled():
+        logger.warning("GCS_RECORDINGS_BUCKET unset — token backfill only, "
+                       "no uploads/cleanup")
+        from shared.db.database import get_db
+        with get_db() as db:
+            rows = db.execute(
+                "SELECT call_key FROM calls WHERE call_key IS NOT NULL "
+                "AND download_token IS NULL").fetchall()
+        for r in rows:
+            ensure_download_token(r["call_key"])
+        logger.info("backfilled %d download tokens", len(rows))
+        return
+    n = sync_pending()
+    d = cleanup_local()
+    logger.info("sync complete: uploaded=%d local_deleted=%d", n, d)
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--once", action="store_true", help="single pass")
+    parser.add_argument("--interval", type=int, default=0,
+                        help="loop every N seconds")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    if args.interval > 0 and not args.once:
+        while True:
+            try:
+                _run_once()
+            except Exception:
+                logger.exception("sync pass failed")
+            time.sleep(args.interval)
+    else:
+        _run_once()
+
+
+if __name__ == "__main__":
+    main()

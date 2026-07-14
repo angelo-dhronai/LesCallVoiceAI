@@ -21,7 +21,7 @@ export function Badge({ children, tone = 'neutral', soft }: { children: ReactNod
     neutral: 'text-soft bg-[var(--surface-2)] ring-[var(--border)]',
   }
   return (
-    <span className={cx('inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-semibold ring-1', tones[tone], soft && 'opacity-90')}>
+    <span className={cx('inline-flex max-w-full items-center gap-1 whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-semibold ring-1', tones[tone], soft && 'opacity-90')}>
       {children}
     </span>
   )
@@ -34,15 +34,19 @@ export function Button({
   size?: 'sm' | 'md'; className?: string; disabled?: boolean; title?: string
 }) {
   const variants: Record<string, string> = {
-    primary: 'text-[#04150d] bg-gradient-to-b from-mint-300 to-mint-500 hover:from-mint-200 hover:to-mint-400 shadow-glow-mint',
-    ghost: 'text-soft bg-[var(--surface-2)] hover:bg-[var(--border)] ring-1 ring-[var(--border)]',
-    soft: 'text-indigo-600 dark:text-indigo-300 bg-indigo-500/12 hover:bg-indigo-500/20 ring-1 ring-indigo-500/20',
-    danger: 'text-rose-600 dark:text-rose-300 bg-rose-500/12 hover:bg-rose-500/20 ring-1 ring-rose-500/20',
+    primary: 'text-white bg-mint-600 hover:bg-mint-500 shadow-sm dark:bg-mint-500 dark:text-[#04150d] dark:hover:bg-mint-400',
+    ghost: 'text-soft bg-[var(--surface-solid)] hover:bg-[var(--surface-2)] ring-1 ring-[var(--border)] hover:ring-[var(--border-strong)]',
+    soft: 'text-indigo-600 dark:text-indigo-300 bg-indigo-500/10 hover:bg-indigo-500/15 ring-1 ring-indigo-500/20',
+    danger: 'text-rose-600 dark:text-rose-300 bg-rose-500/10 hover:bg-rose-500/15 ring-1 ring-rose-500/20',
   }
   return (
     <button title={title} disabled={disabled} onClick={onClick}
-      className={cx('inline-flex items-center justify-center gap-1.5 rounded-xl font-semibold transition-all active:scale-[.97] disabled:opacity-40 disabled:pointer-events-none',
-        size === 'sm' ? 'px-3 py-1.5 text-[12px]' : 'px-4 py-2 text-[13px]', variants[variant], className)}>
+      className={cx('inline-flex items-center justify-center gap-1.5 rounded-lg font-medium transition-all active:scale-[.98] disabled:opacity-40 disabled:pointer-events-none',
+        // Phones get a >=36px tap target; sm: restores today's exact desktop size.
+        size === 'sm'
+          ? 'min-h-[36px] px-2.5 py-1.5 text-[12px] sm:min-h-0'
+          : 'min-h-[36px] px-3.5 py-2 text-[13px] sm:min-h-0',
+        variants[variant], className)}>
       {children}
     </button>
   )
@@ -54,20 +58,21 @@ export function Spinner({ className }: { className?: string }) {
   )
 }
 
-export function EmptyState({ icon, title, hint }: { icon?: ReactNode; title: string; hint?: string }) {
+export function EmptyState({ icon, title, hint, action }: { icon?: ReactNode; title: string; hint?: string; action?: ReactNode }) {
   return (
     <div className="flex flex-col items-center justify-center gap-2 py-16 text-center">
       {icon && <div className="grid h-12 w-12 place-items-center rounded-2xl surface-2 text-dim">{icon}</div>}
       <div className="text-sm font-medium text-soft">{title}</div>
       {hint && <div className="max-w-xs text-xs text-dim">{hint}</div>}
+      {action && <div className="mt-2">{action}</div>}
     </div>
   )
 }
 
 export function SectionHead({ title, sub, right }: { title: string; sub?: string; right?: ReactNode }) {
   return (
-    <div className="mb-4 flex items-end justify-between gap-3">
-      <div>
+    <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+      <div className="min-w-0">
         <h2 className="font-display text-lg font-bold tracking-tight">{title}</h2>
         {sub && <p className="mt-0.5 text-[13px] text-dim">{sub}</p>}
       </div>

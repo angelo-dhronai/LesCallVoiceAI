@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 logger = logging.getLogger("agent_copilot_api")
 
@@ -55,8 +55,23 @@ from backend.app.agent_definition.schema import (                   # noqa: E402
     KnowledgeBase, ResponseBank, CalendarConfig, LLMConfig,
 )
 from backend.app.agent_definition.registry import agent_registry    # noqa: E402
+import agent_builder_api as builder                                 # noqa: E402
 
-router = APIRouter()
+
+async def _copilot_tenancy_dep(request: Request):
+    """Resolve owner, propagate to the builder's ContextVar (Copilot creates
+    agents through builder handlers, which must claim the slug for THIS tenant),
+    and enforce per-owner session access. Async on purpose — see builder."""
+    import auth
+    owner = auth.current_owner(request)
+    request.state.owner = owner
+    builder._REQ_OWNER.set(owner)
+    sid = request.path_params.get("session_id")
+    if sid and not _session_owner_ok(sid, owner):
+        raise HTTPException(status_code=404, detail="session not found")
+
+
+router = APIRouter(dependencies=[Depends(_copilot_tenancy_dep)])
 
 _SESSIONS_DIR = Path(__file__).parent / "copilot_sessions"
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,80}$")
@@ -436,11 +451,13 @@ def _default_lang_of(d: dict) -> str:
     return "en"
 
 
-# The ONE template placeholder the runtime understands: {contact_name} in the
-# opening greeting (conversation.py generate_opening substitutes the outbound
-# contact's name, falling back to "sir/ma'am"). LLMs constantly invent other
-# syntaxes — ${contact_name}, {{contact_name}}, [contact name], {customer_name}
-# — which would be SPOKEN LITERALLY on a real call. Canonicalize them all.
+# The TWO template placeholders the runtime understands, both only in the
+# opening greeting (conversation.py generate_opening):
+#   {contact_name} — the outbound contact's name, falling back to "sir/ma'am"
+#   {current_time} — morning/afternoon/evening in IST at call time
+# LLMs constantly invent other syntaxes — ${contact_name}, {{contact_name}},
+# [contact name], {time_of_day} — which would be SPOKEN LITERALLY on a real
+# call. Canonicalize them all.
 _PLACEHOLDER_RE = re.compile(
     r"(?:\$\{|\{\{|\{|\[|<)\s*"
     r"(?:contact[ _\-]?name|customer[ _\-]?name|person[ _\-]?name|callee[ _\-]?name|contact|name)"
@@ -449,9 +466,22 @@ _PLACEHOLDER_RE = re.compile(
     re.IGNORECASE,
 )
 
+_TIME_PLACEHOLDER_RE = re.compile(
+    r"(?:\$\{|\{\{|\{|\[|<)\s*"
+    r"(?:current[ _\-]?time|time[ _\-]?of[ _\-]?day|greeting[ _\-]?time|day[ _\-]?part)"
+    r"\s*(?:\}\}|\}|\]|>)"
+    r"|\$current[ _\-]?time\b",
+    re.IGNORECASE,
+)
+
 
 def _canonicalize_placeholders(text: str) -> str:
-    return _PLACEHOLDER_RE.sub("{contact_name}", text)
+    text = _PLACEHOLDER_RE.sub("{contact_name}", text)
+    return _TIME_PLACEHOLDER_RE.sub("{current_time}", text)
+
+
+def _any_placeholder(text: str) -> bool:
+    return bool(_PLACEHOLDER_RE.search(text) or _TIME_PLACEHOLDER_RE.search(text))
 
 
 def _prune_nones(node: Any) -> Any:
@@ -556,6 +586,13 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
             elif isinstance(v, dict):
                 v.setdefault("model", "bulbul:v3")
                 v.setdefault("speaker", "simran")
+                if v.get("model") not in ("bulbul:v2", "bulbul:v3-beta", "bulbul:v3"):
+                    # speaker names sometimes land in model (e.g. model: shubh);
+                    # Sarvam 400s the whole call, so coerce to a valid model
+                    if isinstance(v.get("model"), str) and v["model"].strip() and v.get("speaker") in (None, "", "simran"):
+                        v["speaker"] = v["model"].strip().lower()
+                    v["model"] = "bulbul:v3"
+                    notes.append(f"tts model for '{code}' was invalid — reset to bulbul:v3")
                 for k in [k for k in v if k not in voice_fields]:
                     v.pop(k)
             else:  # numeric / junk — keep the platform default voice instead
@@ -741,13 +778,13 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
         # Canonicalize invented placeholder syntaxes — ${contact_name} etc.
         # would be spoken literally on a real call.
         g = rb.get("opening_greeting")
-        if isinstance(g, str) and _PLACEHOLDER_RE.search(g):
+        if isinstance(g, str) and _any_placeholder(g):
             fixed = _canonicalize_placeholders(g)
             if fixed != g:
                 rb["opening_greeting"] = fixed
                 notes.append(
-                    "placeholder in the greeting rewritten to {contact_name} — the only "
-                    "template the call engine understands (single curly braces)"
+                    "placeholder in the greeting rewritten to {contact_name}/{current_time} — "
+                    "the only templates the call engine understands (single curly braces)"
                 )
         if "response_fallback" in rb and not isinstance(rb["response_fallback"], str):
             rb["response_fallback"] = str(rb["response_fallback"])
@@ -825,13 +862,28 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
     return d
 
 
+def _visible_slug(folder: str) -> bool:
+    """Is `folder` an agent the current tenant may see? Multi-tenant guard so
+    name-resolution NEVER enumerates or matches another tenant's agents (the
+    error messages here are shown to the user by the copilot)."""
+    try:
+        allowed = builder._visible_slugs(builder._ctx_owner())  # None = admin
+    except Exception:
+        allowed = None
+    return allowed is None or folder in allowed
+
+
 def _resolve_agent_slug(name: str) -> str:
     """Users say 'Ananya', not 'dhronai_ea' — resolve display names to slugs.
 
     Order: exact folder → lowercased/underscored folder → the agent whose
     spoken name (identity.agent_name) matches, as a whole, a word, or a
     prefix. Ambiguity and no-match raise with a human-friendly list of the
-    agents that DO exist, so the copilot can ask instead of guessing."""
+    agents that DO exist, so the copilot can ask instead of guessing.
+
+    Only the CALLER's own agents are ever considered or named — a tenant can
+    never discover another tenant's agents through this resolver.
+    """
     raw = str(name).strip()
     if not raw:
         raise ValueError("No agent name given")
@@ -839,18 +891,18 @@ def _resolve_agent_slug(name: str) -> str:
     # as "Display (folder)" — accept that exact form back, so any option we
     # show the user is itself a valid, unambiguous input.
     m = re.fullmatch(r".{0,80}\(([A-Za-z0-9_\-]{1,80})\)\s*", raw)
-    if m and (_AGENTS_DIR / m.group(1) / "agent.yaml").exists():
+    if m and _visible_slug(m.group(1)) and (_AGENTS_DIR / m.group(1) / "agent.yaml").exists():
         return m.group(1)
     # Folder lookups only for plain names — anything with path separators or
     # dots must not escape the agents dir (or reach into _archived/).
     folder_match = ""
     if re.fullmatch(r"[A-Za-z0-9 _\-]{1,80}", raw):
-        if (_AGENTS_DIR / raw / "agent.yaml").exists():
+        if _visible_slug(raw) and (_AGENTS_DIR / raw / "agent.yaml").exists():
             folder_match = raw
         else:
             slug = raw.lower().replace(" ", "_").replace("-", "_")
             for candidate in (slug, slug.replace("_", "-")):
-                if (_AGENTS_DIR / candidate / "agent.yaml").exists():
+                if _visible_slug(candidate) and (_AGENTS_DIR / candidate / "agent.yaml").exists():
                     folder_match = candidate
                     break
     if folder_match:
@@ -862,7 +914,7 @@ def _resolve_agent_slug(name: str) -> str:
         collisions = []
         for ypath in sorted(_AGENTS_DIR.glob("*/agent.yaml")):
             folder = ypath.parent.name
-            if folder == folder_match:
+            if folder == folder_match or not _visible_slug(folder):
                 continue
             try:
                 display = (agent_registry.get(folder, _AGENTS_DIR).identity.agent_name or "").strip()
@@ -889,6 +941,8 @@ def _resolve_agent_slug(name: str) -> str:
     display_list: list[str] = []
     for ypath in sorted(_AGENTS_DIR.glob("*/agent.yaml")):
         folder = ypath.parent.name
+        if not _visible_slug(folder):
+            continue
         try:
             agent = agent_registry.get(folder, _AGENTS_DIR)
             display = (agent.identity.agent_name or "").strip()
@@ -1074,7 +1128,7 @@ def _quality_warnings(merged: dict) -> list[str]:
         str(s.get("id") or f"#{i}")
         for i, s in enumerate(stages)
         if isinstance(s, dict) and (
-            _PLACEHOLDER_RE.search(str(s.get("goal") or ""))
+            _any_placeholder(str(s.get("goal") or ""))
             or re.match(r"\s*(?:hello|hi|hey|namaste|namaskar|नमस्ते|नमस्कार)\b[ ,!]",
                         str(s.get("goal") or ""), re.IGNORECASE)
         )
@@ -1136,7 +1190,7 @@ def _quality_warnings(merged: dict) -> list[str]:
         bad_fields = sorted({
             key for key, val in rb.items()
             if key != "opening_greeting"
-            and any(_PLACEHOLDER_RE.search(s) for s in _walk(val))
+            and any(_any_placeholder(s) for s in _walk(val))
         })
         if bad_fields:
             w.append(
@@ -1318,6 +1372,15 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         create_agent — activation needs the user's explicit confirmation.
     """
     guard = guard or {}
+    owner = builder._ctx_owner()
+
+    # Tenant boundary for every tool that names an EXISTING agent: the LLM
+    # cannot be trusted to respect ownership, so enforce it here regardless of
+    # what slug it passes. create_agent is exempted (it claims a new slug).
+    _named = str(args.get("name") or "").strip()
+    if _named and tool != "create_agent":
+        builder._assert_slug_access(_named, owner)
+
     if tool == "list_agents":
         res = await builder.list_agents()
         names = [a.get("name") for a in res.get("agents", [])]
@@ -1363,6 +1426,9 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         target_dir = _AGENTS_DIR / name
         if target_dir.exists():
             raise ValueError(f"Agent '{name}' already exists — use update_agent to edit it")
+        _existing_owner = builder._slug_owner(name)
+        if _existing_owner and _existing_owner != owner and not builder._ctx_is_admin():
+            raise ValueError(f"Agent '{name}' already exists")
         merged = _default_definition(name, definition)
         _normalize_definition(_deep_merge(merged, definition))
         _enforce_invariants(merged, notes)
@@ -1370,7 +1436,15 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         target_dir.mkdir(parents=True, exist_ok=True)
         agent.to_yaml(target_dir / "agent.yaml")
         agent_registry.put(name, agent)
-        logger.info("[copilot] created agent '%s' (%d input repairs)", name, len(notes))
+        try:
+            builder._claim_slug(name, owner, agent.identity.agent_name)
+        except Exception as exc:
+            if not builder._ctx_is_admin():
+                import shutil as _sh
+                _sh.rmtree(target_dir, ignore_errors=True)
+                agent_registry.invalidate(name)
+                raise ValueError(f"could not register ownership: {exc}")
+        logger.info("[copilot] created agent '%s' owner=%s (%d input repairs)", name, owner, len(notes))
         res = {
             "status": "created", "name": name, "agent_id": agent.agent_id,
             "notes": notes, "quality": _quality_warnings(merged),
@@ -1444,6 +1518,10 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                 "Tell the user the agent was created and ASK whether to activate it "
                 "(activation answers real inbound calls); activate only after their explicit yes."
             )
+        if not builder._ctx_is_admin():
+            raise ValueError(
+                "Activation is platform-admin only. To route calls to this agent, "
+                "bind your phone number to it in the Telephony panel.")
         name = str(args["name"]).strip()
         res = await builder.activate_agent(name)
         return res, f"{_agent_display_name(name)} is now answering calls", True, True
@@ -1471,8 +1549,11 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
 # System prompt
 # ─────────────────────────────────────────────────────────────────────────────
 def _system_prompt() -> str:
-    active = _read_active() or "none"
-    return f"""You are the LesCall Agent Copilot — an expert voice-agent designer built into the LesCall dashboard. LesCall runs real-time AI phone agents for Indian businesses (Sarvam STT/TTS + an LLM). An agent is a YAML definition: identity, personality, languages (hi/en/gu), TTS voice, a staged call flow (GREETING → DISCOVERY → INVITE_VISIT → CONFIRMATION → CLOSING), a knowledge base, canned responses, and calendar slots. Exactly one agent is "active" and answers inbound calls (currently: {active}).
+    # The global "active" agent is admin infrastructure (the platform-wide
+    # inbound fallback) — never disclose it to a tenant, whose calls route by
+    # their own DID binding, not this selector.
+    active = (_read_active() or "none") if builder._ctx_is_admin() else "your own agents"
+    return f"""You are the LesCall Agent Copilot — an expert voice-agent designer built into the LesCall dashboard. LesCall runs real-time AI phone agents for Indian businesses (Sarvam STT/TTS + an LLM). An agent is a YAML definition: identity, personality, languages (hi/en/gu), TTS voice, a staged call flow (GREETING → DISCOVERY → INVITE_VISIT → CONFIRMATION → CLOSING), a knowledge base, canned responses, and calendar slots. Inbound calls are answered by the agent bound to the dialed number (currently: {active}).
 
 HOW YOU WORK
 1. NEW AGENT: interview the user ONE short question at a time — NEVER call create_agent on the first request, and never ask multiple questions in one reply. You are gathering enough to build a DEEP agent, not a stub, so keep interviewing until you genuinely have the substance below (usually 5-8 answers). Skip anything already answered; propose smart defaults for minor details instead of asking. Cover, in rough order:
@@ -1508,8 +1589,10 @@ DEFINITION FIELDS you may set (all optional — deep-merged onto defaults). SHAP
 
 THE OPENING LINE & PLACEHOLDERS (get this right — it burned a real user):
 - The first thing spoken on EVERY call is response_bank.opening_greeting, word-for-word. Stage goals are INSTRUCTIONS to the AI (always written in English), never a script. When the user talks about the greeting / the first line / "as soon as the call connects", edit opening_greeting — editing a stage goal will NOT change what plays at connect.
-- Exactly ONE placeholder exists: {{contact_name}} — single curly braces, only inside opening_greeting. On outbound calls it is replaced with the dialed contact's name from Outbound Calls (fallback "sir/ma'am"). When the user wants the agent to greet whoever it calls by name, write e.g. "Hello, am I speaking with {{contact_name}}?" in opening_greeting.
-- NEVER invent any other placeholder or syntax — ${{...}}, {{{{...}}}}, [name], <contact> do not exist and would be SPOKEN ALOUD literally. Never put placeholders in stage goals, knowledge text, or canned responses.
+- Exactly TWO placeholders exist, both single curly braces and ONLY inside opening_greeting:
+  * {{contact_name}} — on outbound calls, replaced with the dialed contact's name from Outbound Calls (fallback "sir/ma'am"). When the user wants the agent to greet whoever it calls by name, write e.g. "Hello, am I speaking with {{contact_name}}?"
+  * {{current_time}} — replaced at call time with morning/afternoon/evening (India time). E.g. "Good {{current_time}}, am I speaking with {{contact_name}}?" becomes "Good morning, am I speaking with Rajesh?". If the greeting is written in Hindi or Gujarati script, the word comes out in that language automatically.
+- NEVER invent any other placeholder or syntax — ${{...}}, {{{{...}}}}, [name], <contact>, {{date}} do not exist and would be SPOKEN ALOUD literally. Never put placeholders in stage goals, knowledge text, or canned responses.
 - calendar: {{"type": "mock", "mock_slots": [{{"day": "Tomorrow", "time": "10:00 AM"}}]}} — the bookable appointment slots the agent offers.
 - llm_config: extra_always_rules, extra_never_rules
 If a tool result includes "notes", the platform auto-corrected or DROPPED some of your input — read them; if content was dropped, put it where the note says (usually a stage goal) with update_agent in the SAME turn.
@@ -1548,6 +1631,52 @@ def _session_path(sid: str) -> Path:
     return _SESSIONS_DIR / f"{sid}.json"
 
 
+def _session_owner(sid: str) -> str | None:
+    """Owner recorded on a session's meta (None for legacy/never-saved)."""
+    try:
+        if sid in _SESSIONS:
+            return _SESSIONS[sid].get("meta", {}).get("owner")
+        path = _session_path(sid)
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8")) or {}
+            return data.get("meta", {}).get("owner")
+    except Exception:
+        pass
+    return None
+
+
+def _session_exists(sid: str) -> bool:
+    return sid in _SESSIONS or _session_path(sid).exists()
+
+
+def _tenant_sid(owner: str | None, sid: str) -> str:
+    """A stable per-tenant session id derived from a stale/foreign one, so a
+    client holding an inaccessible session id gets its OWN continuous chat
+    instead of an error — and never reaches the original session."""
+    import hashlib
+    h = hashlib.sha1(f"{owner or ''}\x00{sid}".encode("utf-8")).hexdigest()[:20]
+    return f"u{h}"
+
+
+def _session_owner_ok(sid: str, owner: str) -> bool:
+    """Who may open a session.
+
+    * admin: any session.
+    * a session that does NOT exist yet: claimable — this request creates it.
+    * an existing session: ONLY its recorded owner.
+
+    A legacy session with no owner (owner=None) is treated as the platform
+    admin's — NOT visible to tenants. (The old code let owner=None be seen by
+    everyone, which leaked every pre-tenancy chat to all tenants.)
+    """
+    import auth
+    if auth.is_admin(owner):
+        return True
+    if not _session_exists(sid):
+        return True
+    return _session_owner(sid) == owner
+
+
 def _load_session(sid: str) -> dict:
     if sid in _SESSIONS:
         return _SESSIONS[sid]
@@ -1559,6 +1688,8 @@ def _load_session(sid: str) -> dict:
             session["messages"] = data.get("messages", [])
             session["transcript"] = data.get("transcript", [])
             session["meta"] = data.get("meta", {})
+            if data.get("owner"):
+                session["owner"] = data["owner"]
         except Exception as exc:  # pragma: no cover - corrupt file: start fresh
             logger.warning("[copilot] could not load session %s: %r", sid, exc)
     _SESSIONS[sid] = session
@@ -1750,9 +1881,25 @@ async def copilot_chat(request: Request) -> dict:
     if not message:
         raise HTTPException(status_code=400, detail="'message' is required")
 
+    # session_id arrives in the BODY, so the router dependency (which only sees
+    # path params) can't gate it — enforce ownership here. Blocks continuing or
+    # reading another tenant's chat.
+    #
+    # But a client may hold a STALE session id (a pre-tenancy chat, or one left
+    # by another account on a shared browser). Instead of erroring, transparently
+    # remap it to THIS tenant's own stable session derived from that id — so even
+    # an old cached frontend keeps working, with full continuity, and never
+    # touches the foreign/legacy chat. The response carries the real (possibly
+    # remapped) session id for the client to adopt.
+    owner = getattr(request.state, "owner", None)
+    if not _session_owner_ok(sid, owner):
+        sid = _tenant_sid(owner, sid)
+
     client = _get_client()
     model = _model_name()
     session = _load_session(sid)
+    # Stamp the tenant on the session so it's scoped from its first turn.
+    session.setdefault("meta", {}).setdefault("owner", owner)
     # Snapshot for exact rollback — popping single messages on error can
     # orphan an assistant tool_calls message and brick the session history.
     mark_messages = len(session["messages"])
@@ -1830,7 +1977,10 @@ async def copilot_chat(request: Request) -> dict:
                         f"Couldn't {_TOOL_VERBS.get(tool_name, tool_name)}: {exc}", False, False,
                     )
                 agents_changed = agents_changed or mutated
-                actions.append({"tool": tool_name, "summary": summary, "ok": ok})
+                actions.append({
+                    "tool": tool_name, "summary": summary, "ok": ok,
+                    "agent": str(args.get("name") or "").strip().lower(),
+                })
                 session["messages"].append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -1897,24 +2047,48 @@ async def copilot_chat(request: Request) -> dict:
         reply += "\n\n⚠️ Nothing was saved in this step — the change did not go through."
         logger.warning("[copilot] truthfulness backstop fired (sid=%s)", sid)
 
+    # ── Hide self-corrected retries from the user-facing action list ────────
+    # The LLM often gets a save rejected (e.g. invented setting name), reads
+    # the error, and immediately retries correctly. A "Couldn't update …"
+    # chip next to successful "Updated …" chips reads as data loss when the
+    # change actually landed. Drop a failed save ONLY when a later successful
+    # save on the SAME agent exists in this turn; genuine unrecovered
+    # failures stay visible (and the backstop above still fires on them).
+    visible_actions = [
+        a for i, a in enumerate(actions)
+        if a["ok"] or a["tool"] not in _MUTATING_TOOLS or not any(
+            b["ok"] and b["tool"] in _MUTATING_TOOLS and b.get("agent") == a.get("agent")
+            for b in actions[i + 1:]
+        )
+    ]
+
     session["messages"].append({"role": "assistant", "content": reply})
-    session["transcript"].append({"role": "assistant", "content": reply, "actions": actions})
+    session["transcript"].append({"role": "assistant", "content": reply, "actions": visible_actions})
     meta = session.setdefault("meta", {})
     meta.setdefault("created_at", _now_iso())
     meta["updated_at"] = _now_iso()
     _save_session(sid)
     return {
         "reply": reply,
-        "actions": actions,
+        "actions": visible_actions,
         "agents_changed": agents_changed,
         "session": _session_summary(sid, session),
     }
 
 
 @router.get("/api/copilot/sessions")
-async def copilot_sessions() -> dict:
-    """All saved conversations, newest first — powers the chat-history sidebar.
+async def copilot_sessions(request: Request) -> dict:
+    """The CALLER's saved conversations, newest first (admins see all).
     Empty sessions (no user message yet) are skipped."""
+    import auth
+    owner = getattr(request.state, "owner", None) or auth.DEFAULT_OWNER
+    show_all = auth.is_admin(owner)
+
+    def _mine(session: dict) -> bool:
+        # Admins see all; tenants see ONLY sessions they own. Legacy/unowned
+        # (owner=None) sessions belong to the admin — never shown to tenants.
+        return show_all or session.get("meta", {}).get("owner") == owner
+
     summaries: list[dict] = []
     seen: set[str] = set()
     try:
@@ -1927,7 +2101,7 @@ async def copilot_sessions() -> dict:
             continue
         try:
             session = _load_session(sid)
-            if not session.get("transcript"):
+            if not session.get("transcript") or not _mine(session):
                 continue
             summaries.append(_session_summary(sid, session, mtime=path.stat().st_mtime))
             seen.add(sid)
@@ -1935,7 +2109,7 @@ async def copilot_sessions() -> dict:
             logger.warning("[copilot] skipping session %s: %r", sid, exc)
     # In-memory sessions not yet flushed to disk (first turn in progress)
     for sid, session in _SESSIONS.items():
-        if sid not in seen and session.get("transcript"):
+        if sid not in seen and session.get("transcript") and _mine(session):
             summaries.append(_session_summary(sid, session))
     summaries.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
     return {"sessions": summaries}

@@ -453,6 +453,36 @@ def _slot_period(time_str: str) -> str:
     return "evening"
 
 
+# Localized time-of-day words for the {current_time} greeting placeholder.
+_TIME_OF_DAY_WORDS = {
+    "en": {"morning": "morning", "afternoon": "afternoon", "evening": "evening"},
+    "hi": {"morning": "सुबह", "afternoon": "दोपहर", "evening": "शाम"},
+    "gu": {"morning": "સવાર", "afternoon": "બપોર", "evening": "સાંજ"},
+}
+
+
+def _time_of_day_word(greeting: str = "") -> str:
+    """Morning/afternoon/evening right now in IST (callers are in India).
+
+    If the surrounding greeting text is written in Devanagari or Gujarati
+    script, return the word in that script so TTS doesn't code-switch
+    mid-greeting.
+    """
+    from datetime import datetime, timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    except Exception:
+        now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    period = "morning" if now.hour < 12 else ("afternoon" if now.hour < 17 else "evening")
+    lang = "en"
+    if re.search(r"[ऀ-ॿ]", greeting):
+        lang = "hi"
+    elif re.search(r"[઀-૿]", greeting):
+        lang = "gu"
+    return _TIME_OF_DAY_WORDS[lang][period]
+
+
 # ---------------------------------------------------------------------------
 _RESPONSE_FALLBACK = "Sorry, could you repeat that?"
 
@@ -712,6 +742,18 @@ class ConversationRouter:
         if _ph.search(greeting):
             _who = self.outbound_contact_name or "sir/ma'am"
             greeting = _ph.sub(lambda _m: _who, greeting)  # lambda: name is literal, not a regex template
+        # Time-of-day personalization: {current_time} → morning/afternoon/evening
+        # in the caller's timezone (IST). Same tolerance for invented syntaxes.
+        _tph = re.compile(
+            r"(?:\$\{|\{\{|\{|\[|<)\s*"
+            r"(?:current[ _\-]?time|time[ _\-]?of[ _\-]?day|greeting[ _\-]?time|day[ _\-]?part)"
+            r"\s*(?:\}\}|\}|\]|>)"
+            r"|\$current[ _\-]?time\b",
+            re.IGNORECASE,
+        )
+        if _tph.search(greeting):
+            _tod = _time_of_day_word(greeting)
+            greeting = _tph.sub(lambda _m: _tod, greeting)
         self.memory.add_assistant(greeting, language=self.state.language)
         self.state.stage = STAGE_GREETING
         # Store for last-response memory (feature 3)

@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { Activity, ChevronDown, CheckCircle2, AlertTriangle } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Activity, ChevronDown, CheckCircle2, XCircle } from 'lucide-react'
 import { cx } from './ui'
 
 export type Service = { name: string; ok: boolean }
@@ -13,10 +13,17 @@ export function HealthPill({ services, overall }: { services: Service[]; overall
     amber: 'text-amber-600 dark:text-amber-300 bg-amber-400/15 ring-amber-400/30',
     rose: 'text-rose-500 dark:text-rose-300 bg-rose-500/12 ring-rose-500/30',
   }
+  // Escape closes the popover (backdrop click already does).
+  useEffect(() => {
+    if (!open) return
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [open])
   return (
     <div className="relative">
-      <button onClick={() => setOpen((o) => !o)}
-        className={cx('inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[12px] font-semibold ring-1 transition', toneCls[tone])}>
+      <button onClick={() => setOpen((o) => !o)} aria-haspopup="true" aria-expanded={open}
+        className={cx('inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11.5px] font-medium ring-1 transition', toneCls[tone])}>
         <span className="relative flex h-2 w-2">
           <span className={cx('absolute inline-flex h-full w-full rounded-full opacity-70 animate-ping', tone === 'mint' ? 'bg-mint-400' : tone === 'amber' ? 'bg-amber-400' : 'bg-rose-400')} />
           <span className={cx('relative inline-flex h-2 w-2 rounded-full', tone === 'mint' ? 'bg-mint-500' : tone === 'amber' ? 'bg-amber-500' : 'bg-rose-500')} />
@@ -36,7 +43,7 @@ export function HealthPill({ services, overall }: { services: Service[]; overall
                 <span className="text-soft">{s.name}</span>
                 {s.ok
                   ? <span className="inline-flex items-center gap-1 text-mint-600 dark:text-mint-300"><CheckCircle2 size={14} />Online</span>
-                  : <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-300"><AlertTriangle size={14} />Down</span>}
+                  : <span className="inline-flex items-center gap-1 text-rose-500 dark:text-rose-300"><XCircle size={14} />Down</span>}
               </div>
             ))}
           </div>

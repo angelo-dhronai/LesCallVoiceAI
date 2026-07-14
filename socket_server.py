@@ -535,10 +535,26 @@ def extract_rtp_info(headers: dict) -> dict:
     raw_caller = g("Caller-Caller-ID-Number", "") or g("Channel-Caller-ID-Number", "")
     caller_number = re.sub(r"[^\d]", "", unquote(raw_caller)) if raw_caller else ""
 
+    # Multi-tenant routing fields (per-DID agent routing): the dialed DID plus
+    # the optional lescall_* channel variables set by the dashboard's outbound
+    # originate. URL-encoded like the caller id; sanitized to path-segment-safe
+    # charsets so they can ride the ws_audio_receiver URL.
+    # Length caps keep the assembled ws URL far below mod_audio_stream's
+    # MAX_WS_URI buffer even with a hostile/garbage dial string.
+    raw_did = g("Caller-Destination-Number", "")
+    did = re.sub(r"[^\d]", "", unquote(raw_did))[:20] if raw_did else ""
+    raw_campaign = g("variable_lescall_campaign_id", "")
+    campaign_id = re.sub(r"[^\d]", "", unquote(raw_campaign))[:20] if raw_campaign else ""
+    raw_slug = g("variable_lescall_agent_slug", "")
+    agent_slug = re.sub(r"[^A-Za-z0-9_-]", "", unquote(raw_slug))[:64] if raw_slug else ""
+
     return {
         "uuid":             g("Channel-Call-UUID") or g("Unique-ID", "unknown"),
         "channel_name":     g("Channel-Name", ""),
         "caller_number":    caller_number,
+        "did":              did,
+        "campaign_id":      campaign_id,
+        "agent_slug":       agent_slug,
         "local_ip":         g("variable_local_media_ip", ""),
         "local_port":       g("variable_local_media_port", ""),
         "remote_ip":        g("variable_remote_media_ip", ""),
@@ -706,7 +722,10 @@ def build_record_payload(wav_path: str) -> bytes:
 
 def build_audio_stream_payload(channel_uuid: str, ws_url: str,
                                sample_rate: int = 8000,
-                               caller_number: str = "") -> bytes:
+                               caller_number: str = "",
+                               did: str = "",
+                               campaign_id: str = "",
+                               agent_slug: str = "") -> bytes:
     """P9-A: bgapi uuid_audio_stream <uuid> start <ws_url> mono <sr>.
 
     mod_audio_stream is registered as an FS API command (NOT a
@@ -730,6 +749,15 @@ def build_audio_stream_payload(channel_uuid: str, ws_url: str,
     it for call audit folder naming. caller_number must be digits-only
     (the + prefix is stripped upstream in extract_rtp_info).
 
+    Multi-tenant plumbing: did (dialed number, digits-only),
+    campaign_id (digits-only) and agent_slug ([A-Za-z0-9_-] only, from
+    the lescall_agent_slug channel variable) travel as positional path
+    segments 3-5: /<uuid>/<caller>/<did>/<campaign>/<agent_slug>.
+    Empty middle segments are sent as "-" so positions never shift;
+    trailing empties are omitted. ws_audio_receiver.py treats "-" or a
+    charset-invalid segment as absent, so old/new sender+receiver
+    combinations stay compatible.
+
     A path segment — NOT a query string — is required because
     mod_audio_stream's validate_ws_uri (audio_streamer_glue.cpp
     line ~516) only accepts characters {alnum, '-', '.'} for the
@@ -749,10 +777,12 @@ def build_audio_stream_payload(channel_uuid: str, ws_url: str,
         scheme_end = url.find("://")
         rest = url[scheme_end + 3:] if scheme_end >= 0 else url
         if "/" not in rest:
-            url = f"{url}/{cu}"
-            cn = caller_number.strip()
-            if cn:
-                url = f"{url}/{cn}"
+            extras = [caller_number.strip(), did.strip(),
+                      campaign_id.strip(), agent_slug.strip()]
+            while extras and not extras[-1]:
+                extras.pop()  # drop trailing empties, keep positions stable
+            segs = [cu] + [s if s else "-" for s in extras]
+            url = url + "/" + "/".join(segs)
     line = (
         "bgapi uuid_audio_stream "
         + cu + " start " + url
@@ -1855,7 +1885,10 @@ def handle(conn: socket.socket, addr) -> None:
                 payload = build_audio_stream_payload(
                     uuid_for_record, AUDIO_STREAM_WS_URL,
                     AUDIO_STREAM_SAMPLE_RATE,
-                    rtp.get("caller_number", ""))
+                    rtp.get("caller_number", ""),
+                    did=rtp.get("did", ""),
+                    campaign_id=rtp.get("campaign_id", ""),
+                    agent_slug=rtp.get("agent_slug", ""))
                 send_raw(conn, payload, "AUDIO_STREAM_START", t0)
                 _t = time.monotonic() - t0
                 cp["T3c_audio_stream_sent"] = _t
@@ -2470,7 +2503,13 @@ def main() -> None:
     # not fail on the first call before an operator has SSH'd in.
     ensure_recording_dir()
     import subprocess
-    subprocess.run(["fs_cli", "-x", "reloadxml"], capture_output=True)
+    try:
+        subprocess.run(["fs_cli", "-x", "reloadxml"], capture_output=True)
+    except FileNotFoundError:
+        # Containerized runtime: fs_cli lives on the host, not in the image.
+        # The reload is a startup nicety only — FS re-reads config on its own
+        # lifecycle; dashboard "apply" paths trigger reloads host-side.
+        log.info("fs_cli not on PATH — skipping startup reloadxml")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST, PORT))

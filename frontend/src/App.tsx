@@ -14,13 +14,15 @@ import ConvAnalytics from './pages/ConvAnalytics'
 import Analytics from './pages/Analytics'
 import FollowupAutomation from './pages/FollowupAutomation'
 import Outbound from './pages/Outbound'
+import Contacts from './pages/Contacts'
 import Usage from './pages/Usage'
 import Control from './pages/Control'
 import Health from './pages/Health'
+import Telephony from './pages/Telephony'
+import Settings from './pages/Settings'
 import AgentsList from './pages/agents/AgentsList'
 import CreateAgent from './pages/agents/CreateAgent'
 import EditAgent from './pages/agents/EditAgent'
-import IntentPreview from './pages/agents/IntentPreview'
 
 export default function App() {
   return (
@@ -40,14 +42,20 @@ export default function App() {
         <Route path="/analytics" element={<Analytics />} />
         <Route path="/followup-automation" element={<FollowupAutomation />} />
         <Route path="/outbound" element={<Outbound />} />
+        <Route path="/contacts" element={<Contacts />} />
         <Route path="/usage" element={<Usage />} />
         <Route path="/control" element={<Control />} />
         <Route path="/health" element={<Health />} />
-        {/* Build — Agent Builder grafted onto the main dashboard */}
+        {/* BYON — trunks + DID→agent routing (multi-tenant telephony) */}
+        <Route path="/telephony" element={<Telephony />} />
+        {/* Account settings — profile details (test-call destination phone) */}
+        <Route path="/settings" element={<Settings />} />
+        {/* Build — one Agents panel: list + New Agent + Intent tester (tab) */}
         <Route path="/build/agents" element={<AgentsList />} />
         <Route path="/build/agents/new" element={<CreateAgent />} />
         <Route path="/build/agents/:name" element={<EditAgent />} />
-        <Route path="/build/intent" element={<IntentPreview />} />
+        {/* Intent preview folded into the Agents panel's "Intent tester" tab */}
+        <Route path="/build/intent" element={<Navigate to="/build/agents" replace />} />
         {/* Old read-only Agent Settings is superseded by the editable builder */}
         <Route path="/agent-settings" element={<Navigate to="/build/agents" replace />} />
         <Route path="*" element={<Placeholder title="Not Found" sub="That route does not exist." />} />

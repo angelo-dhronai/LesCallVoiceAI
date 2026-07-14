@@ -20,11 +20,13 @@ export const demoOverview = {
   runtime: 'degraded' as const,
 }
 
+// Neutral fallback shown only while the real /api/health is still loading —
+// must NOT claim a service is down (that was a hardcoded false alarm).
 export const demoHealth = {
-  overall: 'degraded' as const,
+  overall: 'healthy' as const,
   services: [
     { name: 'System', ok: true },
-    { name: 'AI Pipeline', ok: false },
+    { name: 'AI Pipeline', ok: true },
     { name: 'Telephony', ok: true },
     { name: 'STT (Sarvam)', ok: true },
     { name: 'TTS (Bulbul)', ok: true },

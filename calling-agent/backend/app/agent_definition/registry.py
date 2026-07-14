@@ -30,6 +30,10 @@ class AgentRegistry:
         self._cache: dict[str, AgentDefinition] = {}
         self._lock = threading.Lock()
         self._observer: Optional[object] = None  # watchdog observer when running
+        # Load-failure visibility (P0): last error per agent + total counter,
+        # so a broken agent is flagged loudly instead of silently masked.
+        self._load_errors: dict[str, str] = {}
+        self._load_failure_count: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -42,10 +46,28 @@ class AgentRegistry:
         """
         with self._lock:
             if name not in self._cache:
-                path = self._yaml_path(name, agents_dir)
-                self._cache[name] = AgentDefinition.from_yaml(path)
+                try:
+                    path = self._yaml_path(name, agents_dir)
+                    self._cache[name] = AgentDefinition.from_yaml(path)
+                except Exception as exc:
+                    self._load_errors[name] = repr(exc)
+                    self._load_failure_count += 1
+                    logger.error(
+                        "[registry] AGENT LOAD FAILED for '%s' (failure #%d): %r",
+                        name, self._load_failure_count, exc)
+                    raise
+                self._load_errors.pop(name, None)
                 logger.info("[registry] loaded agent '%s' from %s", name, path)
             return self._cache[name]
+
+    def last_load_error(self, name: str) -> Optional[str]:
+        """Last load failure for *name* (None once a load has succeeded)."""
+        with self._lock:
+            return self._load_errors.get(name)
+
+    def load_failure_count(self) -> int:
+        with self._lock:
+            return self._load_failure_count
 
     def put(self, name: str, agent: AgentDefinition) -> None:
         """Store (or replace) a pre-built AgentDefinition in the cache."""

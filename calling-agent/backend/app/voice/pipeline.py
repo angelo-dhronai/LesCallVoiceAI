@@ -193,7 +193,11 @@ class VoicePipeline:
         self.vad = vad
         
         self.stt = stt or STTRouter()
-        self.conversation = conversation or ConversationRouter()
+        if conversation is None:
+            # CLI/dev default only — telephony always passes a conversation.
+            from ..agent_definition import get_pramukh_agent
+            conversation = ConversationRouter(agent_def=get_pramukh_agent())
+        self.conversation = conversation
         self._hub = event_hub
 
         # TTS uses the sink

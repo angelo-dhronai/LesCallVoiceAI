@@ -553,9 +553,19 @@ class ConversationRouter:
         default_language: str = "hi",
         agent_def: AgentDefinition | None = None,
     ) -> None:
-        # Agent definition drives all domain-specific behaviour.
-        # Explicit constructor args override the definition for backward compat.
-        self._def: AgentDefinition = agent_def or get_pramukh_agent()
+        # Agent definition drives all domain-specific behaviour. It MUST be
+        # explicit: the old `agent_def or get_pramukh_agent()` fallback meant a
+        # failed tenant-agent load silently answered the call as Vishal Patel
+        # from Pramukh Group. Callers that want Pramukh (CLI default) pass
+        # get_pramukh_agent() themselves; the telephony bridge substitutes the
+        # neutral fallback agent on load failure.
+        if agent_def is None:
+            raise ValueError(
+                "ConversationRouter requires an explicit agent_def — pass "
+                "get_pramukh_agent() for the CLI default or "
+                "get_neutral_fallback_agent() for a degraded call."
+            )
+        self._def: AgentDefinition = agent_def
         # LLM provider is swappable via env WITHOUT code changes — set all three
         # to move off US-hosted OpenAI onto a fast in-region endpoint (e.g. Gemini
         # OpenAI-compat) and cut ~1s of trans-Pacific latency per turn:
@@ -2169,7 +2179,9 @@ class ConversationRouter:
         # Using .get() so missing entries get a plain lock line instead of KeyError.
         def _make_lang_header(code: str, name: str) -> str:
             note = _register_notes.get(code, "")
-            other_langs = ", ".join(c for c in _supported_langs if c != code)
+            # sorted(): set order varies per process (hash seed) — pin it so
+            # the prompt is deterministic (required by the golden harness).
+            other_langs = ", ".join(sorted(c for c in _supported_langs if c != code))
             note_line = f"\n{note}" if note else ""
             return (
                 f"⚡ LANGUAGE = {name.upper()}. You MUST write ONLY in {name}.\n"

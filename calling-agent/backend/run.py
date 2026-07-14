@@ -76,6 +76,14 @@ def main() -> None:
             agent_def = AgentDefinition.from_yaml(_yaml)
             logging.getLogger(__name__).info("[startup] Agent loaded: %s (%s)", _name, agent_def.agent_id)
 
+        if agent_def is None:
+            # CLI default agent, passed EXPLICITLY: ConversationRouter no
+            # longer falls back to Pramukh on its own (P0 safety substrate).
+            from app.agent_definition import get_pramukh_agent
+            agent_def = get_pramukh_agent()
+            logging.getLogger(__name__).info(
+                "[startup] No --agent given — using default Pramukh agent")
+
         web_enabled = "--web" in sys.argv
         call_id = f"local-{int(time.time())}"
         tracker = SarvamCreditTracker.get()

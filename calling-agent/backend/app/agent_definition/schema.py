@@ -500,5 +500,25 @@ class AgentDefinition:
         data = _coerce(self)
         out = _Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        with open(out, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        # Atomic write: dump to a temp file in the same directory, then
+        # os.replace() over the target. A call arriving mid-write can now only
+        # ever see the complete old file or the complete new file — a torn
+        # half-written YAML used to parse-fail and drop the caller onto the
+        # fallback agent. watchfiles treats the replace as a change, so the
+        # registry hot-reload keeps working.
+        import os as _os
+        import tempfile as _tempfile
+        fd, tmp_path = _tempfile.mkstemp(
+            prefix=out.name + ".", suffix=".tmp", dir=str(out.parent))
+        try:
+            with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+                f.flush()
+                _os.fsync(f.fileno())
+            _os.replace(tmp_path, out)
+        except BaseException:
+            try:
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise

@@ -247,8 +247,15 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
     try:
         agent_def = agent_registry.get(slug)
     except Exception as exc:
-        logger.error("[%s] [BRIDGE] Failed to load agent '%s': %r — using default",
+        # NEVER fall back to another tenant's agent (the old path answered as
+        # Pramukh's Vishal Patel). Substitute the built-in neutral fallback:
+        # generic persona, no brand, apologizes and asks to call back.
+        logger.error("[%s] [BRIDGE] agent load FAILED for '%s': %r — "
+                     "answering with NEUTRAL_FALLBACK_AGENT",
                      conn_id, slug, exc)
+    if agent_def is None:
+        from backend.app.agent_definition.fallback_agent import get_neutral_fallback_agent
+        agent_def = get_neutral_fallback_agent()
 
     call_id_provider = lambda: conn_id  # noqa: E731 - tiny provider closure
     corrections = agent_def.knowledge_base.stt_corrections if agent_def else None

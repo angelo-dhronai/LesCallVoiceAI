@@ -120,6 +120,13 @@ def test_interview_flow_create_gate(cop):
                                       "organic farms, free trial box for new families, "
                                       "delivery across Surat every Sunday morning."),
             "locations": ["Surat"],
+            # The upgraded extractor emits catalog items whenever the doc
+            # names products — a sales draft's knowledge gate requires them.
+            "catalog": [{"id": "weekly-organic-box",
+                         "name": "Weekly Organic Vegetable Box",
+                         "price_range": "₹499/week",
+                         "pitch_points": ["certified organic farms",
+                                          "free trial box for new families"]}],
         }}
     orig = yf.extract_fields_from_text
     yf.extract_fields_from_text = _fake_extract
@@ -151,7 +158,7 @@ def test_interview_flow_create_gate(cop):
     assert session["interview"]["phase"] == "built"
 
     from backend.app.agent_definition.schema import AgentDefinition
-    agent = AgentDefinition.from_yaml(agents_dir / "greenleaf" / "agent.yaml")
+    agent = AgentDefinition.from_yaml(agents_dir / res3["name"] / "agent.yaml")
     # Draft content survived even though the create call carried nothing:
     assert agent.identity.agent_name == "Kavya"
     assert agent.call_direction == "outbound"

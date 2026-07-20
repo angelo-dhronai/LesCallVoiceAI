@@ -63,9 +63,9 @@ export function Modal({
   const panelRef = useFocusTrap(open)
   if (!open) return null
   return (
-    <div className="fixed inset-0 z-[80] grid place-items-center p-4" role="dialog" aria-modal="true" aria-labelledby={title ? 'modal-title' : undefined}>
-      <div className="absolute inset-0 bg-zinc-950/30" onClick={onClose} />
-      <div ref={panelRef} className={cx('card relative z-10 w-full p-5 shadow-glass-lg animate-fade-up', wide ? 'max-w-2xl' : 'max-w-md')}>
+    <div role="dialog" aria-modal="true" aria-labelledby={title ? 'modal-title' : undefined}>
+      <div className="fixed inset-0 z-[80] bg-zinc-950/30" onClick={onClose} />
+      <div ref={panelRef} className={cx('card relative z-[90] w-full p-5 shadow-glass-lg animate-fade-up', wide ? 'max-w-2xl' : 'max-w-md')}>
         {title && (
           <div className="mb-3 flex items-center justify-between gap-3">
             <h3 id="modal-title" className="font-display text-[15px] font-semibold tracking-tight">{title}</h3>
@@ -95,11 +95,11 @@ export function FullscreenModal({
   const panelRef = useFocusTrap(open)
   if (!open) return null
   return (
-    <div className="fixed inset-0 z-[80]" role="dialog" aria-modal="true" aria-labelledby={title ? 'fullscreen-modal-title' : undefined}>
-      <div className="absolute inset-0 bg-zinc-950/40" onClick={onClose} />
+    <div role="dialog" aria-modal="true" aria-labelledby={title ? 'fullscreen-modal-title' : undefined}>
+      <div className="fixed inset-0 z-[80] bg-zinc-950/40" onClick={onClose} />
       <div
         ref={panelRef}
-        className="absolute inset-0 z-10 flex flex-col overflow-hidden bg-[var(--surface-solid)] shadow-glass-lg animate-fade-up sm:inset-4 sm:rounded-2xl sm:ring-1 sm:ring-[var(--border)] lg:inset-x-10 lg:inset-y-6"
+        className="fixed inset-0 z-[90] flex flex-col overflow-hidden bg-[var(--surface-solid)] shadow-glass-lg animate-fade-up"
       >
         <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-[var(--border)] px-4 py-3 sm:px-6">
           <h3 id="fullscreen-modal-title" className="min-w-0 flex-1 truncate font-display text-[15px] font-bold tracking-tight sm:text-[17px]">

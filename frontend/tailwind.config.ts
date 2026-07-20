@@ -28,6 +28,10 @@ export default {
           dim: '#6f7180',
         },
       },
+      backgroundImage: {
+        'mesh-light': 'radial-gradient(1200px 600px at 10% -10%, rgba(0,245,160,0.10), transparent 55%), radial-gradient(1000px 500px at 100% 0%, rgba(79,70,229,0.10), transparent 50%)',
+        'mesh-dark': 'radial-gradient(1200px 600px at 10% -10%, rgba(0,245,160,0.12), transparent 55%), radial-gradient(1000px 500px at 100% 0%, rgba(79,70,229,0.18), transparent 50%)',
+      },
       borderRadius: {
         xl: '12px', '2xl': '14px', '3xl': '18px',
       },

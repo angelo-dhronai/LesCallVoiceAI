@@ -61,7 +61,8 @@ _ACTIVE_FILE = _AGENTS_DIR / "active_agent.json"
 # Every /api/agents route runs _tenancy_dep (router-level dependency): it
 # resolves the caller's owner email, stashes it in a ContextVar (so the
 # Copilot's in-process calls to these handlers inherit the same tenant), and
-# 404s any {name} the caller doesn't own. Admins (auth.admin_emails) see all.
+# 404s any {name} the caller doesn't own. Roles are flattened — every user is
+# owner-scoped; nobody sees other tenants' agents.
 # Unclaimed slugs (no agents-index row) are hidden from tenants — creation
 # claims the slug for its creator.
 from contextvars import ContextVar  # noqa: E402
@@ -179,9 +180,38 @@ def _write_active(slug: str | None) -> None:
         logger.warning("[builder] could not mirror active_agent.json: %r", exc)
 
 
+DIRECTIONS = ("inbound", "outbound")
+
+
+def agent_family(slug: str) -> str:
+    """The shared base name of a twin pair: 'acme-outbound' -> 'acme'.
+
+    Slugs that predate the twin convention are their own family, so nothing
+    created before this change gets grouped with an unrelated agent.
+    """
+    for d in DIRECTIONS:
+        if slug.endswith(f"-{d}"):
+            return slug[: -len(d) - 1]
+    return slug
+
+
+def twin_slug(base: str, direction: str) -> str:
+    return f"{agent_family(base)}-{direction}"
+
+
+def counterpart_of(slug: str) -> str | None:
+    """The other half of a twin pair, or None for a pre-twin standalone slug."""
+    for d in DIRECTIONS:
+        if slug.endswith(f"-{d}"):
+            other = "outbound" if d == "inbound" else "inbound"
+            return twin_slug(slug, other)
+    return None
+
+
 def _agent_summary(name: str, agent: AgentDefinition) -> dict:
     return {
         "name": name,
+        "family": agent_family(name),
         "agent_id": agent.agent_id,
         "version": agent.version,
         "agent_name": agent.identity.agent_name,
@@ -245,33 +275,20 @@ async def get_agent(name: str) -> dict:
 
 
 # ── create / update / archive ───────────────────────────────────────────────
-@router.post("/api/agents")
-async def create_agent(request: Request) -> dict:
-    """Create a new agent. Body: {"name": "<slug>", ...agent_definition...}."""
-    body = await request.json()
-    name = body.pop("name", None)
-    if not name:
-        raise HTTPException(status_code=400, detail="'name' field is required")
-    if not name.replace("_", "").replace("-", "").isalnum():
-        raise HTTPException(status_code=400, detail="'name' must be alphanumeric with _ or -")
+def write_agent_dir(name: str, spec: dict, owner: str) -> AgentDefinition:
+    """Validate + persist ONE agent (yaml, registry, ownership claim).
+
+    Raises HTTPException on any failure, having already removed a partial
+    directory — the caller is responsible for unwinding earlier siblings.
+    """
     target_dir = _AGENTS_DIR / name
-    if target_dir.exists():
-        raise HTTPException(status_code=409, detail=f"Agent '{name}' already exists — use PUT to update")
-    # Never write into a slug the DB already assigns to another tenant (guards
-    # the narrow orphaned-row case where the folder was removed but the owner
-    # row survived).
-    _existing_owner = _slug_owner(name)
-    if _existing_owner and _existing_owner != _ctx_owner() and not _ctx_is_admin():
-        raise HTTPException(status_code=409, detail=f"Agent '{name}' already exists")
     try:
-        agent = AgentDefinition.from_dict(body)
+        agent = AgentDefinition.from_dict(spec)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Schema validation failed: {exc}")
     target_dir.mkdir(parents=True, exist_ok=True)
     agent.to_yaml(target_dir / "agent.yaml")
     agent_registry.put(name, agent)
-    # Multi-tenant: creation claims the slug for its creator (agents index).
-    owner = _ctx_owner()
     try:
         _claim_slug(name, owner, agent.identity.agent_name)
     except Exception as exc:
@@ -283,8 +300,79 @@ async def create_agent(request: Request) -> dict:
             raise HTTPException(status_code=500,
                                 detail=f"could not register ownership: {exc}")
         logger.warning("[builder] ownership claim failed for %s: %r", name, exc)
-    logger.info("[builder] created agent '%s' (owner=%s)", name, owner)
-    return {"status": "created", "name": name, "agent_id": agent.agent_id}
+    return agent
+
+
+def _assert_slug_free(name: str, owner: str) -> None:
+    if (_AGENTS_DIR / name).exists():
+        raise HTTPException(status_code=409,
+                            detail=f"Agent '{name}' already exists — use PUT to update")
+    # Never write into a slug the DB already assigns to another tenant (guards
+    # the narrow orphaned-row case where the folder was removed but the owner
+    # row survived).
+    existing = _slug_owner(name)
+    if existing and existing != owner and not _ctx_is_admin():
+        raise HTTPException(status_code=409, detail=f"Agent '{name}' already exists")
+
+
+@router.post("/api/agents")
+async def create_agent(request: Request) -> dict:
+    """Create an agent PAIR. Body: {"name": "<base>", ...agent_definition...}.
+
+    One create yields two agents — `<base>-inbound` and `<base>-outbound` —
+    because the two directions need genuinely different prompts (a receptionist
+    answering vs a rep opening a cold call). Both start from the submitted
+    definition with `call_direction` set accordingly; they are independent
+    records from then on and are edited separately.
+
+    Pass `"twin": false` to create a single agent under the exact name given
+    (used by migrations/tests and any caller managing its own naming).
+    """
+    body = await request.json()
+    name = body.pop("name", None)
+    make_twins = body.pop("twin", True)
+    if not name:
+        raise HTTPException(status_code=400, detail="'name' field is required")
+    if not name.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(status_code=400, detail="'name' must be alphanumeric with _ or -")
+    owner = _ctx_owner()
+
+    if not make_twins:
+        _assert_slug_free(name, owner)
+        agent = write_agent_dir(name, body, owner)
+        logger.info("[builder] created agent '%s' (owner=%s)", name, owner)
+        return {"status": "created", "name": name, "agent_id": agent.agent_id}
+
+    # The direction the caller asked for is the one the editor opens on.
+    primary_direction = str(body.get("call_direction") or "inbound")
+    if primary_direction not in DIRECTIONS:
+        primary_direction = "inbound"
+    family = agent_family(name)
+    slugs = {d: twin_slug(family, d) for d in DIRECTIONS}
+    for slug in slugs.values():
+        _assert_slug_free(slug, owner)
+
+    created: list[str] = []
+    try:
+        agents = {}
+        for direction, slug in slugs.items():
+            agents[direction] = write_agent_dir(
+                slug, {**body, "call_direction": direction}, owner)
+            created.append(slug)
+    except Exception:
+        # Half a pair is worse than none: a number could bind to the survivor
+        # and silently use the wrong-direction prompts.
+        for slug in created:
+            shutil.rmtree(_AGENTS_DIR / slug, ignore_errors=True)
+            agent_registry.invalidate(slug)
+        raise
+
+    primary = slugs[primary_direction]
+    logger.info("[builder] created agent pair '%s' (%s + %s, owner=%s)",
+                family, slugs["inbound"], slugs["outbound"], owner)
+    return {"status": "created", "name": primary,
+            "agent_id": agents[primary_direction].agent_id,
+            "family": family, "twins": slugs}
 
 
 @router.put("/api/agents/{name}")

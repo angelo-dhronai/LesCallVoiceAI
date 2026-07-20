@@ -5,7 +5,7 @@ import {
   getAgent, updateAgent, agentToWizardData, mergeWizardIntoDefinition,
   getRawYaml, putRawYaml, validateRaw, getRouting, putRouting,
   uploadDoc, deleteDoc, extractYaml, applyYaml, deleteBooking,
-  activateAgent, archiveAgent, ttsPreviewUrl,
+  archiveAgent, ttsPreviewUrl,
   listRevisions, rollbackAgent, patchAgentOps,
   type Routing, type AgentDoc, type WizardData, type MissingField, type Booking,
   type AgentRevision, type AgentOp,
@@ -54,13 +54,7 @@ export default function EditAgent() {
   }, [])
 
   const { data: agent, isLoading, error } = useGet<any>(['agent', name], `/agents/${name}`)
-  const { data: activeData } = useGet<{ active: string | null }>(['agents-active'], '/agents/active')
-  const isActive = activeData?.active === name
 
-  const onActivate = async () => {
-    try { await activateAgent(name); toast(`"${name}" is now answering inbound calls`, 'success'); refresh(['agents-active'], ['agents']) }
-    catch (e: any) { toast(`Activate failed: ${e.message || e}`, 'error') }
-  }
   const onArchive = async () => {
     if (!confirm(`Archive "${name}"?`)) return
     try { await archiveAgent(name); toast(`Archived "${name}"`, 'success'); nav('/build/agents') }
@@ -85,9 +79,6 @@ export default function EditAgent() {
         actions={
           <div className="flex items-center gap-2">
             <Link to="/build/agents"><Button variant="ghost"><ArrowLeft size={15} /> Agents</Button></Link>
-            {isActive
-              ? <Badge tone="mint" soft><CheckCircle2 size={12} /> Active</Badge>
-              : <Button variant="primary" onClick={onActivate}><Radio size={14} /> Activate</Button>}
             <Button variant="danger" title="Archive agent" onClick={onArchive}>
               <Archive size={14} /><span className="hidden sm:inline">Archive</span>
             </Button>

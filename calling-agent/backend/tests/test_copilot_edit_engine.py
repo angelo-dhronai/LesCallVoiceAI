@@ -33,6 +33,12 @@ def copilot(tmp_path, monkeypatch):
                 agents_dir / "pramukh" / "agent.yaml")
     monkeypatch.setattr(builder, "_AGENTS_DIR", agents_dir)
     monkeypatch.setattr(cop, "_AGENTS_DIR", agents_dir)
+    # An agent on disk is also CLAIMED in the agents index — without the row,
+    # the tenant boundary in _execute_tool rejects every edit with a 404.
+    # (This used to pass only because the caller resolved as an admin, which
+    # bypassed the check entirely; roles are flat now, so the fixture has to
+    # model the real thing.)
+    builder._claim_slug("pramukh", builder._ctx_owner(), "Pramukh")
     from backend.app.agent_definition.registry import agent_registry
     agent_registry.invalidate_all()
     return cop, agents_dir

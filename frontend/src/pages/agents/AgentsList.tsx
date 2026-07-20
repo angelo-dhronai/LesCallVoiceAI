@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useGet, useRefresh } from '../../api/hooks/useApi'
-import { useMe } from '../../api/hooks/useMe'
-import { activateAgent, archiveAgent, type AgentsList as AgentsListT } from '../../api/agents'
+import { archiveAgent, type AgentSummary, type AgentsList as AgentsListT } from '../../api/agents'
 import { patch } from '../../api/mutate'
 import { Card, Button, Badge, EmptyState, Spinner, SkeletonBlock, cx } from '../../components/ui'
 import { PageHeader, AsyncState, Segmented } from '../../components/kit'
@@ -22,16 +21,24 @@ type NumberRow = {
   number: string
   label?: string | null
   inbound_agent_slug?: string | null
+  outbound_agent_slug?: string | null
   config_status?: string | null
 }
+
+/* An agent binds to the slot matching its own call direction — an outbound
+   agent speaks on outgoing calls, an inbound one answers incoming ones. */
+type BindSlot = 'inbound_agent_slug' | 'outbound_agent_slug'
+const slotFor = (dir?: string): BindSlot =>
+  dir === 'outbound' ? 'outbound_agent_slug' : 'inbound_agent_slug'
 
 /* ------------------------------------------------------------------ activate modal */
 
 function ActivateModal({
-  slug, title, numbers, busyId, onConnect, onDisconnect, onClose,
+  slug, title, slot, numbers, busyId, onConnect, onDisconnect, onClose,
 }: {
   slug: string
   title: string
+  slot: BindSlot
   numbers: NumberRow[]
   busyId: number | null
   onConnect: (n: NumberRow) => void
@@ -40,12 +47,14 @@ function ActivateModal({
 }) {
   // A number already live with another agent needs an explicit detach confirm.
   const [confirmFor, setConfirmFor] = useState<NumberRow | null>(null)
+  const outbound = slot === 'outbound_agent_slug'
+  const role = outbound ? 'speaks on outgoing calls from' : 'answers incoming calls on'
 
   return (
     <Modal open onClose={onClose} title={`Activate “${title}”`} wide>
       <p className="mb-3 text-[13px] text-soft">
-        An agent goes live by connecting it to one of your phone numbers — it then answers
-        every call on that number.
+        An agent goes live by connecting it to one of your phone numbers — it then {role}{' '}
+        that number.
       </p>
 
       {numbers.length === 0 ? (
@@ -64,8 +73,9 @@ function ActivateModal({
       ) : (
         <div className="space-y-2">
           {numbers.map((n) => {
-            const mine = n.inbound_agent_slug === slug
-            const free = !n.inbound_agent_slug
+            const holder = n[slot]
+            const mine = holder === slug
+            const free = !holder
             const applied = n.config_status === 'applied'
             const busy = busyId === n.id
             return (
@@ -103,7 +113,7 @@ function ActivateModal({
                     </>
                   ) : (
                     <>
-                      <Badge tone="indigo">Live with “{n.inbound_agent_slug}”</Badge>
+                      <Badge tone="indigo">Live with “{holder}”</Badge>
                       <Button variant="soft" size="sm" disabled={busy} onClick={() => setConfirmFor(n)}>
                         {busy ? <Spinner className="h-3 w-3" /> : <Radio size={13} />} Connect
                       </Button>
@@ -116,7 +126,8 @@ function ActivateModal({
                     <div className="flex items-start gap-2 text-[12.5px] text-soft">
                       <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-600 dark:text-amber-300" />
                       <span>
-                        <b>{n.number}</b> is currently answered by <b>“{n.inbound_agent_slug}”</b>.
+                        <b>{n.number}</b> currently {outbound ? 'calls out with' : 'is answered by'}{' '}
+                        <b>“{holder}”</b>.
                         Detach it and connect <b>“{title}”</b> instead? The switch applies from the next call.
                       </span>
                     </div>
@@ -147,27 +158,26 @@ function ActivateModal({
 export default function AgentsList() {
   const { data, isLoading, error } = useGet<AgentsListT>(['agents'], '/agents', { refetchInterval: 15000 })
   const { data: numbersData } = useGet<{ numbers: NumberRow[] }>(['numbers'], '/numbers')
-  const { data: me } = useMe()
-  const isAdmin = me?.is_admin === true
   const refresh = useRefresh()
   const toast = useToast()
   const [busy, setBusy] = useState<string>('')
   const [bindBusyId, setBindBusyId] = useState<number | null>(null)
   const [tab, setTab] = useState<Tab>('agents')
   const [confirmArchive, setConfirmArchive] = useState<string>('')
-  const [activating, setActivating] = useState<{ slug: string; title: string } | null>(null)
+  const [activating, setActivating] = useState<{ slug: string; title: string; slot: BindSlot } | null>(null)
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => () => { if (confirmTimer.current) clearTimeout(confirmTimer.current) }, [])
 
   const numbers = useMemo(() => numbersData?.numbers ?? [], [numbersData])
-  const boundTo = (slug: string) => numbers.filter((n) => n.inbound_agent_slug === slug)
+  const boundTo = (a: AgentSummary) =>
+    numbers.filter((n) => n[slotFor(a.call_direction)] === a.name)
 
   const connectNumber = async (n: NumberRow) => {
     if (!activating) return
     setBindBusyId(n.id)
     try {
-      await patch(`/numbers/${n.id}`, { inbound_agent_slug: activating.slug })
+      await patch(`/numbers/${n.id}`, { [activating.slot]: activating.slug })
       toast(`“${activating.title}” is now live on ${n.number}`, 'success')
       refresh(['numbers'], ['agents'])
     } catch (e: any) {
@@ -178,30 +188,16 @@ export default function AgentsList() {
   }
 
   const disconnectNumber = async (n: NumberRow) => {
+    if (!activating) return
     setBindBusyId(n.id)
     try {
-      await patch(`/numbers/${n.id}`, { inbound_agent_slug: '' })
+      await patch(`/numbers/${n.id}`, { [activating.slot]: '' })
       toast(`${n.number} disconnected — it has no agent now`, 'info')
       refresh(['numbers'], ['agents'])
     } catch (e: any) {
       toast(`Could not disconnect: ${e.message || e}`, 'error')
     } finally {
       setBindBusyId(null)
-    }
-  }
-
-  // Admin-only: the legacy platform fallback (active_agent.json) that answers
-  // calls arriving with no DID→agent binding.
-  const onSetFallback = async (name: string) => {
-    setBusy(name)
-    try {
-      await activateAgent(name)
-      toast(`"${name}" is now the platform fallback agent`, 'success')
-      refresh(['agents'])
-    } catch (e: any) {
-      toast(`Failed: ${e.message || e}`, 'error')
-    } finally {
-      setBusy('')
     }
   }
 
@@ -226,8 +222,25 @@ export default function AgentsList() {
     }
   }
 
-  const agents = [...(data?.agents ?? [])].sort((a, b) =>
-    (boundTo(b.name).length - boundTo(a.name).length) || (Number(b.active) - Number(a.active)))
+  /* Twins created together (`acme-inbound` / `acme-outbound`) share a family
+     and read as ONE logical agent with two direction variants. */
+  const families = useMemo(() => {
+    const byFamily = new Map<string, AgentSummary[]>()
+    for (const a of data?.agents ?? []) {
+      const key = a.family || a.name
+      byFamily.set(key, [...(byFamily.get(key) ?? []), a])
+    }
+    return [...byFamily.entries()]
+      .map(([key, list]) => {
+        // inbound first — the primary variant supplies the card's identity
+        const variants = [...list].sort((x, y) =>
+          Number(x.call_direction === 'outbound') - Number(y.call_direction === 'outbound'))
+        const live = variants.reduce((sum, v) => sum + boundTo(v).length, 0)
+        return { key, variants, primary: variants[0], live }
+      })
+      .sort((a, b) => (b.live - a.live)
+        || (Number(b.variants.some((v) => v.active)) - Number(a.variants.some((v) => v.active))))
+  }, [data, numbers])
 
   return (
     <div className="space-y-6">
@@ -258,7 +271,7 @@ export default function AgentsList() {
         </div>
       ) : (
       <AsyncState error={error}>
-        {agents.length === 0 ? (
+        {families.length === 0 ? (
           <EmptyState
             icon={<Bot size={22} />}
             title="No agents yet"
@@ -271,11 +284,12 @@ export default function AgentsList() {
           />
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            {agents.map((a) => {
-              const bound = boundTo(a.name)
-              const activated = bound.length > 0
+            {families.map((f) => {
+              const a = f.primary
+              const activated = f.live > 0
+              const brokenVariants = f.variants.filter((v) => v.error)
               return (
-              <Card key={a.name} className="flex flex-col gap-3 p-5" hover glow={activated ? 'mint' : undefined}>
+              <Card key={f.key} className="flex flex-col gap-3 p-5" hover glow={activated ? 'mint' : undefined}>
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -288,25 +302,23 @@ export default function AgentsList() {
                           <CheckCircle2 size={12} /> Activated
                         </Badge>
                       )}
-                      {isAdmin && a.active && (
-                        <span title="Answers calls that arrive with no number→agent binding (active_agent.json)">
-                          <Badge tone="indigo" soft>fallback</Badge>
-                        </span>
-                      )}
                     </div>
                     <div className="truncate text-[12px] text-dim">{a.company || '—'}</div>
                   </div>
-                  <code title={a.name} className="max-w-[45%] truncate rounded-md bg-[var(--surface-2)] px-2 py-0.5 font-mono text-[11px] text-soft ring-1 ring-[var(--border)]">
-                    {a.name}
+                  <code title={f.variants.map((v) => v.name).join(', ')} className="max-w-[45%] truncate rounded-md bg-[var(--surface-2)] px-2 py-0.5 font-mono text-[11px] text-soft ring-1 ring-[var(--border)]">
+                    {f.key}
                     {a.version && <span className="ml-1 text-[10px] text-dim">v{a.version}</span>}
                   </code>
                 </div>
 
-                {a.error ? (
+                {brokenVariants.length > 0 && (
                   <div role="alert" className="rounded-lg bg-rose-500/10 px-3 py-2 text-[12px] text-rose-600 ring-1 ring-rose-500/20 dark:text-rose-300">
-                    Invalid YAML: {a.error}
+                    {brokenVariants.map((v) => (
+                      <div key={v.name} className="truncate">Invalid YAML in {v.name}: {v.error}</div>
+                    ))}
                   </div>
-                ) : (
+                )}
+                {!a.error && (
                   <div className="flex flex-wrap items-center gap-1.5">
                     {(a.languages ?? []).map((l) => (
                       <span key={l} className="inline-flex items-center gap-1 rounded-md bg-[var(--surface-2)] px-2 py-0.5 text-[11px] font-semibold text-soft ring-1 ring-[var(--border)]">
@@ -319,16 +331,6 @@ export default function AgentsList() {
                     >
                       <GitBranch size={11} /> {(a.stages ?? []).length} stages
                     </span>
-                    <span
-                      className={
-                        a.call_direction === 'outbound'
-                          ? 'inline-flex items-center gap-1 rounded-md bg-indigo-500/12 px-2 py-0.5 text-[11px] font-semibold text-indigo-600 ring-1 ring-indigo-500/30 dark:text-indigo-300'
-                          : 'inline-flex items-center gap-1 rounded-md bg-mint-400/10 px-2 py-0.5 text-[11px] font-semibold text-mint-700 ring-1 ring-mint-400/30 dark:text-mint-300'
-                      }
-                    >
-                      {a.call_direction === 'outbound' ? <PhoneOutgoing size={11} /> : <PhoneIncoming size={11} />}
-                      {a.call_direction === 'outbound' ? 'outbound' : 'inbound'}
-                    </span>
                     {(a.calendar_slots ?? 0) > 0 && (
                       <span className="inline-flex items-center gap-1 rounded-md bg-[var(--surface-2)] px-2 py-0.5 text-[11px] font-semibold text-soft ring-1 ring-[var(--border)]">
                         <CalendarDays size={11} /> {a.calendar_slots} slots
@@ -337,54 +339,68 @@ export default function AgentsList() {
                   </div>
                 )}
 
-                <div className="mt-1 flex flex-wrap items-center gap-2 border-t border-[var(--border)] pt-3">
-                  {activated ? (
-                    <>
-                      <span
-                        title={`Answering calls on ${bound.map((n) => n.number).join(', ')}`}
-                        className="inline-flex max-w-full items-center gap-1.5 rounded-xl bg-mint-400/10 px-3.5 py-2 text-[13px] font-semibold text-mint-700 ring-1 ring-mint-400/30 dark:text-mint-300"
-                      >
-                        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-mint-400 animate-pulse-soft" />
-                        <Radio size={14} className="shrink-0" />
-                        <span className="truncate">Live on {bound.map((n) => n.number).join(', ')}</span>
-                      </span>
-                      <Button variant="ghost" size="sm"
-                        onClick={() => setActivating({ slug: a.name, title: a.agent_name || a.name })}>
-                        Change number
-                      </Button>
-                    </>
-                  ) : (
-                    <Button variant="primary"
-                      onClick={() => setActivating({ slug: a.name, title: a.agent_name || a.name })}
-                      disabled={!!a.error}>
-                      <Radio size={14} /> Activate
-                    </Button>
-                  )}
-                  {isAdmin && !a.active && (
-                    <Button variant="ghost" size="sm" onClick={() => onSetFallback(a.name)}
-                      disabled={busy === a.name || !!a.error}
-                      title="Admin: make this the platform fallback agent (answers calls with no number binding)">
-                      {busy === a.name ? <Spinner className="h-3 w-3" /> : 'Set fallback'}
-                    </Button>
-                  )}
-                  <Link to={`/build/agents/${a.name}`} className="ml-auto">
-                    <Button variant="ghost"><Pencil size={14} /> Edit</Button>
-                  </Link>
-                  {confirmArchive === a.name ? (
-                    <Button
-                      variant="danger"
-                      size="sm"
-                      onClick={() => onArchive(a.name)}
-                      disabled={busy === a.name}
-                      title={`"${a.name}" will be moved to agents/_archived and stop being selectable.`}
-                    >
-                      Archive "{a.name}"?
-                    </Button>
-                  ) : (
-                    <Button variant="ghost" onClick={() => requestArchive(a.name)} disabled={busy === a.name} title="Archive agent">
-                      {busy === a.name ? <Spinner className="h-3.5 w-3.5" /> : <Archive size={14} />}
-                    </Button>
-                  )}
+                {/* One row per direction variant — the twins of a single agent. */}
+                <div className="mt-1 flex flex-col gap-2.5 border-t border-[var(--border)] pt-3">
+                  {f.variants.map((v) => {
+                    const outbound = v.call_direction === 'outbound'
+                    const bound = boundTo(v)
+                    const live = bound.length > 0
+                    return (
+                      <div key={v.name} className="flex flex-wrap items-center gap-2">
+                        <span
+                          title={v.name}
+                          className={
+                            outbound
+                              ? 'inline-flex items-center gap-1 rounded-md bg-indigo-500/12 px-2 py-0.5 text-[11px] font-semibold text-indigo-600 ring-1 ring-indigo-500/30 dark:text-indigo-300'
+                              : 'inline-flex items-center gap-1 rounded-md bg-mint-400/10 px-2 py-0.5 text-[11px] font-semibold text-mint-700 ring-1 ring-mint-400/30 dark:text-mint-300'
+                          }
+                        >
+                          {outbound ? <PhoneOutgoing size={11} /> : <PhoneIncoming size={11} />}
+                          {outbound ? 'outbound' : 'inbound'}
+                        </span>
+                        {live ? (
+                          <>
+                            <span
+                              title={`${outbound ? 'Calling out from' : 'Answering calls on'} ${bound.map((n) => n.number).join(', ')}`}
+                              className="inline-flex min-w-0 items-center gap-1.5 rounded-xl bg-mint-400/10 px-3 py-1.5 text-[12.5px] font-semibold text-mint-700 ring-1 ring-mint-400/30 dark:text-mint-300"
+                            >
+                              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-mint-400 animate-pulse-soft" />
+                              <Radio size={13} className="shrink-0" />
+                              <span className="truncate">Live on {bound.map((n) => n.number).join(', ')}</span>
+                            </span>
+                            <Button variant="ghost" size="sm"
+                              onClick={() => setActivating({ slug: v.name, title: v.agent_name || v.name, slot: slotFor(v.call_direction) })}>
+                              Change number
+                            </Button>
+                          </>
+                        ) : (
+                          <Button variant="soft" size="sm"
+                            onClick={() => setActivating({ slug: v.name, title: v.agent_name || v.name, slot: slotFor(v.call_direction) })}
+                            disabled={!!v.error}>
+                            <Radio size={13} /> Activate
+                          </Button>
+                        )}
+                        <Link to={`/build/agents/${v.name}`} className="ml-auto">
+                          <Button variant="ghost" size="sm"><Pencil size={13} /> Edit</Button>
+                        </Link>
+                        {confirmArchive === v.name ? (
+                          <Button
+                            variant="danger"
+                            size="sm"
+                            onClick={() => onArchive(v.name)}
+                            disabled={busy === v.name}
+                            title={`"${v.name}" will be moved to agents/_archived and stop being selectable.`}
+                          >
+                            Archive "{v.name}"?
+                          </Button>
+                        ) : (
+                          <Button variant="ghost" size="sm" onClick={() => requestArchive(v.name)} disabled={busy === v.name} title={`Archive ${v.name}`}>
+                            {busy === v.name ? <Spinner className="h-3.5 w-3.5" /> : <Archive size={13} />}
+                          </Button>
+                        )}
+                      </div>
+                    )
+                  })}
                 </div>
               </Card>
               )
@@ -399,9 +415,9 @@ export default function AgentsList() {
           <Info size={14} className="mt-0.5 shrink-0 text-indigo-500" />
           <p className="text-[12px] text-soft">
             <span className="font-semibold">Activating</span> connects an agent to one of your phone
-            numbers — it then answers every call on that number. Manage your numbers in{' '}
-            <Link to="/telephony" className="font-semibold text-indigo-600 hover:underline dark:text-indigo-300">Numbers (BYON)</Link>
-            {isAdmin && <>; the <span className="font-semibold">fallback</span> agent (admin-only) answers calls that arrive with no number binding</>}.
+            numbers — the inbound twin answers incoming calls on it, the outbound twin speaks on calls
+            placed from it. Manage your numbers in{' '}
+            <Link to="/telephony" className="font-semibold text-indigo-600 hover:underline dark:text-indigo-300">Numbers (BYON)</Link>.
           </p>
         </div>
       )}
@@ -410,6 +426,7 @@ export default function AgentsList() {
         <ActivateModal
           slug={activating.slug}
           title={activating.title}
+          slot={activating.slot}
           numbers={numbers}
           busyId={bindBusyId}
           onConnect={connectNumber}

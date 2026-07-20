@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  buildAgentPayload, createAgent, putRouting, activateAgent,
+  buildAgentPayload, createAgent, putRouting,
   extractFromDocument, extractedFieldsToWizardPatch,
   type WizardData, type Routing, type MissingField,
 } from '../../api/agents'
@@ -13,7 +13,7 @@ import {
   PersonalitySection, KnowledgeSection, CallFlowSection, ResponsesSection,
   RoutingFields, SLUG_RE, type TimeWindowDraft,
 } from './AgentFormSections'
-import { ChevronLeft, ChevronRight, FileUp, Wand2, Check, AlertTriangle } from 'lucide-react'
+import { ChevronLeft, ChevronRight, FileUp, Wand2, Check, AlertTriangle, Info } from 'lucide-react'
 
 const STEPS = ['Basics', 'Languages', 'Personality', 'Knowledge', 'Call Script', 'Calendar', 'Objections & Rules', 'Routing', 'Review']
 
@@ -109,7 +109,6 @@ export default function CreateAgent() {
   const [d, setD] = useState<WizardData>(initial)
   const [r, setR] = useState<Routing>({ did: '', caller_id_prefixes: [], fallback_agent: '', time_windows: [] })
   const [win, setWin] = useState<TimeWindowDraft>({ start: '', end: '' })
-  const [activateNow, setActivateNow] = useState(false)
   const [saving, setSaving] = useState(false)
   const [extracting, setExtracting] = useState(false)
   const [extractingName, setExtractingName] = useState('')
@@ -231,7 +230,10 @@ export default function CreateAgent() {
         ...d,
         products: d.products.filter((p) => p.name.trim()),
       })
-      await createAgent(payload)
+      // Creation makes a pair — res.name is the primary slug (base + a
+      // -inbound/-outbound suffix), never the base name typed in the form.
+      const res = await createAgent(payload)
+      const slug = res?.name || d.name
 
       // Routing — applied after creation; skipped silently when all fields empty.
       const time_windows = win.start !== '' && win.end !== ''
@@ -240,7 +242,7 @@ export default function CreateAgent() {
       const hasRouting = !!(r.did || (r.caller_id_prefixes || []).length || r.fallback_agent || time_windows.length)
       if (hasRouting) {
         try {
-          await putRouting(d.name, {
+          await putRouting(slug, {
             did: r.did || '',
             caller_id_prefixes: r.caller_id_prefixes || [],
             fallback_agent: r.fallback_agent || '',
@@ -251,18 +253,9 @@ export default function CreateAgent() {
         }
       }
 
-      if (activateNow) {
-        try {
-          await activateAgent(d.name)
-          toast(`Agent "${d.name}" created and activated`, 'success')
-        } catch (e: any) {
-          toast(`Agent created, but activation failed: ${e.message || e}`, 'error')
-        }
-      } else {
-        toast(`Agent "${d.name}" created`, 'success')
-      }
+      toast(`Agents "${res?.twins?.inbound || `${d.name}-inbound`}" and "${res?.twins?.outbound || `${d.name}-outbound`}" created — connect one to a number to go live`, 'success')
       createdRef.current = true
-      nav(`/build/agents/${d.name}`)
+      nav(`/build/agents/${slug}`)
     } catch (e: any) {
       toast(`Create failed: ${e.message || e}`, 'error')
       setStep(STEPS.length - 1)
@@ -409,6 +402,18 @@ export default function CreateAgent() {
         </div>
         {step === 0 && (
           <div className="space-y-6">
+            <div className="flex items-start gap-2 rounded-xl bg-indigo-500/10 px-4 py-3 ring-1 ring-indigo-500/20">
+              <Info size={14} className="mt-0.5 shrink-0 text-indigo-500" />
+              <p className="text-[12px] text-soft">
+                The slug you enter is a <span className="font-semibold">base name</span> — two agents are
+                created from it:{' '}
+                <code className="font-mono text-[11px]">{d.name || 'your-slug'}-inbound</code> (answers
+                incoming calls) and{' '}
+                <code className="font-mono text-[11px]">{d.name || 'your-slug'}-outbound</code> (speaks on
+                outgoing calls). Both start from what you fill in here and can be edited separately
+                afterwards.
+              </p>
+            </div>
             <BasicsSection d={d} set={set} showErrors={attemptedNext} />
             <div>
               <div className="eyebrow mb-2">Call type *</div>
@@ -436,7 +441,11 @@ export default function CreateAgent() {
         {step === 8 && (
           <div className="space-y-4">
             <div className="flex flex-wrap items-center gap-2">
-              <Badge tone="indigo" soft><span className="max-w-[60vw] truncate">{d.name}</span></Badge>
+              <Badge tone="indigo" soft>
+                <span className="max-w-[60vw] truncate" title={`${d.name}-inbound and ${d.name}-outbound`}>
+                  {d.name}-inbound + -outbound
+                </span>
+              </Badge>
               <Badge tone="mint" soft><span className="max-w-[60vw] truncate">{d.agent_name}</span></Badge>
               <Badge tone={d.call_direction === 'outbound' ? 'amber' : 'mint'} soft>{d.call_direction}</Badge>
               <span className="text-[13px] text-soft">{d.company_name}</span>
@@ -485,17 +494,6 @@ export default function CreateAgent() {
                 {' '}and add availability.
               </div>
             )}
-            <label className="flex items-center gap-2 rounded-lg bg-[var(--surface-2)] px-3 py-2.5 text-[13px] font-medium text-soft ring-1 ring-[var(--border)]">
-              <input
-                type="checkbox"
-                checked={activateNow}
-                onChange={(e) => setActivateNow(e.target.checked)}
-                className="h-4 w-4 accent-[var(--accent)]"
-              />
-              {d.call_direction === 'outbound'
-                ? 'Activate immediately — this agent becomes the one used for outbound campaigns right after creation'
-                : 'Activate immediately — this agent starts answering inbound calls right after creation'}
-            </label>
             <details className="rounded-xl bg-[var(--surface-2)] p-4 ring-1 ring-[var(--border)]">
               <summary className="cursor-pointer text-[12px] font-semibold text-soft">Preview generated definition (JSON)</summary>
               <pre className="mt-3 max-h-80 overflow-auto text-[11px] leading-relaxed text-dim">{JSON.stringify(buildAgentPayload({ ...d, products: d.products.filter((p) => p.name.trim()) }), null, 2)}</pre>

@@ -192,6 +192,13 @@ class LanguageConfig:
     greeting_language: str = ""
     # Hint that the greeting should be bilingual (informational for now).
     bilingual_greeting: bool = False
+    # How the language of closing-flavoured lines (closing_responses,
+    # decline_farewell, wrong_number_close) is chosen.
+    # ''         = today: state.language at the moment of the final utterance
+    #              (the single most misdetection-prone turn — 'bye bye thank
+    #              you' flips a Hindi call to English one turn before close).
+    # 'dominant' = majority language of the caller's turns this call.
+    closing_language_policy: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +465,13 @@ class KnowledgeBase:
     portfolio_section_label: str = "KNOWLEDGE BASE"
     location_aliases: list[str] = field(default_factory=list)
     objection_patterns: list[str] = field(default_factory=list)
+    # How custom objection_patterns combine with the platform's universal
+    # deferral set at intent-detection time.
+    # 'replace' = today: any custom pattern list REPLACES the ~28 universal
+    #             phrases (load-bearing for both Pramukh agents).
+    # 'extend'  = custom patterns are ADDED to the universal set — authoring
+    #             5 domain phrases no longer disables 'not interested' etc.
+    objection_patterns_mode: str = "replace"
     time_patterns: list[str] = field(default_factory=list)
     qa_field_signals: dict[str, list[str]] = field(default_factory=dict)
     stt_corrections: STTCorrections = field(default_factory=STTCorrections)
@@ -497,6 +511,15 @@ class GuardrailsConfig:
     """NEVER/ALWAYS rules + honesty/compliance/escalation policy.
     Defaults = today's FIRM RULES band byte-for-byte."""
     use_builtin_rules: bool = True
+    # Which builtin FIRM RULES pack renders when use_builtin_rules is true.
+    # 'real_estate' = today's exact band (default — every existing agent).
+    # 'generic'     = industry-neutral variant: keeps every domain-neutral
+    #                 hygiene rule, swaps the site-visit/property/portfolio
+    #                 lines for appointment/catalogue equivalents.
+    # honesty may additionally carry knowledge_grounding: 'strict' → renders
+    # the KNOWLEDGE GROUNDING band (deflect-not-invent) after the knowledge
+    # section. Absent = today (no band).
+    builtin_rules_pack: str = "real_estate"
     never_rules: list[str] = field(default_factory=list)   # '✗ NEVER <rule>'
     always_rules: list[str] = field(default_factory=list)  # '✓ <rule>'
     # {unknown_answer_policy: '', forbidden_fabrications: [prices, dates]}
@@ -554,6 +577,15 @@ class LLMConfig:
     filler_timeout_s: float         # how long to wait before playing a filler
     intent_classify_timeout_s: float
     max_response_length: int        # character cap before truncation
+    # Filler frequency governors (0/0/False = today's exact behaviour:
+    # a filler on EVERY turn whose first LLM chunk exceeds filler_timeout_s).
+    # min_gap_turns: suppress a filler within N turns of the previous one.
+    # max_per_call: hard cap per call. ack_extended: also recognise
+    # Devanagari/Gujarati-script affirmations as simple acks (so approvals
+    # get the short approval filler, not the 'let me check' one).
+    filler_min_gap_turns: int = 0
+    filler_max_per_call: int = 0
+    filler_ack_extended: bool = False
     # Additional domain-specific NEVER/ALWAYS rules appended to the
     # platform's built-in rules in the system prompt. (D4: from_dict aliases
     # these into guardrails when guardrails carries no rules of its own —
@@ -688,6 +720,7 @@ class AgentDefinition:
             allow_code_mixing=_as_bool(lang_d, "allow_code_mixing", False),
             greeting_language=_as_str(lang_d, "greeting_language"),
             bilingual_greeting=_as_bool(lang_d, "bilingual_greeting", False),
+            closing_language_policy=_as_str(lang_d, "closing_language_policy"),
         )
 
         cal_d = _as_dict(d, "calendar")
@@ -755,6 +788,8 @@ class AgentDefinition:
                                             "KNOWLEDGE BASE") or "KNOWLEDGE BASE",
             location_aliases=[str(x) for x in _as_list(kb_d, "location_aliases")],
             objection_patterns=[str(x) for x in _as_list(kb_d, "objection_patterns")],
+            objection_patterns_mode=(
+                _as_str(kb_d, "objection_patterns_mode", "replace") or "replace"),
             time_patterns=[str(x) for x in _as_list(kb_d, "time_patterns")],
             qa_field_signals=_as_dict(kb_d, "qa_field_signals"),
             stt_corrections=stt_corrections,
@@ -800,6 +835,9 @@ class AgentDefinition:
             filler_timeout_s=_as_float(llm_d, "filler_timeout_s", 1.5),
             intent_classify_timeout_s=_as_float(llm_d, "intent_classify_timeout_s", 1.0),
             max_response_length=_as_int(llm_d, "max_response_length", 400),
+            filler_min_gap_turns=_as_int(llm_d, "filler_min_gap_turns", 0),
+            filler_max_per_call=_as_int(llm_d, "filler_max_per_call", 0),
+            filler_ack_extended=_as_bool(llm_d, "filler_ack_extended", False),
             extra_never_rules=[str(x) for x in _as_list(llm_d, "extra_never_rules")],
             extra_always_rules=[str(x) for x in _as_list(llm_d, "extra_always_rules")],
         )
@@ -889,6 +927,9 @@ class AgentDefinition:
         gr_d = _as_dict(d, "guardrails")
         guardrails = GuardrailsConfig(
             use_builtin_rules=_as_bool(gr_d, "use_builtin_rules", True),
+            builtin_rules_pack=(
+                _as_str(gr_d, "builtin_rules_pack", "real_estate")
+                or "real_estate"),
             never_rules=[str(x) for x in _as_list(gr_d, "never_rules")],
             always_rules=[str(x) for x in _as_list(gr_d, "always_rules")],
             honesty=_as_dict(gr_d, "honesty"),

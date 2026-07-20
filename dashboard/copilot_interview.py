@@ -129,10 +129,35 @@ def _done_data_capture(draft):
     return not missing, missing
 
 
+def _is_sales_draft(draft) -> bool:
+    """Outbound agents and flows with pitch/recommend stages SELL — they must
+    enumerate what they are allowed to claim, or the live model improvises a
+    catalog (Kaapd: 'party-wear sarees' invented into an empty catalog).
+    Limitation: inbound flows whose stages carry no roles fall back to the
+    prose gate."""
+    if str(draft.get("call_direction") or "").strip().lower() == "outbound":
+        return True
+    stages = _get(draft, "call_flow", "stages", default=[]) or []
+    return any(isinstance(s, dict) and s.get("role") in ("pitch", "recommend")
+               for s in stages)
+
+
 def _done_knowledge(draft):
     text = _get(draft, "knowledge_base", "portfolio_prompt_text", default="")
     catalog = _get(draft, "knowledge_base", "catalog", default=[]) or []
+    catalog = [c for c in catalog
+               if isinstance(c, dict) and str(c.get("name") or "").strip()]
     docs = draft.get("_ingested_docs") or []
+    if _is_sales_draft(draft):
+        # A prose paragraph alone lets the agent improvise products — a sales
+        # agent needs at least one named catalog item (skip_layer remains the
+        # user's escape hatch; strict grounding covers the skipped case).
+        ok = bool(catalog)
+        return ok, ([] if ok else
+                    ["each product or product family the agent may claim, as "
+                     "catalog items (name + 1-2 pitch points) — a text "
+                     "description alone lets the agent improvise products; "
+                     "mine the uploaded document/session before asking again"])
     ok = _nonempty_str(text, 80) or bool(catalog) or bool(docs)
     return ok, ([] if ok else
                 ["the products/services knowledge (≥80 chars, a catalog, or an uploaded document)"])
@@ -141,26 +166,48 @@ def _done_knowledge(draft):
 def _done_objections(draft):
     playbook = _get(draft, "response_bank", "objection_playbook", default=[]) or []
     playbook = [o for o in playbook if isinstance(o, dict)]
+    # objection_responses ({lang: [str]}) is the other real home for pushback
+    # answers — recording there must satisfy this layer too, or the interview
+    # re-asks a question the user already answered (incident 2026-07-15).
+    responses = _get(draft, "response_bank", "objection_responses", default={}) or {}
+    has_responses = isinstance(responses, dict) and any(
+        isinstance(v, list) and any(_nonempty_str(x) for x in v)
+        for v in responses.values())
     missing = []
     if not playbook:
+        if has_responses:
+            return True, []
         missing.append("the top pushbacks and the best answer to each")
         return False, missing
-    langs = _supported_langs(draft)
+    # An answer in ANY language closes the topic — full language coverage is
+    # a quality concern (the copilot can translate), never a reason to re-ask
+    # a user who already gave the answers (Kaapd doc test: en-only answers
+    # with hi/en supported left the layer open on some extraction runs).
     bad = [o.get("id") or "?" for o in playbook
            if not (isinstance(o.get("answer"), dict)
-                   and all(_nonempty_str(o["answer"].get(l)) for l in langs))]
-    if bad:
-        missing.append("objection answers in every language for: " + ", ".join(map(str, bad)))
+                   and any(_nonempty_str(v) for v in o["answer"].values()))]
+    if bad and not has_responses:
+        missing.append("the best answer to: " + ", ".join(map(str, bad)))
     return not missing, missing
 
 
 def _done_scheduling(draft):
-    ok = bool(_get(draft, "calendar", "mock_slots", default=[])
-              or _get(draft, "call_flow", "scheduling", default={})
-              or _get(draft, "call_flow", "callback_policy", default={})
-              or _get(draft, "follow_up", "whatsapp_promise", default={}))
+    # "We don't book appointments" is a VALID answer — an explicit no-booking
+    # marker closes the layer (previously mock_slots=[] could never satisfy
+    # it, which is how no-booking agents shipped phantom calendars).
+    _sched = _get(draft, "call_flow", "scheduling", default={}) or {}
+    no_booking = (
+        str(_get(draft, "calendar", "type", default="")).lower() == "none"
+        or (isinstance(_sched, dict) and _sched.get("enabled") is False))
+    ok = no_booking or bool(
+        _get(draft, "calendar", "mock_slots", default=[])
+        or _get(draft, "call_flow", "scheduling", default={})
+        or _get(draft, "call_flow", "callback_policy", default={})
+        or _get(draft, "follow_up", "whatsapp_promise", default={}))
     return ok, ([] if ok else
-                ["bookable slots / scheduling style / callback or WhatsApp follow-up policy"])
+                ["bookable slots / scheduling style / callback or WhatsApp "
+                 "follow-up policy — or say the business doesn't book "
+                 "appointments (calendar.type: none)"])
 
 
 def _done_guardrails(draft):
@@ -261,10 +308,12 @@ INTERVIEW_LAYERS: list[InterviewLayer] = [
         done=_done_knowledge),
     InterviewLayer(
         "objections_branching", "Objections", True,
-        ["response_bank.objection_playbook", "call_flow.stages[].branches"],
+        ["response_bank.objection_playbook", "response_bank.objection_responses"],
         "What are the top pushbacks callers give ('too expensive', 'not now'), "
         "and the best answer to each? After the pitch: what should happen on "
-        "interest, on rejection, and on 'what else do you have'?",
+        "interest, on rejection, and on 'what else do you have'? (Interest/"
+        "rejection handling belongs in the wording of the EXISTING stage goals "
+        "— never replace call_flow.stages to record objections.)",
         done=_done_objections),
     InterviewLayer(
         "scheduling_followup", "Scheduling", True,
@@ -338,6 +387,8 @@ def render_interview_state(progress: dict) -> str:
     if progress["next_layer_id"]:
         layer = _LAYERS_BY_ID[progress["next_layer_id"]]
         lines.append(f"NEXT: ask exactly this ONE question ({layer.title}): {progress['next_question']}")
+        if layer.spec_paths:
+            lines.append("Record answers under: " + ", ".join(layer.spec_paths))
         if progress["next_followup"]:
             lines.append(f"Then, if natural: {progress['next_followup']}")
         missing = next((l["missing"] for l in progress["layers"]

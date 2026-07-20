@@ -6,24 +6,19 @@ import { HealthPill, type Service } from '../components/HealthPill'
 import { cx } from '../components/ui'
 import { clockTime, num } from '../lib/format'
 import { NAV } from '../lib/nav'
-import { useMe } from '../api/hooks/useMe'
 import { useGet } from '../api/hooks/useApi'
 
-/** Flattened, admin-filtered list of navigable pages for the quick-jump search. */
+/** Flattened list of navigable pages for the quick-jump search. */
 function usePages() {
-  const { data: me } = useMe()
-  const isAdmin = me?.is_admin !== false
   return useMemo(() => {
     const out: { to: string; label: string; group: string; icon: any }[] = []
     for (const g of NAV) {
-      if (g.admin && !isAdmin) continue
       for (const i of g.items) {
-        if (i.admin && !isAdmin) continue
         out.push({ to: i.to, label: i.label, group: g.title, icon: i.icon })
       }
     }
     return out
-  }, [isAdmin])
+  }, [])
 }
 
 /** Close a popover on Escape. */
@@ -169,19 +164,18 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
         </div>
 
         <div className="ml-auto flex items-center gap-1.5">
-          {/* Live call-minutes usage → Usage page */}
-          <button
-            onClick={() => navigate('/usage')}
-            title="Call minutes used this month — open Usage"
-            aria-label="Call minutes used this month — open Usage"
-            className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-[12px] font-medium text-soft ring-1 ring-[var(--border)] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
+          {/* Live call-minutes usage (owner-scoped) */}
+          <span
+            title="Call minutes used this month"
+            aria-label="Call minutes used this month"
+            className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-[12px] font-medium text-soft ring-1 ring-[var(--border)]"
           >
             <Timer size={13} className="text-dim" />
             <span className="tabular-nums">
               {minutes.data?.minutes_month != null ? `${num(minutes.data.minutes_month)} min` : '— min'}
             </span>
             <span className="hidden text-dim sm:inline">this month</span>
-          </button>
+          </span>
           <span className="hidden px-1.5 text-[12px] font-medium tabular-nums text-dim md:block" title="Live clock">{now}</span>
 
           <div className="relative">

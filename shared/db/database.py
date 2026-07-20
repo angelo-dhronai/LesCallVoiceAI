@@ -69,7 +69,30 @@ MIGRATIONS: list[str] = [
     # Callback auto-dial context: why we are calling back (call_aim / past
     # context) — rendered as a WHY-YOU-ARE-CALLING-BACK prompt block.
     "ALTER TABLE call_links ADD COLUMN context_note TEXT",
+    # F8 per-call agent fidelity: WHICH agent revision/sha answered the call,
+    # the F6 preflight health marker ('ok' | 'load_failed' |
+    # 'preflight_failed:<stage>'), and per-call LLM usage counters. Written by
+    # conversation_call_bridge._persist_call_row at teardown.
+    "ALTER TABLE calls ADD COLUMN agent_revision INTEGER",
+    "ALTER TABLE calls ADD COLUMN agent_sha TEXT",
+    "ALTER TABLE calls ADD COLUMN agent_health TEXT",
+    "ALTER TABLE calls ADD COLUMN llm_models_used TEXT",
+    "ALTER TABLE calls ADD COLUMN llm_fallback_turns INTEGER",
+    # Per-direction agent binding: a DID's outbound agent is no longer forced to
+    # be its inbound agent. Backfilled once (see POST_MIGRATIONS) so existing
+    # numbers keep placing calls with exactly the agent they used before.
+    "ALTER TABLE phone_numbers ADD COLUMN outbound_agent_slug TEXT",
 ]
+
+# Follow-up statements run ONLY on the migration run that actually added the
+# column (keyed by the MIGRATIONS entry above). A plain backfill in MIGRATIONS
+# would re-run on every boot and silently re-bind an outbound slot a tenant
+# deliberately cleared.
+POST_MIGRATIONS: dict[str, list[str]] = {
+    "ALTER TABLE phone_numbers ADD COLUMN outbound_agent_slug TEXT": [
+        "UPDATE phone_numbers SET outbound_agent_slug = inbound_agent_slug",
+    ],
+}
 
 _init_lock = threading.Lock()
 _initialized_urls: set[str] = set()
@@ -154,6 +177,12 @@ def init_db(conn, url: str | None = None) -> None:
             # Postgres aborts the transaction on any error; clear it so the
             # next migration statement can run.
             conn.rollback()
+            continue
+        # Reached only when the statement genuinely applied — so these run once,
+        # on the boot that introduced the column, and never again.
+        for follow_up in POST_MIGRATIONS.get(stmt, []):
+            conn.execute(follow_up)
+            conn.commit()
 
 
 def _ensure_initialized(url: str) -> None:

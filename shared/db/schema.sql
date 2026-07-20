@@ -50,13 +50,17 @@ CREATE TABLE IF NOT EXISTS trunks (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- A DID bound to a trunk AND an inbound agent slug. THE inbound routing table.
+-- A DID bound to a trunk AND one agent PER DIRECTION. THE routing table.
+-- inbound_agent_slug answers calls TO this DID; outbound_agent_slug speaks on
+-- calls placed FROM it. They are independent bindings — an inbound receptionist
+-- and an outbound sales agent are different agents with different prompts.
 CREATE TABLE IF NOT EXISTS phone_numbers (
     id {PK},
     number TEXT NOT NULL UNIQUE,
     sig_digits TEXT,
     trunk_id INTEGER REFERENCES trunks(id) ON DELETE SET NULL,
     inbound_agent_slug TEXT,
+    outbound_agent_slug TEXT,
     owner TEXT,
     direction TEXT DEFAULT 'both',
     label TEXT,
@@ -118,6 +122,14 @@ CREATE TABLE IF NOT EXISTS calls (
     -- Integer PK of the contacts row this call is bound to (resolved by
     -- owner+sig_digits at call end; unknown callers get a contact created).
     contact_id INTEGER,
+    -- F8 per-call agent fidelity: which agent revision/sha served the call,
+    -- the F6 preflight health marker ('ok' | 'load_failed' |
+    -- 'preflight_failed:<stage>'), and LLM usage counters for the call.
+    agent_revision INTEGER,
+    agent_sha TEXT,
+    agent_health TEXT,
+    llm_models_used TEXT,
+    llm_fallback_turns INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_calls_owner ON calls(owner);

@@ -36,7 +36,7 @@ from backend.app.voice.stt.router import STTRouter
 from backend.app.voice.tracking_stt import TrackingSarvamSTT, TrackingWhisperSTT
 from backend.app.voice.tracking_tts import TrackingSarvamTTS
 from backend.app.voice.credit_tracker import SarvamCreditTracker
-from backend.app.agent_definition.registry import agent_registry
+from backend.app.agent_definition.registry import agent_registry, default_agents_dir
 
 logger = logging.getLogger("call_bridge")
 
@@ -51,7 +51,12 @@ PLAYBACK_PORT = 9004
 # dashboard's Agent Builder "Activate" button writes agents/active_agent.json
 # ({"active": "<slug>"}); every inbound call runs that agent. Multi-agent /
 # per-DID routing can be layered on later via routing.yaml + resolve_agent().
-AGENTS_DIR = Path(os.path.abspath("calling-agent")) / "agents"
+# Derived from the registry module location (NOT the CWD) so the watcher and
+# every yaml-exists probe below watch the exact directory the registry loads
+# from, no matter where the process was launched. Resolves to the identical
+# <repo>/calling-agent/agents path as the old CWD-based form under
+# cd /home/angelo/lescall.
+AGENTS_DIR = default_agents_dir()
 ACTIVE_AGENT_FILE = AGENTS_DIR / "active_agent.json"
 DEFAULT_AGENT = os.environ.get("DEFAULT_AGENT", "pramukh")
 
@@ -104,21 +109,28 @@ def _agent_yaml_exists(slug: str) -> bool:
 
 
 def resolve_agent_slug(did: str = "", campaign_id: int | None = None,
-                       agent_slug: str = "", dial_meta: dict | None = None) -> str:
+                       agent_slug: str = "", dial_meta: dict | None = None,
+                       direction: str = "inbound") -> str:
     """Resolve WHICH agent answers this call (multi-tenant routing, plan §2).
 
     Precedence:
       1. explicit agent_slug   — set as a channel variable at originate time
       2. campaign.agent_slug   — outbound campaign binding (shared DB)
-      3. phone_numbers lookup  — inbound: the dialed DID's bound agent (shared DB)
+      3. phone_numbers lookup  — the DID's agent for THIS DIRECTION (shared DB)
       4. dial_meta agent_slug  — the call_link.json dial record (fallback link)
       5. active_agent.json     — legacy single-active-agent behavior
+
+    `direction` picks which binding column step 3 reads: an outbound leg uses
+    outbound_agent_slug (falling back to inbound_agent_slug when the tenant has
+    not bound one), so a number's outbound sales agent is never mistaken for its
+    inbound receptionist.
 
     NEVER raises: if the shared DB is absent/unseeded or a bound slug has no
     agent.yaml on disk, resolution falls through to the legacy path so a live
     call can never be dropped by routing.
     """
     if _agent_yaml_exists(agent_slug):
+        logger.info("[BRIDGE] agent %s resolved via explicit", agent_slug)
         return agent_slug
     if agent_slug:
         logger.warning("[BRIDGE] explicit agent slug %r has no agent.yaml — falling through",
@@ -131,20 +143,38 @@ def resolve_agent_slug(did: str = "", campaign_id: int | None = None,
                 row = db.execute("SELECT agent_slug FROM campaigns WHERE id=?",
                                  (campaign_id,)).fetchone()
                 if row and _agent_yaml_exists(row["agent_slug"] or ""):
+                    logger.info("[BRIDGE] agent %s resolved via campaign",
+                                row["agent_slug"])
                     return row["agent_slug"]
             if did:
                 sig = significant_digits(did)
                 if sig:
                     row = db.execute(
-                        "SELECT inbound_agent_slug FROM phone_numbers WHERE sig_digits=?",
-                        (sig,)).fetchone()
-                    if row and _agent_yaml_exists(row["inbound_agent_slug"] or ""):
-                        return row["inbound_agent_slug"]
+                        "SELECT inbound_agent_slug, outbound_agent_slug "
+                        "FROM phone_numbers WHERE sig_digits=?", (sig,)).fetchone()
+                    if row:
+                        # Outbound prefers its own binding; an unbound outbound
+                        # slot degrades to the inbound agent rather than
+                        # dropping through to the legacy global agent.
+                        if direction == "outbound":
+                            candidates = [row["outbound_agent_slug"],
+                                          row["inbound_agent_slug"]]
+                        else:
+                            candidates = [row["inbound_agent_slug"]]
+                        for cand in candidates:
+                            if _agent_yaml_exists(cand or ""):
+                                logger.info("[BRIDGE] agent %s resolved via did "
+                                            "(direction=%s)", cand, direction)
+                                return cand
     except Exception as exc:
         logger.warning("[BRIDGE] DB agent routing unavailable (%r) — legacy resolution", exc)
     if dial_meta and _agent_yaml_exists(dial_meta.get("agent_slug", "")):
+        logger.info("[BRIDGE] agent %s resolved via dial_meta",
+                    dial_meta["agent_slug"])
         return dial_meta["agent_slug"]
-    return _resolve_active_agent_slug()
+    slug = _resolve_active_agent_slug()
+    logger.info("[BRIDGE] agent %s resolved via active-legacy", slug)
+    return slug
 
 
 def _dial_matches_phone(caller_number: str, dial: dict | None) -> bool:
@@ -233,17 +263,23 @@ def _lookup_recent_outbound_dial(caller_number: str = "") -> dict | None:
 
 
 def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = None,
-                       agent_slug: str = "", dial_meta: dict | None = None):
-    """Resolve this call's agent and build (slug, conversation, stt, tts).
+                       agent_slug: str = "", dial_meta: dict | None = None,
+                       direction: str = "inbound"):
+    """Resolve this call's agent and build (slug, conversation, stt, tts, health).
 
     Mirrors backend/run.py so telephony runs the data-driven agent identically
     to the CLI/web pipeline: STT corrections + TTS voice come from the agent's
     YAML. A load failure degrades to the default ConversationRouter rather than
     dropping the call.
+
+    agent_health (F6): 'ok' | 'load_failed' | 'preflight_failed:<stage>' —
+    recorded on the calls row so a degraded call is visible after the fact.
     """
     slug = resolve_agent_slug(did=did, campaign_id=campaign_id,
-                              agent_slug=agent_slug, dial_meta=dial_meta)
+                              agent_slug=agent_slug, dial_meta=dial_meta,
+                              direction=direction)
     agent_def = None
+    agent_health = "ok"
     try:
         agent_def = agent_registry.get(slug)
     except Exception as exc:
@@ -253,6 +289,29 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
         logger.error("[%s] [BRIDGE] agent load FAILED for '%s': %r — "
                      "answering with NEUTRAL_FALLBACK_AGENT",
                      conn_id, slug, exc)
+        agent_health = "load_failed"
+
+    # F6 call-start preflight (PROMPT_PREFLIGHT, default ON): render every
+    # stage × language prompt on THROWAWAY routers before the greeting. A
+    # deterministic prompt-build bug (Incident B: per-turn TypeError swallowed
+    # into "Sorry, could you repeat that?") is caught here in ~5-15ms and the
+    # call degrades to the neutral fallback instead of a dead loop. The live
+    # router/session state is never touched.
+    if (agent_def is not None
+            and os.environ.get("PROMPT_PREFLIGHT", "").strip().lower() != "false"):
+        try:
+            from backend.app.agent_definition.preflight import preflight_agent
+            agent_health = preflight_agent(agent_def, slug=slug)
+        except Exception as exc:  # preflight harness itself must never drop a call
+            logger.error("[%s] [PREFLIGHT] harness error for '%s': %r",
+                         conn_id, slug, exc, exc_info=True)
+            agent_health = "ok"
+        if agent_health != "ok":
+            logger.error("[%s] [BRIDGE] preflight FAILED for '%s' (%s) — "
+                         "answering with NEUTRAL_FALLBACK_AGENT",
+                         conn_id, slug, agent_health)
+            agent_def = None  # same degradation path as a load failure
+
     if agent_def is None:
         from backend.app.agent_definition.fallback_agent import get_neutral_fallback_agent
         agent_def = get_neutral_fallback_agent()
@@ -278,7 +337,7 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
         pace=tts_pace,
     )
     conversation = ConversationRouter(agent_def=agent_def)
-    return slug, conversation, stt, tts
+    return slug, conversation, stt, tts, agent_health
 
 class TelephonySession:
     """Manages one AI pipeline per phone call."""
@@ -317,16 +376,34 @@ class TelephonySession:
         routing_did = "" if confident_outbound else did
         routing_dial_meta = dial if dial_phone_match else None
 
+        # Direction is decided BEFORE the agent stack is built: it selects which
+        # of the number's two agent bindings (inbound vs outbound) applies.
+        self.direction = "outbound" if (campaign_id is not None or dial) else "inbound"
+
         # Resolve this call's agent (DID / campaign / explicit slug) and build
         # its STT/TTS the same way run.py does.
-        self.agent_slug, conversation, stt, tts = _build_agent_stack(
+        self.agent_slug, conversation, stt, tts, self.agent_health = _build_agent_stack(
             conn_id, did=routing_did, campaign_id=campaign_id,
-            agent_slug=agent_slug, dial_meta=routing_dial_meta)
-        self.direction = "outbound" if (campaign_id is not None or dial) else "inbound"
+            agent_slug=agent_slug, dial_meta=routing_dial_meta,
+            direction=self.direction)
+        self.conversation = conversation
+        # F8 per-call fidelity: WHICH agent bytes answered this call. Meta is
+        # captured by the registry at load; absent (e.g. neutral fallback or
+        # put() entries) records 0/''.
+        _meta = None
+        try:
+            _meta = agent_registry.meta(self.agent_slug)
+        except Exception as exc:
+            logger.warning("[%s] agent meta lookup failed: %r", conn_id, exc)
+        self.agent_revision = int((_meta or {}).get("revision") or 0)
+        self.agent_sha = str((_meta or {}).get("sha256") or "")
         self.owner = _lookup_agent_owner(self.agent_slug)
-        logger.info("[%s] Active agent: %s (direction=%s did=%s campaign=%s owner=%s)",
-                    conn_id, self.agent_slug, self.direction, did or "-",
-                    campaign_id if campaign_id is not None else "-", self.owner or "-")
+        logger.info("[%s] Active agent: %s rev=%s sha=%s (direction=%s did=%s "
+                    "campaign=%s owner=%s health=%s)",
+                    conn_id, self.agent_slug, self.agent_revision,
+                    self.agent_sha[:12] or "-", self.direction, did or "-",
+                    campaign_id if campaign_id is not None else "-",
+                    self.owner or "-", self.agent_health)
 
         # Call context: was this session started by an outbound dial? If so,
         # hand the dialed contact's name/number to the agent so it opens by
@@ -392,7 +469,11 @@ class TelephonySession:
         self.pipeline_task = asyncio.create_task(self.pipeline.run_until_shutdown())
         self.playback_task = asyncio.create_task(self._playback_loop())
         self.event_task = asyncio.create_task(self._event_loop())
-        _audit_session = await audit_manager.create(self.conn_id, caller_number=self.caller_number)
+        _audit_session = await audit_manager.create(
+            self.conn_id, caller_number=self.caller_number,
+            agent_slug=self.agent_slug,
+            agent_revision=self.agent_revision,
+            agent_sha=self.agent_sha)
         # Capture the recording folder name NOW — it IS the call_key the
         # dashboard history/recordings/analysis are keyed by. The audit session
         # is popped from the manager at close(), so we can't fetch it later in
@@ -735,12 +816,23 @@ class TelephonySession:
                     contact_id = self._resolve_contact_id(db, phone)
             except Exception as exc:
                 logger.warning("[%s] contact binding failed: %r", self.conn_id, exc)
+            # F8 fidelity fields. llm_models_used / llm_fallback_turns are
+            # populated by the ConversationRouter (parallel change); getattr
+            # with defaults keeps this write correct regardless of which side
+            # lands first.
+            conv = getattr(self, "conversation", None)
+            llm_models_used = json.dumps(
+                getattr(conv, "llm_models_used", []) or [])
+            llm_fallback_turns = int(
+                getattr(conv, "llm_fallback_turns", 0) or 0)
             db.execute(
                 "INSERT INTO calls (conn_id, call_key, direction, agent_slug, campaign_id, "
                 "phone, sig_digits, language, started_at, ended_at, duration_s, owner, "
                 "transcript, summary, collected_data, recording_path, "
-                "download_token, recording_url, contact_id, outcome, outcome_kind) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "download_token, recording_url, contact_id, outcome, outcome_kind, "
+                "agent_revision, agent_sha, agent_health, "
+                "llm_models_used, llm_fallback_turns) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT (conn_id) DO UPDATE SET "
                 "call_key=COALESCE(excluded.call_key, calls.call_key), "
                 "ended_at=excluded.ended_at, "
@@ -754,13 +846,23 @@ class TelephonySession:
                 "recording_url=COALESCE(calls.recording_url, excluded.recording_url), "
                 "contact_id=COALESCE(calls.contact_id, excluded.contact_id), "
                 "outcome=COALESCE(excluded.outcome, calls.outcome), "
-                "outcome_kind=COALESCE(excluded.outcome_kind, calls.outcome_kind)",
+                "outcome_kind=COALESCE(excluded.outcome_kind, calls.outcome_kind), "
+                # First segment's fidelity record wins on a reconnect upsert.
+                "agent_revision=COALESCE(calls.agent_revision, excluded.agent_revision), "
+                "agent_sha=COALESCE(calls.agent_sha, excluded.agent_sha), "
+                "agent_health=COALESCE(calls.agent_health, excluded.agent_health), "
+                "llm_models_used=COALESCE(calls.llm_models_used, excluded.llm_models_used), "
+                "llm_fallback_turns=COALESCE(calls.llm_fallback_turns, excluded.llm_fallback_turns)",
                 (self.conn_id, call_key, self.direction, self.agent_slug, self.campaign_id,
                  phone or None, significant_digits(phone) or None,
                  lang or None, _iso(started), _iso(ended), round(ended - started, 1),
                  self.owner or None,
                  transcript, summary, collected, recording_path,
-                 token, rec_url, contact_id, outcome, outcome_kind),
+                 token, rec_url, contact_id, outcome, outcome_kind,
+                 int(getattr(self, "agent_revision", 0) or 0),
+                 str(getattr(self, "agent_sha", "") or "") or None,
+                 str(getattr(self, "agent_health", "") or "") or None,
+                 llm_models_used, llm_fallback_turns),
             )
 
     async def _event_loop(self):

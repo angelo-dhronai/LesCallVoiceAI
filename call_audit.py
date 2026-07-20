@@ -45,9 +45,16 @@ _AUDIO_QUEUE_MAXSIZE = 200  # ~4s of 20ms frames at 16kHz; excess frames dropped
 class CallAuditSession:
     """Per-call recording session. All writes are non-blocking."""
 
-    def __init__(self, call_id: str, caller_number: str = "") -> None:
+    def __init__(self, call_id: str, caller_number: str = "",
+                 agent_slug: str = "", agent_revision: Optional[int] = None,
+                 agent_sha: str = "") -> None:
         self.call_id = call_id
         self.caller_number = caller_number or "unknown"
+        # F8 per-call agent fidelity (optional — defaults keep old callers
+        # byte-compatible): which agent revision/sha served this call.
+        self.agent_slug = agent_slug or ""
+        self.agent_revision = agent_revision
+        self.agent_sha = agent_sha or ""
         self._start_time = time.time()
         self._start_dt = datetime.now(timezone.utc)
 
@@ -164,6 +171,10 @@ class CallAuditSession:
             "stt_provider": self._stt_provider,
             "fallback_used": self._fallback_used,
             "transcript_count": self._transcript_count,
+            # F8 per-call agent fidelity — which agent bytes served the call.
+            "agent_slug": self.agent_slug,
+            "agent_revision": self.agent_revision,
+            "agent_sha": self.agent_sha,
         }
         try:
             with open(self._meta_path, "w", encoding="utf-8") as f:
@@ -204,12 +215,17 @@ class CallAuditManager:
     def enabled(self) -> bool:
         return ENABLE_CALL_AUDIT
 
-    async def create(self, call_id: str, caller_number: str = "") -> Optional[CallAuditSession]:
+    async def create(self, call_id: str, caller_number: str = "",
+                     agent_slug: str = "", agent_revision: Optional[int] = None,
+                     agent_sha: str = "") -> Optional[CallAuditSession]:
         if not ENABLE_CALL_AUDIT:
             return None
         if call_id in self._sessions:
             return self._sessions[call_id]
-        session = CallAuditSession(call_id, caller_number=caller_number)
+        session = CallAuditSession(call_id, caller_number=caller_number,
+                                   agent_slug=agent_slug,
+                                   agent_revision=agent_revision,
+                                   agent_sha=agent_sha)
         self._sessions[call_id] = session
         await session.start()
         return session

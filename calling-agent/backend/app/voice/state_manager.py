@@ -251,6 +251,7 @@ class ConversationStateManager:
         self._pending_fields: set[str] = set()   # e.g. name awaiting confirmation
         # v2 bookkeeping — all additive:
         self.asked_count: dict[str, int] = {}    # slot -> times asked
+        self._asked_turn: dict[str, int] = {}    # slot -> turn last counted
         self.skipped: set[str] = set()           # max_asks exhausted
         self.readback_done: set[str] = set()     # read-back confirmed slots
         self.extra_flags: dict[str, Any] = {}    # e.g. whatsapp_promised (→ collected_data)
@@ -634,10 +635,17 @@ class ConversationStateManager:
     def note_asked(self, name: str) -> None:
         """Ask-fatigue bookkeeping (v2): called at question-selection time.
         At max_asks (when >0) the slot moves to `skipped` — excluded from
-        `missing`, satisfied for stage advancement."""
+        `missing`, satisfied for stage advancement.
+
+        Counted at most ONCE per turn_index: this runs on every prompt BUILD
+        (retries/rebuilds included), and per-build counting would burn a
+        slot's max_asks budget without the agent ever voicing a question."""
         spec = self.slots.get(name)
         if spec is None:
             return
+        if self._asked_turn.get(name) == self.turn_index:
+            return
+        self._asked_turn[name] = self.turn_index
         self.asked_count[name] = self.asked_count.get(name, 0) + 1
         max_asks = getattr(spec, "max_asks", 0) or 0
         if max_asks > 0 and self.asked_count[name] >= max_asks and \

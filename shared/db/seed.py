@@ -144,14 +144,15 @@ def seed(url: str | None = None, *,
                 "SELECT id FROM trunks WHERE name=?", (trunk["name"],)
             ).fetchone()["id"]
 
-            # The DID, routed to the active agent.
+            # The DID, routed to the active agent in BOTH directions (a seeded
+            # dev number should be able to answer and to dial out immediately).
             db.execute(
                 "INSERT INTO phone_numbers "
-                "(number, sig_digits, trunk_id, inbound_agent_slug, owner, "
-                " direction, label, config_status) VALUES (?,?,?,?,?,?,?,?)"
-                " ON CONFLICT DO NOTHING",
-                (did, significant_digits(did), trunk_id, active_slug, OWNER,
-                 "both", "Plivo DID", "applied"))
+                "(number, sig_digits, trunk_id, inbound_agent_slug, "
+                " outbound_agent_slug, owner, direction, label, config_status) "
+                "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                (did, significant_digits(did), trunk_id, active_slug, active_slug,
+                 OWNER, "both", "Plivo DID", "applied"))
 
         summary = {
             table: db.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]

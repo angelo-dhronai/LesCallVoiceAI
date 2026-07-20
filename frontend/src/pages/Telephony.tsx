@@ -21,15 +21,19 @@ type Trunk = {
 }
 type PhoneNumber = {
   id: number; number: string; sig_digits: string; trunk_id?: number | null
-  inbound_agent_slug?: string | null; direction: string; label?: string
+  inbound_agent_slug?: string | null; outbound_agent_slug?: string | null
+  direction: string; label?: string
   config_status: string
 }
+/** Which of a number's two agent bindings a control writes to. */
+type BindField = 'inbound_agent_slug' | 'outbound_agent_slug'
 type ServerInfo = {
   sip_uri: string; public_ip: string; sip_port: number; transport: string
   rtp_range: string; notes: string[]
 }
 type Instructions = { trunk: string; sip_uri: string; rtp_range: string; steps: string[] }
-type AgentsResponse = { agents: { name: string }[]; active?: string | null }
+type AgentOption = { name: string; call_direction?: 'inbound' | 'outbound' }
+type AgentsResponse = { agents: AgentOption[]; active?: string | null }
 type ConfirmTarget = { kind: 'number'; n: PhoneNumber } | { kind: 'trunk'; t: Trunk }
 
 function statusTone(s?: string): 'mint' | 'amber' | 'rose' | 'neutral' {
@@ -46,6 +50,23 @@ function fmtDate(dt?: string | null) {
 }
 const digits = (s: string) => s.replace(/\D/g, '')
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
+
+/* Agent <option>s for one direction slot. An agent built for the other
+   direction is still selectable — the suffix is a hint, not a restriction. */
+function AgentOptions({ agents, want }: { agents: AgentOption[]; want: 'inbound' | 'outbound' }) {
+  return (
+    <>
+      {agents.map((a) => {
+        const dir = a.call_direction === 'outbound' ? 'outbound' : 'inbound'
+        return (
+          <option key={a.name} value={a.name}>
+            {a.name}{dir !== want ? ` (built for ${dir})` : ''}
+          </option>
+        )
+      })}
+    </>
+  )
+}
 
 /* One copy-paste value the user has to put into their carrier console. */
 function CopyValue({ label, value, hint, onCopy }: {
@@ -76,7 +97,8 @@ const CONNECT_PHASES = ['Create trunk', 'Register number', 'Deploy to FreeSWITCH
 const PROVIDERS = ['plivo', 'twilio', 'telnyx', 'vonage', 'other']
 
 const EMPTY_CONNECT = {
-  provider: 'plivo', number: '', sip_domain: '', inbound_agent_slug: '',
+  provider: 'plivo', number: '', sip_domain: '',
+  inbound_agent_slug: '', outbound_agent_slug: '',
   trunk_name: '', provider_ips: '', username: '', password: '',
 }
 const EMPTY_TRUNK = {
@@ -105,9 +127,11 @@ export default function Telephony() {
   const [touched, setTouched] = useState<{ number?: boolean; sip_domain?: boolean }>({})
   const [confirmTarget, setConfirmTarget] = useState<ConfirmTarget | null>(null)
   const [collapsedChecklists, setCollapsedChecklists] = useState<Set<number>>(new Set())
-  const [justSaved, setJustSaved] = useState<number | null>(null)
+  // keyed by `${field}-${number id}` so each direction gets its own tick
+  const [justSaved, setJustSaved] = useState<string | null>(null)
 
-  const agentSlugs = agentsQ.data?.agents?.map((a) => a.name) ?? []
+  const agentList = agentsQ.data?.agents ?? []
+  const agentSlugs = agentList.map((a) => a.name)
   const trunks = trunksQ.data?.trunks ?? []
   const numbers = numbersQ.data?.numbers ?? []
   const info = infoQ.data
@@ -165,6 +189,8 @@ export default function Telephony() {
         number: num,
         trunk_id: trunkId,
         inbound_agent_slug: connectForm.inbound_agent_slug || undefined,
+        // left alone → not sent; the backend mirrors the inbound choice
+        outbound_agent_slug: connectForm.outbound_agent_slug || undefined,
         label: 'connected via panel',
       })
     } catch (e: any) {
@@ -186,20 +212,29 @@ export default function Telephony() {
     setTouched({})
     refresh(['telephony'])
     if (res.status === 'applied') {
-      toast(`${num} is connected and routed${connectForm.inbound_agent_slug ? ` to ${connectForm.inbound_agent_slug}` : ''} 🎉`, 'success')
+      const inSlug = connectForm.inbound_agent_slug
+      const outSlug = connectForm.outbound_agent_slug || inSlug
+      const routedTo = !inSlug ? ''
+        : outSlug === inSlug ? ` to ${inSlug}`
+          : ` — ${inSlug} answers, ${outSlug} calls out`
+      toast(`${num} is connected and routed${routedTo} 🎉`, 'success')
     } else {
       toast(`Number registered, but the FreeSWITCH deploy reported "${res.status}" — press Apply on the trunk (Advanced) to retry`, 'error')
     }
   })
 
   /* ------------------------------- numbers ------------------------------ */
-  const rebind = (n: PhoneNumber, slug: string) => run(`rebind-${n.id}`, async () => {
-    await patch(`/numbers/${n.id}`, { inbound_agent_slug: slug })
-    toast(`${n.number} → ${slug || '(none)'} — effective on the next call`, 'success')
-    setJustSaved(n.id)
-    setTimeout(() => setJustSaved((cur) => (cur === n.id ? null : cur)), 1500)
-    refresh(['telephony'])
-  })
+  const rebind = (n: PhoneNumber, field: BindField, slug: string) => {
+    const key = `${field}-${n.id}`
+    return run(`rebind-${key}`, async () => {
+      await patch(`/numbers/${n.id}`, { [field]: slug })
+      const which = field === 'inbound_agent_slug' ? 'incoming calls' : 'outgoing calls'
+      toast(`${n.number} ${which} → ${slug || '(none)'} — effective on the next call`, 'success')
+      setJustSaved(key)
+      setTimeout(() => setJustSaved((cur) => (cur === key ? null : cur)), 1500)
+      refresh(['telephony'])
+    })
+  }
   const deleteNumberNow = (n: PhoneNumber) => {
     run(`del-num-${n.id}`, async () => {
       await del(`/numbers/${n.id}`)
@@ -363,11 +398,11 @@ export default function Telephony() {
               <span className="mt-1 block text-[11px] text-rose-500">Should look like xxxxxxxx.zt.plivo.com (no sip: prefix)</span>
             )}
           </Field>
-          <Field label="Agent that answers">
+          <Field label="Agent that answers incoming calls">
             <Select value={connectForm.inbound_agent_slug}
               onChange={(e) => setConnectForm({ ...connectForm, inbound_agent_slug: e.target.value })}>
               <option value="">(choose later)</option>
-              {agentSlugs.map((s) => <option key={s} value={s}>{s}</option>)}
+              <AgentOptions agents={agentList} want="inbound" />
             </Select>
             {agentSlugs.length === 0 && !agentsQ.isLoading && (
               <span className="mt-1 block text-[11px] text-dim">
@@ -376,6 +411,16 @@ export default function Telephony() {
                 {' '}(you can still connect the number now and bind later)
               </span>
             )}
+          </Field>
+          <Field label="Agent that speaks on outgoing calls">
+            <Select value={connectForm.outbound_agent_slug}
+              onChange={(e) => setConnectForm({ ...connectForm, outbound_agent_slug: e.target.value })}>
+              <option value="">(same as incoming)</option>
+              <AgentOptions agents={agentList} want="outbound" />
+            </Select>
+            <span className="mt-1 block text-[11px] text-dim">
+              Optional — leave as is and outgoing calls use the same agent as incoming ones.
+            </span>
           </Field>
         </div>
         <div className="mt-2 sm:pl-8">
@@ -448,8 +493,8 @@ export default function Telephony() {
         <div className="mb-3">
           <div className="text-[13px] font-semibold">Your numbers</div>
           <div className="text-[12px] text-dim">
-            Bind <b>your agent</b> to a number and apply its trunk — then it answers inbound calls and
-            places outbound ones. Use <b>Test call</b> to ring your own phone (set it in{' '}
+            Bind <b>your agents</b> to a number — one for the calls it answers, one for the calls it
+            places — and apply its trunk. Use <b>Test call</b> to ring your own phone (set it in{' '}
             <Link to="/settings" className="font-semibold text-indigo-600 hover:underline dark:text-indigo-300">Settings</Link>)
             and hear your agent exactly as callers do.
           </div>
@@ -461,11 +506,14 @@ export default function Telephony() {
           ) : (
             <Table>
               <THead>
-                <TH>Number</TH><TH>Agent</TH><TH>Trunk</TH><TH>Config</TH><TH></TH>
+                <TH>Number</TH><TH>Agents</TH><TH>Trunk</TH><TH>Config</TH><TH></TH>
               </THead>
               <tbody>
                 {numbers.map((n) => {
-                  const hasAgent = !!n.inbound_agent_slug
+                  const hasInbound = !!n.inbound_agent_slug
+                  const hasOutbound = !!n.outbound_agent_slug
+                  // Fully configured only once BOTH directions are bound.
+                  const hasAgent = hasInbound && hasOutbound
                   const applied = n.config_status === 'applied'
                   const ownsAgent = agentSlugs.length > 0
                   const callable = hasAgent && applied
@@ -473,8 +521,14 @@ export default function Telephony() {
                   const steps = [
                     { done: ownsAgent, label: 'Create your own agent',
                       hint: 'Build an agent in Copilot or Create Agent', action: 'agent' },
-                    { done: hasAgent, label: 'Bind your agent to this number',
-                      hint: 'Pick it in the Agent column', action: null },
+                    { done: hasAgent,
+                      label: 'Bind an agent to both directions of this number',
+                      hint: hasInbound && !hasOutbound
+                        ? 'Incoming is set — pick one under "Speaks on outgoing calls"'
+                        : !hasInbound && hasOutbound
+                          ? 'Outgoing is set — pick one under "Answers incoming calls"'
+                          : 'Pick one for each direction in the Agents column',
+                      action: null },
                     { done: applied, label: 'Apply the trunk',
                       hint: 'Advanced → Apply generates the phone-system config', action: null },
                   ]
@@ -494,19 +548,33 @@ export default function Telephony() {
                       )}
                     </TD>
                     <TD>
-                      <span className="inline-flex items-center gap-2">
-                        <Select value={n.inbound_agent_slug || ''}
-                          disabled={busy === `rebind-${n.id}`}
-                          onChange={(e) => rebind(n, e.target.value)}
-                          className={hasAgent ? '' : 'ring-1 ring-amber-500/50'}>
-                          <option value="">(pick your agent)</option>
-                          {agentSlugs.map((s) => <option key={s} value={s}>{s}</option>)}
-                        </Select>
-                        {busy === `rebind-${n.id}` && <Spinner className="h-3 w-3" />}
-                        {busy !== `rebind-${n.id}` && justSaved === n.id && (
-                          <CheckCircle2 size={14} className="text-mint-500 animate-fade-up" />
-                        )}
-                      </span>
+                      <div className="flex flex-col gap-2">
+                        {([
+                          { field: 'inbound_agent_slug', want: 'inbound', label: 'Answers incoming calls', bound: hasInbound },
+                          { field: 'outbound_agent_slug', want: 'outbound', label: 'Speaks on outgoing calls', bound: hasOutbound },
+                        ] as { field: BindField; want: 'inbound' | 'outbound'; label: string; bound: boolean }[]).map((slot) => {
+                          const key = `${slot.field}-${n.id}`
+                          const working = busy === `rebind-${key}`
+                          return (
+                            <label key={slot.field} className="flex flex-col gap-1">
+                              <span className="text-[11px] font-semibold uppercase tracking-wide text-dim">{slot.label}</span>
+                              <span className="inline-flex items-center gap-2">
+                                <Select value={n[slot.field] || ''}
+                                  disabled={working}
+                                  onChange={(e) => rebind(n, slot.field, e.target.value)}
+                                  className={slot.bound ? '' : 'ring-1 ring-amber-500/50'}>
+                                  <option value="">(pick your agent)</option>
+                                  <AgentOptions agents={agentList} want={slot.want} />
+                                </Select>
+                                {working && <Spinner className="h-3 w-3" />}
+                                {!working && justSaved === key && (
+                                  <CheckCircle2 size={14} className="text-mint-500 animate-fade-up" />
+                                )}
+                              </span>
+                            </label>
+                          )
+                        })}
+                      </div>
                     </TD>
                     <TD className="text-dim">{trunks.find((t) => t.id === n.trunk_id)?.name || '—'}</TD>
                     <TD>
@@ -518,7 +586,7 @@ export default function Telephony() {
                     <TD>
                       <div className="flex items-center justify-end gap-2">
                         <Button size="sm" variant="soft" title={callable
-                            ? `Ring your phone from ${n.number} with "${n.inbound_agent_slug}" live`
+                            ? `Ring your phone from ${n.number} with "${n.outbound_agent_slug}" live`
                             : 'Finish the setup steps first'}
                           disabled={!callable || busy === `test-${n.id}`}
                           onClick={() => testCall(n)}>

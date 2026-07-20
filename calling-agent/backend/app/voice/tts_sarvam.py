@@ -103,6 +103,9 @@ class SarvamTTS(StreamingTTS):
     Sarvam AI Bulbul TTS — streams audio via HTTP and plays through an AudioSink.
     """
 
+    # Counter for empty/near-empty text attempts (for metrics)
+    _empty_text_count = 0
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -177,6 +180,20 @@ class SarvamTTS(StreamingTTS):
         if not self._api_key:
             logger.warning("[TTS:Sarvam] No API key — skipping")
             self._playing = False
+            return
+
+        # Check for empty or near-empty text
+        if not text or len(text.strip()) < 2:
+            logger.warning(
+                "[TTS:Sarvam] Attempting to speak empty or near-empty text: %r", text
+            )
+            self.__class__._empty_text_count += 1
+            if self.__class__._empty_text_count % 10 == 0:
+                logger.warning(
+                    "[TTS:Sarvam] Empty text count: %d", self.__class__._empty_text_count
+                )
+            self._playing = False
+            self._reset()
             return
 
         chunk_count = 0

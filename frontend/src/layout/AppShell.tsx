@@ -33,9 +33,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   useEffect(() => { document.title = `${titleFor(pathname)} · LesCall` }, [pathname])
 
   return (
-    <div className="min-h-screen bg-[var(--bg)]">
+    <div className="min-h-screen bg-[var(--bg)] bg-mesh-light dark:bg-mesh-dark">
       <Sidebar collapsed={collapsed} liveCount={liveCount} mobileOpen={mobileOpen} onCloseMobile={() => setMobileOpen(false)} />
-      <div className={cx('transition-all duration-300', collapsed ? 'lg:pl-16' : 'lg:pl-[248px]')}>
+      <div className={cx('transition-all duration-300', collapsed ? 'lg:pl-[92px]' : 'lg:pl-[260px]')}>
         {/* Full-bleed: panels use the whole browser width (user request) */}
         <div className="px-4 pb-12 sm:px-6 lg:px-8">
           <Topbar

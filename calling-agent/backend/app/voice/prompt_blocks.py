@@ -17,6 +17,7 @@ from ..agent_definition.catalog import (
     evaluate_match_rules,
     render_catalog_prompt,
 )
+from .stage_roles import stage_role as _effective_stage_role
 
 _COUNT_WORDS = {1: "ONE", 2: "TWO", 3: "THREE", 4: "FOUR", 5: "FIVE"}
 
@@ -309,6 +310,20 @@ def brand_block(agent_def: AgentDefinition) -> list[str]:
 # Calendar (v2 scheduling config — L5)
 # ---------------------------------------------------------------------------
 
+def _has_scheduling_stage(agent_def: AgentDefinition) -> bool:
+    """True when any stage's EFFECTIVE role (explicit, else derived from the
+    legacy id) is scheduling/confirmation — i.e. the flow actually books.
+    Empty stage list keeps today's behaviour (render)."""
+    stages = getattr(agent_def.call_flow, "stages", None) or []
+    if not stages:
+        return True
+    return any(
+        _effective_stage_role(s, getattr(s, "id", "")) in
+        ("scheduling", "confirmation")
+        for s in stages
+    )
+
+
 def calendar_block(
     agent_def: AgentDefinition,
     appointment_time: str | None,
@@ -320,6 +335,11 @@ def calendar_block(
         return []
     if appointment_time:
         return []  # already scheduled — surfaced in CALL STATE above
+    if not _has_scheduling_stage(agent_def):
+        # A calendar band on a flow that never schedules steers the model
+        # toward booking behaviour it has no stage for (Kaapd: six junk
+        # 10:00 AM slots injected into a B2B sample-send call).
+        return []
     if free_slots:
         _slot_list = ", ".join(f"{s.day} at {s.time}" for s in free_slots)
         if _sched_style(agent_def) == "flexible":
@@ -367,6 +387,36 @@ def portfolio_block(agent_def: AgentDefinition, lang: str = "en") -> list[str]:
         lines.append("▸ For these topics do NOT give specifics — " + defer_line + ": "
                      + ", ".join(str(x) for x in defer) + ".")
     return lines
+
+
+def knowledge_grounding_block(agent_def: AgentDefinition) -> list[str]:
+    """━━ KNOWLEDGE GROUNDING (STRICT) ━━ — deflect-not-invent, rendered
+    directly after the knowledge section so 'the section above' stays true.
+    Gated on guardrails.honesty.knowledge_grounding == 'strict' (a value no
+    pre-existing agent carries). Absent/other → [] (zero bytes)."""
+    gr = getattr(agent_def, "guardrails", None)
+    honesty = (getattr(gr, "honesty", None) or {}) if gr else {}
+    if str(honesty.get("knowledge_grounding") or "").strip() != "strict":
+        return []
+    label = agent_def.knowledge_base.portfolio_section_label
+    return [
+        "",
+        "━━ KNOWLEDGE GROUNDING (STRICT) ━━",
+        f"The {label} section above is your ONLY source of truth about what "
+        "this business makes, sells, stocks, offers and charges.",
+        "✗ NEVER name, confirm, or describe any product, service, variant, "
+        "price, discount, stock level, or delivery timeline that is not "
+        "written there — not even when the caller asks for it by name or "
+        "assumes you have it.",
+        "✗ NEVER answer a product, price, or availability question from "
+        "general knowledge. If it is not in the section above, you do not "
+        "know it.",
+        "▸ When asked about something not covered there, deflect in ONE "
+        "short sentence: offer to send the catalogue or have the team check "
+        "and share exact details — then steer back to your CURRENT GOAL.",
+        "▸ 'I'll check and get back to you' is a GOOD answer. A confident "
+        "guess is a failed call.",
+    ]
 
 
 def match_rules_block(agent_def: AgentDefinition, slot_state: dict,
@@ -471,17 +521,41 @@ def anti_repetition_block(agent_def: AgentDefinition) -> list[str]:
 # Objection handling (v2 playbook — D3)
 # ---------------------------------------------------------------------------
 
-def objection_block(agent_def: AgentDefinition) -> list[str]:
+def objection_block(agent_def: AgentDefinition, lang: str = "en") -> list[str]:
     """━━ OBJECTION HANDLING ━━ — playbook prompt_guidance when present,
-    else the built-in 4 lines verbatim."""
+    else the entries' own scripted answers, else the built-in 4 lines
+    verbatim (empty playbook only)."""
     playbook = getattr(agent_def.response_bank, "objection_playbook", None) or []
+    proofs = "; ".join(getattr(agent_def.brand, "trust_proofs", []) or [])
     guided = [str(o.get("prompt_guidance") or "").strip()
               for o in playbook if str(o.get("prompt_guidance") or "").strip()]
     if guided:
-        proofs = "; ".join(getattr(agent_def.brand, "trust_proofs", []) or [])
         return ["", "━━ OBJECTION HANDLING ━━"] + [
             g.replace("{trust_proofs}", proofs) for g in guided
         ]
+    # Playbook authored as id/patterns/answer (what the Copilot and the
+    # document extractor emit): the user's scripted answers ARE the band.
+    # Falling through to the builtin real-estate lines here is how the Kaapd
+    # agent got "30 years, zero stalls, RERA" spoken about fabrics.
+    composed: list[str] = []
+    for o in playbook:
+        if len(composed) >= 8:
+            break
+        if not isinstance(o, dict):
+            continue
+        answer = " ".join(_lang_pick(o.get("answer") or {}, lang).split())
+        if not answer:
+            continue
+        if len(answer) > 240:
+            answer = answer[:237].rstrip() + "..."
+        pats = [str(p).strip() for p in (o.get("patterns") or [])
+                if str(p).strip()]
+        trigger = " / ".join(f"'{p}'" for p in pats[:2]) \
+            or f"'{str(o.get('id') or 'objection').replace('_', ' ').strip()}'"
+        composed.append(
+            f"{trigger} → {answer}".replace("{trust_proofs}", proofs))
+    if composed:
+        return ["", "━━ OBJECTION HANDLING ━━"] + composed
     return [
         "",
         "━━ OBJECTION HANDLING ━━",
@@ -512,13 +586,21 @@ def _pricing_rule(agent_def: AgentDefinition, lang: str) -> str:
             "or discounts unprompted — only discuss these when the caller explicitly asks")
 
 
-def _fabrication_rule(agent_def: AgentDefinition) -> str:
-    """honesty.forbidden_fabrications; default [prices, dates] = exact line."""
+def _fabrication_rule(agent_def: AgentDefinition,
+                      default_rule: str = "✗ NEVER make up prices or dates "
+                                          "not listed above") -> str:
+    """honesty.forbidden_fabrications; default [prices, dates] = exact line.
+    default_rule lets the generic pack widen the default to include products
+    while per-agent forbidden_fabrications keep working for both packs."""
     honesty = getattr(agent_def.guardrails, "honesty", None) or {}
     items = honesty.get("forbidden_fabrications") or []
+    if isinstance(items, str):
+        items = [items]
+    elif not isinstance(items, (list, tuple)):
+        items = []  # a bool/other here must never crash the prompt build
     items = [str(x) for x in items if str(x).strip()]
     if not items or items == ["prices", "dates"]:
-        return "✗ NEVER make up prices or dates not listed above"
+        return default_rule
     return f"✗ NEVER make up {' or '.join(items)} not listed above"
 
 
@@ -527,10 +609,54 @@ def firm_rules_block(agent_def: AgentDefinition, lang: str = "en") -> list[str]:
     + per-agent never/always rules + honesty/compliance/escalation sections."""
     gr = getattr(agent_def, "guardrails", None)
     use_builtin = getattr(gr, "use_builtin_rules", True) if gr else True
+    pack = (str(getattr(gr, "builtin_rules_pack", "real_estate")
+                or "real_estate") if gr else "real_estate")
     n = _offer_count(agent_def)
     flexible = _sched_style(agent_def) == "flexible"
     lines: list[str] = ["", "━━ FIRM RULES ━━"]
-    if use_builtin:
+    if use_builtin and pack == "generic":
+        # Industry-neutral band: every domain-neutral hygiene rule from the
+        # real_estate pack verbatim; the five real-estate lines replaced with
+        # mission/catalogue/appointment equivalents. (A fabric agent carrying
+        # "push toward a site visit" is how the Kaapd call went off-script.)
+        phone_rule = (
+            "✓ When you capture the caller's phone number, confirm it by reading it back "
+            "ONCE, exactly as instructed in CONVERSATION STATE"
+            if _has_phone_readback_slot(agent_def) else
+            "✗ NEVER repeat the caller's phone number back to them unless they explicitly ask you to confirm it"
+        )
+        if flexible:
+            sched_rules = [
+                "✓ Offer available time slots flexibly and accept a caller-proposed time when it matches a free slot",
+            ]
+        else:
+            sched_rules = [
+                f"✗ NEVER give more than {n} time options when offering an appointment or callback",
+                f"✗ NEVER ask an open 'when suits you?' — always give exactly {_count_word(n)} specific time options",
+            ]
+        lines += [
+            "✗ NEVER use hollow filler phrases: 'खुशी हुई', 'आपका जवाब सुनकर खुशी हुई', 'Happy to help', "
+            "'It was a pleasure', 'आपकी बात सुनकर', 'ખુશી થઈ', 'Glad to hear'. "
+            "Every sentence must either gather missing info, handle an objection, or move the call toward its CALL MISSION.",
+            _pricing_rule(agent_def, lang),
+            phone_rule,
+            "✗ NEVER ask for information that is already marked ✓ in CONVERSATION STATE",
+            sched_rules[0],
+            "✗ NEVER dump the whole catalogue on one caller",
+            _fabrication_rule(agent_def, default_rule="✗ NEVER make up "
+                              "products, prices or dates not listed above"),
+            *(sched_rules[1:] if not flexible else []),
+            "✗ NEVER ask 'Do you have any questions?' — only answer questions when the caller asks one",
+            "✗ NEVER push the conversation to a new topic if the caller is still on the current one",
+            "✗ NEVER launch into a detailed pitch before confirming it is a good moment to talk",
+            "✗ NEVER interrupt a caller's train of thought with an unrelated topic",
+            "✓ Use caller's name naturally — at most once every 4-5 turns. Do NOT open every response with their name.",
+            "✓ No bullet points, lists, markdown, or emojis in your spoken responses",
+            "✓ Only say things that are a direct, natural response to what the caller just said",
+            "✓ Use contractions: I'll, I'm, we've, it's, don't, can't — always",
+            "✓ Open each turn with a varied natural acknowledgment (Got it / Sure / Right / Absolutely — never twice in a row)",
+        ]
+    elif use_builtin:
         phone_rule = (
             "✓ When you capture the caller's phone number, confirm it by reading it back "
             "ONCE, exactly as instructed in CONVERSATION STATE"

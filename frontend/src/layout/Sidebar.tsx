@@ -10,13 +10,11 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
 }) {
   const { data: me } = useMe()
   const [filter, setFilter] = useState('')   // mobile-drawer quick filter
-  const isAdmin = me?.is_admin !== false   // default-show until identity resolves
   const needle = filter.trim().toLowerCase()
   const groups = NAV
-    .filter((g) => !g.admin || isAdmin)
     .map((g) => ({
       ...g,
-      items: g.items.filter((it) => (!it.admin || isAdmin) && (!needle || it.label.toLowerCase().includes(needle))),
+      items: g.items.filter((it) => !needle || it.label.toLowerCase().includes(needle)),
     }))
     .filter((g) => g.items.length > 0)
   const email = me?.email || ''
@@ -39,12 +37,15 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
       <aside
         aria-label="Main navigation"
         className={cx(
-          'fixed inset-y-0 left-0 z-50 flex flex-col border-r border-[var(--border)] bg-[var(--surface-solid)] transition-all duration-300',
-          collapsed ? 'lg:w-16' : 'lg:w-[248px]',
-          // Mobile: off-canvas drawer; desktop: docked full-height rail.
-          'w-[264px]',
+          'fixed z-50 flex flex-col transition-all duration-300',
+          // Mobile: solid off-canvas drawer, docked to the edge.
+          'inset-y-0 left-0 w-[264px] border-r border-[var(--border)] bg-[var(--surface-solid)]',
+          // Desktop: detached glass card floating inside the viewport.
+          // lg:overflow-hidden clips the full-bleed dividers to the radius.
+          'lg:glass lg:inset-y-3 lg:left-3 lg:rounded-3xl lg:border lg:overflow-hidden',
+          collapsed ? 'lg:w-[76px]' : 'lg:w-[244px]',
           mobileOpen ? 'translate-x-0 shadow-glass-lg' : '-translate-x-full',
-          'lg:translate-x-0 lg:shadow-none',
+          'lg:translate-x-0',
         )}>
         {/* Brand */}
         <div className={cx('flex h-14 shrink-0 items-center border-b border-[var(--border)] px-4', collapsed && 'lg:justify-center lg:px-0')}>
@@ -108,7 +109,7 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
             </div>
           ))}
           {/* Scroll cue: hints that more nav items exist below on short viewports */}
-          <div aria-hidden="true" className="pointer-events-none sticky bottom-0 -mt-6 h-6 bg-gradient-to-t from-[var(--surface-solid)] to-transparent" />
+          <div aria-hidden="true" className="pointer-events-none sticky bottom-0 -mt-6 h-6 bg-gradient-to-t from-[var(--surface-solid)] to-transparent lg:from-[var(--surface)]" />
         </nav>
 
         {/* Identity */}
@@ -121,9 +122,7 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
             <div className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-indigo-600 text-[12px] font-semibold text-white">{initial}</div>
           )}
           <div className={cx('min-w-0 flex-1 leading-tight', collapsed && 'lg:hidden')}>
-            <div className="truncate text-[12.5px] font-medium">
-              {displayName}{isAdmin && me?.mode === 'multi-tenant' && <span className="ml-1.5 rounded bg-mint-500/10 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-mint-700 dark:text-mint-400">admin</span>}
-            </div>
+            <div className="truncate text-[12.5px] font-medium">{displayName}</div>
             <div className="truncate text-[11px] text-dim">{email || 'signed in'}</div>
           </div>
           {me?.mode === 'multi-tenant' && (

@@ -14,6 +14,8 @@ export type AgentSummary = {
   active?: boolean
   error?: string
   call_direction?: 'inbound' | 'outbound'
+  /** Twin grouping key — `acme-inbound` and `acme-outbound` share family `acme`. */
+  family?: string
   calendar_slots?: number
 }
 export type AgentsList = { agents: AgentSummary[]; active: string | null }
@@ -69,7 +71,6 @@ export type IntentResult = {
 /* ───────────────────────── reads ───────────────────────── */
 export const listAgents = () => api<AgentsList>('/agents')
 export const getAgent = (name: string) => api<any>(`/agents/${name}`)
-export const getActive = () => api<{ active: string | null }>('/agents/active')
 export const getRawYaml = (name: string) =>
   api<string>(`/agents/${name}/raw`, { headers: { Accept: 'text/plain' } })
 export const getRouting = (name: string) => api<Routing>(`/agents/${name}/routing`)
@@ -77,7 +78,17 @@ export const listDocs = (name: string) =>
   api<{ documents: AgentDoc[] }>(`/agents/${name}/documents`)
 
 /* ───────────────────────── writes ───────────────────────── */
-export const createAgent = (payload: any) => post('/agents', payload)
+/** Creating an agent creates a PAIR — `<base>-inbound` and `<base>-outbound`.
+ *  `name` is the primary slug to open in the editor; it is NOT the base name
+ *  the user typed, so always navigate/route with the returned value. */
+export type CreateAgentResult = {
+  status: string
+  name: string
+  agent_id?: string
+  family?: string
+  twins?: { inbound: string; outbound: string }
+}
+export const createAgent = (payload: any) => post<CreateAgentResult>('/agents', payload)
 
 /** rev = the `_rev` from getAgent(). When sent, a concurrent edit (e.g. by
  *  the Copilot) 409s instead of being silently clobbered. */
@@ -87,7 +98,6 @@ export const updateAgent = (name: string, payload: any, rev?: string) =>
     body: JSON.stringify(payload),
     headers: rev ? { 'If-Match': rev } : undefined,
   })
-export const activateAgent = (name: string) => post(`/agents/${name}/activate`)
 export const archiveAgent = (name: string) => del(`/agents/${name}`)
 
 export const putRawYaml = (name: string, yamlText: string, rev?: string) =>

@@ -586,6 +586,13 @@ class ConversationRouter:
         )
         self._base_url = os.environ.get("LLM_BASE_URL", "").strip() or None
         self._model = model or os.environ.get("LLM_MODEL", "").strip() or self._def.llm_config.model
+        # Gemini 3.x models "think" by default and thinking tokens count against
+        # max_tokens, so short-budget calls (warmup max_tokens=1, language
+        # classify max_tokens=5) come back empty. LLM_REASONING_EFFORT=none
+        # disables it. Primary client only — the OpenAI fallback (gpt-4o-mini)
+        # rejects the param.
+        _reff = os.environ.get("LLM_REASONING_EFFORT", "").strip()
+        self._llm_extra: dict = {"reasoning_effort": _reff} if _reff else {}
         self._timeout = timeout if timeout is not None else self._def.llm_config.timeout_s
         self._client: AsyncOpenAI | None = None
         _qa_signals = self._def.knowledge_base.qa_field_signals or None
@@ -634,6 +641,18 @@ class ConversationRouter:
         # Fallback LLM (lazy; see _get_fallback_client).
         self._fallback_client: AsyncOpenAI | None = None
         self._fallback_model: str = "gpt-4o-mini"
+        # Per-call fidelity record: which model(s) actually spoke, and how
+        # many turns rode the fallback. Persisted into the calls table by the
+        # telephony bridge — the historical log holds 666 silent mid-call
+        # switches to the US-hosted fallback with only a WARNING line.
+        self.llm_models_used: list[str] = [self._model]
+        self.llm_fallback_turns: int = 0
+        # Filler frequency governors (llm_config; 0/0 = uncapped = today).
+        self._fillers_played: int = 0
+        self._last_filler_turn: int = -999
+        # Consecutive-LLM-failure streak (env LLM_FAILURE_STREAK_LIMIT,
+        # 0/unset = off = today's endless canned-fallback behaviour).
+        self._llm_failure_streak: int = 0
         # Async LLM slot-extractor bookkeeping (strong ref; latest turn only).
         self._slot_extract_task: asyncio.Task | None = None
         self._slot_extract_enabled = (
@@ -1034,11 +1053,19 @@ class ConversationRouter:
 
         # --- Intent detection ---
         _kb = self._def.knowledge_base
+        # objection_patterns_mode 'extend' merges the universal deferral set
+        # with the agent's custom patterns; 'replace' (default) keeps today's
+        # semantics where any custom list disables the ~28 universal phrases
+        # (load-bearing for both Pramukh agents' custom lists).
+        _obj_patterns = _kb.objection_patterns
+        if (_obj_patterns and str(getattr(
+                _kb, "objection_patterns_mode", "replace")) == "extend"):
+            _obj_patterns = list(_DEFAULT_OBJECTION_PATTERNS) + list(_obj_patterns)
         intent = detect_intent(
             text,
             self.state.stage,
             location_aliases=frozenset(_kb.location_aliases),
-            objection_patterns=_kb.objection_patterns,
+            objection_patterns=_obj_patterns,
             time_patterns=_kb.time_patterns,
         )
 
@@ -1107,10 +1134,12 @@ class ConversationRouter:
             self.state.is_closing = True
             # D9: response_bank.closing_responses is the real farewell line
             # when present ({} = today's localized/hardcoded chain).
+            _close_lang = self._closing_language()
             _closing = self._lang_response(
-                self._def.response_bank.closing_responses)
+                self._def.response_bank.closing_responses, lang=_close_lang)
             resp = _closing or self._localized(
-                "closing", "Thank you for your time! We'll be in touch. Have a great day!")
+                "closing", "Thank you for your time! We'll be in touch. Have a great day!",
+                lang=_close_lang)
             self.memory.add_assistant(resp, language=self.state.language)
             self._store_last_response(resp)
             self.state.stage = STAGE_CLOSING
@@ -1129,7 +1158,8 @@ class ConversationRouter:
                 self.state.stage = STAGE_CLOSING
                 self.call_outcome = self.call_outcome or "wrong_number"
                 self.state_mgr.extra_flags["wrong_number"] = True
-                resp = self._lang_response(self._def.outbound.wrong_number_close) \
+                resp = self._lang_response(self._def.outbound.wrong_number_close,
+                                           lang=self._closing_language()) \
                     or "I'm so sorry — it seems I have the wrong number. Have a great day!"
                 self.memory.add_assistant(resp, language=self.state.language)
                 self._store_last_response(resp)
@@ -1171,11 +1201,14 @@ class ConversationRouter:
                 # Escalation handoff replaces the farewell only when enabled.
                 esc = self._def.guardrails.escalation or {}
                 resp = ""
+                _close_lang = self._closing_language()
                 if esc.get("enabled"):
-                    resp = self._lang_response(esc.get("handoff_message") or {})
+                    resp = self._lang_response(esc.get("handoff_message") or {},
+                                               lang=_close_lang)
                 if not resp:
                     resp = self._lang_response(
-                        self._def.response_bank.decline_farewell) \
+                        self._def.response_bank.decline_farewell,
+                        lang=_close_lang) \
                         or "Thank you for your time. Have a great day!"
                 if _is_dnd:
                     self.state_mgr.extra_flags["dnd_requested"] = True
@@ -1474,6 +1507,14 @@ class ConversationRouter:
             return False
         return True
 
+    # Recognized AND-side condition keys of advance_when. max_turns is NOT
+    # one of them — it is an OR-escape evaluated in _maybe_advance_stage, so
+    # {intent: affirmation, max_turns: 3} advances on the affirmation OR on
+    # turn 3, and a bare {max_turns: 3} waits for turn 3 (never turn 1 via
+    # the vacuous-True path).
+    _AW_AND_KEYS = ("min_turns", "all_collect_filled", "slots", "intent",
+                    "appointment_captured")
+
     def _advance_when_met(self, stage_def, aw: dict) -> bool:
         """Declarative advance_when gate (all present conditions AND-ed)."""
         if aw.get("min_turns"):
@@ -1627,11 +1668,40 @@ class ConversationRouter:
         # pacing for this stage (empty = today's exact behaviour).
         aw = getattr(current_def, "advance_when", None) or {}
         if aw:
-            if self._advance_when_met(current_def, aw) and \
+            try:
+                _mx = int(aw.get("max_turns") or 0)
+            except (TypeError, ValueError):
+                _mx = 0
+            # AND-side conditions met, OR the max_turns time-escape reached.
+            # Without the escape, a never-satisfied condition strands the
+            # stage forever (the Kaapd failure shape); without the
+            # _AW_AND_KEYS guard, a bare {max_turns: N} would advance on
+            # turn 1 via _advance_when_met's vacuous True.
+            _met = (any(k in aw for k in self._AW_AND_KEYS)
+                    and self._advance_when_met(current_def, aw))
+            if (_met or (_mx and dt >= _mx)) and \
                     not _blocked_into_closing(next_stage_id):
                 self.state.stage = next_stage_id
                 self.state.discovery_turns = 0
-                logger.info("[STAGE] → %s (advance_when met)", next_stage_id)
+                logger.info("[STAGE] → %s (advance_when %s)", next_stage_id,
+                            "met" if _met else f"max_turns {_mx} reached")
+            return
+
+        # Goal-met advance for yes/no confirmation stages — EXPLICIT role
+        # only: the derived shim maps legacy OPENING → confirm_person and
+        # would silently change existing outbound-skeleton agents. No agent
+        # on disk carries an explicit confirm_person role today. Reuses the
+        # deterministic [INTENT] classification set earlier this turn; three
+        # of the Kaapd call's six turns were affirmations wasted against an
+        # already-satisfied confirm goal.
+        if (getattr(current_def, "role", "") == "confirm_person"
+                and self.state.last_intent == "affirmation"
+                and dt >= 1
+                and not _blocked_into_closing(next_stage_id)):
+            self.state.stage = next_stage_id
+            self.state.discovery_turns = 0
+            logger.info("[STAGE] → %s (confirm_person affirmation)",
+                        next_stage_id)
             return
 
         # Slot-aware early advancement: when the caller front-loads their
@@ -1763,6 +1833,7 @@ class ConversationRouter:
                     max_tokens=120,
                     temperature=0,
                     response_format={"type": "json_object"},
+                    **self._llm_extra,
                 ),
                 timeout=2.5,
             )
@@ -2259,6 +2330,20 @@ class ConversationRouter:
     # LLM consumption with filler support
     # ------------------------------------------------------------------
 
+    def _filler_allowed(self) -> bool:
+        """Filler frequency governors (llm_config.filler_max_per_call /
+        filler_min_gap_turns; 0 = ungoverned = today's behaviour: a filler on
+        every turn whose first LLM chunk beats filler_timeout_s — which on
+        the Kaapd call was every turn). Suppressed filler = wait silently."""
+        cfg = self._def.llm_config
+        max_per_call = int(getattr(cfg, "filler_max_per_call", 0) or 0)
+        if max_per_call and self._fillers_played >= max_per_call:
+            return False
+        min_gap = int(getattr(cfg, "filler_min_gap_turns", 0) or 0)
+        if min_gap and (self.state.turn_count - self._last_filler_turn) < min_gap:
+            return False
+        return True
+
     async def _consume_llm_with_filler(
         self,
         llm_queue: asyncio.Queue,
@@ -2281,9 +2366,12 @@ class ConversationRouter:
                 llm_queue.get(), timeout=self._def.llm_config.filler_timeout_s,
             )
         except asyncio.TimeoutError:
-            filler = self._pick_filler()
-            self.state.filler_used = True
-            yield EngineResult(text=filler, is_shortcut=True, intent="filler")
+            if self._filler_allowed():
+                filler = self._pick_filler()
+                self.state.filler_used = True
+                self._fillers_played += 1
+                self._last_filler_turn = self.state.turn_count
+                yield EngineResult(text=filler, is_shortcut=True, intent="filler")
             first_chunk = await llm_queue.get()
 
         if first_chunk is not None:
@@ -2339,11 +2427,34 @@ class ConversationRouter:
         try:
             async for chunk in self._call_llm_stream(text):
                 await queue.put(chunk)
+            self._llm_failure_streak = 0
         except asyncio.CancelledError:
             pass
         except Exception:
             logger.exception("[LLM] Background stream failed")
+            # Incident B (2026-07-15): a deterministic prompt-build crash is
+            # indistinguishable from a network blip here — three live calls
+            # answered every turn with the canned fallback. Streak tracking
+            # lets the platform end the loop honestly instead of repeating.
+            self._llm_failure_streak += 1
             fallback = self._def.response_bank.lang_fallbacks.get(self.state.language, self._def.response_bank.response_fallback)
+            _limit = 0
+            try:
+                _limit = int(os.environ.get("LLM_FAILURE_STREAK_LIMIT", "0"))
+            except ValueError:
+                _limit = 0
+            if _limit > 0 and self._llm_failure_streak >= _limit:
+                logger.error(
+                    "[LLM] %d consecutive failures — closing gracefully "
+                    "instead of looping the canned fallback",
+                    self._llm_failure_streak)
+                self.call_outcome = self.call_outcome or "system_error"
+                self.state.is_closing = True
+                fallback = (self._lang_response(
+                    self._def.response_bank.graceful_close)
+                    or self._lang_response(
+                        self._def.response_bank.decline_farewell)
+                    or fallback)
             try:
                 queue.put_nowait(fallback)
             except asyncio.QueueFull:
@@ -2368,8 +2479,6 @@ class ConversationRouter:
             pass
 
         system = self._build_system_prompt()
-        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
-        messages.extend(self.memory.get_history_for_llm())
 
         # Final language enforcement — closest to generation for maximum effect
         lang_names = {"hi": "Hindi", "gu": "Gujarati", "en": "English"}
@@ -2399,7 +2508,16 @@ class ConversationRouter:
                 f"{_lang_script_note.get(self.state.language, '')} "
                 f"Do NOT mix languages. Do NOT switch mid-sentence."
             )
-        messages.append({"role": "system", "content": _final})
+        # ONE system message, always. Gemini's OpenAI-compat endpoint keeps
+        # only a single systemInstruction — with the language trailer sent as
+        # a SECOND system message it silently REPLACED the entire agent
+        # prompt, so since the Gemini switch every live turn ran prompt-less:
+        # no persona, no knowledge, no rules (calls cf6b0e23 / 25dbbabb —
+        # the model even parroted the trailer's own 'Ananya/Mr. Ben' example).
+        # Merging is provider-agnostic: OpenAI-style backends honor it too.
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system + "\n\n" + _final}]
+        messages.extend(self.memory.get_history_for_llm())
 
         _SENTENCE_END = re.compile(r'[.!?।]\s')
         # Clause boundary (comma/colon/semicolon too) — used ONLY for the first
@@ -2421,6 +2539,7 @@ class ConversationRouter:
                     max_tokens=self._def.llm_config.max_tokens,
                     temperature=0.7,
                     stream=True,
+                    **self._llm_extra,
                 )
             except asyncio.CancelledError:
                 raise
@@ -2432,6 +2551,10 @@ class ConversationRouter:
                     "[LLM] Primary (%s) failed: %s — falling back to %s",
                     self._model, _primary_exc, self._fallback_model,
                 )
+                # Fidelity record: a different model spoke this turn.
+                if self._fallback_model not in self.llm_models_used:
+                    self.llm_models_used.append(self._fallback_model)
+                self.llm_fallback_turns += 1
                 stream = await fb.chat.completions.create(
                     model=self._fallback_model,
                     messages=messages,
@@ -2606,6 +2729,13 @@ class ConversationRouter:
                     self.state.stage in (STAGE_GREETING, STAGE_DISCOVERY)
                     or next((i for i, s in enumerate(self._def.call_flow.stages)
                              if s.id == self.state.stage), 0) <= 1
+                    # A stage that DECLARES slots to collect gets the strong
+                    # ask-next-missing-slot directive at any index. Gate is
+                    # collect-only (never role: the live pramukh_agent has
+                    # explicit 'discovery' roles at index 2-3 whose prompts
+                    # must stay byte-identical). Empty on every stage of both
+                    # Pramukh agents and every pre-existing agent.
+                    or bool(getattr(self._stage_def(), "collect", None))
                 ),
             ),
             *([
@@ -2622,11 +2752,12 @@ class ConversationRouter:
                                   self._stage_role()),
             *_cal_lines,
             *pb.portfolio_block(self._def, lang),
+            *pb.knowledge_grounding_block(self._def),
             *pb.guidelines_block(self._def),
             *_personality_lines,
             *pb.style_block(self._def),
             *pb.anti_repetition_block(self._def),
-            *pb.objection_block(self._def),
+            *pb.objection_block(self._def, lang),
             *pb.firm_rules_block(self._def, lang),
         ]
 
@@ -2746,6 +2877,7 @@ class ConversationRouter:
                 }],
                 max_tokens=5,
                 temperature=0.0,
+                **self._llm_extra,
             )
             raw = response.choices[0].message.content.strip().lower()
             return _LANG_NAME_TO_CODE.get(raw, "en")
@@ -2856,10 +2988,42 @@ class ConversationRouter:
             return "en"
         return self.state.language
 
-    def _lang_response(self, bank: dict) -> str:
+    def _closing_language(self) -> str:
+        """Language for closing-flavoured lines (closing_responses,
+        decline_farewell, wrong_number_close). Policy '' = today: the
+        last-turn state.language — the single most misdetection-prone turn
+        ('bye bye thank you' flipped the all-Hindi Kaapd call to English one
+        turn before the close). 'dominant' = majority language over the
+        caller's turns this call, restricted to languages.supported;
+        tie-break = most recent, fallback = state.language."""
+        policy = str(getattr(self._def.languages, "closing_language_policy",
+                             "") or "")
+        if policy != "dominant":
+            return self.state.language
+        supported = set(self._def.languages.supported or [])
+        turns = [t for t in (getattr(self.memory, "_turns", None) or [])
+                 if getattr(t, "role", "") == "user"]
+        counts: dict[str, int] = {}
+        for t in turns:
+            tl = getattr(t, "language", "") or ""
+            if tl and (not supported or tl in supported):
+                counts[tl] = counts.get(tl, 0) + 1
+        if not counts:
+            return self.state.language
+        best = max(counts.values())
+        winners = {l for l, c in counts.items() if c == best}
+        if len(winners) > 1:
+            for t in reversed(turns):
+                tl = getattr(t, "language", "") or ""
+                if tl in winners:
+                    return tl
+        return next(iter(winners))
+
+    def _lang_response(self, bank: dict, lang: str | None = None) -> str:
         """Per-language response chain: lang → en → first value → ''.
         Fixes the ['en'] KeyError traps for Copilot-built agents."""
-        lang = self.state.language
+        if lang is None:
+            lang = self.state.language
         if not isinstance(bank, dict) or not bank:
             return ""
         val = bank.get(lang) or bank.get("en") or next(iter(bank.values()), "")
@@ -2983,7 +3147,24 @@ class ConversationRouter:
             # Gujarati affirmations
             "ha", "haa", "ji", "bilkul", "zaroor", "saru", "thik chhe",
         }
-        clean_words = set(re.sub(r"[^\w\s]", "", last_user).split())
+        # filler_ack_extended: recognise Devanagari/Gujarati-script
+        # affirmations too — otherwise an all-Devanagari approval always
+        # lands in the 'thinking' pool ('एक मिनट…' before every turn of the
+        # Kaapd call). Per-call conditional union — never mutate the set
+        # shared shape across agents in one process.
+        if getattr(self._def.llm_config, "filler_ack_extended", False):
+            _ACK_TOKENS = _ACK_TOKENS | {
+                "हाँ", "हां", "जी", "हाँजी", "जीहाँ", "बिल्कुल", "बिलकुल",
+                "ठीक", "अच्छा", "ज़रूर", "जरूर", "सही",
+                "હા", "જી", "બરાબર", "ચોક્કસ", "જરૂર", "સારું",
+            }
+            # \w drops Devanagari/Gujarati combining marks ('हाँ' → 'ह'),
+            # so script text must be tokenized with the marks preserved or
+            # the extended tokens can never match.
+            clean_words = set(re.findall(
+                r"[\wऀ-ॿ઀-૿]+", last_user))
+        else:
+            clean_words = set(re.sub(r"[^\w\s]", "", last_user).split())
         is_simple_ack = (
             len(clean_words) <= 6
             and bool(clean_words & _ACK_TOKENS)
@@ -3070,6 +3251,7 @@ class ConversationRouter:
                 messages=[{"role": "user", "content": "hi"}],
                 max_tokens=1,
                 temperature=0.0,
+                **self._llm_extra,
             )
             ConversationRouter._warmup_done_flag = True
             logger.info("[CONV] LLM warmup complete (first time this process)")
@@ -3080,8 +3262,10 @@ class ConversationRouter:
     # Localization helpers
     # ------------------------------------------------------------------
 
-    def _localized(self, key: str, fallback: str) -> str:
-        loc = self._def.response_bank.localized_responses.get(self.state.language, {})
+    def _localized(self, key: str, fallback: str,
+                   lang: str | None = None) -> str:
+        loc = self._def.response_bank.localized_responses.get(
+            lang if lang is not None else self.state.language, {})
         val = loc.get(key)
         if val is None:
             return fallback

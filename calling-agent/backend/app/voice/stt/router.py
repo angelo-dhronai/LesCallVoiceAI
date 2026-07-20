@@ -21,6 +21,7 @@ import re
 import time
 import logging
 from collections import Counter
+from dataclasses import dataclass
 
 from .base import STTProvider, STTResult  # noqa: F401 — re-exported for pipeline
 from .sarvam import SarvamSTT, SarvamRateLimitError
@@ -195,15 +196,38 @@ _UNSUPPORTED_SCRIPT_RE = re.compile(
 )
 
 
+# Rejection-reason code for the unsupported-script filter.  The router uses
+# this to distinguish "Sarvam transcribed real speech in the wrong script"
+# (retry-worthy — see F16) from every other rejection type (noise/hallucination
+# — NOT retry-worthy).
+SCRIPT_REJECT_REASON = "unsupported_script"
+
+
 def validate_transcript(text: str) -> str:
     """
     Clean and validate an STT transcript. Returns empty string to reject.
 
     Steps: normalize -> strip fillers -> reject short -> reject hallucinations
     -> reject unsupported scripts -> reject excessive repetition.
+
+    Thin wrapper around :func:`validate_transcript_ex` preserving the original
+    text-only contract for existing callers.
+    """
+    cleaned, _reason = validate_transcript_ex(text)
+    return cleaned
+
+
+def validate_transcript_ex(text: str) -> tuple[str, str | None]:
+    """
+    Clean and validate an STT transcript.
+
+    Returns ``(cleaned_text, None)`` on success or ``("", reason)`` on
+    rejection, where ``reason`` is a stable code matching the
+    ``[STT-FILTER] reason=...`` log lines (e.g. ``"unsupported_script"``,
+    ``"hallucination"``, ``"low_quality"``).
     """
     if not text:
-        return ""
+        return "", "empty"
 
     # Normalize
     cleaned = text.lower().strip()
@@ -216,14 +240,14 @@ def validate_transcript(text: str) -> str:
     # Length check
     if len(cleaned) < 2:
         logger.info("[STT-FILTER] reason=too_short text=%r", text)
-        return ""
+        return "", "too_short"
 
     # Unsupported-script filter — Sarvam's auto-detect sometimes transcribes
     # noisy/short audio into Korean, Malayalam, Tamil, etc. which are never
     # valid user input. Reject immediately.
     if _UNSUPPORTED_SCRIPT_RE.search(text):
         logger.info("[STT-FILTER] reason=unsupported_script text=%r", text)
-        return ""
+        return "", SCRIPT_REJECT_REASON
 
     # Marathi rejection: Marathi shares Devanagari with Hindi so the script
     # regex cannot filter it. High-confidence copulas (आहे/आहेत/आहात) reject
@@ -231,29 +255,29 @@ def validate_transcript(text: str) -> str:
     # Other Marathi markers require 2+ hits to avoid false positives.
     if any(m in text for m in _MARATHI_HIGH_CONFIDENCE):
         logger.info("[STT-FILTER] reason=marathi_copula text=%r", text)
-        return ""
+        return "", "marathi_copula"
     _marathi_hits = sum(1 for m in _MARATHI_MARKERS if m in text)
     if _marathi_hits >= 2:
         logger.info("[STT-FILTER] reason=marathi_transcript hits=%d text=%r", _marathi_hits, text)
-        return ""
+        return "", "marathi_transcript"
 
     # Hallucination filter
     for hallucination in _HALLUCINATIONS:
         if hallucination in cleaned:
             logger.info("[STT-FILTER] reason=hallucination text=%r match=%r", text, hallucination)
-            return ""
+            return "", "hallucination"
 
     # Repeated character/syllable patterns like "s-s-s-s-s-" or "na na na"
     if _REPEATED_CHAR_RE.match(cleaned):
         logger.info("[STT-FILTER] reason=repeated_pattern text=%r", text)
-        return ""
+        return "", "repeated_pattern"
 
     # Devanagari hallucination filter
     for hallucination in _DEVANAGARI_HALLUCINATIONS:
         if hallucination in text:
             logger.info("[STT-FILTER] reason=devanagari_hallucination text=%r match=%r",
                         text, hallucination)
-            return ""
+            return "", "devanagari_hallucination"
 
     # Repetition check: if >60% of words are the same word
     words = cleaned.split()
@@ -263,19 +287,19 @@ def validate_transcript(text: str) -> str:
         if most_common_count / len(words) > _REPETITION_THRESHOLD:
             logger.info("[STT-FILTER] reason=repetition text=%r ratio=%.2f",
                         text, most_common_count / len(words))
-            return ""
+            return "", "repetition"
 
     # Single-word garbage: common misrecognitions from noise
     if len(words) == 1 and cleaned in _GARBAGE_SINGLE_WORDS:
         logger.info("[STT-FILTER] reason=garbage_single_word text=%r", text)
-        return ""
+        return "", "garbage_single_word"
 
     # Single Devanagari/Gujarati script garbage tokens (raw text, not lowercased —
     # the lower/strip pass mangles non-ASCII and we want exact match).
     raw_stripped = text.strip()
     if raw_stripped in _GARBAGE_SCRIPT_TOKENS:
         logger.info("[STT-FILTER] reason=garbage_script_token text=%r", text)
-        return ""
+        return "", "garbage_script_token"
 
     # Quality scoring: reject function-word-only short fragments.
     # Uses the ORIGINAL text so Devanagari/Gujarati characters are intact.
@@ -284,9 +308,17 @@ def validate_transcript(text: str) -> str:
     quality = _score_transcript_quality(text)
     if quality < _QUALITY_THRESHOLD:
         logger.info("[STT-FILTER] reason=low_quality score=%.2f text=%r", quality, text)
-        return ""
+        return "", "low_quality"
 
-    return cleaned
+    return cleaned, None
+
+
+@dataclass
+class _RejectedTranscript:
+    """Details of a non-empty provider transcript rejected by validation."""
+    reason: str
+    raw_text: str
+    detected_language: str | None
 
 
 class STTRouter:
@@ -328,6 +360,14 @@ class STTRouter:
         self._sarvam_rl_until: float = 0.0   # monotonic time when backoff expires
         self._sarvam_rl_count: int = 0        # consecutive rate-limit strikes
 
+        # F16 script-misdetection counters — read by the bridge/pipeline for
+        # observability. reject: primary transcript was non-empty but rejected
+        # as unsupported_script (real speech transcribed in the wrong script).
+        # recovered: the single forced-language Sarvam retry produced a valid
+        # transcript for that turn.
+        self.script_reject_count: int = 0
+        self.script_recovered_count: int = 0
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -337,7 +377,22 @@ class STTRouter:
         audio_bytes: bytes,
         sample_rate: int = 16_000,
         language: str = "en",
+        default_language: str | None = None,
     ) -> STTResult:
+        """
+        Transcribe one audio segment.
+
+        Parameters
+        ----------
+        language : str
+            Language hint forwarded to the provider. "unknown" = auto-detect.
+        default_language : str | None
+            F16: best-known conversation language (e.g. "hi", "gu-IN") used
+            ONLY for the single forced-language Sarvam retry when the primary
+            transcript is rejected as unsupported-script. Ignored otherwise.
+            The pipeline passes it from conversation state once a language has
+            actually been established; None/"unknown" disables the retry.
+        """
         duration_ms = len(audio_bytes) / (sample_rate * 2) * 1000
         logger.info("[STT] Audio segment: %.0f ms, %d bytes", duration_ms, len(audio_bytes))
 
@@ -350,32 +405,20 @@ class STTRouter:
                 "[STT] Sarvam rate-limited (%.0fs remaining) — routing to fallback",
                 remaining,
             )
-            text, _, _ = await self._try_provider(
+            text, _, _, _ = await self._try_provider(
                 self._fallback, "fallback", audio_bytes, sample_rate, language
             )
             return STTResult(text=text)
 
         # ── Try primary (Sarvam) ─────────────────────────────────────────
         try:
-            text, had_error, detected_lang = await self._try_provider(
+            text, had_error, detected_lang, reject = await self._try_provider(
                 self._primary, "primary", audio_bytes, sample_rate, language
             )
         except SarvamRateLimitError as exc:
             # Apply exponential backoff; reset on the next successful call
-            self._sarvam_rl_count += 1
-            backoff = min(
-                _RL_INITIAL_BACKOFF_S * (2 ** (self._sarvam_rl_count - 1)),
-                _RL_MAX_BACKOFF_S,
-            )
-            self._sarvam_rl_until = time.monotonic() + backoff
-            logger.warning(
-                "[STT] Sarvam rate-limited (strike %d) — backoff %.0fs, "
-                "retry-after=%s — routing to fallback",
-                self._sarvam_rl_count,
-                backoff,
-                exc.retry_after,
-            )
-            text, _, _ = await self._try_provider(
+            self._apply_sarvam_backoff(exc)
+            text, _, _, _ = await self._try_provider(
                 self._fallback, "fallback", audio_bytes, sample_rate, language
             )
             return STTResult(text=text)
@@ -387,7 +430,17 @@ class STTRouter:
             return STTResult(text=text, detected_language=detected_lang)
 
         if not had_error:
-            # Sarvam processed the audio cleanly but found no speech.
+            # F16: Sarvam produced REAL text but in an unsupported script
+            # (e.g. genuine Hindi transcribed as Gurmukhi/pa-IN). The audio
+            # demonstrably contained speech — retry once with the language
+            # forced, then fall back to Whisper if that also fails.
+            if reject is not None and reject.reason == SCRIPT_REJECT_REASON:
+                return await self._recover_script_misdetection(
+                    reject, audio_bytes, sample_rate, language, default_language
+                )
+
+            # Sarvam processed the audio cleanly but found no speech, or the
+            # transcript was noise/hallucination (any non-script rejection).
             # Whisper would produce the same (empty or hallucinated) result,
             # so skip it entirely to avoid wasting quota.
             logger.info(
@@ -397,7 +450,7 @@ class STTRouter:
 
         # ── Primary had a genuine API/network error → try fallback ───────
         logger.info("[STT] Primary errored — routing to fallback provider")
-        text, _, _ = await self._try_provider(
+        text, _, _, _ = await self._try_provider(
             self._fallback, "fallback", audio_bytes, sample_rate, language
         )
         if text:
@@ -409,6 +462,113 @@ class STTRouter:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _apply_sarvam_backoff(self, exc: SarvamRateLimitError) -> None:
+        """Record a 429 strike and open the exponential backoff window."""
+        self._sarvam_rl_count += 1
+        backoff = min(
+            _RL_INITIAL_BACKOFF_S * (2 ** (self._sarvam_rl_count - 1)),
+            _RL_MAX_BACKOFF_S,
+        )
+        self._sarvam_rl_until = time.monotonic() + backoff
+        logger.warning(
+            "[STT] Sarvam rate-limited (strike %d) — backoff %.0fs, "
+            "retry-after=%s — routing to fallback",
+            self._sarvam_rl_count,
+            backoff,
+            exc.retry_after,
+        )
+
+    @staticmethod
+    def _resolve_script_retry_language(
+        language: str, default_language: str | None
+    ) -> str | None:
+        """
+        Best-known language for the forced-language script retry (F16).
+
+        Preference order: the explicit ``language`` hint the router received
+        (when it is a real hint, not "unknown"), then the conversation-state
+        ``default_language``. Returns None when no hint exists — the retry
+        must not fire on the first utterance of a call.
+        """
+        if language and language != "unknown":
+            return language
+        if default_language and default_language != "unknown":
+            return default_language
+        return None
+
+    async def _recover_script_misdetection(
+        self,
+        reject: _RejectedTranscript,
+        audio_bytes: bytes,
+        sample_rate: int,
+        language: str,
+        default_language: str | None,
+    ) -> STTResult:
+        """
+        F16: the primary transcript contained real speech transcribed in an
+        unsupported script (Sarvam auto-detect misfire, e.g. Hindi → Gurmukhi).
+
+        Retry Sarvam ONCE with the language forced to the best-known
+        conversation language. If the retry also fails, the segment is
+        FALLBACK-ELIGIBLE (speech was demonstrably present) and Whisper runs.
+        Without a language hint, today's drop behaviour is preserved.
+        """
+        self.script_reject_count += 1
+        retry_lang = self._resolve_script_retry_language(language, default_language)
+
+        if not retry_lang:
+            logger.warning(
+                "[STT] Script misdetection: rejected %r (detected_lang=%s) but no "
+                "language hint available — dropping segment (no retry, no fallback)",
+                reject.raw_text, reject.detected_language,
+            )
+            return STTResult(text="")
+
+        logger.warning(
+            "[STT] Script misdetection: rejected %r (detected_lang=%s) — retrying "
+            "Sarvam once with language forced to %s",
+            reject.raw_text, reject.detected_language, retry_lang,
+        )
+
+        retry_reject: _RejectedTranscript | None = None
+        try:
+            text, had_error, detected_lang, retry_reject = await self._try_provider(
+                self._primary, "primary-script-retry",
+                audio_bytes, sample_rate, retry_lang,
+            )
+        except SarvamRateLimitError as exc:
+            # Same backoff bookkeeping as the main path; the segment stays
+            # fallback-eligible since the audio contained speech.
+            self._apply_sarvam_backoff(exc)
+            text, had_error, detected_lang = "", True, None
+
+        if text:
+            self.script_recovered_count += 1
+            self._sarvam_rl_count = 0
+            logger.warning(
+                "[STT] Script-retry recovered transcript %r (lang=%s, forced=%s)",
+                text, detected_lang, retry_lang,
+            )
+            return STTResult(text=text, detected_language=detected_lang)
+
+        # Retry rejected/empty/errored → audio contained speech, so this is
+        # fallback-eligible (unlike a clean-empty no-speech segment).
+        logger.warning(
+            "[STT] Script-retry failed (reject_reason=%s, had_error=%s) — "
+            "audio contained speech, routing to fallback",
+            retry_reject.reason if retry_reject else None, had_error,
+        )
+        fb_text, _, fb_lang, _ = await self._try_provider(
+            self._fallback, "fallback", audio_bytes, sample_rate, retry_lang
+        )
+        if fb_text:
+            logger.info("[STT] Fallback succeeded after script reject: %r", fb_text)
+        else:
+            logger.warning(
+                "[STT] Fallback also failed after script reject — dropping segment"
+            )
+        return STTResult(text=fb_text, detected_language=fb_lang if fb_text else None)
 
     def _post_process(self, text: str, language: str) -> str:
         if not text:
@@ -422,13 +582,13 @@ class STTRouter:
         audio_bytes: bytes,
         sample_rate: int,
         language: str,
-    ) -> tuple[str, bool, str | None]:
+    ) -> tuple[str, bool, str | None, _RejectedTranscript | None]:
         """
         Attempt transcription with up to (max_retries + 1) attempts.
 
         Returns
         -------
-        (transcript, had_error, detected_language)
+        (transcript, had_error, detected_language, reject)
             transcript : str
                 Clean, post-processed text; empty string if nothing usable.
             had_error : bool
@@ -438,6 +598,11 @@ class STTRouter:
             detected_language : str | None
                 BCP-47 language code returned by the provider (e.g. "gu-IN"),
                 or None if the provider did not report one.
+            reject : _RejectedTranscript | None
+                Set when the provider returned a NON-EMPTY transcript that
+                validate_transcript rejected — carries the rejection reason,
+                raw text, and detected language so the caller can decide
+                whether the rejection is retry-worthy (unsupported script).
         """
         had_error = False
 
@@ -456,29 +621,33 @@ class STTRouter:
                         "provider=%s attempt=%d",
                         confidence, text, label, attempt,
                     )
-                    return "", False, None
+                    return "", False, None, None
 
                 if len(text) < self._min_length:
                     logger.info(
                         "[STT] %s short/empty transcript %r (attempt %d) — no speech",
                         label, text, attempt,
                     )
-                    return "", False, None
+                    return "", False, None, None
 
-                validated = validate_transcript(text)
+                validated, reject_reason = validate_transcript_ex(text)
                 if validated:
                     processed = self._post_process(validated, language)
                     logger.info(
                         "[STT] %s attempt %d: %r -> validated %r -> processed %r",
                         label, attempt, text, validated, processed,
                     )
-                    return processed, False, detected_lang
+                    return processed, False, detected_lang, None
 
                 logger.info(
                     "[STT] %s transcript %r rejected by validation (attempt %d)",
                     label, text, attempt,
                 )
-                return "", False, None
+                return "", False, None, _RejectedTranscript(
+                    reason=reject_reason or "unknown",
+                    raw_text=text,
+                    detected_language=detected_lang,
+                )
 
             except SarvamRateLimitError:
                 raise
@@ -496,4 +665,4 @@ class STTRouter:
                     label, attempt + 1, self._max_retries + 1,
                 )
 
-        return "", had_error, None
+        return "", had_error, None, None

@@ -32,6 +32,7 @@ Design notes
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import dataclasses
 import json
@@ -57,6 +58,7 @@ from backend.app.agent_definition.schema import (                   # noqa: E402
     PostCallConfig,
 )
 from backend.app.agent_definition.registry import agent_registry    # noqa: E402
+from backend.app.agent_definition.boot_check import engine_boot_check  # noqa: E402
 from backend.app.agent_definition import store as agent_store       # noqa: E402
 from backend.app.agent_definition.diff import (                     # noqa: E402
     apply_ops as _apply_ops, compute_diff as _compute_diff,
@@ -92,6 +94,7 @@ async def _copilot_tenancy_dep(request: Request):
 router = APIRouter(dependencies=[Depends(_copilot_tenancy_dep)])
 
 _SESSIONS_DIR = Path(__file__).parent / "copilot_sessions"
+_MINE_DUMP_MIN_CHARS = 1500  # a paste this big during a build is mined server-side
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,80}$")
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{1,60}$")
 _MAX_TOOL_ITERATIONS = 8
@@ -314,7 +317,6 @@ def _default_definition(name: str, provided: dict) -> dict:
 
     tts_voices = {l: {"model": "bulbul:v3", "speaker": "simran", "pace": 1.15} for l in supported}
     register_notes = {l: s(l, "register_note") for l in supported}
-    slots_text = {l: s(l, "slots_text") for l in supported}
 
     # Outbound agents lead the call and need a pitch-shaped flow, not the
     # inbound welcome→discovery→book skeleton. Pick the skeleton that matches
@@ -349,6 +351,9 @@ def _default_definition(name: str, provided: dict) -> dict:
             "allow_code_mixing": default_lang == "hi",
             "tts_voices": tts_voices,
             "register_notes": register_notes,
+            # F15: the farewell speaks the call's dominant language, not
+            # whatever a misdetected final "bye bye thank you" flipped to.
+            "closing_language_policy": "dominant",
         },
         "call_flow": {
             "stages": copy.deepcopy(base_stages),
@@ -361,6 +366,10 @@ def _default_definition(name: str, provided: dict) -> dict:
             "portfolio_section_label": "KNOWLEDGE BASE",
             "location_aliases": [],
             "objection_patterns": list(_DEFAULT_OBJECTION_PATTERNS),
+            # F15: custom patterns EXTEND the universal deferral set for new
+            # agents — authoring 5 domain phrases no longer disables 'not
+            # interested' / 'stop calling' / 'busy'.
+            "objection_patterns_mode": "extend",
             "time_patterns": list(_DEFAULT_TIME_PATTERNS),
             "qa_field_signals": {
                 "name": ["your name", "naam", "aapka naam", "may i know your name", "who am i speaking"],
@@ -384,23 +393,31 @@ def _default_definition(name: str, provided: dict) -> dict:
             "response_fallback": s(default_lang, "lang_fallback"),
             "graceful_close": {l: s(l, "graceful_close") for l in supported},
             "localized_responses": {},
-            "proactive_prompts": {},
         },
+        # F13: the calendar starts EMPTY — a phantom 3-slot default used to
+        # ship a live-availability band into flows that never schedule
+        # anything. The interview's scheduling layer captures real slots (or
+        # an explicit "we don't book"), and mock_slots stay [] otherwise.
         "calendar": {
             "type": "mock",
-            "mock_slots": [
-                {"day": "Tomorrow", "time": "11:00 AM"},
-                {"day": "Tomorrow", "time": "4:00 PM"},
-                {"day": "This Saturday", "time": "12:00 PM"},
-            ],
-            "slots_text": slots_text,
+            "mock_slots": [],
+            "slots_text": {},
         },
         "llm_config": {
-            "model": "gpt-4o-mini",
+            # F9: no "model" key — the runtime model is env-governed
+            # (LLM_MODEL wins over any per-agent value; conversation.py:588).
+            # Writing gpt-4o-mini here was a false affordance users could
+            # never actually exercise.
             "max_tokens": 160,
             "timeout_s": 5.0,
             "stream_timeout_s": 7.0,
-            "filler_timeout_s": 0.6,
+            # F15: 0.6s sat below the live model's typical first-chunk
+            # latency (630-1178ms measured), guaranteeing a filler on every
+            # turn; the caps keep fillers occasional instead of a verbal tic.
+            "filler_timeout_s": 1.2,
+            "filler_min_gap_turns": 2,
+            "filler_max_per_call": 3,
+            "filler_ack_extended": True,
             "intent_classify_timeout_s": 1.0,
             "max_response_length": 400,
             "extra_never_rules": [],
@@ -410,7 +427,20 @@ def _default_definition(name: str, provided: dict) -> dict:
         # empty = exactly today's engine behaviour.
         "brand": {},
         "outbound": {},
-        "guardrails": {"use_builtin_rules": True},
+        # F2/F14: new agents get the industry-neutral rules pack and strict
+        # knowledge grounding (deflect-not-invent). The Copilot LLM sets
+        # builtin_rules_pack back to 'real_estate' for real-estate
+        # businesses; user-provided honesty values win on merge.
+        "guardrails": {
+            "use_builtin_rules": True,
+            "builtin_rules_pack": "generic",
+            "honesty": {
+                "knowledge_grounding": "strict",
+                "unknown_answer_policy": (
+                    "say you'll check with the team and share exact details "
+                    "after the call"),
+            },
+        },
         "follow_up": {},
         "post_call": {},
     }
@@ -487,6 +517,181 @@ def _default_lang_of(d: dict) -> str:
     return "en"
 
 
+# ── F1: alias rewrite — the vocabulary the LLM sees (interview layer ids,
+# natural field names) is not the vocabulary the spec accepts. Rename known
+# misfires to their canonical paths BEFORE the drop-unknown pass, so a good
+# answer recorded under a wrong-but-obvious key lands instead of erroring
+# (incident: update_draft({"call_objective": ...}) → everything dropped).
+# INVARIANT: no alias key may be a real top-level key (tested), so this can
+# never touch a well-formed definition — including full-document normalizes.
+#
+# alias key → (path tuple, accepted value types)
+_TOP_LEVEL_ALIASES: dict[str, tuple[tuple[str, ...], tuple[type, ...]]] = {
+    # call objective / mission (the incident class — layer id 'call_objective')
+    "call_objective": (("call_flow", "call_goal"), (str,)),
+    "objective": (("call_flow", "call_goal"), (str,)),
+    "call_goal": (("call_flow", "call_goal"), (str,)),
+    "goal": (("call_flow", "call_goal"), (str,)),
+    "mission": (("call_flow", "call_goal"), (str,)),
+    "direction": (("call_direction",), (str,)),
+    # persona scalars
+    "tone": (("personality", "tone"), (str,)),
+    "energy": (("personality", "energy"), (str,)),
+    "style": (("personality", "style"), (str,)),
+    "traits": (("personality", "traits"), (list,)),
+    "ai_disclosure": (("personality", "ai_disclosure"), (str,)),
+    # identity scalars
+    "agent_name": (("identity", "agent_name"), (str,)),
+    "company": (("identity", "company_name"), (str,)),
+    "company_name": (("identity", "company_name"), (str,)),
+    "business_name": (("identity", "company_name"), (str,)),
+    "role_description": (("identity", "role_description"), (str,)),
+    # greeting / closing
+    "greeting": (("response_bank", "opening_greeting"), (str,)),
+    "opening_line": (("response_bank", "opening_greeting"), (str,)),
+    "opening_greeting": (("response_bank", "opening_greeting"), (str,)),
+    "closing_responses": (("response_bank", "closing_responses"), (dict,)),
+    # knowledge
+    "knowledge": (("knowledge_base", "portfolio_prompt_text"), (str,)),
+    "knowledge_text": (("knowledge_base", "portfolio_prompt_text"), (str,)),
+    "catalog_text": (("knowledge_base", "portfolio_prompt_text"), (str,)),
+    "portfolio_prompt_text": (("knowledge_base", "portfolio_prompt_text"), (str,)),
+    "catalog": (("knowledge_base", "catalog"), (list,)),
+    # call flow / objections / guardrails / brand / calendar lists
+    "stages": (("call_flow", "stages"), (list,)),
+    "objections": (("response_bank", "objection_playbook"), (list,)),
+    "objection_playbook": (("response_bank", "objection_playbook"), (list,)),
+    "objection_responses": (("response_bank", "objection_responses"), (list, dict)),
+    "never_rules": (("guardrails", "never_rules"), (list,)),
+    "always_rules": (("guardrails", "always_rules"), (list,)),
+    "trust_proofs": (("brand", "trust_proofs"), (list,)),
+    "mock_slots": (("calendar", "mock_slots"), (list,)),
+}
+
+# Interview layer ids the LLM may echo back as section names → the section
+# their dict content belongs in. ('languages' and real sections need no entry;
+# 'call_objective' dicts are unpacked key-by-key below.)
+_LAYER_ID_SECTION_ALIASES: dict[str, str] = {
+    "business_identity": "identity",
+    "persona_voice": "personality",
+    "brand_trust": "brand",
+    "guardrails_compliance": "guardrails",
+    "scheduling_followup": "calendar",
+    "knowledge_catalog": "knowledge_base",
+    "greeting_close": "response_bank",
+    "objections_branching": "response_bank",
+}
+
+
+def _alias_set(d: dict, path: tuple[str, ...], value: Any,
+               notes: list[str], alias_key: str) -> None:
+    """Place an aliased value at its canonical path. An explicit real value
+    already there wins — the alias is dropped with a note, never a clobber."""
+    node = d
+    for p in path[:-1]:
+        nxt = node.get(p)
+        if nxt is None:
+            nxt = node[p] = {}
+        elif not isinstance(nxt, dict):
+            notes.append(f"'{alias_key}' ignored — '{p}' has an unusable shape")
+            return
+        node = nxt
+    leaf = path[-1]
+    dest = ".".join(path)
+    if node.get(leaf) not in (None, "", [], {}):
+        notes.append(f"'{alias_key}' ignored — '{dest}' was already provided explicitly")
+        return
+    node[leaf] = value
+    notes.append(f"aliased '{alias_key}' → {dest}")
+
+
+def _alias_rewrite(d: dict, notes: list[str]) -> None:
+    """F1: rename known-wrong top-level keys to canonical spec paths, in place.
+    Conservative by design — only unambiguous key+shape pairs move; anything
+    else is left for the drop-unknown pass (which notes it with suggestions)."""
+    # Dotted spec paths sent as FLAT keys ({"call_flow.stages": [...]}) are
+    # expanded into the nested form before anything else — the incident
+    # interview (2026-07-15) lost a whole project catalog because
+    # "knowledge_base.known_projects" was treated as one unknown key and the
+    # closest-match hint suggested the same dotted string straight back.
+    for key in [k for k in list(d.keys())
+                if isinstance(k, str) and "." in k
+                and k.split(".")[0] in _TOP_LEVEL_KEYS]:
+        parts = key.split(".")
+        val = d.pop(key)
+        nested = val
+        for p in reversed(parts[1:]):
+            nested = {p: nested}
+        target = d.setdefault(parts[0], {})
+        if isinstance(target, dict):
+            _deep_merge(target, nested)
+            notes.append(f"expanded dotted key '{key}' into its nested form")
+        else:
+            d[key] = val  # top-level slot holds a non-dict — leave for the shape pass
+    for key in [k for k in d if k in _TOP_LEVEL_ALIASES]:
+        path, types = _TOP_LEVEL_ALIASES[key]
+        val = d[key]
+        if isinstance(val, types) and (val or isinstance(val, (int, float))):
+            d.pop(key)
+            _alias_set(d, path, val, notes, key)
+    # 'data_capture' (layer id) as a slot list
+    dc = d.get("data_capture")
+    if isinstance(dc, list) and "slots" not in d:
+        d["slots"] = d.pop("data_capture")
+        notes.append("aliased 'data_capture' → slots")
+    # layer-id keys carrying a dict of that layer's settings → their section
+    for key in [k for k in d if k in _LAYER_ID_SECTION_ALIASES]:
+        val = d[key]
+        if isinstance(val, dict) and val:
+            section = _LAYER_ID_SECTION_ALIASES[key]
+            d.pop(key)
+            target = d.setdefault(section, {})
+            if isinstance(target, dict):
+                for sk, sv in val.items():
+                    target.setdefault(sk, sv)
+                notes.append(f"aliased '{key}' → {section}")
+            else:
+                d[key] = val  # section unusable — put it back for the shape pass
+    # 'call_objective'/'objective' as a dict: unpack the two known subkeys
+    for key in ("call_objective", "objective"):
+        val = d.get(key)
+        if isinstance(val, dict):
+            d.pop(key)
+            g = val.get("call_goal") or val.get("goal") or val.get("objective")
+            if isinstance(g, str) and g.strip():
+                _alias_set(d, ("call_flow", "call_goal"), g, notes, f"{key}.goal")
+            cd = val.get("call_direction") or val.get("direction")
+            if isinstance(cd, str) and cd.strip():
+                _alias_set(d, ("call_direction",), cd, notes, f"{key}.direction")
+
+
+def _canonical_paths() -> list[str]:
+    """Every real setting path ('call_flow.call_goal', 'slots', …) — the
+    close-match vocabulary for drop notes."""
+    paths = sorted(_TOP_LEVEL_KEYS - _SERVER_MANAGED_KEYS)
+    for section, cls in _SECTION_DATACLASSES.items():
+        paths.extend(f"{section}.{f}" for f in sorted(_fields_of(cls)))
+    return paths
+
+
+def _closest_paths(key: str, n: int = 2) -> list[str]:
+    import difflib
+    paths = _canonical_paths()
+    # Match on leaf names AND known alias names, so both 'call_goal' and a
+    # near-miss like 'call_objektive' resolve to 'call_flow.call_goal'.
+    vocab = {p.rsplit(".", 1)[-1]: p for p in paths}
+    vocab.update({alias: ".".join(path)
+                  for alias, (path, _t) in _TOP_LEVEL_ALIASES.items()})
+    vocab.update({lid: section for lid, section in _LAYER_ID_SECTION_ALIASES.items()})
+    hits: list[str] = []
+    for m in difflib.get_close_matches(key, list(vocab), n=n, cutoff=0.6):
+        if vocab[m] not in hits:
+            hits.append(vocab[m])
+    hits += [p for p in difflib.get_close_matches(key, paths, n=n, cutoff=0.6)
+             if p not in hits]
+    return hits[:n]
+
+
 # The TWO template placeholders the runtime understands, both only in the
 # opening greeting (conversation.py generate_opening):
 #   {contact_name} — the outbound contact's name, falling back to "sir/ma'am"
@@ -546,6 +751,9 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
     pruned = _prune_nones(d)
     d.clear()
     d.update(pruned)
+
+    # ── F1: known-wrong key names → canonical paths (before anything drops) ─
+    _alias_rewrite(d, notes)
 
     # ── sections in impossible container shapes ─────────────────────────────
     for section in ("identity", "personality"):
@@ -775,6 +983,44 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
                     day, _, tme = row.partition(" at ")
                     if day.strip() and tme.strip():
                         fixed_slots.append({"day": day.strip(), "time": tme.strip()})
+            # F13 sanity (runs only when the payload itself carried a
+            # calendar — an untouched stored agent is never rewritten):
+            # exact-duplicate (day,time) pairs dropped, keep-first order.
+            _seen: set[tuple[str, str]] = set()
+            _deduped = []
+            for slot in fixed_slots:
+                key = (slot["day"].lower(), slot["time"].lower())
+                if key in _seen:
+                    continue
+                _seen.add(key)
+                _deduped.append(slot)
+            if len(_deduped) < len(fixed_slots):
+                notes.append(f"calendar: {len(fixed_slots) - len(_deduped)} "
+                             "duplicate slot(s) removed")
+            fixed_slots = _deduped
+            # A degenerate calendar where >=4 slots share one identical time
+            # string is LLM anchoring, not real availability (Kaapd: six
+            # 10:00 AM slots) — keep the first two, flag the rest.
+            _by_time: dict[str, int] = {}
+            for slot in fixed_slots:
+                _by_time[slot["time"].lower()] = _by_time.get(slot["time"].lower(), 0) + 1
+            for tkey, cnt in _by_time.items():
+                if cnt >= 4:
+                    kept, trimmed = [], 0
+                    for slot in fixed_slots:
+                        if slot["time"].lower() == tkey and sum(
+                                1 for s in kept if s["time"].lower() == tkey) >= 2:
+                            trimmed += 1
+                            continue
+                        kept.append(slot)
+                    fixed_slots = kept
+                    notes.append(
+                        f"calendar had {cnt} slots all at the same time "
+                        f"({tkey}) — kept two; confirm the real availability")
+            if len(fixed_slots) > 12:
+                notes.append(f"calendar capped at 12 slots "
+                             f"({len(fixed_slots) - 12} dropped)")
+                fixed_slots = fixed_slots[:12]
             cal["mock_slots"] = fixed_slots
         elif "mock_slots" in cal:
             cal.pop("mock_slots")
@@ -969,11 +1215,32 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
     default_lang_v2 = _default_lang_of(d)
 
     def _lang_dict(val):
-        """str → {default_lang: str}; dict of str kept; anything else None."""
+        """str → {default_lang: str}; dict of str kept; anything else None.
+
+        A {lang: {situation: line}} nest (how users naturally dictate
+        closings) is flattened to one line per language — the thank-you /
+        closing-most line — instead of silently becoming {} and losing the
+        content behind a success status (incident 2026-07-15: greeting_close
+        re-asked forever because closing_responses normalized to {}).
+        Never returns an empty dict: empty means None so callers drop + note.
+        """
         if isinstance(val, str):
             return {default_lang_v2: val} if val.strip() else None
         if isinstance(val, dict):
-            return {str(k): str(v) for k, v in val.items() if isinstance(v, (str, int, float))}
+            out = {}
+            for k, v in val.items():
+                if isinstance(v, (str, int, float)) and str(v).strip():
+                    out[str(k)] = str(v)
+                elif isinstance(v, dict):
+                    strs = {str(kk): str(vv).strip() for kk, vv in v.items()
+                            if isinstance(vv, (str, int, float)) and str(vv).strip()}
+                    if strs:
+                        pick = next((strs[kk] for kk in
+                                     ("thank_you", "closing", "closing_line",
+                                      "close", "goodbye", "final")
+                                     if kk in strs), None)
+                        out[str(k)] = pick or list(strs.values())[-1]
+            return out or None
         return None
 
     br = d.get("brand")
@@ -1027,6 +1294,24 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
             if k in gr and not isinstance(gr[k], dict):
                 gr.pop(k)
                 notes.append(f"guardrails.{k} had an unusable shape — ignored")
+        hon = gr.get("honesty")
+        if isinstance(hon, dict):
+            # forbidden_fabrications is a LIST of things never to invent — the
+            # engine iterates it in the prompt build, so a bare bool crashed
+            # every turn of a live call (incident 2026-07-15: agent stuck on
+            # "could you repeat that"). bool True = "use the default" → drop.
+            if "forbidden_fabrications" in hon:
+                ff = hon["forbidden_fabrications"]
+                if isinstance(ff, bool) or ff is None:
+                    hon.pop("forbidden_fabrications")
+                elif isinstance(ff, str):
+                    hon["forbidden_fabrications"] = [ff] if ff.strip() else []
+                elif isinstance(ff, list):
+                    hon["forbidden_fabrications"] = [str(x) for x in ff if str(x).strip()]
+                else:
+                    hon.pop("forbidden_fabrications")
+            if "unknown_answer_policy" in hon and not isinstance(hon["unknown_answer_policy"], str):
+                hon["unknown_answer_policy"] = str(hon["unknown_answer_policy"])
         comp = gr.get("compliance")
         if isinstance(comp, dict):
             for k in ("disclaimers", "dnd_phrases", "restricted_topics"):
@@ -1163,15 +1448,29 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
                 good_pb.append(o)
             rb2["objection_playbook"] = good_pb
         if "closing_responses" in rb2:
-            fixed = _lang_dict(rb2["closing_responses"])
+            raw_cr = rb2["closing_responses"]
+            fixed = _lang_dict(raw_cr)
             if fixed is None:
                 rb2.pop("closing_responses")
+                notes.append(
+                    "response_bank.closing_responses had an unusable shape — "
+                    "NOT saved. Send {lang: ONE closing line string} per "
+                    "language; retry update_draft with that shape now.")
             else:
+                if isinstance(raw_cr, dict) and any(
+                        isinstance(v, dict) for v in raw_cr.values()):
+                    notes.append(
+                        "closing_responses were nested per-situation — kept the "
+                        "final thank-you line per language as THE closing line "
+                        "(the engine speaks one closing per language); the "
+                        "situational lines belong in the stage goals")
                 rb2["closing_responses"] = fixed
         if "ai_disclosure_responses" in rb2:
             fixed = _lang_dict(rb2["ai_disclosure_responses"])
             if fixed is None:
                 rb2.pop("ai_disclosure_responses")
+                notes.append("response_bank.ai_disclosure_responses had an "
+                             "unusable shape — NOT saved ({lang: str} expected)")
             else:
                 rb2["ai_disclosure_responses"] = fixed
         if "canned_phrases" in rb2:
@@ -1218,7 +1517,9 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
             )
     for k in [k for k in d if k not in _TOP_LEVEL_KEYS]:
         d.pop(k)
-        notes.append(f"top-level '{k}' is not a real setting — dropped")
+        close = _closest_paths(k)
+        hint = f" Did you mean: {', '.join(close)}?" if close else ""
+        notes.append(f"top-level '{k}' is not a real setting — dropped.{hint}")
 
     return d
 
@@ -1245,6 +1546,19 @@ def _invariant_violations(merged: dict) -> list[str]:
     greeting = rb.get("opening_greeting") if isinstance(rb, dict) else None
     if not (isinstance(greeting, str) and greeting.strip()):
         problems.append("opening_greeting would become empty")
+    # F9: max_tokens is the spoken-brevity budget — an LLM-authored
+    # "unlimited"/true/4096 must fail the proposal, not ship (checks, never
+    # mutations, per §5.4).
+    lc = merged.get("llm_config") or {}
+    if isinstance(lc, dict) and "max_tokens" in lc:
+        try:
+            _mt = int(lc["max_tokens"])
+        except (TypeError, ValueError):
+            _mt = -1
+        if not (80 <= _mt <= 512):
+            problems.append(
+                f"llm_config.max_tokens would become {lc['max_tokens']!r} "
+                "(must be an integer between 80 and 512)")
     return problems
 
 
@@ -1478,6 +1792,17 @@ def _replace_in_tree(node: Any, pattern: "re.Pattern", replacement: str) -> tupl
     return node, 0
 
 
+_MALE_VOICES = {"shubh", "abhilash", "karun"}
+_FEMALE_VOICES = {"simran", "anushka", "manisha", "vidya"}
+# Platform default lines that carry grammatical gender: feminine -> masculine.
+_GENDERED_DEFAULTS: dict[str, dict[str, tuple[str, str]]] = {
+    "timeout_fallbacks": {
+        "hi": ("मैं इस पर वापस आती हूँ।", "मैं इस पर वापस आता हूँ।"),
+        "gu": ("હું આના પર પાછી આવું છું.", "હું આના પર પાછો આવું છું."),
+    },
+}
+
+
 def _enforce_invariants(merged: dict, notes: list[str]) -> None:
     """Final gate before validate/write: whatever the merge produced, these
     properties must hold or the agent would die on its first call."""
@@ -1502,6 +1827,38 @@ def _enforce_invariants(merged: dict, notes: list[str]) -> None:
     for code in clean_sup:
         rn.setdefault(code, (_LANG_STRINGS.get(code) or _LANG_STRINGS["en"])["register_note"])
 
+    # Gender consistency: the VOICE is a deliberate user choice, the "she"
+    # pronoun and the feminine Hindi/Gujarati fallbacks are only platform
+    # defaults — a default must never contradict the user's input (Kaapd
+    # audit 2026-07-15: Karan spoke with shubh but carried pronouns 'she'
+    # and 'मैं इस पर वापस आती हूँ।'). Only unambiguous cases are corrected,
+    # and only where the value still IS the default.
+    _speakers = {str((tv.get(c) or {}).get("speaker") or "").strip().lower()
+                 for c in clean_sup}
+    _male, _female = _speakers & _MALE_VOICES, _speakers & _FEMALE_VOICES
+    if bool(_male) != bool(_female):
+        _pron = "he" if _male else "she"
+        _opposite = "she" if _male else "he"
+        _fixed = []
+        for _section in ("identity", "personality"):
+            _node = merged.get(_section)
+            if isinstance(_node, dict) and _node.get("pronouns") == _opposite:
+                _node["pronouns"] = _pron
+                _fixed.append(f"{_section}.pronouns")
+        if _pron == "he":
+            _rb = merged.get("response_bank")
+            if isinstance(_rb, dict):
+                for _field, _table in _GENDERED_DEFAULTS.items():
+                    _val = _rb.get(_field)
+                    if isinstance(_val, dict):
+                        for _code, _pair in _table.items():
+                            if _val.get(_code) == _pair[0]:
+                                _val[_code] = _pair[1]
+                                _fixed.append(f"response_bank.{_field}.{_code}")
+        if _fixed:
+            notes.append(f"matched the default wording to the {_pron} voice: "
+                         + ", ".join(_fixed))
+
     cf = merged.setdefault("call_flow", {})
     if not isinstance(cf, dict):
         cf = merged["call_flow"] = {}
@@ -1519,12 +1876,252 @@ def _enforce_invariants(merged: dict, notes: list[str]) -> None:
         notes.append("opening greeting was missing — a simple default was set (tell the user)")
 
 
-def _quality_warnings(merged: dict) -> list[str]:
+# ─── create-time enrichment (F10) ────────────────────────────────────────────
+# Kaapd incident (call cf6b0e23): the Copilot emitted six stages with
+# advance_when {} / collect [] / role '' and 8-turn thresholds — every
+# advancement gate in the engine was dead, the call never left stage 0, and
+# the user's discovery questions (written correctly into the PITCH goal)
+# never reached a single prompt. These rules derive the machine-readable
+# wiring FROM what the user already provided. Every rule fills empty fields
+# only, is idempotent, and emits a note.
+#
+# PLACEMENT IS LOAD-BEARING: called ONLY from the create_agent handler.
+# _normalize_definition re-runs over EXISTING agents' change subtrees on
+# every copilot edit — enrichment there would silently rewire the live
+# pramukh_agent (which exactly matches the all-empty precondition).
+
+from backend.app.voice.stage_roles import LEGACY_STAGE_ROLES  # noqa: E402
+
+_ENRICH_ROLE_TURNS = {"greeting": 2, "confirm_person": 2, "discovery": 6,
+                      "pitch": 4, "recommend": 4, "scheduling": 6,
+                      "confirmation": 3}
+
+# Names whose <1ms regex capture is keyed on the UNTYPED legacy dispatch —
+# stamping a type on them silently downgrades capture to LLM-only.
+_LEGACY_SLOT_NAMES = {"name", "location", "bhk", "configuration",
+                      "property_type", "budget", "timeline", "loan_required",
+                      "purpose", "occupation"}
+
+_ROLE_HINTS = [
+    ("confirm_person", re.compile(
+        r"right person|correct person|speaking (with|to)|owner|"
+        r"confirm.{0,24}(person|identity)|am i talking", re.I)),
+    ("greeting", re.compile(
+        r"introduce|good time|good moment|is (it|this) a good", re.I)),
+    # 'delivery particulars' is data capture, NOT appointment scheduling —
+    # a scheduling role wrongly revives the calendar band for the flow.
+    ("scheduling", re.compile(
+        r"schedul|book (a |an )?(visit|slot|appointment|time)|appointment|"
+        r"time slot|call.?back", re.I)),
+    ("recommend", re.compile(
+        r"recommend|offer|match|suggest|sample", re.I)),
+    ("closing", re.compile(
+        r"thank(s| them| you).{0,40}(end|close)|politely end|"
+        r"goodbye|wrap(s|ping)? up", re.I)),
+]
+
+
+def _slot_identity_tokens(slot: dict) -> set[str]:
+    """Words that identify a slot in prose: its name, label and question
+    wording (>=4-char words; 3 for name parts)."""
+    toks: set[str] = set()
+    name = str(slot.get("name") or "").replace("_", " ").lower()
+    toks.update(w for w in name.split() if len(w) >= 3)
+    toks.update(w for w in re.findall(
+        r"\w+", str(slot.get("label") or "").lower()) if len(w) >= 4)
+    q = slot.get("question") or {}
+    if isinstance(q, dict):
+        for v in q.values():
+            toks.update(w for w in re.findall(r"\w+", str(v).lower())
+                        if len(w) >= 4)
+    return toks
+
+
+def _enrich_new_agent(d: dict, notes: list[str]) -> None:
+    """CREATE-ONLY: derive stage wiring (collect / advance_when / role /
+    pacing), qa signals, defer_line and slot types from the user's own
+    content. Fills-empty-only; a second application is a no-op."""
+    cf = d.get("call_flow") or {}
+    stages = cf.get("stages") if isinstance(cf, dict) else None
+    if not isinstance(stages, list) or not stages:
+        return
+    stages = [s for s in stages if isinstance(s, dict)]
+    slots = [s for s in (d.get("slots") or []) if isinstance(s, dict)]
+    turns_default = {s["id"]: s["turns_until_advance"]
+                     for s in (_DEFAULT_STAGES + _DEFAULT_OUTBOUND_STAGES)}
+    last_idx = len(stages) - 1
+
+    # 1. COLLECT — assign each required slot to the stage whose goal mentions
+    # it. Conservative: only when NO stage is already wired (a partially
+    # wired flow is a deliberate design the platform must not second-guess).
+    if slots and not any(s.get("collect") for s in stages):
+        assignments: dict[int, list[str]] = {}
+        match_counts: dict[int, int] = {}
+        unmatched: list[str] = []
+        for slot in slots:
+            if not slot.get("required", False):
+                continue
+            sname = str(slot.get("name") or "")
+            if not sname:
+                continue
+            toks = _slot_identity_tokens(slot)
+            best_i, best_score = -1, 0
+            for i, st in enumerate(stages):
+                goal_words = set(re.findall(
+                    r"\w+", str(st.get("goal") or "").lower()))
+                score = len(toks & goal_words)
+                if score > best_score:
+                    best_i, best_score = i, score
+            if best_i >= 0:
+                assignments.setdefault(best_i, []).append(sname)
+                match_counts[best_i] = match_counts.get(best_i, 0) + best_score
+            else:
+                unmatched.append(sname)
+        if unmatched:
+            # Fall back to the stage that already matched the most slots,
+            # else the first mid-flow stage.
+            if match_counts:
+                tgt = max(match_counts, key=lambda i: match_counts[i])
+            else:
+                tgt = next((i for i in range(len(stages))
+                            if 0 < i < last_idx), 0)
+            assignments.setdefault(tgt, []).extend(unmatched)
+        for i, names in assignments.items():
+            stages[i]["collect"] = names
+            notes.append(
+                f"wired slots {', '.join(names)} into stage "
+                f"{stages[i].get('id', i)} (its goal asks for them)")
+
+    # 2. ROLE — only for custom ids (legacy ids already derive correctly)
+    # with no explicit role. Position first, then goal-text hints, then
+    # collect ⇒ discovery.
+    for i, st in enumerate(stages):
+        sid = str(st.get("id") or "")
+        if st.get("role") or sid.upper() in LEGACY_STAGE_ROLES:
+            continue
+        text = f"{sid.replace('_', ' ')} {st.get('goal') or ''}"
+        role = ""
+        if i == last_idx:
+            role = "closing"
+        else:
+            for cand, pat in _ROLE_HINTS:
+                if pat.search(text):
+                    role = cand
+                    break
+            if not role and st.get("collect"):
+                role = "discovery"
+        if role:
+            st["role"] = role
+            notes.append(f"stage {sid or i}: derived role '{role}'")
+
+    # 3. ADVANCE_WHEN — a stage that collects slots exits when they're
+    # filled (with a time escape so a shy caller can't strand it); an
+    # outbound confirm-person stage exits on the caller's yes.
+    direction = str(d.get("call_direction") or "").lower()
+    for st in stages[:-1] if len(stages) > 1 else []:
+        if st.get("advance_when"):
+            continue
+        if st.get("collect"):
+            st["advance_when"] = {"all_collect_filled": True, "max_turns": 6}
+            notes.append(
+                f"stage {st.get('id')}: advances when its slots are filled "
+                "(6-turn escape)")
+        elif (st.get("role") == "confirm_person" and direction == "outbound"):
+            st["advance_when"] = {"intent": "affirmation",
+                                  "min_turns": 1, "max_turns": 3}
+            notes.append(
+                f"stage {st.get('id')}: advances on the caller's yes "
+                "(3-turn escape)")
+
+    # 4. PACING — only values still equal to the normalizer's injected
+    # default for that id are rewritable (an explicit different number is
+    # user/LLM pacing and stands). Never touches the last stage.
+    for i, st in enumerate(stages):
+        if i == last_idx:
+            continue
+        sid = str(st.get("id") or "")
+        injected = turns_default.get(sid, 8)
+        cur = st.get("turns_until_advance")
+        if cur != injected:
+            continue
+        role = st.get("role") or LEGACY_STAGE_ROLES.get(sid.upper(), "")
+        new = _ENRICH_ROLE_TURNS.get(role, 4 if injected == 8 else injected)
+        if role == "discovery":
+            new = max(4, len(st.get("collect") or []) + 2)
+        if new != cur:
+            st["turns_until_advance"] = new
+            notes.append(
+                f"stage {sid or i}: pacing {cur}→{new} turns "
+                "(conversational pace for its role)")
+
+    # 5. QA FIELD SIGNALS — no-re-ask protection for the user's own slots.
+    kb = d.setdefault("knowledge_base", {})
+    if isinstance(kb, dict) and slots:
+        signals = kb.setdefault("qa_field_signals", {})
+        if isinstance(signals, dict):
+            for slot in slots:
+                sname = str(slot.get("name") or "")
+                if not sname or sname in signals:
+                    continue
+                sig = [sname.replace("_", " ")]
+                label = str(slot.get("label") or "").strip()
+                if label and label.lower() not in [s.lower() for s in sig]:
+                    sig.append(label)
+                signals[sname] = sig
+
+    # 6. PRICING DEFER LINE — the user's scripted rates answer becomes the
+    # deflection line the FIRM RULES render (their words, not the generic
+    # 'the team will share exact pricing').
+    pricing = kb.get("pricing_policy") if isinstance(kb, dict) else None
+    if (isinstance(pricing, dict) and pricing.get("mode") == "defer"
+            and not pricing.get("defer_line")):
+        playbook = ((d.get("response_bank") or {}).get("objection_playbook")
+                    or [])
+        _rates = re.compile(r"rate|price|pricing|expensive|cost|mehng", re.I)
+        for o in playbook:
+            if not isinstance(o, dict):
+                continue
+            hay = " ".join([str(o.get("id") or "")]
+                           + [str(p) for p in (o.get("patterns") or [])])
+            answer = o.get("answer") or {}
+            if _rates.search(hay) and isinstance(answer, dict) and answer:
+                default_lang = ((d.get("languages") or {}).get("default")
+                                or "en")
+                line = str(answer.get(default_lang) or answer.get("en")
+                           or next(iter(answer.values()), "")).strip()
+                if line:
+                    pricing["defer_line"] = {default_lang: line}
+                    notes.append(
+                        "pricing defer line set from your scripted rates "
+                        "answer")
+                break
+
+    # 7. SLOT TYPES — explicit contract; number-shaped slots gain the <1ms
+    # regex capture. Legacy-named slots stay untyped (typing them kills
+    # their name-keyed extractor).
+    _qty = re.compile(r"quantity|qty|count|volume|number_of|how_many", re.I)
+    for slot in slots:
+        sname = str(slot.get("name") or "")
+        if not sname or sname.lower() in _LEGACY_SLOT_NAMES:
+            continue
+        if str(slot.get("type") or ""):
+            continue
+        slot["type"] = "number" if _qty.search(sname) else "text"
+
+
+def _quality_warnings(merged: dict,
+                      include_wiring_lints: bool = True) -> list[str]:
     """Deterministic depth check on the FINAL definition. The runtime only
     speaks as richly as these fields are written — a one-line stage goal or an
     empty knowledge paragraph makes a shallow call no matter how good the chat
     was. Returned in the tool result so the copilot enriches thin content in
-    the SAME turn instead of reporting a hollow agent as done."""
+    the SAME turn instead of reporting a hollow agent as done.
+
+    include_wiring_lints: the F12 stage-wiring lints are emitted for
+    CREATE/VALIDATE only — on update results they would nag every edit of a
+    pre-enricher agent (e.g. the live pramukh_agent) and the copilot's
+    same-turn self-repair would push unrequested pacing edits onto a
+    production agent."""
     w: list[str] = []
     direction = str(merged.get("call_direction") or "inbound").strip().lower()
 
@@ -1629,6 +2226,81 @@ def _quality_warnings(merged: dict) -> list[str]:
                 f"contain placeholder text that would be SPOKEN LITERALLY on a call: {', '.join(bad_fields)}. "
                 "Rewrite them without placeholders (or move the personalization into the greeting)."
             )
+
+    # ── F12: stage-wiring lints ──────────────────────────────────────────────
+    # Suppressed for pure-legacy flows (every id in LEGACY_STAGE_ROLES):
+    # legacy pacing is intentional, and warnings surface on UPDATE results
+    # too — an LLM 'fixing' production Pramukh pacing from a nag is a real
+    # failure mode.
+    _all_legacy = bool(stages) and all(
+        str(s.get("id") or "").upper() in LEGACY_STAGE_ROLES
+        for s in stages if isinstance(s, dict))
+    if stages and not _all_legacy and include_wiring_lints:
+        slot_names = {str(s.get("name") or "") for s in
+                      (merged.get("slots") or []) if isinstance(s, dict)
+                      and s.get("required")}
+        slot_names.discard("")
+        collected = {str(n) for s in stages if isinstance(s, dict)
+                     for n in (s.get("collect") or [])}
+        orphaned = sorted(slot_names - collected)
+        if orphaned:
+            w.append(
+                "Required slots collected by NO stage: "
+                f"{', '.join(orphaned)}. The agent is never forced to ask "
+                "for them — add them to the collect list of the stage whose "
+                "goal asks those questions."
+            )
+        _exempt_roles = ("scheduling", "confirmation", "closing")
+        slow = [
+            str(s.get("id") or f"#{i}") for i, s in enumerate(stages[:-1])
+            if isinstance(s, dict)
+            and str(s.get("id") or "").upper() not in LEGACY_STAGE_ROLES
+            and (s.get("role") or "") not in _exempt_roles
+            and 8 <= int(s.get("turns_until_advance") or 0) < 99
+            and not (s.get("advance_when") or {})
+        ]
+        if slow:
+            w.append(
+                "These stages need 8+ caller turns to advance and have no "
+                f"advance_when condition: {', '.join(slow)}. At conversational "
+                "pace one such stage consumes an entire call — set "
+                "advance_when (all_collect_filled / intent + max_turns) or "
+                "turns_until_advance 2-4."
+            )
+        unstoppable = [
+            str(s.get("id") or f"#{i}") for i, s in enumerate(stages)
+            if isinstance(s, dict)
+            and any(k in (s.get("advance_when") or {})
+                    for k in ("intent", "slots", "all_collect_filled"))
+            and not (s.get("advance_when") or {}).get("max_turns")
+        ]
+        if unstoppable:
+            w.append(
+                "These stages' advance_when has no max_turns escape: "
+                f"{', '.join(unstoppable)}. A condition that never fires "
+                "strands the call in that stage forever — add max_turns."
+            )
+
+    # Playbook language coverage: the deterministic matcher is a literal
+    # substring test, so patterns/answers missing the DEFAULT language can
+    # never fire on real calls in that language.
+    _default_lang = str(((merged.get("languages") or {}).get("default"))
+                        or "en")
+    _playbook = ((merged.get("response_bank") or {}).get("objection_playbook")
+                 or [])
+    _uncovered = [
+        str(o.get("id") or "?") for o in _playbook
+        if isinstance(o, dict)
+        and isinstance(o.get("answer"), dict) and o.get("answer")
+        and not str(o["answer"].get(_default_lang) or "").strip()
+    ]
+    if _uncovered and _default_lang != "en":
+        w.append(
+            f"Objection answers missing the agent's default language "
+            f"({_default_lang}): {', '.join(_uncovered)}. Add "
+            f"{_default_lang} versions so the scripted answers can be "
+            "spoken on real calls."
+        )
     return w
 
 
@@ -1758,10 +2430,13 @@ TOOLS: list[dict] = [
             "description": (
                 "Record interview answers into the new-agent DRAFT (server-side, survives any "
                 "context length). Call this IMMEDIATELY whenever the user gives information for "
-                "a new agent — mine info dumps completely. Pass the same partial-definition "
-                "shape as create_agent. Returns which topics are still open and the next "
-                "question to ask. Set source='proposal' when recording defaults YOU proposed "
-                "and the user accepted."
+                "a new agent — mine info dumps completely, recording their wording VERBATIM. "
+                "Pass the same partial-definition shape as create_agent. Returns which topics "
+                "are still open and the next question to ask. Set source='proposal' when "
+                "recording defaults YOU proposed and the user accepted. The server ranks every "
+                "value: content the user actually said outranks copy you wrote, so a write that "
+                "would overwrite their wording is dropped and reported in notes. Write your own "
+                "copy only for topics the user has not spoken on."
             ),
             "parameters": {
                 "type": "object",
@@ -1825,6 +2500,32 @@ TOOLS: list[dict] = [
                     "ops": {"type": "array", "items": {"type": "object"},
                             "description": "surgical ops: [{op: set|append|remove_at|move, path, value?, to?}]"},
                     "reason": {"type": "string", "description": "one-line reason for the change"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "enrich_agent",
+            "description": ("Repair an EXISTING agent built before the "
+                            "platform's stage-wiring enrichment: derives "
+                            "collect/advance_when/role/pacing from its own "
+                            "goals and slots, plus the modern defaults "
+                            "(neutral rules pack, strict knowledge grounding, "
+                            "filler caps) — fills empty fields ONLY, never "
+                            "overwrites anything authored. ALWAYS run as a "
+                            "dry-run first and show the user the diff; pass "
+                            "confirm=true only after they approve."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "agent slug"},
+                    "confirm": {"type": "boolean",
+                                "description": "true ONLY after the user has "
+                                               "seen and approved the dry-run "
+                                               "diff"},
                 },
                 "required": ["name"],
             },
@@ -2031,6 +2732,344 @@ TOOLS: list[dict] = [
 ]
 
 
+_EDIT_TOOLS = {"get_agent", "update_agent", "update_stage", "add_stage",
+               "remove_stage", "reorder_stages", "update_slot", "add_slot",
+               "remove_slot", "replace_mentions", "activate_agent",
+               "rollback_agent", "get_revisions"}
+
+
+def _should_mine_dump(session: dict, message: str, attachments: list) -> bool:
+    """A big paste is auto-mined unless this session is clearly editing an
+    existing agent: the agent is already built from this interview, or any
+    edit tool has been used. Attachments take the ingest_document path."""
+    if len(message) < _MINE_DUMP_MIN_CHARS or attachments:
+        return False
+    iv = _interview_state(session)
+    if iv.get("phase") == "built":
+        return False
+    for m in session.get("messages") or []:
+        for tc in m.get("tool_calls") or []:
+            if ((tc.get("function") or {}).get("name")) in _EDIT_TOOLS:
+                return False
+    return True
+
+
+def _extracted_fields_to_changes(fields: dict) -> dict:
+    """Map the document-extractor's flat field names to draft paths (the same
+    shape update_draft expects). Full interview coverage — a document or
+    pasted dump that scripts objections, the call flow, closings, persona,
+    languages, or slots must close those topics, not get re-asked."""
+    ch: dict = {}
+    _id_map = ("agent_name", "company_name", "company_tagline",
+               "role_description", "contact")
+    for k in _id_map:
+        if fields.get(k):
+            ch.setdefault("identity", {})[k] = fields[k]
+    kb_map = ("portfolio_prompt_text", "known_projects", "locations",
+              "objection_patterns", "catalog", "match_rules", "pricing_policy")
+    for k in kb_map:
+        if fields.get(k):
+            ch.setdefault("knowledge_base", {})[k] = fields[k]
+    rb_map = ("opening_greeting", "objection_playbook", "objection_responses",
+              "closing_responses")
+    for k in rb_map:
+        if fields.get(k):
+            ch.setdefault("response_bank", {})[k] = fields[k]
+    if fields.get("call_direction"):
+        ch["call_direction"] = fields["call_direction"]
+    if fields.get("call_goal"):
+        ch.setdefault("call_flow", {})["call_goal"] = fields["call_goal"]
+    if isinstance(fields.get("stages"), list) and fields["stages"]:
+        ch.setdefault("call_flow", {})["stages"] = fields["stages"]
+    for k in ("personality", "languages"):
+        if isinstance(fields.get(k), dict) and fields[k]:
+            ch[k] = fields[k]
+    if isinstance(fields.get("slots"), list) and fields["slots"]:
+        ch["slots"] = fields["slots"]
+    for k in ("extra_always_rules", "extra_never_rules"):
+        if fields.get(k):
+            ch.setdefault("llm_config", {})[k] = fields[k]
+    for k in ("brand", "guardrails"):
+        if isinstance(fields.get(k), dict):
+            ch[k] = fields[k]
+    if fields.get("appointment_slots"):
+        ch.setdefault("calendar", {})["mock_slots"] = fields["appointment_slots"]
+    # F11: logistics-group routes — extracted policies used to have no home
+    # and were silently dropped (Kaapd: WhatsApp catalogue promise, Tuesday
+    # callback doctrine, Mon-Sat dispatch window, scripted English opener).
+    if isinstance(fields.get("scheduling"), dict) and fields["scheduling"]:
+        ch.setdefault("call_flow", {})["scheduling"] = fields["scheduling"]
+    if isinstance(fields.get("callback_policy"), dict) and fields["callback_policy"]:
+        cb = dict(fields["callback_policy"])
+        # An extracted-but-disabled policy is dead at conversation.py's
+        # enabled gate — extraction means the document wants it.
+        cb.setdefault("enabled", True)
+        ch.setdefault("call_flow", {})["callback_policy"] = cb
+    if isinstance(fields.get("whatsapp_promise"), dict) and fields["whatsapp_promise"]:
+        wp = dict(fields["whatsapp_promise"])
+        wp.setdefault("enabled", True)
+        ch.setdefault("follow_up", {})["whatsapp_promise"] = wp
+    if isinstance(fields.get("opening_greeting_by_language"), dict) \
+            and fields["opening_greeting_by_language"]:
+        ch.setdefault("outbound", {})["opening_greeting"] = \
+            fields["opening_greeting_by_language"]
+    return ch
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Input-priority regime: the USER's words outrank the model's authorship.
+#
+# Every draft leaf carries a provenance rank. A write may only land if it
+# ranks >= what already sits at that path, so the model can fill gaps with
+# its own copy (its "free power") but can NEVER overwrite something the user
+# actually said. The rank is SERVER-VERIFIED, not taken on trust: the model
+# declaring source='user' does not make it so — spoken content must trace
+# back to the user's own text (typed or in a document they supplied).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PROV_RANK = {"authored": 0, "proposal": 1, "derived": 2, "confirmed": 3}
+_VERIFY_MIN_CHARS = 25      # below this a string is structural (enum/flag/name)
+_TRACE_NGRAM = 3            # phrase length: what invention cannot fake
+_TRACE_MIN_OVERLAP = 0.35   # share of a value's phrases that must be the user's
+
+
+def _norm_words(text: str) -> list[str]:
+    return re.findall(r"\w+", str(text).lower(), flags=re.UNICODE)
+
+
+def _ngrams(words: list[str], n: int = _TRACE_NGRAM) -> set[str]:
+    return {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+
+def _user_corpus(session: dict) -> set[str]:
+    """The USER's own phrases this session — their typed messages plus the
+    text of any document they supplied. Phrases (not loose words): against a
+    long brief nearly every common word appears somewhere, so word-overlap
+    would wave through invented copy built from ordinary vocabulary (the
+    'I understand you are busy…' lines of the Kaapd incident). A sentence the
+    user never wrote does not share their PHRASING."""
+    words: set[str] = set()
+    phrases: set[str] = set()
+    for m in session.get("messages") or []:
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            w = _norm_words(m["content"])
+            words.update(w)
+            phrases.update(_ngrams(w))
+    iv = session.get("interview") or {}
+    for text in iv.get("input_texts") or []:
+        w = _norm_words(text)
+        words.update(w)
+        phrases.update(_ngrams(w))
+    # One set: phrases plus \x00-tagged single words for the short-value path.
+    return phrases | {f"\x00{w}" for w in words}
+
+
+def _traces_to_user(value: str, corpus: set[str]) -> bool:
+    """Does this spoken content come from the user's own words? Phrase-level
+    evidence: the model legitimately reflows, trims and reorders what the
+    user wrote (many phrases survive), but it cannot conjure the user's
+    phrasing out of nothing."""
+    words = _norm_words(value)
+    if not words:
+        return True
+    if len(words) < _TRACE_NGRAM:
+        return all(f"\x00{w}" in corpus for w in words)
+    grams = _ngrams(words)
+    hits = sum(1 for g in grams if g in corpus)
+    return (hits / len(grams)) >= _TRACE_MIN_OVERLAP
+
+
+def _long_strings(value) -> list[str]:
+    """Every sentence-length string anywhere inside a value — including the
+    goals buried in call_flow.stages[] and the answers inside
+    objection_playbook[].answer, which is where invented copy hides."""
+    out: list[str] = []
+    if isinstance(value, str):
+        if len(value.strip()) >= _VERIFY_MIN_CHARS:
+            out.append(value)
+    elif isinstance(value, dict):
+        for v in value.values():
+            out.extend(_long_strings(v))
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            out.extend(_long_strings(v))
+    return out
+
+
+def _verified_rank(value, corpus: set[str], claimed: str) -> str:
+    """Rank one leaf. Short scalars are structure (enums, flags, names, langs)
+    and keep the claimed rank — the risk is invented CONTENT, the sentences a
+    real caller would hear. Those must trace to the user or they are the
+    model's own authorship, whatever it claims. Half tracing is enough: the
+    model legitimately translates and trims what the user gave."""
+    longs = _long_strings(value)
+    if not longs:
+        return claimed
+    traced = sum(1 for s in longs if _traces_to_user(s, corpus))
+    return claimed if traced >= max(1, len(longs) // 2) else "authored"
+
+
+def _rank_changes(changes: dict, corpus: set[str], claimed: str) -> dict[str, str]:
+    """path -> verified rank name, for every leaf of a changes tree.
+
+    Fails OPEN: with no user text to check against there is no evidence of
+    invention, so nothing is downgraded. Verification may only demote content
+    it can positively see the user never wrote."""
+    out: dict[str, str] = {}
+    if not corpus:
+        return {p: claimed for p in _paths_of_changes(changes)}
+
+    def _walk(node: dict, prefix: str) -> None:
+        for k, v in (node or {}).items():
+            p = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict) and v:
+                _walk(v, p)
+            else:
+                out[p] = _verified_rank(v, corpus, claimed)
+    _walk(changes, "")
+    return out
+
+
+def _get_path(tree: dict, path: str):
+    node = tree
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _pop_path(tree: dict, path: str) -> None:
+    parts = path.split(".")
+    node = tree
+    for part in parts[:-1]:
+        node = node.get(part) if isinstance(node, dict) else None
+        if node is None:
+            return
+    if isinstance(node, dict):
+        node.pop(parts[-1], None)
+
+
+def _strip_outranked(changes: dict, draft: dict, provenance: dict,
+                     incoming: dict[str, str], notes: list[str],
+                     note_prefix: str = "kept your own input over") -> list[str]:
+    """THE enforcement point: drop every incoming leaf that would overwrite a
+    higher-ranked value already in the draft. Returns the dropped paths."""
+    dropped: list[str] = []
+    for path, in_rank in sorted(incoming.items()):
+        existing = _get_path(draft, path)
+        if existing in (None, "", [], {}):
+            continue                      # a gap — anyone may fill it
+        held = (provenance or {}).get(path)
+        if held is None:
+            continue                      # unprovenanced (defaults) — replaceable
+        if _PROV_RANK.get(in_rank, 0) < _PROV_RANK.get(held, 0):
+            _pop_path(changes, path)
+            dropped.append(path)
+    if dropped:
+        notes.append(f"{note_prefix} new copy for: " + ", ".join(dropped[:8])
+                     + (f" (+{len(dropped) - 8} more)" if len(dropped) > 8 else ""))
+    return dropped
+
+
+def _strip_confirmed_paths(changes: dict, provenance: dict, notes: list[str]) -> None:
+    """Derived (document/dump) data must never overwrite what the user
+    confirmed in the interview — drop those leaves in place."""
+    dropped = []
+    for path in [p for p, v in (provenance or {}).items() if v == "confirmed"]:
+        parts = path.split(".")
+        node = changes
+        for p in parts[:-1]:
+            node = node.get(p) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, dict) and parts[-1] in node:
+            node.pop(parts[-1])
+            dropped.append(path)
+    if dropped:
+        notes.append("kept your confirmed answers over the document for: "
+                     + ", ".join(sorted(dropped)[:8]))
+
+
+def _merge_extracted_into_draft(session: dict, fields: dict) -> tuple[dict, list[str], dict, list[str]]:
+    """Shared by ingest_document and the pasted-dump auto-miner: map extracted
+    fields to draft paths, apply protection rules, merge, record provenance.
+    Returns (draft_changes, notes, progress, layers_closed)."""
+    notes: list[str] = []
+    iv = _interview_state(session)
+    before = interview_progress(iv["draft"], iv["skipped"])
+    done_before = {l["id"] for l in before["layers"] if l["done"] or l["skipped"]}
+    draft_changes = _extracted_fields_to_changes(fields)
+    # F11 backstop (LLM-proof): a document that yielded known_projects but no
+    # catalog still produces catalog items — the ONE knowledge field the
+    # prompt renderer actually shows the LLM (known_projects is never
+    # rendered; Kaapd shipped catalog:[] and the model improvised sarees).
+    # DRAFT-ONLY: never applied to existing agents; only when catalog is
+    # empty in both the extraction and the draft.
+    _kb_ch = draft_changes.get("knowledge_base") or {}
+    _draft_kb = (iv["draft"].get("knowledge_base")
+                 if isinstance(iv["draft"].get("knowledge_base"), dict)
+                 else {}) or {}
+    if (isinstance(_kb_ch.get("known_projects"), dict)
+            and _kb_ch["known_projects"]
+            and not _kb_ch.get("catalog")
+            and not _draft_kb.get("catalog")):
+        _synth = []
+        for key, val in _kb_ch["known_projects"].items():
+            canonical = (str(val[0]) if isinstance(val, (list, tuple)) and val
+                         else str(key).title())
+            loc = (str(val[1]) if isinstance(val, (list, tuple))
+                   and len(val) > 1 and str(val[1]) != "Standard" else "")
+            item = {"id": re.sub(r"[^a-z0-9]+", "-", str(key).lower()).strip("-"),
+                    "name": canonical, "aliases": [str(key)]}
+            if loc:
+                item["location"] = loc
+            _synth.append(item)
+        if _synth:
+            draft_changes.setdefault("knowledge_base", {})["catalog"] = _synth
+            notes.append(
+                f"catalog synthesized from the document's product families "
+                f"({len(_synth)} item(s)) — names only, nothing invented")
+    _strip_confirmed_paths(draft_changes, iv.get("provenance") or {}, notes)
+    # A document never replaces a call flow the interview already built.
+    cur_stages = ((iv["draft"].get("call_flow") or {}).get("stages")
+                  if isinstance(iv["draft"].get("call_flow"), dict) else None) or []
+    new_cf = draft_changes.get("call_flow")
+    if isinstance(new_cf, dict) and "stages" in new_cf and len(cur_stages) >= 2:
+        new_cf.pop("stages")
+        notes.append("kept the existing call flow — the extracted stages were "
+                     "not applied (edit stages explicitly to change the flow)")
+    _normalize_definition(draft_changes, notes)
+    def _drop_empty(node: dict) -> None:
+        # extractors emit hollow shells like {"en": [], "hi": []} — prune
+        # empty lists AND dicts so they never land in the draft
+        for k in list(node.keys()):
+            v = node[k]
+            if isinstance(v, dict):
+                _drop_empty(v)
+            if isinstance(v, (dict, list)) and not v:
+                node.pop(k)
+    _drop_empty(draft_changes)
+    # Input priority: document content is the USER's input (rank 'derived'),
+    # so it beats anything the model authored on its own, but never beats
+    # what the user typed directly ('confirmed', stripped above).
+    ranks = {p: "derived" for p in _paths_of_changes(draft_changes)}
+    _strip_outranked(draft_changes, iv["draft"], iv.get("provenance") or {},
+                     ranks, notes,
+                     note_prefix="kept your typed answers over the document's")
+    _drop_empty(draft_changes)
+    _deep_merge(iv["draft"], draft_changes)
+    for p in sorted(_paths_of_changes(draft_changes)):
+        prev = iv["provenance"].get(p)
+        if _PROV_RANK.get("derived", 2) >= _PROV_RANK.get(prev, -1):
+            iv["provenance"][p] = "derived"
+    iv["phase"] = "interviewing"
+    progress = interview_progress(iv["draft"], iv["skipped"])
+    layers_closed = [l["title"] for l in progress["layers"]
+                     if (l["done"] or l["skipped"]) and l["id"] not in done_before]
+    return draft_changes, notes, progress, layers_closed
+
+
 async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tuple[Any, str, bool, bool]:
     """Run one tool. Returns (result, summary, ok, mutated_agents).
 
@@ -2109,42 +3148,234 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         _normalize_definition(definition, notes)
         if not _SLUG_RE.match(name):
             raise ValueError("slug must be lowercase letters/digits with _ or - (2-61 chars)")
-        target_dir = _AGENTS_DIR / name
-        if target_dir.exists():
-            raise ValueError(f"Agent '{name}' already exists — use update_agent to edit it")
-        _existing_owner = builder._slug_owner(name)
-        if _existing_owner and _existing_owner != owner and not builder._ctx_is_admin():
-            raise ValueError(f"Agent '{name}' already exists")
+        # One create yields a PAIR: <base>-inbound and <base>-outbound. The two
+        # directions need different prompts, and binding a number now asks for
+        # an agent per direction — so both must exist from the start.
+        _family = builder.agent_family(name)
+        _twins = {d: builder.twin_slug(_family, d) for d in builder.DIRECTIONS}
+        for _slug in _twins.values():
+            if (_AGENTS_DIR / _slug).exists():
+                raise ValueError(f"Agent '{_slug}' already exists — use update_agent to edit it")
+            _existing_owner = builder._slug_owner(_slug)
+            if _existing_owner and _existing_owner != owner and not builder._ctx_is_admin():
+                raise ValueError(f"Agent '{_slug}' already exists")
         # v2: create CONSUMES the draft — everything captured during the
         # interview lands in the YAML even if the final tool call is thin and
         # the chat history was trimmed (fixes the 48-message context loss).
         _draft = copy.deepcopy(_iv.get("draft") or {})
         _draft.pop("_ingested_docs", None)
-        merged = _default_definition(name, _deep_merge(copy.deepcopy(_draft), definition))
-        _normalize_definition(_deep_merge(merged, _draft))
+        # The interview draft is AUTHORITATIVE over the model's definition
+        # argument. Incident 2026-07-15 (pramukh_agent): the fallback model
+        # passed a self-authored definition (fabricated projects, brand facts,
+        # phone numbers, call_direction=inbound) and the old merge order let
+        # it clobber every confirmed interview answer. Sections the interview
+        # touched are stripped from the definition entirely; elsewhere the
+        # definition only fills gaps, with the draft merged last.
+        _prov_sections = {p.split(".")[0] for p in (_iv.get("provenance") or {})}
+        _overridden = sorted(k for k in list(definition.keys()) if k in _prov_sections)
+        for k in _overridden:
+            definition.pop(k)
+        if _overridden:
+            notes.append(
+                "definition sections already answered in the interview were "
+                "ignored in favor of the draft: " + ", ".join(_overridden))
+        merged = _default_definition(name, _deep_merge(copy.deepcopy(definition), copy.deepcopy(_draft)))
         _normalize_definition(_deep_merge(merged, definition))
+        _normalize_definition(_deep_merge(merged, _draft))
         _enforce_invariants(merged, notes)
+        _enrich_new_agent(merged, notes)
+        # F9: create COERCES an invalid max_tokens (the update path REJECTS —
+        # checks not mutations there; here nothing exists yet to protect).
+        _lc = merged.get("llm_config")
+        if isinstance(_lc, dict) and "max_tokens" in _lc:
+            try:
+                _mt = int(_lc["max_tokens"])
+            except (TypeError, ValueError):
+                _mt = -1
+            if not (80 <= _mt <= 512):
+                notes.append(f"llm_config.max_tokens {_lc['max_tokens']!r} "
+                             "was invalid — set to 160")
+                _lc["max_tokens"] = 160
+            else:
+                _lc["max_tokens"] = _mt
         agent = AgentDefinition.from_dict(merged)          # validate before any write
-        target_dir.mkdir(parents=True, exist_ok=True)
-        agent.to_yaml(target_dir / "agent.yaml")
-        agent_registry.put(name, agent)
+        # F7 (Incident B): render every prompt surface the way a live call
+        # would — a definition that would crash or misrender live is refused
+        # HERE, with the failing field family named, instead of degrading
+        # three real calls to "Sorry, could you repeat that?".
+        _bc_mode = os.environ.get("ENGINE_BOOT_CHECK", "strict").lower()
+        if _bc_mode != "off":
+            _bc = await asyncio.to_thread(engine_boot_check, agent)
+            if _bc["errors"]:
+                raise ValueError(
+                    "Engine check failed — this agent would crash on a live "
+                    "call: " + "; ".join(_bc["errors"][:5])
+                    + ". Fix the offending fields and retry create_agent.")
+            notes.extend(f"engine check: {w}" for w in _bc["warnings"])
+        # The interviewed direction is the one the user gets dropped into; the
+        # counterpart is the same definition with call_direction flipped, ready
+        # to be tailored. The boot check above already renders both directions.
+        _primary_dir = str(merged.get("call_direction") or "inbound")
+        if _primary_dir not in builder.DIRECTIONS:
+            _primary_dir = "inbound"
+        import shutil as _sh
+        _created: list[str] = []
+        _agents = {}
         try:
-            builder._claim_slug(name, owner, agent.identity.agent_name)
+            for _d, _slug in _twins.items():
+                _spec = {**merged, "call_direction": _d}
+                _adef = agent if _d == _primary_dir else AgentDefinition.from_dict(_spec)
+                _dir = _AGENTS_DIR / _slug
+                _dir.mkdir(parents=True, exist_ok=True)
+                if _d != _primary_dir:
+                    _adef.call_direction = _d
+                _adef.to_yaml(_dir / "agent.yaml")
+                agent_registry.put(_slug, _adef)
+                _agents[_d] = _adef
+                _created.append(_slug)
+                builder._claim_slug(_slug, owner, _adef.identity.agent_name)
         except Exception as exc:
             if not builder._ctx_is_admin():
-                import shutil as _sh
-                _sh.rmtree(target_dir, ignore_errors=True)
-                agent_registry.invalidate(name)
-                raise ValueError(f"could not register ownership: {exc}")
-        logger.info("[copilot] created agent '%s' owner=%s (%d input repairs)", name, owner, len(notes))
+                # Half a pair is worse than none — a number could bind to the
+                # survivor and run wrong-direction prompts.
+                for _slug in _created:
+                    _sh.rmtree(_AGENTS_DIR / _slug, ignore_errors=True)
+                    agent_registry.invalidate(_slug)
+                raise ValueError(f"could not create the agent pair: {exc}")
+        name = _twins[_primary_dir]
+        agent = _agents.get(_primary_dir, agent)
+        logger.info("[copilot] created agent pair '%s' (%s + %s) owner=%s (%d input repairs)",
+                    _family, _twins["inbound"], _twins["outbound"], owner, len(notes))
         _iv["phase"] = "built"
+        _iv["built_slug"] = name
         res = {
             "status": "created", "name": name, "agent_id": agent.agent_id,
+            "family": _family, "twins": _twins,
             "notes": notes, "quality": _quality_warnings(merged),
             "provenance_confirmed": sum(1 for v in (_iv.get("provenance") or {}).values()
                                         if v == "confirmed"),
         }
         return res, f"Created {agent.identity.agent_name or name}", True, True
+
+    if tool == "enrich_agent":
+        name = str(args["name"]).strip()
+        confirm = bool(args.get("confirm"))
+        if name in ("pramukh", "pramukh_agent"):
+            raise ValueError(
+                "Refused: this is a golden-pinned production agent — its "
+                "pacing and rules are intentional. Use normal update_agent "
+                "edits the user asks for, never bulk enrichment.")
+        current, base_rev = _read_full_definition(name)
+        candidate = copy.deepcopy(current)
+        notes: list[str] = []
+        _enrich_new_agent(candidate, notes)
+        # Real-estate-looking agents keep the real-estate pack — the pack
+        # switch is only for the industry-mismatch class (fabric agent
+        # carrying site-visit rules).
+        _kb = candidate.get("knowledge_base") or {}
+        _kb_text = " ".join([
+            str(_kb.get("portfolio_prompt_text") or ""),
+            str(_kb.get("portfolio_section_label") or ""),
+            " ".join((_kb.get("qa_field_signals") or {}).keys()
+                     if isinstance(_kb.get("qa_field_signals"), dict) else []),
+        ]).lower()
+        _looks_re = any(m in _kb_text for m in
+                        ("bhk", "real estate", "property", "site visit",
+                         "project portfolio"))
+        # NOTE: _read_full_definition returns the CANONICAL form — schema
+        # defaults are materialized as explicit keys — so every check below
+        # compares against the old-default VALUE, never key absence.
+        gr = candidate.setdefault("guardrails", {})
+        if isinstance(gr, dict):
+            if (str(gr.get("builtin_rules_pack") or "real_estate")
+                    == "real_estate" and not _looks_re):
+                gr["builtin_rules_pack"] = "generic"
+                notes.append("industry-neutral conversation rules (this "
+                             "agent was carrying the built-in real-estate "
+                             "rule pack)")
+            honesty = gr.setdefault("honesty", {})
+            if isinstance(honesty, dict) and \
+                    not str(honesty.get("knowledge_grounding") or ""):
+                honesty["knowledge_grounding"] = "strict"
+                notes.append("strict knowledge grounding — the agent will "
+                             "deflect instead of inventing products/prices")
+        lc = candidate.setdefault("llm_config", {})
+        if isinstance(lc, dict):
+            if lc.get("filler_timeout_s") == 0.6:  # the old skeleton literal
+                lc["filler_timeout_s"] = 1.2
+                notes.append("filler timeout 0.6s→1.2s (0.6 sat below the "
+                             "live model's first-word latency — a filler "
+                             "played on every turn)")
+            if not lc.get("filler_min_gap_turns"):
+                lc["filler_min_gap_turns"] = 2
+            if not lc.get("filler_max_per_call"):
+                lc["filler_max_per_call"] = 3
+            if not lc.get("filler_ack_extended"):
+                lc["filler_ack_extended"] = True
+        langs = candidate.setdefault("languages", {})
+        if isinstance(langs, dict) and \
+                not str(langs.get("closing_language_policy") or ""):
+            langs["closing_language_policy"] = "dominant"
+            notes.append("closing line follows the call's dominant language")
+        if isinstance(_kb, dict) and _kb.get("objection_patterns") \
+                and str(_kb.get("objection_patterns_mode")
+                        or "replace") == "replace":
+            _kb["objection_patterns_mode"] = "extend"
+            notes.append("custom objection phrases now EXTEND the universal "
+                         "set instead of replacing it")
+        # Empty catalog + populated known_projects: synthesize the catalog
+        # items the prompt renderer actually shows (names only — nothing
+        # invented; same backstop the document-ingest path applies).
+        if isinstance(_kb, dict) and not _kb.get("catalog") \
+                and isinstance(_kb.get("known_projects"), dict) \
+                and _kb["known_projects"]:
+            _synth = []
+            for key, val in _kb["known_projects"].items():
+                canonical = (str(val[0]) if isinstance(val, (list, tuple))
+                             and val else str(key).title())
+                loc = (str(val[1]) if isinstance(val, (list, tuple))
+                       and len(val) > 1 and str(val[1]) != "Standard" else "")
+                item = {"id": re.sub(r"[^a-z0-9]+", "-",
+                                     str(key).lower()).strip("-"),
+                        "name": canonical, "aliases": [str(key)]}
+                if loc:
+                    item["location"] = loc
+                _synth.append(item)
+            _kb["catalog"] = _synth
+            notes.append(f"catalog built from its product families "
+                         f"({len(_synth)} item(s)) — names only, nothing "
+                         "invented")
+        diff = [d for d in _compute_diff(current, candidate)
+                if d["path"] not in ("revision", "updated_at", "updated_by")]
+        if not diff:
+            return ({"status": "no_changes", "name": name},
+                    f"{_agent_display_name(name)} already has full wiring — "
+                    "nothing to repair", True, False)
+        # The repaired candidate must itself pass the engine boot-check.
+        _bc = await asyncio.to_thread(
+            engine_boot_check, AgentDefinition.from_dict(candidate))
+        if _bc["errors"]:
+            raise ValueError("Enrichment produced a definition that fails "
+                             "the engine check (not applied): "
+                             + "; ".join(_bc["errors"][:3]))
+        if not confirm:
+            return ({"status": "dry_run", "name": name,
+                     "diff": _render_diff(diff), "notes": notes,
+                     "changes": len(diff)},
+                    f"Repair preview for {_agent_display_name(name)} — "
+                    f"{len(diff)} change(s), nothing applied yet", True, False)
+        result = agent_store.write_agent(
+            name, candidate, actor=_copilot_actor(), base_rev=base_rev,
+            reason="enrich_agent: stage wiring + modern defaults repair",
+            owner=builder._ctx_owner(), is_admin=builder._ctx_is_admin(),
+            agents_dir=_AGENTS_DIR)
+        logger.info("[copilot] enriched agent '%s' rev=%s (%d changes)",
+                    name, result["revision"], len(diff))
+        return ({"status": "enriched", "name": name,
+                 "diff": _render_diff(diff), "notes": notes,
+                 "revision": result["revision"], "effective": "next_call"},
+                f"Repaired {_agent_display_name(name)} — "
+                f"{len(diff)} change(s), effective next call", True, True)
 
     if tool == "update_agent":
         name = str(args["name"]).strip()
@@ -2178,6 +3409,26 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         if violations:
             raise ValueError("Refused — this change would break the agent: "
                              + "; ".join(violations))
+        # F7: engine boot-check on the merged result. Default 'warn' for
+        # UPDATE (one burn-in cycle — a legacy agent with a pre-existing
+        # latent crash must not be edit-locked); flip to strict via env.
+        _bc_mode = os.environ.get(
+            "ENGINE_BOOT_CHECK_UPDATE",
+            os.environ.get("ENGINE_BOOT_CHECK", "warn")).lower()
+        if _bc_mode != "off":
+            try:
+                _bc = await asyncio.to_thread(
+                    engine_boot_check, AgentDefinition.from_dict(merged))
+            except Exception as exc:  # from_dict itself failing IS the signal
+                _bc = {"errors": [f"definition no longer parses: {exc}"],
+                       "warnings": []}
+            if _bc["errors"]:
+                _msg = ("Engine check failed — this update would crash live "
+                        "calls: " + "; ".join(_bc["errors"][:5]))
+                if _bc_mode == "strict":
+                    raise ValueError(_msg)
+                logger.error("[copilot] %s (warn mode — write allowed)", _msg)
+                notes.append("ENGINE CHECK (advisory): " + _msg)
         expected = _paths_of_changes(changes)
         result = agent_store.write_agent(
             name, merged, actor=_copilot_actor(), base_rev=base_rev,
@@ -2188,7 +3439,8 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                     name, ", ".join(changes.keys()), result["revision"])
         res = {
             "status": "updated", "name": name, "changed_sections": sorted(changes.keys()),
-            "notes": notes, "quality": _quality_warnings(merged),
+            "notes": notes,
+            "quality": _quality_warnings(merged, include_wiring_lints=False),
             "revision": result["revision"], "effective": "next_call",
         }
         return res, f"Updated {_agent_display_name(name)} — {_friendly_sections(sorted(changes.keys()))}", True, True
@@ -2277,25 +3529,131 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         if session is None:
             raise ValueError("no session for the draft")
         iv = _interview_state(session)
+        if iv.get("phase") == "built":
+            # Post-create, the draft is dead: writes here changed NOTHING on
+            # the live agent while reporting "Noted" (incident 2026-07-15:
+            # the user's 'make it outbound' and 'voice shubh' requests were
+            # swallowed by the dead draft after pramukh_agent was created).
+            _slug = str(iv.get("built_slug") or "").strip()
+            _target = f"'{_slug}'" if _slug else "the created agent"
+            raise ValueError(
+                f"The agent {_target} was ALREADY CREATED from this interview — "
+                "the draft is no longer live, and editing it changes NOTHING on "
+                "the real agent. Apply the user's change NOW with "
+                f"update_agent(name={_target}, changes={{...}}) — or "
+                "update_stage/add_stage/remove_stage/reorder_stages/update_slot "
+                "for stage and slot edits. Do not tell the user it was updated "
+                "until one of THOSE tools succeeds. To build a different agent, "
+                "start a new chat.")
         changes = _coerce_obj(args.get("changes") or {})
-        source = "derived" if str(args.get("source") or "") == "proposal" else "confirmed"
+        # The model's claim is only a HINT — _rank_changes verifies spoken
+        # content against the user's own words before it earns 'confirmed'.
+        claimed = "proposal" if str(args.get("source") or "") == "proposal" else "confirmed"
         notes: list[str] = []
         _normalize_definition(changes, notes)
-        for k in [k for k, v in changes.items() if isinstance(v, dict) and not v]:
-            changes.pop(k)
+
+        # Prune emptied branches RECURSIVELY: when normalization strips all
+        # content out of a nested field (e.g. closing_responses sent in an
+        # unusable shape), the write must not report that path as recorded —
+        # an empty leaf left in place produced a lying success and an
+        # interview topic that never completed (incident 2026-07-15).
+        def _drop_empty_dicts(node: dict) -> None:
+            for k in list(node.keys()):
+                v = node[k]
+                if isinstance(v, dict):
+                    _drop_empty_dicts(v)
+                    if not v:
+                        node.pop(k)
+        _drop_empty_dicts(changes)
+        # Destructive-replace guard: lists merge by whole replacement, so a
+        # model that misfiles an objections answer under call_flow.stages
+        # would silently wipe a built flow (incident 2026-07-15: an 8-stage
+        # flow replaced by one 'pushback_handling' stage, three turns in a
+        # row). A shrink to stages the draft has never seen is refused with a
+        # repairable error; growing, same-size rewrites, and trims to a
+        # subset of the existing stage ids still pass.
+        new_stages = (changes.get("call_flow") or {}).get("stages") \
+            if isinstance(changes.get("call_flow"), dict) else None
+        if isinstance(new_stages, list):
+            cur_cf = iv["draft"].get("call_flow")
+            old_stages = (cur_cf.get("stages") if isinstance(cur_cf, dict) else None) or []
+            old_ids = [str(s.get("id") or "") for s in old_stages if isinstance(s, dict)]
+            new_ids = sorted({str(s.get("id") or "")
+                              for s in new_stages if isinstance(s, dict)})
+            if (len(old_ids) >= 2 and len(new_stages) < len(old_ids)
+                    and not set(new_ids).issubset(set(old_ids))):
+                raise ValueError(
+                    "REFUSED — call_flow.stages is replaced WHOLE, and this update "
+                    f"would delete the existing {len(old_ids)}-stage flow "
+                    f"({', '.join(old_ids)}) leaving only: {', '.join(new_ids)}. "
+                    "Nothing was changed. If you are recording objections or "
+                    "pushback answers, they belong in "
+                    "response_bank.objection_playbook (list of {id, patterns: "
+                    "[caller phrasings], answer: {lang: str}}) or "
+                    "response_bank.objection_responses ({lang: [str]}) — retry "
+                    "update_draft NOW with those paths and do NOT touch "
+                    "call_flow. To genuinely restructure the flow, resend the "
+                    "FULL stages list including every existing stage you keep.")
+        if not changes:
+            # F2: a machine-repairable failure. The LLM must fix its field
+            # paths and retry — the USER's answer was never the problem.
+            progress = interview_progress(iv["draft"], iv["skipped"])
+            layer_line = ""
+            if progress["next_layer_id"]:
+                layer = next(l for l in INTERVIEW_LAYERS
+                             if l.id == progress["next_layer_id"])
+                layer_line = (f" The CURRENT topic ({layer.title}) records under: "
+                              + ", ".join(layer.spec_paths) + ".")
+            raise ValueError(
+                "Nothing was recorded — the field names didn't match real settings. "
+                + " ".join(notes) + layer_line
+                + " Retry update_draft NOW with the corrected paths. The user's "
+                "answer was fine — do NOT ask them to rephrase and do NOT tell "
+                "them a setting doesn't exist.")
+        # ── input priority ──────────────────────────────────────────────
+        # Rank every leaf against the user's actual words, then refuse any
+        # leaf that would overwrite something better-sourced. The model may
+        # fill gaps freely; it may not rewrite the user (incident
+        # 2026-07-15: invented objection_responses on a topic the brief
+        # had already scripted).
+        ranks = _rank_changes(changes, _user_corpus(session), claimed)
+        _strip_outranked(changes, iv["draft"], iv.get("provenance") or {},
+                         ranks, notes,
+                         note_prefix="kept the wording you gave over new")
+        _drop_empty_dicts(changes)
         if not changes:
             raise ValueError(
-                "None of that mapped to real settings — nothing was recorded. " + " ".join(notes))
+                "Nothing was recorded: every field in that call would have "
+                "overwritten wording the USER already gave, with copy they "
+                "did not. Their input stands. Do NOT retry the same content — "
+                "either move on to the next open topic, or, if the user just "
+                "asked for a change in their latest message, quote THEIR words "
+                "in the new value.")
+        authored = sorted(p for p, r in ranks.items()
+                          if r == "authored" and p in _paths_of_changes(changes))
+        if authored:
+            notes.append(
+                "recorded as YOUR draft copy (the user has not said this): "
+                + ", ".join(authored[:8])
+                + ". If the user gave wording for it, re-record theirs verbatim.")
         _deep_merge(iv["draft"], changes)
         iv["phase"] = "interviewing"
         for p in sorted(_paths_of_changes(changes)):
-            iv["provenance"][p] = source
+            # the VERIFIED rank, never the model's claim
+            iv["provenance"][p] = ranks.get(p, claimed)
         progress = interview_progress(iv["draft"], iv["skipped"])
         # Quality moves PRE-create: warn on the merged preview now, so thin
         # content is challenged during the interview, not after the write.
         preview = _default_definition("draft_preview", copy.deepcopy(iv["draft"]))
         _deep_merge(preview, copy.deepcopy(iv["draft"]))
         preview.pop("_ingested_docs", None)
+        # Preview through the same create-time enrichment so the lints match
+        # what create_agent will actually produce (throwaway dict — the draft
+        # itself is never mutated here).
+        try:
+            _enrich_new_agent(preview, [])
+        except Exception:  # enrichment must never break a draft update
+            logger.exception("[copilot] preview enrichment failed")
         quality = _quality_warnings(preview)
         res = {
             "status": "draft_updated",
@@ -2348,64 +3706,53 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         doc_id = str(args.get("doc_id") or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9_\-.]{1,120}", doc_id):
             raise ValueError("invalid doc_id")
-        doc_path = _UPLOADS_DIR / sid / doc_id
-        if not doc_path.exists():
-            raise ValueError(f"No uploaded document '{doc_id}' on this conversation")
-        from backend.app.documents.extractor import extract_text
-        content = doc_path.read_bytes()
-        extracted = extract_text(content, doc_id)
-        if not extracted.strip():
-            raise ValueError("No text could be extracted from this document")
+        # Extracted text persists in the session, so re-ingesting (e.g. when a
+        # chat is continued days later) is instant and never re-runs OCR.
+        _doc_store = session.setdefault("documents", {})
+        cached = _doc_store.get(doc_id) or {}
+        extracted = str(cached.get("text") or "")
+        if not extracted:
+            doc_path = _find_uploaded_doc(sid, doc_id, guard.get("owner"))
+            if doc_path is None:
+                raise ValueError(f"No uploaded document '{doc_id}' on this conversation")
+            from backend.app.documents.extractor import extract_text
+            content = doc_path.read_bytes()
+            # extract may hit Gemini OCR (network, up to ~2 min) — keep the
+            # event loop free.
+            extracted = await asyncio.to_thread(extract_text, content, doc_id)
+            if not extracted.strip():
+                raise ValueError("No text could be extracted from this document")
+            _doc_store[doc_id] = {"text": extracted[:400_000],
+                                  "chars": len(extracted),
+                                  "ingested_at": _now_iso()}
+            _save_session(sid)
         from backend.app.documents.yaml_filler import extract_fields_from_text
+        # The document's text IS user input — register it in the corpus so
+        # content traced to it ranks above the model's own authorship.
+        _interview_state(session).setdefault("input_texts", []).append(extracted)
         result = extract_fields_from_text(extracted)
         if result.get("status") != "ok":
             raise ValueError(result.get("error") or "extraction failed")
         fields = result.get("fields") or {}
-        # Field-name → draft-path mapping (same shape update_draft expects).
-        draft_changes: dict = {}
-        _id_map = {"agent_name": "agent_name", "company_name": "company_name",
-                   "company_tagline": "company_tagline",
-                   "role_description": "role_description", "contact": "contact"}
-        for src_key, id_key in _id_map.items():
-            if fields.get(src_key):
-                draft_changes.setdefault("identity", {})[id_key] = fields[src_key]
-        kb_map = ("portfolio_prompt_text", "known_projects", "locations",
-                  "objection_patterns", "catalog", "match_rules", "pricing_policy")
-        for k in kb_map:
-            if fields.get(k):
-                draft_changes.setdefault("knowledge_base", {})[k] = fields[k]
-        if fields.get("opening_greeting"):
-            draft_changes.setdefault("response_bank", {})["opening_greeting"] = fields["opening_greeting"]
-        if fields.get("call_direction"):
-            draft_changes["call_direction"] = fields["call_direction"]
-        for k in ("extra_always_rules", "extra_never_rules"):
-            if fields.get(k):
-                draft_changes.setdefault("llm_config", {})[k] = fields[k]
-        for k in ("brand", "guardrails"):
-            if isinstance(fields.get(k), dict):
-                draft_changes[k] = fields[k]
-        if fields.get("appointment_slots"):
-            draft_changes.setdefault("calendar", {})["mock_slots"] = fields["appointment_slots"]
-        notes: list[str] = []
-        _normalize_definition(draft_changes, notes)
+        draft_changes, notes, progress, layers_closed = \
+            _merge_extracted_into_draft(session, fields)
         iv = _interview_state(session)
-        _deep_merge(iv["draft"], draft_changes)
         docs = iv["draft"].setdefault("_ingested_docs", [])
         if doc_id not in docs:
             docs.append(doc_id)
-        for p in sorted(_paths_of_changes(draft_changes)):
-            iv["provenance"][p] = "derived"
-        iv["phase"] = "interviewing"
-        progress = interview_progress(iv["draft"], iv["skipped"])
         res = {
             "status": "ingested", "doc_id": doc_id,
             "extracted_fields": sorted(k for k in fields if fields.get(k)),
+            "recorded_paths": sorted(_paths_of_changes(draft_changes)),
+            "topics_closed": layers_closed,
             "missing": result.get("missing") or [],
             "notes": notes,
             "open_layers": progress["open_layers"],
             "next_question": progress["next_question"],
         }
-        return res, f"Read the document and pulled {len(fields)} field(s) into the draft", True, False
+        closed_txt = (" — closed: " + ", ".join(layers_closed)) if layers_closed else ""
+        return (res, f"Read the document and pulled {len(fields)} field(s) "
+                     f"into the draft{closed_txt}", True, False)
 
     # ── v2 surgical edit engine (plan §5.3/§5.5) ─────────────────────────────
 
@@ -2648,11 +3995,12 @@ def _system_prompt(session: dict | None = None) -> str:
     return f"""You are the LesCall Agent Copilot — an expert voice-agent designer built into the LesCall dashboard. LesCall runs real-time AI phone agents for Indian businesses (Sarvam STT/TTS + an LLM). An agent is a YAML definition: identity, personality, languages (hi/en/gu), TTS voice, a staged call flow with branching, a knowledge base + product catalog, data-capture slots, canned responses, guardrails, and calendar slots. Inbound calls are answered by the agent bound to the dialed number (currently: {active}).
 
 HOW YOU WORK
-1. NEW AGENT — the interview is a MACHINE, not a vibe. The moment the user wants a new agent, start recording EVERY fact they give with update_draft (mine info dumps completely — never let information sit only in chat). An INTERVIEW STATE block appears below when a draft exists: it is the server's truth about which topics are done and the ONE next question to ask — follow it. Ask ONE short question per reply. Propose smart defaults instead of over-asking; after the business + objective are known, PROPOSE a tailored slot set, stage skeleton, and likely objections for that business type and record accepted proposals with update_draft(source='proposal'). Voices — female: simran, anushka, manisha, vidya; male: shubh, abhilash, karun. create_agent is REFUSED by the server until every compulsory topic is complete or the user explicitly declined it (then call skip_layer with their exact words). When all topics close, summarize the plan in 3-5 short lines and ask "shall I build it?".
-2. Draft the copy YOURSELF, and make it DEEP — a thin agent is a failure. Every stage goal is 2-4 full sentences of concrete instructions (what to say, which talking point to use, what to accomplish before advancing) — never a 5-word label. The knowledge paragraph carries the real substance (it is injected on EVERY turn). Write real objection_responses. All copy is natural and phone-appropriate, in the agent's languages (greeting in the default language). For an outbound pitch, the mission and talking points MUST live in the stage goals and the knowledge paragraph — that is the only way they reach the live call.
-3. Call create_agent with the customized fields — always include call_direction, a real knowledge_base.portfolio_prompt_text, substantive call_flow.stages, and (for outbound) objection_responses. The platform fills the rest (calendar, fillers, timeouts, objection patterns). Slug = lowercase with underscores.
-4. RIGHT AFTER create_agent (and after any content edit): read the tool result. If it lists "quality" warnings, the agent is too shallow to run well — fix EVERY warning with update_agent in this SAME turn (richer stage goals, a fuller knowledge paragraph, real objection responses) before you say a word to the user. Only once the result comes back with no quality warnings do you tell the user it's built. Then confirm in one sentence and ASK whether to activate it (activation makes it answer REAL inbound phone calls). CRITICAL: call activate_agent ONLY after the user's explicit yes in their most recent message — never in the same turn as creation, never assumed. If they decline, that's fine — leave the current active agent alone and offer further edits.
-5. EDITS — this must be BULLETPROOF:
+1. NEW AGENT — the interview is a MACHINE, not a vibe. The moment the user wants a new agent, start recording EVERY fact they give with update_draft (mine info dumps completely — never let information sit only in chat). An INTERVIEW STATE block appears below when a draft exists: it is the server's truth about which topics are done and the ONE next question to ask — follow it. Ask ONE short question per reply. Propose smart defaults instead of over-asking; after the business + objective are known, PROPOSE a tailored slot set, stage skeleton, and likely objections for that business type and record accepted proposals with update_draft(source='proposal'). Voices — female: simran, anushka, manisha, vidya; male: shubh, abhilash, karun. create_agent is REFUSED by the server until every compulsory topic is complete or the user explicitly declined it (then call skip_layer with their exact words). When all topics close, summarize the plan in 3-5 short lines and ask "shall I build it?". Tool errors from update_draft/create_agent are YOURS to fix: correct the field paths (the error and the INTERVIEW STATE name the real ones) and retry silently — NEVER tell the user their answer "isn't a real setting" and NEVER ask them to rephrase because of a field-mapping problem.
+2. THE USER'S INPUT OUTRANKS YOU — ALWAYS. Anything they typed or put in a document is the source of truth: record it VERBATIM (their exact lines, their exact objection answers, their exact rules) and never paraphrase, "improve", translate away, or replace it with copy of your own. The server enforces this: a write that would overwrite better-sourced wording is dropped, and content you invented is flagged back to you as YOUR copy. Your own authorship is for GAPS ONLY — a topic the user has said nothing about. There, draft DEEP: stage goals of 2-4 full sentences of concrete instructions (never a 5-word label), a knowledge paragraph carrying real substance (it is injected on EVERY turn), real objection responses, natural phone-appropriate copy in the agent's languages. But when the user HAS spoken on a topic, your job is to transcribe them, not to write. NEVER invent facts (products, prices, phone numbers, brand claims, locations, policies) — a fabricated fact gets SPOKEN to real callers. If a tool result says content was recorded as YOUR draft copy and the user did give wording for it, re-record theirs verbatim in the same turn. For an outbound pitch, the mission and talking points MUST live in the stage goals and the knowledge paragraph — that is the only way they reach the live call.
+3. Get the copy into the DRAFT with update_draft BEFORE creating — create_agent builds the agent FROM THE INTERVIEW DRAFT, and the draft always wins: any definition you pass to create_agent is ignored for every topic the interview answered, and only fills topics the user explicitly skipped. NEVER invent facts (projects, prices, phone numbers, brand claims, locations) the user did not give you — a fabricated fact gets SPOKEN to real callers. Slug = lowercase with underscores.
+4. After create_agent succeeds the draft is DEAD — update_draft is refused. Every further change ("make it outbound", "change the voice", greeting edits) goes through update_agent (or the stage/slot tools) on the created agent, and you must confirm the change with THOSE tool results, never from a draft write.
+5. RIGHT AFTER create_agent (and after any content edit): read the tool result. If it lists "quality" warnings, the agent is too shallow to run well — fix EVERY warning with update_agent in this SAME turn (richer stage goals, a fuller knowledge paragraph, real objection responses) before you say a word to the user. Only once the result comes back with no quality warnings do you tell the user it's built. Then confirm in one sentence and ASK whether to activate it (activation makes it answer REAL inbound phone calls). CRITICAL: call activate_agent ONLY after the user's explicit yes in their most recent message — never in the same turn as creation, never assumed. If they decline, that's fine — leave the current active agent alone and offer further edits.
+6. EDITS — this must be BULLETPROOF:
    a. Users name agents by their spoken name ("Ananya") — pass that name as-is to tools; resolution to the right agent is automatic. If a tool says no such agent exists, tell the user plainly which agents DO exist and ask which they meant — never guess a different agent and never silently switch to the active one.
    b. Call get_agent first if you haven't read that agent THIS conversation, and re-read it before any edit you're not 100% sure about.
    c. RENAMES/SWAPS: when the user changes something that can appear in more than one place — a person (boss, owner, CEO), the company, a product, a city, a price, a phone number, or the agent's own name — you MUST use replace_mentions (find/replace across the whole agent), NOT update_agent. Example: "assistant for Mr. Ben → Mr. Umang" = replace_mentions(find="Mr. Ben", replace="Mr. Umang"). A partial edit that leaves old mentions in the greeting or responses is a FAILURE.
@@ -2668,7 +4016,7 @@ DEFINITION FIELDS you may set (all optional — deep-merged onto defaults). SHAP
 - personality: pronouns (she|he), energy (low|medium|high), tone, style, custom_instructions, traits [str], energy_mirroring (bool), ai_disclosure ("deflect"|"admit"|"admit_if_pressed"), verbosity_max_sentences (int)
 - languages MUST be an OBJECT, never a list: {{"supported": ["hi","en"], "default": "hi", "allow_code_mixing": true, "stt_forced_language": "", "tts_voices": {{"hi": {{"model":"bulbul:v3","speaker":"simran","pace":1.15}}, "en": {{...}}}}}}. tts_voices lives INSIDE languages — never at the top level.
 - call_direction: the STRING "inbound" or "outbound" — never a list. If the user wants BOTH, use "inbound" — the platform automatically applies the outbound approach whenever it places the call.
-- call_flow: {{"call_goal": "one-sentence mission", "stages": [{{id, order, goal, turns_until_advance, role, collect: [slot names], advance_when: {{all_collect_filled|slots|min_turns|intent|appointment_captured}}, branches: [{{when_intent: affirmation|negation|question, goto: STAGE_ID, max_takes, actions: [capture_phone|promise_whatsapp_media|book_visit|schedule_callback]}}]}}], "scheduling": {{offer_count, style: exact_n|flexible}}, "callback_policy": {{enabled, capture_slot, responses: {{lang: str}}, counts_as_decline}}, "completed_when": {{required_slots, require_appointment}}}}. Stage roles: greeting|confirm_person|discovery|pitch|recommend|scheduling|confirmation|closing. Write goals in ENGLISH as instructions (the agent replies in the caller's language).
+- call_flow: {{"call_goal": "one-sentence mission", "stages": [{{id, order, goal, turns_until_advance, role, collect: [slot names], advance_when: {{all_collect_filled|slots|min_turns|intent|appointment_captured, max_turns: N (time escape — the stage also advances at turn N even if the condition never fires)}}, branches: [{{when_intent: affirmation|negation|question, goto: STAGE_ID, max_takes, actions: [capture_phone|promise_whatsapp_media|book_visit|schedule_callback]}}]}}], "scheduling": {{offer_count, style: exact_n|flexible, enabled: false when the business doesn't book}}, "callback_policy": {{enabled, capture_slot, responses: {{lang: str}}, counts_as_decline}}, "completed_when": {{required_slots, require_appointment}}}}. Stage roles: greeting|confirm_person|discovery|pitch|recommend|scheduling|confirmation|closing. Write goals in ENGLISH as instructions (the agent replies in the caller's language). STAGE WIRING IS WHAT MAKES THE FLOW ACTUALLY RUN: every stage SHOULD carry role; a stage whose goal asks for slots lists them in collect and uses advance_when {{all_collect_filled: true, max_turns: 6}}; a yes/no confirmation stage gets turns_until_advance 2-3 or advance_when {{intent: affirmation, max_turns: 3}}; NEVER leave a mid-flow stage needing 8+ caller turns — one such stage consumes an entire call and the rest of your flow never plays (this is exactly how a live agent ignored its whole script). If you omit the wiring at create time the platform derives it from the goals and slots — but wiring you write explicitly always wins.
 - slots (TOP-LEVEL list — the qualification schema, the heart of data capture): [{{name, priority (lower asked first), required, label, question: {{hi/en/gu: exact wording}}, type: text|number|money|enum|boolean|phone|date|time|location, enum_values, enum_synonyms, depends_on: [slot names never asked before], merge_policy: free|correction_gated|confirm, confirm_readback: ""|verbatim|digit_groups_2 (phone in 2-digit groups), max_asks (2 recommended), reask_question: {{lang}}}}]. EVERY new agent gets slots for what it must collect, with questions in EVERY supported language.
 - knowledge_base: portfolio_prompt_text (plain-English paragraph — injected every turn), portfolio_section_label, locations, objection_patterns, known_projects {{"lowercase key": ["Canonical Name", "location or price"]}}, catalog [{{id, name, location, configurations, price_range, availability, positioning_tag, pitch_points, aliases, facts}}], match_rules [{{when: {{slot: value or "<=40L"}}, recommend: [ids], reason}}], pricing_policy {{mode: on_request|state_freely|defer, defer_line: {{lang}}}}, stt_corrections {{use_builtin_tables: false for non-real-estate agents}}
 - brand: spoken_company_name, positioning_tagline, credibility_markers [str], trust_proofs [top 2-3 — objection ammo], regions_served, contact_phone, whatsapp_number
@@ -2676,8 +4024,9 @@ DEFINITION FIELDS you may set (all optional — deep-merged onto defaults). SHAP
 - outbound (for outbound agents): identity_confirm_line/good_time_check_line/pitch/wrong_person_response/busy_response/wrong_number_close (all {{lang: str}}), wrong_number_patterns [str], opening_greeting {{lang}}
 - guardrails: never_rules [str], always_rules [str], honesty {{unknown_answer_policy, forbidden_fabrications}}, compliance {{disclaimers, consent_line, dnd_phrases (["stop calling","remove my number"] recommended for new agents), restricted_topics}}, escalation {{enabled, triggers, handoff_message: {{lang}}}}
 - follow_up: whatsapp_promise {{enabled, assets, promise_line: {{lang}}}}, callback {{enabled, default_delay_hours}}
-- calendar: {{"type": "mock", "mock_slots": [{{"day": "Tomorrow", "time": "10:00 AM"}}], day_synonyms, booking_confirmation_line: {{lang}}}}
-- post_call: outcomes [{{id, label, kind: success|progress|failure}}], success_definition {{mandatory_slots, gate_closing}}, scoring {{enabled, criteria_prompt, score_labels}}
+- calendar: {{"type": "mock", "mock_slots": [{{"day": "Tomorrow", "time": "11:00 AM"}}, {{"day": "Friday", "time": "4:30 PM"}}], day_synonyms, booking_confirmation_line: {{lang}}}}. Times must be REALISTIC and VARIED — never the same time repeated across days. Omit mock_slots entirely (or set type: "none") when the business doesn't book time slots — a phantom calendar steers the agent toward booking behaviour its flow doesn't have.
+- post_call: outcomes [{{id, label, kind: success|progress|failure}}], scoring {{enabled, criteria_prompt, score_labels}}
+- guardrails.builtin_rules_pack: "generic" (default for new agents — industry-neutral conversation rules) or "real_estate" (set this for real-estate businesses — site-visit/property-focused rules). guardrails.honesty.knowledge_grounding: "strict" (default for new agents) makes the agent deflect instead of inventing when asked about products/prices not in its knowledge — keep it unless the user explicitly wants free improvisation.
 
 THE OPENING LINE & PLACEHOLDERS (get this right — it burned a real user):
 - The first thing spoken on EVERY call is response_bank.opening_greeting, word-for-word. Stage goals are INSTRUCTIONS to the AI (always written in English), never a script. When the user talks about the greeting / the first line / "as soon as the call connects", edit opening_greeting — editing a stage goal will NOT change what plays at connect.
@@ -2690,6 +4039,7 @@ If a tool result includes non-empty "quality" warnings, the agent is too shallow
 WHEN THE USER SAYS A CHANGE "isn't in the agent" or "wasn't implemented": do not just re-word the same field. get_agent, and translate their intent into the fields the CALL actually reads — the mission/talking points belong in call_flow.stages goals AND knowledge_base.portfolio_prompt_text (both are spoken), the pitch is not "implemented" if it only sits in one thin stage goal. Enrich those, then confirm what specifically changed.
 
 TRUTHFULNESS (ABSOLUTE — violations are the worst possible failure):
+- SUMMARIES ARE READ, NEVER INVENTED: when you describe the agent's plan/objective/direction to the user ("here is a summary", "shall I build it?"), every claim must come from the CURRENT draft or tool results — its call_direction, call_flow.call_goal, stages and languages — never from generic boilerplate. Telling a user their OUTBOUND sample-kit sales agent will "handle customer inquiries" and "answer inbound calls" (a real incident) makes them doubt everything that was actually captured correctly.
 - Only claim something was created/updated/activated if a tool result in THIS turn confirms it (status created/updated/activated/replaced). A tool result with status FAILED means NOTHING happened.
 - After a FAILED result: fix the input and retry in the same turn if you can; otherwise tell the user plainly it didn't work. NEVER re-send an earlier success message after a failure.
 - Never say "it's set up" / "it's activated" / "it will now..." unless you just did it, successfully, with a tool.
@@ -2722,6 +4072,33 @@ _AGENT_READING_TOOLS = {"get_agent", "get_routing"}
 
 def _session_path(sid: str) -> Path:
     return _SESSIONS_DIR / f"{sid}.json"
+
+
+def _find_uploaded_doc(sid: str, doc_id: str, owner: str | None) -> Path | None:
+    """Locate an uploaded document for this conversation.
+
+    Primary: this session's own upload folder. Fallback: another folder of the
+    SAME owner — covers a doc attached moments before the user hit "New chat",
+    or a session id that got remapped between upload and ingest. Never serves
+    a document from a folder whose session belongs to someone else.
+    """
+    p = _UPLOADS_DIR / sid / doc_id
+    if p.exists():
+        return p
+    if not owner:
+        return None
+    try:
+        candidates = sorted(_UPLOADS_DIR.glob(f"*/{doc_id}"),
+                            key=lambda c: c.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    for cand in candidates:
+        cand_sid = cand.parent.name
+        if cand_sid != sid and _session_owner(cand_sid) == owner:
+            logger.info("[copilot] doc %s served from sibling session %s -> %s",
+                        doc_id, cand_sid, sid)
+            return cand
+    return None
 
 
 def _session_owner(sid: str) -> str | None:
@@ -2785,6 +4162,8 @@ def _load_session(sid: str) -> dict:
                 session["pending_changes"] = data["pending_changes"]
             if data.get("interview"):
                 session["interview"] = data["interview"]
+            if data.get("documents"):
+                session["documents"] = data["documents"]
             if data.get("owner"):
                 session["owner"] = data["owner"]
         except Exception as exc:  # pragma: no cover - corrupt file: start fresh
@@ -2880,6 +4259,58 @@ def _context_window(messages: list[dict]) -> list[dict]:
     return out
 
 
+_TOOLS_CHARS: int | None = None
+
+
+def _tools_chars() -> int:
+    global _TOOLS_CHARS
+    if _TOOLS_CHARS is None:
+        _TOOLS_CHARS = len(json.dumps(TOOLS))
+    return _TOOLS_CHARS
+
+
+def _approx_tokens(messages: list[dict]) -> int:
+    """Conservative request-size estimate (chars/3.5 over-counts vs Groq's
+    tokenizer, which is the safe direction). Tool schemas ride on every
+    request, so they are part of the floor."""
+    chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
+    return int((chars + _tools_chars()) / 3.5)
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(_env(name) or default)
+    except ValueError:
+        return default
+
+
+def _fit_messages(messages: list[dict], budget_tokens: int) -> list[dict]:
+    """Shrink a request to fit a model's per-minute token ceiling: compact old
+    tool results, then drop the oldest turns. The system prompt and the
+    CURRENT turn (last user message onward) are never dropped. Safe for the
+    interview: its ground truth is the server-side draft, not chat history."""
+    if _approx_tokens(messages) <= budget_tokens or len(messages) < 2:
+        return messages
+    system, tail = messages[0], [dict(m) for m in messages[1:]]
+    last_user = max((i for i, m in enumerate(tail) if m.get("role") == "user"), default=0)
+    for i in range(last_user):
+        c = tail[i].get("content") or ""
+        if tail[i].get("role") == "tool" and len(c) > 300:
+            tail[i] = {**tail[i], "content": c[:300] + " …[truncated]"}
+    while _approx_tokens([system] + tail) > budget_tokens:
+        last_user = max((i for i, m in enumerate(tail) if m.get("role") == "user"), default=0)
+        if last_user == 0:
+            break  # only the current turn left
+        tail.pop(0)
+        # never leave orphaned tool results / tool-calling assistants in front
+        while tail and (
+            tail[0].get("role") == "tool"
+            or (tail[0].get("role") == "assistant" and tail[0].get("tool_calls"))
+        ):
+            tail.pop(0)
+    return [system] + tail
+
+
 def _fallback_model_name() -> str:
     """Second Groq model used when the primary exhausts its daily token quota.
     Groq rate limits are PER MODEL, so a sibling model has its own fresh
@@ -2908,26 +4339,73 @@ def _openai_fallback() -> tuple[Any, str] | None:
     return _oai_client, model
 
 
+def _adapt_tool_calls_for_provider(messages: list[dict], cli) -> list[dict]:
+    """Gemini 3 (OpenAI-compat) requires every assistant functionCall in
+    history to carry extra_content.google.thought_signature and 400s
+    without it; other providers may reject the unknown field. Adapt a
+    COPY of the history per provider — the session store is not touched.
+    Legacy history entries (recorded before signatures were preserved)
+    get the migration placeholder Google documents for this case."""
+    is_gemini = "generativelanguage" in str(getattr(cli, "base_url", "") or "")
+    out: list[dict] = []
+    for m in messages:
+        tcs = m.get("tool_calls") if isinstance(m, dict) else None
+        if not tcs:
+            out.append(m)
+            continue
+        m2 = dict(m)
+        new_tcs = []
+        for tc in tcs:
+            tc2 = copy.deepcopy(tc)
+            if is_gemini:
+                extra = tc2.setdefault("extra_content", {})
+                if isinstance(extra, dict):
+                    goog = extra.setdefault("google", {})
+                    if isinstance(goog, dict) and not goog.get("thought_signature"):
+                        goog["thought_signature"] = "context_engineering_is_the_way_to_go"
+            else:
+                tc2.pop("extra_content", None)
+            new_tcs.append(tc2)
+        m2["tool_calls"] = new_tcs
+        out.append(m2)
+    return out
+
+
 async def _chat_completion(client, model: str, messages: list[dict]):
     """One LLM call with retries for Groq's `tool_use_failed` (the model emitted
     a malformed/truncated tool call — a known llama flakiness). On failure we
     re-ask with a corrective nudge appended; the nudge is never persisted.
-    On a 429 (daily token quota exhausted) the call walks a fallback chain:
-    sibling Groq model (separate per-model quota), then OpenAI gpt-4o-mini."""
-    from openai import BadRequestError, RateLimitError
+    On a 413/429 (request over the model's TPM ceiling / quota exhausted) the
+    call walks a fallback chain: sibling Groq model (separate per-model
+    quota), then OpenAI gpt-4o-mini. Every Groq attempt is FITTED to that
+    model's tokens-per-minute ceiling first (Groq counts input + max_tokens
+    per request, per model, per org) — a request that cannot fit is never
+    sent, so a 413 on one model can't kill the whole turn anymore."""
+    from openai import APIStatusError, BadRequestError
 
-    async def _attempt(cli, mdl: str):
+    async def _attempt(cli, mdl: str, msgs: list[dict], max_toks: int):
+        msgs = _adapt_tool_calls_for_provider(msgs, cli)
+        # Gemini models think by default and thinking tokens count against
+        # max_tokens — cap it via COPILOT_LLM_REASONING_EFFORT / LLM_REASONING_EFFORT.
+        # Gemini-only: OpenAI fallback models (gpt-4o-mini) reject the param.
+        _extra: dict = {}
+        _reff = _env("LLM_REASONING_EFFORT")
+        if _reff and mdl.startswith("gemini"):
+            _extra["reasoning_effort"] = _reff
         nudge: list[dict] = []
         last_exc: Exception | None = None
-        for _ in range(3):
+        for attempt in range(3):
             try:
                 completion = await cli.chat.completions.create(
                     model=mdl,
-                    messages=messages + nudge,
+                    messages=msgs + nudge,
                     tools=TOOLS,
                     tool_choice="auto",
-                    temperature=0.3,
-                    max_tokens=4096,
+                    # temperature 0 on retries: a malformed tool call is a
+                    # sampling flake — determinism beats creativity here.
+                    temperature=0.3 if attempt == 0 else 0.0,
+                    max_tokens=max_toks,
+                    **_extra,
                 )
                 return completion.choices[0].message
             except BadRequestError as exc:
@@ -2945,23 +4423,43 @@ async def _chat_completion(client, model: str, messages: list[dict]):
                 }]
         raise last_exc  # type: ignore[misc]
 
-    chain: list[tuple[Any, str]] = [(client, model)]
+    # (client, model, max_tokens, input budget; 0 budget = send as-is).
+    # Primary budget is HALF the TPM so a multi-iteration tool loop (2+ LLM
+    # calls per user turn, same minute, same model) still fits the ceiling.
+    primary_tpm = _int_env("LLM_TPM", 30000)
+    primary_max = _int_env("LLM_MAX_TOKENS", 3000)
+    fb_tpm = _int_env("LLM_FALLBACK_TPM", 12000)
+    fb_max = _int_env("LLM_FALLBACK_MAX_TOKENS", 2000)
+    chain: list[tuple[Any, str, int, int]] = [
+        (client, model, primary_max, max(8000, primary_tpm // 2 - primary_max - 500))]
     fallback = _fallback_model_name()
     if fallback and fallback != model:
-        chain.append((client, fallback))
+        chain.append((client, fallback, fb_max, max(7000, fb_tpm - fb_max - 500)))
     oai = _openai_fallback()
     if oai:
-        chain.append(oai)
+        chain.append((*oai, 4096, 0))
 
-    last_rate_exc: Exception | None = None
-    for i, (cli, mdl) in enumerate(chain):
+    last_chain_exc: Exception | None = None
+    for i, (cli, mdl, max_toks, budget) in enumerate(chain):
+        msgs = _fit_messages(messages, budget) if budget else messages
         try:
-            return await _attempt(cli, mdl)
-        except RateLimitError as exc:
-            last_rate_exc = exc
+            return await _attempt(cli, mdl, msgs, max_toks)
+        except APIStatusError as exc:
+            status = getattr(exc, "status_code", None)
+            # Walk the chain on: token-limit failures (413/429) AND a model
+            # that can't produce valid tool JSON after 3 nudged tries (400
+            # tool_use_failed — a per-model weakness; the next model usually
+            # emits it fine). Anything else is a real bug — raise it.
+            if status not in (413, 429) and not (
+                    status == 400 and "tool_use_failed" in str(exc)):
+                raise
+            last_chain_exc = exc
             if i + 1 < len(chain):
-                logger.warning("[copilot] %s rate-limited — retrying on fallback %s", mdl, chain[i + 1][1])
-    raise last_rate_exc  # type: ignore[misc]
+                logger.warning("[copilot] %s failed (%s%s) — retrying on fallback %s",
+                               mdl, status,
+                               " tool_use_failed" if status == 400 else "",
+                               chain[i + 1][1])
+    raise last_chain_exc  # type: ignore[misc]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3022,7 +4520,44 @@ async def copilot_chat(request: Request) -> dict:
         "session": session,
         "user_message": message,
         "sid": sid,
+        "owner": owner,
     }
+
+    # Deterministic dump mining: a large paste during an agent build is run
+    # through the SAME extractor as an attached document BEFORE the chat model
+    # sees the turn, so absorbing it never depends on the model's diligence.
+    # Fires whenever the session is not editing an existing agent — the first
+    # live test (Kaapd brief, 2026-07-15) pasted the dump as the SECOND
+    # message, before anything was recorded, and a draft-or-first-turn guard
+    # wrongly skipped it. Extraction failure degrades silently to the
+    # prompt-driven mining that exists today.
+    if _should_mine_dump(session, message, attachments):
+        try:
+            import asyncio as _asyncio
+            from backend.app.documents.yaml_filler import extract_fields_from_text
+            _res = await _asyncio.get_running_loop().run_in_executor(
+                None, extract_fields_from_text, message)
+            if _res.get("status") == "ok" and _res.get("fields"):
+                _ch, _notes, _prog, _closed = _merge_extracted_into_draft(
+                    session, _res["fields"])
+                if _ch:
+                    _closed_txt = (" Topics now closed: " + ", ".join(_closed) + ".") if _closed else ""
+                    session["messages"].append({
+                        "role": "system",
+                        "content": "[The platform already extracted the user's pasted "
+                                   "content into the draft — recorded: "
+                                   + ", ".join(sorted(_ch.keys())) + "."
+                                   + _closed_txt
+                                   + ((" Notes: " + " | ".join(_notes)) if _notes else "")
+                                   + " Do NOT re-ask about these topics and do NOT "
+                                     "re-record the same content; acknowledge what was "
+                                     "absorbed and ask only about what is still open.]"})
+                    actions.append({"tool": "mine_dump", "ok": True, "agent": "",
+                                    "summary": "Absorbed the pasted content into the draft"
+                                               + ((" — closed: " + ", ".join(_closed)) if _closed else "")})
+        except Exception:
+            logger.warning("[copilot] dump auto-mining failed (falling back to "
+                           "prompt-driven mining)", exc_info=True)
 
     try:
         for _ in range(_MAX_TOOL_ITERATIONS):
@@ -3037,6 +4572,18 @@ async def copilot_chat(request: Request) -> dict:
                 reply = (msg.content or "").strip()
                 break
 
+            def _tc_extra(tc) -> dict:
+                # Gemini (OpenAI-compat) rides its thought_signature in
+                # extra_content on the tool call — it must round-trip
+                # verbatim or the next request 400s. Other providers set
+                # nothing here and the dict stays clean.
+                extra = getattr(tc, "extra_content", None)
+                if extra is None and getattr(tc, "model_extra", None):
+                    extra = tc.model_extra.get("extra_content")
+                if hasattr(extra, "model_dump"):
+                    extra = extra.model_dump()
+                return {"extra_content": extra} if isinstance(extra, dict) else {}
+
             session["messages"].append({
                 "role": "assistant",
                 "content": msg.content or "",
@@ -3045,6 +4592,7 @@ async def copilot_chat(request: Request) -> dict:
                         "id": tc.id,
                         "type": "function",
                         "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        **_tc_extra(tc),
                     }
                     for tc in msg.tool_calls
                 ],
@@ -3141,6 +4689,20 @@ async def copilot_chat(request: Request) -> dict:
                     "agents_changed": False,
                     "session": _session_summary(sid, session),
                 }
+            # Continuity: persist the turn as an error marker so a page reload
+            # (or a container restart) still shows this chat where it left
+            # off. The LLM message history stays rolled back — a retry
+            # re-sends the message cleanly.
+            session["transcript"].append({"role": "user", "content": message})
+            session["transcript"].append({
+                "role": "assistant", "actions": [], "isError": True,
+                "content": ("⚠️ A temporary backend error interrupted this "
+                            "message — nothing was changed. Please send it again."),
+            })
+            meta = session.setdefault("meta", {})
+            meta.setdefault("created_at", _now_iso())
+            meta["updated_at"] = _now_iso()
+            _save_session(sid)
             raise HTTPException(status_code=502, detail=f"Copilot LLM error: {exc}")
 
     if not reply:
@@ -3281,9 +4843,84 @@ async def copilot_upload(request: Request) -> dict:
     dest = _UPLOADS_DIR / sid
     dest.mkdir(parents=True, exist_ok=True)
     (dest / doc_id).write_bytes(content)
+    # Claim the (possibly remapped) session for this owner NOW, so the chat
+    # turn that follows resolves to the SAME sid and ingest_document finds the
+    # file. Without this the sid stays unowned and the chat remaps it again.
+    if owner:
+        _load_session(sid).setdefault("meta", {}).setdefault("owner", owner)
+        _save_session(sid)
     logger.info("[copilot] upload %s/%s (%d bytes)", sid, doc_id, len(content))
     return {"status": "uploaded", "doc_id": doc_id, "session_id": sid,
             "note": "pass this doc_id in the chat body's `attachments` list"}
+
+
+@router.post("/api/copilot/try/{name}")
+async def copilot_try_agent(name: str, request: Request) -> dict:
+    """F17: 'Try your agent' — one text turn against a built agent using the
+    LIVE env model, exactly the engine a phone call gets. The Kaapd failures
+    (fabricated products, ignored flow, real-estate objections) were all
+    discoverable in sixty seconds of text chat; the first execution of a
+    built agent must never again be a production phone call.
+
+    Body: {"messages": [{"role": "user"|"assistant", "text": "..."}, ...]}
+    — full turn history each call; the router is rebuilt and replayed so the
+    endpoint stays stateless. Returns the reply plus the live stage/slot
+    state so the tester can SEE the flow advancing."""
+    owner = getattr(request.state, "owner", None)
+    _slug_owner = builder._slug_owner(name)
+    if _slug_owner and owner and _slug_owner != owner \
+            and not builder._ctx_is_admin():
+        raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
+    yaml_path = _AGENTS_DIR / name / "agent.yaml"
+    if not yaml_path.exists():
+        raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
+    body = await request.json()
+    msgs = [m for m in (body.get("messages") or [])
+            if isinstance(m, dict) and str(m.get("text") or "").strip()][-30:]
+    if not msgs or msgs[-1].get("role") != "user":
+        raise HTTPException(status_code=400,
+                            detail="messages must end with a user turn")
+    from backend.app.voice.conversation import ConversationRouter
+
+    def _fresh_router():
+        agent = agent_registry.get(name)
+        r = ConversationRouter(agent_def=agent,
+                               default_language=agent.languages.default)
+        r.call_direction = str(body.get("direction")
+                               or agent.call_direction or "outbound")
+        r.outbound_contact_name = str(body.get("contact_name") or "Test Caller")
+        r.outbound_contact_phone = "9999999999"
+        return r
+
+    router_obj = _fresh_router()
+    reply_parts: list[str] = []
+    try:
+        _ = await router_obj.generate_opening()
+        # Replay history: prior user turns re-drive the real state machine;
+        # prior assistant turns are injected as memory only.
+        for m in msgs[:-1]:
+            if m.get("role") == "user":
+                async for res in router_obj.process(str(m["text"])):
+                    pass
+            else:
+                router_obj.memory.add_assistant(str(m["text"]))
+        async for res in router_obj.process(str(msgs[-1]["text"])):
+            if getattr(res, "text", ""):
+                reply_parts.append(res.text)
+    except Exception as exc:
+        logger.exception("[copilot] try-agent turn failed for %s", name)
+        raise HTTPException(status_code=502,
+                            detail=f"engine turn failed: {exc}")
+    meta = agent_registry.meta(name) or {}
+    return {
+        "reply": " ".join(reply_parts).strip(),
+        "stage": router_obj.state.stage,
+        "language": router_obj.state.language,
+        "slots": {k: v for k, v in dict(router_obj.state_mgr.state).items()
+                  if v is not None},
+        "agent_revision": meta.get("revision", 0),
+        "model": router_obj._model,
+    }
 
 
 @router.get("/api/copilot/sessions")
@@ -3341,11 +4978,24 @@ async def copilot_delete_session(session_id: str) -> dict:
 
 
 @router.get("/api/copilot/sessions/{session_id}")
-async def copilot_session(session_id: str) -> dict:
+async def copilot_session(session_id: str, request: Request) -> dict:
     """Return the UI transcript for a session (page-reload restore)."""
     if not _SESSION_ID_RE.match(session_id):
         raise HTTPException(status_code=400, detail="invalid session_id")
     session = _load_session(session_id)
+    # Claim the session for the requester (the tenancy guard already ensured
+    # it's theirs or brand-new). Without this, a GET-created session sits in
+    # _SESSIONS with no owner, and the NEXT write (upload/chat) treats it as
+    # foreign and remaps to a hashed sid — which is how an uploaded document
+    # ended up in one session folder while ingest_document looked in another.
+    owner = getattr(request.state, "owner", None)
+    if owner and not session.setdefault("meta", {}).get("owner"):
+        session["meta"]["owner"] = owner
+        # Persist the claim only for sessions with real content — an empty
+        # GET-created session stays memory-only (no junk files), and the
+        # first chat turn saves it with the owner already stamped.
+        if session.get("transcript"):
+            _save_session(session_id)
     return {
         "session_id": session_id,
         "transcript": session["transcript"],

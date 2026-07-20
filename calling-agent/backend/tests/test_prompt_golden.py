@@ -28,18 +28,28 @@ from app.voice.conversation import ConversationRouter
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "golden_prompts"
 PRAMUKH_YAML = AGENTS_DIR / "pramukh" / "agent.yaml"
+PRAMUKH_AGENT_YAML = AGENTS_DIR / "pramukh_agent" / "agent.yaml"
 
 REGEN = os.environ.get("GOLDEN_REGEN", "") == "1"
 
 STAGES = ["GREETING", "DISCOVERY", "PROJECT_MATCH",
           "INVITE_VISIT", "CONFIRMATION", "CLOSING"]
+# The Copilot-built production sibling (DID-routed, takes live outbound
+# calls). It has NO other prompt protection — the load sweep alone cannot
+# catch a rendered-prompt regression, which is how an engine change could
+# alter live behaviour with CI green (2026-07-15 audit).
+PA_STAGES = ["CONFIRM_IDENTITY", "ASK_LOCATION_PREFERENCES",
+             "ASK_PROPERTY_SIZE_PREFERENCES", "ASK_BUDGET_PREFERENCES",
+             "RECOMMEND_PROPERTIES", "SUGGEST_SITE_VISIT",
+             "SCHEDULE_SITE_VISIT", "NO_SITE_VISIT", "CLOSING"]
 LANGS = ["hi", "en", "gu"]
 DIRECTIONS = ["inbound", "outbound"]
 
 
-def _make_router(stage: str, lang: str, direction: str) -> ConversationRouter:
+def _make_router(stage: str, lang: str, direction: str,
+                 yaml_path: Path = PRAMUKH_YAML) -> ConversationRouter:
     """Router over the live Pramukh YAML with a FIXED, deterministic CallState."""
-    agent = AgentDefinition.from_yaml(PRAMUKH_YAML)
+    agent = AgentDefinition.from_yaml(yaml_path)
     router = ConversationRouter(agent_def=agent, default_language=lang)
 
     # Deterministic calendar: bypass bookings.json so live bookings can never
@@ -64,8 +74,9 @@ def _make_router(stage: str, lang: str, direction: str) -> ConversationRouter:
     return router
 
 
-def _fixture_path(stage: str, lang: str, direction: str) -> Path:
-    return FIXTURE_DIR / f"pramukh__{stage}__{lang}__{direction}.txt"
+def _fixture_path(stage: str, lang: str, direction: str,
+                  slug: str = "pramukh") -> Path:
+    return FIXTURE_DIR / f"{slug}__{stage}__{lang}__{direction}.txt"
 
 
 @pytest.mark.parametrize("direction", DIRECTIONS)
@@ -86,6 +97,29 @@ def test_pramukh_prompt_golden(stage: str, lang: str, direction: str) -> None:
         f"System prompt for stage={stage} lang={lang} direction={direction} "
         f"changed. If this is DELIBERATE, regenerate with GOLDEN_REGEN=1 and "
         f"review the fixture diff."
+    )
+
+
+@pytest.mark.parametrize("direction", DIRECTIONS)
+@pytest.mark.parametrize("lang", LANGS)
+@pytest.mark.parametrize("stage", PA_STAGES)
+def test_pramukh_agent_prompt_golden(stage: str, lang: str,
+                                     direction: str) -> None:
+    router = _make_router(stage, lang, direction,
+                          yaml_path=PRAMUKH_AGENT_YAML)
+    prompt = router._build_system_prompt()
+    path = _fixture_path(stage, lang, direction, slug="pramukh_agent")
+    if REGEN or not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(prompt, encoding="utf-8")
+        if not REGEN:
+            pytest.skip(f"fixture created: {path.name} — rerun to enforce")
+        return
+    expected = path.read_text(encoding="utf-8")
+    assert prompt == expected, (
+        f"pramukh_agent prompt for stage={stage} lang={lang} "
+        f"direction={direction} changed. If DELIBERATE, regenerate with "
+        f"GOLDEN_REGEN=1 and review the fixture diff."
     )
 
 

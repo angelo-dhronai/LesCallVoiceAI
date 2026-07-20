@@ -72,7 +72,7 @@ def test_seven_step_agent_via_copilot(cop):
     from app.agent_definition.schema import AgentDefinition
     from app.voice.conversation import ConversationRouter
 
-    agent = AgentDefinition.from_yaml(agents_dir / "seven_step" / "agent.yaml")
+    agent = AgentDefinition.from_yaml(agents_dir / res2["name"] / "agent.yaml")
     assert agent.call_direction == "outbound"
     assert [s.id for s in agent.call_flow.stages][:2] == ["OPENING", "DISCOVER_LOCATION"]
 

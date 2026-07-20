@@ -12,7 +12,6 @@ type Profile = {
   phone: string
   company: string
   picture?: string
-  is_admin?: boolean
 }
 
 export default function Settings() {
@@ -71,7 +70,6 @@ export default function Settings() {
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="truncate text-[14px] font-semibold">{name || 'Your account'}</span>
-                    {data?.is_admin && <Badge tone="mint" soft>admin</Badge>}
                   </div>
                   <div className="flex min-w-0 items-center gap-1.5 text-[12px] text-dim">
                     <Mail size={12} className="shrink-0" /> <span className="truncate">{data?.email}</span>

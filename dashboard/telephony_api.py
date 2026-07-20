@@ -88,6 +88,28 @@ def _validate_agent_binding(db, slug: str, owner: str) -> None:
         raise HTTPException(status_code=403, detail="agent belongs to another tenant")
 
 
+def _warn_direction_mismatch(slug: str, want: str) -> None:
+    """Log when an agent authored for one direction is bound to the other slot.
+
+    Deliberately NOT an error: the outbound column is backfilled from the
+    inbound one, so every pre-existing number would otherwise 400 on its next
+    unrelated edit. This is the breadcrumb for 'the outbound agent behaves like
+    a receptionist' reports.
+    """
+    if not slug:
+        return
+    try:
+        import yaml
+        with open(AGENTS_DIR / slug / "agent.yaml", encoding="utf-8") as fh:
+            have = str((yaml.safe_load(fh) or {}).get("call_direction") or "inbound")
+    except Exception:
+        return
+    if have != want:
+        logger.warning("agent '%s' is authored call_direction=%s but is bound to "
+                       "the %s slot — it will use %s-shaped prompts on %s calls",
+                       slug, have, want, have, want)
+
+
 # Carrier signaling blocks are /16 or narrower in practice; anything broader
 # (or 0.0.0.0/…, loopback) would let one tenant swing the platform-global SIP
 # allow-list wide open.
@@ -281,11 +303,17 @@ async def create_number(request: Request, owner: str = Depends(current_owner)):
         raise HTTPException(status_code=400, detail="number must have at least 7 digits")
     trunk_id = body.get("trunk_id")
     slug = str(body.get("inbound_agent_slug") or "").strip()
+    # Omitting the outbound slug mirrors the inbound one, so a number registered
+    # by an older client (or the simple form) can place calls immediately.
+    out_slug = str(body.get("outbound_agent_slug") or slug).strip()
 
     with get_db() as db:
         if trunk_id is not None:
             _trunk_or_404(db, int(trunk_id), owner)  # ownership check
         _validate_agent_binding(db, slug, owner)
+        _validate_agent_binding(db, out_slug, owner)
+        _warn_direction_mismatch(slug, "inbound")
+        _warn_direction_mismatch(out_slug, "outbound")
         dup = db.execute(
             "SELECT id, owner FROM phone_numbers WHERE number=? OR sig_digits=?",
             (number, sig)).fetchone()
@@ -295,14 +323,16 @@ async def create_number(request: Request, owner: str = Depends(current_owner)):
             raise HTTPException(status_code=409, detail="number unavailable")
         row = db.execute(
             "INSERT INTO phone_numbers (number, sig_digits, trunk_id, "
-            "inbound_agent_slug, owner, direction, label) VALUES (?,?,?,?,?,?,?) "
-            "RETURNING id",
-            (number, sig, trunk_id, slug or None, owner,
+            "inbound_agent_slug, outbound_agent_slug, owner, direction, label) "
+            "VALUES (?,?,?,?,?,?,?,?) RETURNING id",
+            (number, sig, trunk_id, slug or None, out_slug or None, owner,
              str(body.get("direction") or "both"),
              str(body.get("label") or ""))).fetchone()
-    logger.info("number registered: %s -> agent=%s (owner=%s)", number, slug, owner)
+    logger.info("number registered: %s -> in=%s out=%s (owner=%s)",
+                number, slug, out_slug, owner)
     return {"id": row["id"], "number": number, "sig_digits": sig,
             "inbound_agent_slug": slug or None,
+            "outbound_agent_slug": out_slug or None,
             "note": "run POST /api/trunks/{trunk_id}/apply to generate the "
                     "FreeSWITCH dialplan for this DID"}
 
@@ -319,11 +349,14 @@ async def update_number(number_id: int, request: Request,
         if not row:
             raise HTTPException(status_code=404, detail="number not found")
         updates, params = [], []
-        if "inbound_agent_slug" in body:
-            slug = str(body.get("inbound_agent_slug") or "").strip()
-            _validate_agent_binding(db, slug, owner)
-            updates.append("inbound_agent_slug=?")
-            params.append(slug or None)
+        for field, want in (("inbound_agent_slug", "inbound"),
+                            ("outbound_agent_slug", "outbound")):
+            if field in body:
+                slug = str(body.get(field) or "").strip()
+                _validate_agent_binding(db, slug, owner)
+                _warn_direction_mismatch(slug, want)
+                updates.append(f"{field}=?")
+                params.append(slug or None)
         if "direction" in body:
             updates.append("direction=?")
             params.append(str(body["direction"]))

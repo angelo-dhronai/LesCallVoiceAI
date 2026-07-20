@@ -101,16 +101,16 @@ def _cookie_secure() -> bool:
     return OAUTH_REDIRECT_URL.startswith("https://")
 
 
-def admin_emails() -> set[str]:
-    """Platform admins: the only accounts allowed to touch the legacy
-    single-tenant surfaces (call history, contacts, runtime control, keys…)
-    until those stores are per-tenant (Part B Phase 3+)."""
-    raw = os.environ.get("LESCALL_ADMIN_EMAILS", DEFAULT_OWNER)
-    return {e.strip().lower() for e in raw.split(",") if e.strip()}
-
-
 def is_admin(email: str) -> bool:
-    return bool(email) and email.lower() in admin_emails()
+    """Roles are flattened (2026-07-15): NO account has admin status — every
+    user gets the same owner-scoped view and the same dashboard options. The
+    function is kept as the single choke point so the remaining admin-only
+    branches (legacy single-tenant endpoints, see-all-rows scopes, the
+    platform-fallback-agent controls) stay uniformly dead instead of being
+    half-removed. Legacy pre-tenancy RESOURCES (the shared Plivo trunk,
+    unowned rows) still belong to DEFAULT_OWNER — that is data ownership,
+    not a role."""
+    return False
 
 
 def allowed_emails() -> set[str]:
@@ -212,14 +212,13 @@ router = APIRouter()
 def me(request: Request):
     if not oauth_enabled():
         return {"mode": "single-tenant", "email": DEFAULT_OWNER,
-                "login_required": False, "is_admin": True}
+                "login_required": False}
     session = read_session_cookie(request.cookies.get(SESSION_COOKIE))
     if not session:
         return JSONResponse({"mode": "multi-tenant", "login_required": True}, status_code=401)
     return {"mode": "multi-tenant", "login_required": False,
             "email": session["email"], "name": session.get("name", ""),
-            "picture": session.get("picture", ""),
-            "is_admin": is_admin(session["email"])}
+            "picture": session.get("picture", "")}
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +244,6 @@ def get_profile(request: Request):
         "phone": (row["phone"] if row else "") or "",
         "company": (row["company"] if row else "") or "",
         "picture": (row["picture"] if row else "") or "",
-        "is_admin": is_admin(owner),
     }
 
 
@@ -400,12 +398,13 @@ def login_page(request: Request):
 _OPEN_PREFIXES = ("/auth/", "/login", "/static/", "/api/auth/me", "/favicon",
                   "/api/recordings/dl/")
 
-# API prefixes ordinary tenants may use — every handler under these performs
-# its own per-owner scoping. EVERYTHING ELSE under /api/ is admin-only: the
-# legacy stores (contacts, call history, recordings, runtime control, keys…)
-# are single-tenant JSON files with no owner column, so exposing them to any
-# non-admin session would leak the founding tenant's data. Deny by default:
-# a newly added legacy endpoint is automatically admin-only.
+# API prefixes tenants may use — every handler under these performs its own
+# per-owner scoping. EVERYTHING ELSE under /api/ is DENIED for every session
+# (roles are flattened; there are no admins): the legacy stores (runtime
+# control, keys, follow-up automation…) are single-tenant surfaces with no
+# owner column, so exposing them to any session would leak the founding
+# tenant's data. Deny by default: a newly added legacy endpoint is
+# automatically unreachable until it is owner-scoped and listed here.
 _TENANT_API_PREFIXES = (
     "/api/auth/",
     "/api/agents",       # owner-scoped in agent_builder_api
@@ -449,8 +448,7 @@ def install_login_gate(app) -> None:
                         return RedirectResponse("/login")
                     return JSONResponse({"detail": "login required"}, status_code=401)
                 if (path.startswith("/api/")
-                        and not any(path.startswith(p) for p in _TENANT_API_PREFIXES)
-                        and not is_admin(session.get("email", ""))):
+                        and not any(path.startswith(p) for p in _TENANT_API_PREFIXES)):
                     return JSONResponse(
-                        {"detail": "admin only"}, status_code=403)
+                        {"detail": "not available"}, status_code=403)
         return await call_next(request)

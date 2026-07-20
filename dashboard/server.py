@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import re
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -895,44 +896,60 @@ def _read_transcript(folder: str) -> list[dict]:
 # Health / service status helpers
 # ---------------------------------------------------------------------------
 
-def _check_port(port: int) -> bool:
+# Runtime services and the port each one owns. Liveness comes from the port,
+# not a PID: the runtime runs in its own container, so its PIDs are namespaced
+# (10, 11) and mean nothing here — /proc/<pid> from the API container would hit
+# an unrelated process or, worse, report a dead runtime as alive.
+RUNTIME_SERVICE_PORTS = {
+    "socket_server": 9000,      # FreeSWITCH ESL control
+    "ws_audio_receiver": 9001,  # media WebSocket + AI bridge
+}
+
+
+def _check_port(port: int, host: str = "127.0.0.1") -> bool:
+    """TCP-connect probe.
+
+    Must not shell out to `ss`: that binary is absent from the app image, so
+    the old implementation raised FileNotFoundError, swallowed it, and reported
+    every port down — pinning the dashboard to "degraded" after the 2026-07-14
+    container cutover. Every service shares the host network namespace, so a
+    loopback connect probes them accurately from inside any container.
+    """
     try:
-        result = subprocess.run(["ss", "-ltn"], capture_output=True,
-                                text=True, timeout=2)
-        return f":{port} " in result.stdout
-    except Exception:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.0)
+            return sock.connect_ex((host, port)) == 0
+    except OSError:
         return False
 
 
-def _check_pid(pid_str: str) -> bool:
+def _read_pid_file(name: str) -> str | None:
+    """Best-effort PID, for display only — never for liveness.
+
+    Only present under the legacy start_all.sh path, which writes PID files
+    beside the logs. The container entrypoint keeps them inside the runtime
+    container, so this returns None there and the UI shows a dash.
+    """
     try:
-        return os.path.exists(f"/proc/{int(pid_str.strip())}")
-    except (ValueError, TypeError):
-        return False
+        f = LOGS_LATEST / f"{name}.pid"
+        return f.read_text().strip() if f.is_file() else None
+    except OSError:
+        return None
 
 
 def _get_runtime_health() -> dict:
-    services: dict[str, dict] = {}
     run_dir = LOGS_LATEST
-    if run_dir.is_symlink() or run_dir.is_dir():
-        for pid_file in run_dir.glob("*.pid"):
-            if pid_file.stem == "call_bridge_filter":
-                continue
-            try:
-                pid_str = pid_file.read_text().strip()
-                services[pid_file.stem] = {
-                    "pid": pid_str,
-                    "running": _check_pid(pid_str),
-                }
-            except Exception:
-                services[pid_file.stem] = {"pid": "?", "running": False}
+    ports = {str(p): _check_port(p) for p in RUNTIME_SERVICE_PORTS.values()}
 
-    ports = {str(p): _check_port(p) for p in [9000, 9001]}
-    all_up = (
-        bool(services)
-        and all(s["running"] for s in services.values())
-        and all(ports.values())
-    )
+    services: dict[str, dict] = {}
+    for name, port in RUNTIME_SERVICE_PORTS.items():
+        entry: dict[str, Any] = {"running": ports[str(port)], "port": port}
+        pid = _read_pid_file(name)
+        if pid:
+            entry["pid"] = pid
+        services[name] = entry
+
+    all_up = bool(services) and all(s["running"] for s in services.values())
     return {
         "services": services,
         "ports": ports,
@@ -3556,14 +3573,16 @@ _AGENTS_DIR = LESCALL_ROOT / "calling-agent" / "agents"
 
 
 def _agent_owned_by(slug: str, owner: str) -> bool:
-    """True if `slug` exists on disk AND (owner owns it OR is admin)."""
+    """True if `slug` exists on disk AND the owner owns it. The founding
+    account also owns the legacy pre-tenancy agents that predate the agents
+    index (resource ownership, not an admin role — roles are flattened)."""
     if not slug:
         return False
     try:
         import auth
         if not (_AGENTS_DIR / slug / "agent.yaml").exists():
             return False
-        if auth.is_admin(owner):
+        if _is_founding_owner(owner):
             return True
         from shared.db.database import get_db
         with get_db() as db:
@@ -3585,19 +3604,20 @@ def _outbound_identity(owner: str) -> dict:
 
     Any missing precondition raises OutboundIdentityError with a specific
     reason — the call is REFUSED, never silently placed with someone else's
-    number, trunk, or agent. The platform admin falls back to the legacy
-    global trunk/agent so the founding operator keeps working.
+    number, trunk, or agent. The founding account falls back to its own
+    legacy global trunk/agent (pre-tenancy resources it owns) so the
+    founding operator keeps working.
 
     Returns {caller_id, gateway_name, agent_slug, number, source}.
     """
-    import auth
-    is_admin = auth.is_admin(owner)
+    is_founder = _is_founding_owner(owner)
     try:
         from shared.db.database import get_db
         with get_db() as db:
             # Every outbound-capable number the tenant registered, best first.
             rows = [dict(r) for r in db.execute(
-                "SELECT p.number, p.inbound_agent_slug, t.name AS trunk_name, "
+                "SELECT p.number, p.inbound_agent_slug, p.outbound_agent_slug, "
+                "t.name AS trunk_name, "
                 "t.config_status AS trunk_status, t.owner AS trunk_owner "
                 "FROM phone_numbers p JOIN trunks t ON t.id = p.trunk_id "
                 "WHERE p.owner=? AND (p.direction='both' OR p.direction='outbound') "
@@ -3607,7 +3627,7 @@ def _outbound_identity(owner: str) -> dict:
         rows = []
 
     if not rows:
-        if is_admin:
+        if is_founder:
             return {"caller_id": OUTBOUND_CALLER_ID, "gateway_name": ADMIN_GATEWAY_NAME,
                     "agent_slug": _active_agent_slug(), "number": OUTBOUND_CALLER_ID,
                     "source": "admin-global"}
@@ -3625,15 +3645,18 @@ def _outbound_identity(owner: str) -> dict:
     reasons: list[str] = []
     for r in rows:
         num = r["number"]
-        if r["trunk_owner"] != owner and not is_admin:
+        if r["trunk_owner"] != owner and not is_founder:
             reasons.append(f"{num}: its trunk belongs to another account")
             continue
         if r["trunk_status"] != "applied":
             reasons.append(f"{num}: press Apply on its trunk in the Telephony panel first")
             continue
-        slug = r["inbound_agent_slug"] or ""
+        # This is the OUTBOUND leg: use the number's outbound agent. An unbound
+        # outbound slot falls back to the inbound agent so a tenant who never
+        # touched the new field keeps dialing exactly as before.
+        slug = r["outbound_agent_slug"] or r["inbound_agent_slug"] or ""
         if not _agent_owned_by(slug, owner):
-            reasons.append(f"{num}: bind one of YOUR agents to this number in the Telephony panel first")
+            reasons.append(f"{num}: bind one of YOUR agents to this number's OUTBOUND slot in the Telephony panel first")
             continue
         return {
             "caller_id": re.sub(r"[^\d]", "", num),
@@ -3791,7 +3814,8 @@ async def number_test_call(number_id: int, request: Request) -> JSONResponse:
         from shared.db.database import get_db
         with get_db() as db:
             row = db.execute(
-                "SELECT p.number, p.inbound_agent_slug, t.name AS trunk_name, "
+                "SELECT p.number, p.inbound_agent_slug, p.outbound_agent_slug, "
+                "t.name AS trunk_name, "
                 "t.config_status AS trunk_status, t.owner AS trunk_owner "
                 "FROM phone_numbers p LEFT JOIN trunks t ON t.id = p.trunk_id "
                 "WHERE p.id=? AND p.owner=?", (number_id, owner)).fetchone()
@@ -3803,14 +3827,16 @@ async def number_test_call(number_id: int, request: Request) -> JSONResponse:
 
     if not row:
         return JSONResponse({"ok": False, "reason": "number not found"}, status_code=404)
-    if not row["trunk_name"] or (row["trunk_owner"] != owner and not _is_admin_owner(owner)):
+    if not row["trunk_name"] or (row["trunk_owner"] != owner and not _is_founding_owner(owner)):
         return JSONResponse({"ok": False, "reason": "attach this number to your trunk first"},
                             status_code=400)
     if row["trunk_status"] != "applied":
         return JSONResponse({"ok": False,
                              "reason": "press Apply on this number's trunk first"},
                             status_code=400)
-    slug = row["inbound_agent_slug"] or ""
+    # The test call is placed FROM this number, so it exercises the OUTBOUND
+    # binding — which is the one worth proving before a campaign runs.
+    slug = row["outbound_agent_slug"] or row["inbound_agent_slug"] or ""
     if not _agent_owned_by(slug, owner):
         return JSONResponse({"ok": False,
                              "reason": "bind one of your agents to this number first"},
@@ -3846,10 +3872,13 @@ async def number_test_call(number_id: int, request: Request) -> JSONResponse:
                                     f"now — pick up to talk to '{slug}'."})
 
 
-def _is_admin_owner(owner: str) -> bool:
+def _is_founding_owner(owner: str) -> bool:
+    """The founding account owns the legacy pre-tenancy resources (the shared
+    Plivo trunk, agents without an index row). Resource ownership only —
+    roles are flattened and no account has admin status."""
     try:
         import auth
-        return auth.is_admin(owner)
+        return bool(owner) and owner == auth.DEFAULT_OWNER
     except Exception:
         return False
 

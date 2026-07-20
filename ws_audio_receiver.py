@@ -386,6 +386,7 @@ async def handle_connection(websocket, path: str, args):
     dialed_did = ""
     campaign_id = None
     agent_slug = ""
+    _rejected_agent_slug = ""
 
     try:
 
@@ -434,16 +435,38 @@ async def handle_connection(websocket, path: str, args):
                 (c.isalnum() or c in "-_") for c in s
             ):
                 agent_slug = s
+            elif s and s != "-":
+                # LOUD routing: a present-but-invalid slug segment used to be
+                # dropped silently — the call then answered as whatever agent
+                # legacy resolution picked, with zero trace of why.
+                _rejected_agent_slug = s
 
-    except Exception:
+    except Exception as exc:
+
+        # LOUD routing: log the parse failure BEFORE zeroing everything —
+        # a malformed path silently downgrading a call to legacy agent
+        # resolution must leave a trace.
+        log.warning(
+            "[WS] path parse failed for %r: %r — routing segments cleared",
+            path,
+            exc,
+        )
 
         fs_uuid = ""
         caller_number = ""
         dialed_did = ""
         campaign_id = None
         agent_slug = ""
+        _rejected_agent_slug = ""
 
     conn_id = fs_uuid if fs_uuid else uuidlib.uuid4().hex[:8]
+
+    if _rejected_agent_slug:
+        log.warning(
+            "[%s] WS path agent slug rejected: %r",
+            conn_id,
+            _rejected_agent_slug,
+        )
 
     t0 = time.monotonic()
 

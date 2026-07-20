@@ -151,8 +151,14 @@ def test_max_asks_skip():
     r = _router()
     r.state_mgr.observe_user("Vapi")
     r.state_mgr.observe_user("2 bhk")
-    # budget now missing (deps met); asking it max_asks=2 times skips it
+    # budget now missing (deps met); asking it on max_asks=2 DISTINCT turns
+    # skips it. Asks are counted once per turn_index — prompt rebuilds within
+    # a turn used to double-count and burn the budget without the agent ever
+    # voicing a question (2026-07-15 fix).
     r.state_mgr.note_asked("budget")
+    r.state_mgr.note_asked("budget")   # same turn — must NOT count again
+    assert r.state_mgr.asked_count["budget"] == 1
+    r.state_mgr.observe_user("hmm let me think")   # next turn
     r.state_mgr.note_asked("budget")
     gaps = r.state_mgr.detect_missing_slots()
     assert "budget" in gaps["skipped"]

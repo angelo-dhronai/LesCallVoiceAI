@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Building2, Mail, PhoneCall, Save, User } from 'lucide-react'
 import { useGet, useRefresh } from '../api/hooks/useApi'
 import { put } from '../api/mutate'
-import { Badge, Button, Card, Spinner } from '../components/ui'
+import { Button, Card, Spinner } from '../components/ui'
 import { PageHeader, Field, Input, AsyncState } from '../components/kit'
+import { Avatar, AvatarFallback, AvatarImage } from '../components/ui/avatar'
 import { useToast } from '../components/Toast'
 
 type Profile = {
@@ -33,6 +34,15 @@ export default function Settings() {
     setSeeded(true)
   }, [data, seeded])
 
+  // Save stays disabled until something actually differs from the server copy —
+  // an always-enabled Save invites no-op writes and reads as "did that work?".
+  const dirty = useMemo(() => {
+    if (!data) return false
+    return name !== (data.name || '')
+      || phone !== (data.phone ? `+${data.phone}` : '')
+      || company !== (data.company || '')
+  }, [data, name, phone, company])
+
   const save = async () => {
     setSaving(true)
     try {
@@ -56,23 +66,20 @@ export default function Settings() {
 
       <div className="grid gap-4 lg:grid-cols-[minmax(0,560px)_1fr]">
         <Card className="p-5">
-          <AsyncState loading={isLoading} error={error}>
+          <AsyncState loading={isLoading} error={error} variant="text" rows={7}>
             <div className="space-y-4">
               <div className="flex items-center gap-3">
-                {data?.picture ? (
-                  <img src={data.picture} alt="" referrerPolicy="no-referrer"
-                    className="h-10 w-10 rounded-full object-cover ring-1 ring-black/5" />
-                ) : (
-                  <div className="grid h-10 w-10 place-items-center rounded-full bg-gradient-to-br from-indigo-400 to-indigo-600 text-[14px] font-bold text-white">
+                <Avatar className="h-10 w-10">
+                  {data?.picture && <AvatarImage src={data.picture} alt="" referrerPolicy="no-referrer" />}
+                  <AvatarFallback className="bg-gradient-to-br from-indigo-400 to-indigo-600 text-base font-bold text-white">
                     {(name || data?.email || 'A').trim().charAt(0).toUpperCase()}
-                  </div>
-                )}
+                  </AvatarFallback>
+                </Avatar>
                 <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate text-[14px] font-semibold">{name || 'Your account'}</span>
-                  </div>
-                  <div className="flex min-w-0 items-center gap-1.5 text-[12px] text-dim">
-                    <Mail size={12} className="shrink-0" /> <span className="truncate">{data?.email}</span>
+                  <div className="truncate text-base font-semibold">{name || 'Your account'}</div>
+                  <div className="flex min-w-0 items-center gap-1.5 text-xs text-dim">
+                    <Mail size={12} className="shrink-0" aria-hidden />
+                    <span className="truncate">{data?.email}</span>
                   </div>
                 </div>
               </div>
@@ -91,7 +98,7 @@ export default function Settings() {
                   <Input value={phone} onChange={(e) => setPhone(e.target.value)}
                     placeholder="+91 98765 43210" inputMode="tel" className="pl-9" />
                 </div>
-                <p className="mt-1 text-[11.5px] text-dim">
+                <p className="mt-1 text-xs text-dim">
                   Include the country code. Test calls from your BYON numbers ring this phone,
                   so you can hear your agent exactly as callers do.
                 </p>
@@ -106,10 +113,11 @@ export default function Settings() {
               </Field>
 
               <div className="flex items-center gap-3 pt-1">
-                <Button onClick={save} disabled={saving}>
+                <Button onClick={save} disabled={saving || !dirty}>
                   {saving ? <Spinner className="h-3.5 w-3.5" /> : <Save size={14} />}
                   {saving ? 'Saving…' : 'Save changes'}
                 </Button>
+                {dirty && !saving && <span className="text-xs text-dim">Unsaved changes</span>}
               </div>
             </div>
           </AsyncState>
@@ -117,7 +125,7 @@ export default function Settings() {
 
         <Card className="h-fit p-5">
           <div className="eyebrow mb-2">Why we ask</div>
-          <ul className="space-y-2.5 text-[13px] text-soft">
+          <ul className="space-y-2.5 text-sm text-soft">
             <li className="flex items-start gap-2">
               <PhoneCall size={14} className="mt-0.5 shrink-0 text-mint-600 dark:text-mint-300" />
               <span><span className="font-semibold">Phone</span> — the “Test call” button on your

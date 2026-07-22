@@ -541,6 +541,11 @@ class FollowUpConfig:
     whatsapp_promise: dict = field(default_factory=dict)
     # {enabled: false, default_delay_hours: 24}
     callback: dict = field(default_factory=dict)
+    # In-call vague-commitment clarification (PLAN-intelligence-layer §2.8):
+    # when the caller makes a vague promise ("call me next week"), ask exactly
+    # ONE polite clarifying question so the follow-up can be scheduled
+    # precisely. {enabled: false} — off by default; existing agents unchanged.
+    clarify_commitments: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +636,11 @@ class AgentDefinition:
     guardrails: GuardrailsConfig = field(default_factory=GuardrailsConfig)
     follow_up: FollowUpConfig = field(default_factory=FollowUpConfig)
     post_call: PostCallConfig = field(default_factory=PostCallConfig)
+    # Persistent customer memory (Customer Intelligence Hub): pre-call context
+    # injection for returning customers. {use_customer_context: true} —
+    # default ON; the INTEL_PRECALL_CONTEXT env var is the platform
+    # kill-switch. Pattern mirrors follow_up.clarify_commitments.
+    memory: dict = field(default_factory=dict)
     # Server-managed audit fields — stamped by agent_definition/store.py,
     # stripped from LLM input by the Copilot normalizer, never read by the
     # runtime.
@@ -947,6 +957,7 @@ class AgentDefinition:
         follow_up = FollowUpConfig(
             whatsapp_promise=_as_dict(fu_d, "whatsapp_promise"),
             callback=_as_dict(fu_d, "callback"),
+            clarify_commitments=_as_dict(fu_d, "clarify_commitments"),
         )
 
         pc_d = _as_dict(d, "post_call")
@@ -975,6 +986,7 @@ class AgentDefinition:
             guardrails=guardrails,
             follow_up=follow_up,
             post_call=post_call,
+            memory=_as_dict(d, "memory"),
             revision=_as_int(d, "revision", 0),
             updated_at=_as_str(d, "updated_at"),
             updated_by=_as_str(d, "updated_by"),

@@ -1,15 +1,17 @@
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Fragment, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Phone, Upload, Plus, Trash2, Play, Square, ChevronDown, RefreshCw } from 'lucide-react'
 import { post, patch, del, postForm } from '../api/mutate'
 import { useGet, useRefresh } from '../api/hooks/useApi'
 import { useToast } from '../components/Toast'
-import { Card, Badge, Button, EmptyState, SectionHead, SkeletonBlock, Spinner, cx } from '../components/ui'
+import { useConfirm } from '../components/confirm'
+import { Card, Badge, Button, EmptyState, IconButton, LiveDot, SectionHead, SkeletonBlock, Spinner, cx } from '../components/ui'
 import {
   PageHeader, Table, THead, TH, TR, TD, StatusBadge, SearchInput,
   Input, Select, Field, Segmented, AsyncState,
 } from '../components/kit'
 import { StatCard } from '../components/StatCard'
+import { useDebounced, useUrlParam } from '../lib/hooks'
 import { num } from '../lib/format'
 
 type Stats = {
@@ -88,29 +90,9 @@ const fmtDateTime = (s?: string | null): string => {
   return d.toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })
 }
 
-/** Debounce a fast-changing value (used for the search box → query key). */
-function useDebounced<T>(value: T, ms: number): T {
-  const [v, setV] = useState(value)
-  useEffect(() => {
-    const t = setTimeout(() => setV(value), ms)
-    return () => clearTimeout(t)
-  }, [value, ms])
-  return v
-}
-
-/** Green ping dot shown while a campaign is dialing. */
-function LivePulse({ className }: { className?: string }) {
-  return (
-    <span className={cx('relative flex h-2 w-2 shrink-0', className)}>
-      <span className="absolute h-full w-full animate-ping rounded-full bg-mint-400 opacity-75" />
-      <span className="relative h-2 w-2 rounded-full bg-mint-500" />
-    </span>
-  )
-}
-
 function CampaignTallies({ camp }: { camp: CampaignStatus }) {
   return (
-    <div className="flex flex-wrap gap-2 text-[12px]">
+    <div className="flex flex-wrap gap-2 text-xs">
       <Badge tone="mint">Answered {num(camp.answered)}</Badge>
       <Badge tone="amber">No answer {num(camp.no_answer)}</Badge>
       <Badge tone="amber">Busy {num(camp.busy)}</Badge>
@@ -131,6 +113,7 @@ function ProgressBar({ pct }: { pct: number }) {
 
 export default function Outbound() {
   const toast = useToast()
+  const confirm = useConfirm()
   const qc = useQueryClient()
   const refresh = useRefresh()
   const invalidate = () => {
@@ -138,10 +121,10 @@ export default function Outbound() {
     qc.invalidateQueries({ queryKey: ['outbound-stats'] })
   }
 
-  // filters
-  const [cs, setCs] = useState<string>('all')
-  const [dp, setDp] = useState<string>('all')
-  const [q, setQ] = useState('')
+  // filters — mirrored into the URL so refresh/back/share keep the view
+  const [cs, setCs] = useUrlParam('cs', 'all')
+  const [dp, setDp] = useUrlParam('dp', 'all')
+  const [q, setQ] = useUrlParam('q')
   const dq = useDebounced(q, 300)
 
   // add contacts form
@@ -230,6 +213,16 @@ export default function Outbound() {
   }
 
   async function changeDisposition(id: Contact['id'], disposition: string) {
+    // The toast system has no undo action, so writing-off a lead gets a
+    // confirm BEFORE the patch instead of an after-the-fact undo.
+    if (disposition === 'rejected') {
+      const ok = await confirm({
+        title: 'Mark as rejected?',
+        description: 'This writes the lead off — campaigns and follow-ups will skip it.',
+        confirmLabel: 'Mark rejected',
+      })
+      if (!ok) { invalidate(); return } // refetch snaps the <select> back
+    }
     try {
       await patch(`/outbound/contacts/${id}`, { disposition })
       toast('Disposition updated', 'success')
@@ -241,7 +234,12 @@ export default function Outbound() {
 
   async function callContact(c: Contact) {
     const label = c.name ? `${c.phone} (${c.name})` : c.phone
-    if (!confirm(`Place a real call to ${label} now?`)) return
+    const ok = await confirm({
+      title: 'Place call now?',
+      description: `A real call will be placed to ${label} immediately.`,
+      confirmLabel: 'Call now',
+    })
+    if (!ok) return
     setDialingId(c.id)
     try {
       const r = await post<{ status?: string }>(`/outbound/dial/${c.id}`, {})
@@ -256,7 +254,12 @@ export default function Outbound() {
 
   async function deleteContact(c: Contact) {
     const label = c.name ? `${c.phone} (${c.name})` : c.phone
-    if (!confirm(`Delete ${label}? This cannot be undone.`)) return
+    const ok = await confirm({
+      title: 'Delete contact?',
+      description: `${label} will be removed permanently. This cannot be undone.`,
+      destructive: true,
+    })
+    if (!ok) return
     setDeletingId(c.id)
     try {
       await del(`/outbound/contacts/${c.id}`)
@@ -270,8 +273,14 @@ export default function Outbound() {
   }
 
   async function clearAll() {
-    const countLabel = stats.total != null ? `ALL ${num(stats.total)}` : 'ALL'
-    if (!confirm(`Delete ${countLabel} contacts? This cannot be undone.`)) return
+    const countLabel = stats.total != null ? `all ${num(stats.total)}` : 'ALL'
+    const ok = await confirm({
+      title: 'Delete all contacts?',
+      description: `This deletes ${countLabel} contacts permanently — call history, dispositions and notes included. This cannot be undone.`,
+      destructive: true,
+      confirmLabel: 'Delete all',
+    })
+    if (!ok) return
     try {
       await del('/outbound/contacts/all')
       toast('All contacts cleared', 'success')
@@ -335,7 +344,7 @@ export default function Outbound() {
         actions={
           <>
             {campRunning && (
-              <Badge tone="mint"><LivePulse /> Campaign running</Badge>
+              <Badge tone="mint"><LiveDot /> Campaign running</Badge>
             )}
             <Button variant="ghost" onClick={() => refresh(['outbound-contacts'], ['outbound-stats'], ['campaign'])}>
               <RefreshCw size={14} /> Refresh
@@ -400,7 +409,7 @@ export default function Outbound() {
             <div id="add-contacts-panel" className="mt-5 grid gap-6 animate-fade-up lg:grid-cols-2">
               {/* manual */}
               <div className="space-y-3">
-                <div className="text-[12px] font-semibold text-dim">Add manually</div>
+                <div className="text-xs font-semibold text-dim">Add manually</div>
                 <Field label="Phone *">
                   <Input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+91…" />
                 </Field>
@@ -417,7 +426,7 @@ export default function Outbound() {
 
               {/* bulk */}
               <div className="space-y-3">
-                <div className="text-[12px] font-semibold text-dim">Bulk upload (.csv, .xlsx, .txt)</div>
+                <div className="text-xs font-semibold text-dim">Bulk upload (.csv, .xlsx, .txt)</div>
                 <label
                   onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
                   onDragLeave={() => setDragOver(false)}
@@ -434,8 +443,8 @@ export default function Outbound() {
                     dragOver && 'border-mint-400/60 bg-mint-400/5',
                   )}>
                   <Upload size={18} className="text-dim" />
-                  <span className="text-[13px] font-medium text-soft">Click to browse or drop a file</span>
-                  <span className="text-[12px] text-dim">CSV, XLSX or TXT — must include a phone column</span>
+                  <span className="text-sm font-medium text-soft">Click to browse or drop a file</span>
+                  <span className="text-xs text-dim">CSV, XLSX or TXT — must include a phone column</span>
                   <input
                     ref={fileRef}
                     type="file"
@@ -467,9 +476,9 @@ export default function Outbound() {
               </Select>
               {queued != null && (
                 queued > 0 ? (
-                  <div className="mt-1 text-[12px] text-dim tabular-nums">{num(queued)} contacts will be queued</div>
+                  <div className="mt-1 text-xs text-dim tabular-nums">{num(queued)} contacts will be queued</div>
                 ) : (
-                  <div className="mt-1 text-[12px] font-medium text-amber-600 dark:text-amber-300">No contacts match — nothing to dial</div>
+                  <div className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-300">No contacts match — nothing to dial</div>
                 )
               )}
             </div>
@@ -493,9 +502,9 @@ export default function Outbound() {
 
         {campRunning && (
           <div className="mt-5 space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[13px]">
+            <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-sm">
               <div className="flex min-w-0 items-center gap-2 text-soft">
-                <LivePulse />
+                <LiveDot />
                 <span className="truncate font-semibold text-[var(--text)]">{camp.current_name || '—'}</span>
                 {camp.current_phone && <span className="text-dim tabular-nums">{camp.current_phone}</span>}
               </div>
@@ -509,10 +518,10 @@ export default function Outbound() {
         {/* Last-run summary stays visible once the campaign ends */}
         {!campRunning && total > 0 && (
           <div className="mt-5 space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-3 text-[13px]">
+            <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
               <div className="flex items-center gap-2">
                 <span className="eyebrow">Last run</span>
-                {camp.started_at && <span className="text-[12px] text-dim">started {fmtDateTime(camp.started_at)}</span>}
+                {camp.started_at && <span className="text-xs text-dim">started {fmtDateTime(camp.started_at)}</span>}
               </div>
               <div className="tabular-nums text-dim">{completed} / {total} completed</div>
             </div>
@@ -522,7 +531,7 @@ export default function Outbound() {
         )}
 
         {camp.error && (
-          <div role="alert" className="mt-3 rounded-xl bg-rose-500/10 px-3 py-2 text-[12px] font-medium text-rose-600 ring-1 ring-rose-500/20 dark:text-rose-300">
+          <div role="alert" className="mt-3 rounded-xl bg-rose-500/10 px-3 py-2 text-xs font-medium text-rose-600 ring-1 ring-rose-500/20 dark:text-rose-300">
             {camp.error}
           </div>
         )}
@@ -537,7 +546,7 @@ export default function Outbound() {
             <SearchInput value={q} onChange={setQ} placeholder="Search phone or name…" className="w-56" />
             {searching && <Spinner className="absolute right-3 top-1/2 -translate-y-1/2" />}
           </div>
-          <span className="text-[12px] text-dim tabular-nums">{num(listTotal)} contacts</span>
+          <span className="text-xs text-dim tabular-nums">{num(listTotal)} contacts</span>
           <div className="ml-auto border-l border-[var(--border)] pl-3">
             <Button variant="danger" size="sm" onClick={clearAll}>
               <Trash2 size={14} /> Clear all{stats.total != null ? ` (${num(stats.total)})` : ''}
@@ -617,14 +626,15 @@ export default function Outbound() {
                         <TD className="tabular-nums">{num(c.call_count)}</TD>
                         <TD>
                           <div className="flex items-center justify-end gap-1.5" onClick={(e) => e.stopPropagation()}>
-                            <Button size="sm" variant="ghost" title={`Call ${c.name || c.phone || 'contact'} now`} className="min-h-[34px] min-w-[34px]"
+                            <IconButton label={`Call ${c.name || c.phone || 'contact'} now`}
                               disabled={dialingId === c.id} onClick={() => callContact(c)}>
                               {dialingId === c.id ? <Spinner /> : <Phone size={14} />}
-                            </Button>
-                            <Button size="sm" variant="danger" title={`Delete ${c.name || c.phone || 'contact'}`} className="min-h-[34px] min-w-[34px]"
+                            </IconButton>
+                            <IconButton label={`Delete ${c.name || c.phone || 'contact'}`}
+                              className="!text-rose-500 hover:!bg-rose-500/10"
                               disabled={deletingId === c.id} onClick={() => deleteContact(c)}>
                               {deletingId === c.id ? <Spinner /> : <Trash2 size={14} />}
-                            </Button>
+                            </IconButton>
                           </div>
                         </TD>
                       </TR>
@@ -635,15 +645,15 @@ export default function Outbound() {
                             <div className="grid gap-4 py-1 sm:grid-cols-2 lg:grid-cols-4">
                               <div>
                                 <div className="eyebrow mb-1">Notes</div>
-                                <div className="text-[13px] text-soft">{c.notes || '—'}</div>
+                                <div className="text-sm text-soft">{c.notes || '—'}</div>
                               </div>
                               <div>
                                 <div className="eyebrow mb-1">Call notes</div>
-                                <div className="text-[13px] text-soft">{c.call_notes || '—'}</div>
+                                <div className="text-sm text-soft">{c.call_notes || '—'}</div>
                               </div>
                               <div>
                                 <div className="eyebrow mb-1">Added</div>
-                                <div className="text-[13px] text-soft" title={c.added_at ?? undefined}>{fmtDateTime(c.added_at)}</div>
+                                <div className="text-sm text-soft" title={c.added_at ?? undefined}>{fmtDateTime(c.added_at)}</div>
                               </div>
                               <div>
                                 <div className="eyebrow mb-1">Call history</div>
@@ -652,12 +662,12 @@ export default function Outbound() {
                                     {c.call_history.map((h, hi) => (
                                       <span key={hi} className="inline-flex items-center gap-1.5">
                                         <StatusBadge value={h.call_status} />
-                                        <span className="text-[11px] text-dim">{fmtDateTime(h.ts)}</span>
+                                        <span className="text-2xs text-dim">{fmtDateTime(h.ts)}</span>
                                       </span>
                                     ))}
                                   </div>
                                 ) : (
-                                  <div className="text-[13px] text-dim">—</div>
+                                  <div className="text-sm text-dim">—</div>
                                 )}
                               </div>
                             </div>

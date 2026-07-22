@@ -1595,6 +1595,37 @@ def _visible_slug(folder: str) -> bool:
     return allowed is None or folder in allowed
 
 
+_DIRECTION_SUFFIXES = ("-outbound", "-inbound")
+
+
+def _direction_of(folder: str) -> str:
+    """'lead_qualifier-outbound' → 'outbound'; '' when the folder carries no
+    direction suffix."""
+    for suf in _DIRECTION_SUFFIXES:
+        if folder.endswith(suf):
+            return suf[1:]
+    return ""
+
+
+def _direction_pair(matches: list[tuple[str, str]]) -> bool:
+    """True when every match is the SAME agent, differing only by call
+    direction — the one ambiguity that can be settled without asking."""
+    bases = set()
+    for folder, _ in matches:
+        d = _direction_of(folder)
+        bases.add(folder[: -(len(d) + 1)] if d else folder)
+    return len(bases) == 1 and all(_direction_of(f) for f, _ in matches)
+
+
+def _pick_by_direction(matches: list[tuple[str, str]], dir_hint: str) -> str:
+    if not dir_hint or not _direction_pair(matches):
+        return ""
+    for folder, _ in matches:
+        if _direction_of(folder) == dir_hint:
+            return folder
+    return ""
+
+
 def _resolve_agent_slug(name: str) -> str:
     """Users say 'Ananya', not 'dhronai_ea' — resolve display names to slugs.
 
@@ -1659,6 +1690,20 @@ def _resolve_agent_slug(name: str) -> str:
         return folder_match
 
     wanted = raw.lower()
+    # A direction the user tacked onto the name — "Prakhar (outbound)",
+    # "outbound Prakhar". Held aside rather than matched, so it can settle an
+    # inbound/outbound pair below instead of derailing the name lookup (before
+    # this, "Prakhar (outbound)" matched NOTHING and reported that no such
+    # agent exists). Only a standalone word or a parenthetical counts — never a
+    # direction embedded in a slug like "outbound_lead_qualifier".
+    _DIR_HINT_RE = re.compile(
+        r"\((inbound|outbound)\)\s*$|^(inbound|outbound)\s+|\s+(inbound|outbound)\s*$")
+    dir_hint = ""
+    m_dir = _DIR_HINT_RE.search(wanted)
+    if m_dir:
+        dir_hint = next(g for g in m_dir.groups() if g)
+        wanted = _DIR_HINT_RE.sub(" ", wanted).strip()
+
     matches: list[tuple[str, str]] = []  # (folder, display)
     display_list: list[str] = []
     for ypath in sorted(_AGENTS_DIR.glob("*/agent.yaml")):
@@ -1677,8 +1722,22 @@ def _resolve_agent_slug(name: str) -> str:
     if len(matches) == 1:
         return matches[0][0]
     if len(matches) > 1:
+        # The commonest "ambiguity" is one agent that exists in both call
+        # directions. That is not a real question for the user when the
+        # direction is already in what they said, or in the surrounding
+        # request — resolve it instead of spending a turn asking.
+        picked = _pick_by_direction(matches, dir_hint)
+        if picked:
+            return picked
         opts = ", ".join(f"{disp} ({f})" for f, disp in matches)
-        raise ValueError(f"More than one agent matches '{raw}': {opts}. Ask the user which one they mean.")
+        extra = ""
+        if _direction_pair(matches):
+            extra = (" These are the same agent in both call directions — if the "
+                     "user's request makes the direction clear, retry with "
+                     f"'{matches[0][1]} (inbound)' or '{matches[0][1]} (outbound)' "
+                     "instead of asking.")
+        raise ValueError(f"More than one agent matches '{raw}': {opts}. Ask the "
+                         f"user which one they mean.{extra}")
     raise ValueError(f"No agent called '{raw}'. The agents that exist are: {', '.join(display_list) or 'none yet'}.")
 
 
@@ -2344,7 +2403,10 @@ TOOLS: list[dict] = [
             "description": "Read the full current definition of one agent (identity, languages, stages, greeting, knowledge, etc.). Always call this before editing an agent you haven't read this conversation.",
             "parameters": {
                 "type": "object",
-                "properties": {"name": {"type": "string", "description": "agent slug, e.g. 'pramukh'"}},
+                "properties": {"name": {"type": "string", "description":
+                    "agent slug or spoken name, e.g. 'pramukh'. When one agent "
+                    "exists in both call directions, add the direction rather "
+                    "than asking: 'Prakhar (outbound)'."}},
                 "required": ["name"],
             },
         },
@@ -2948,6 +3010,71 @@ def _pop_path(tree: dict, path: str) -> None:
             return
     if isinstance(node, dict):
         node.pop(parts[-1], None)
+
+
+def _set_path(tree: dict, path: str, value) -> None:
+    parts = path.split(".")
+    node = tree
+    for part in parts[:-1]:
+        nxt = node.get(part) if isinstance(node, dict) else None
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[part] = nxt
+        node = nxt
+    node[parts[-1]] = value
+
+
+def _rebase_change(chg: dict) -> tuple[dict, str]:
+    """Re-seat a pending proposal on top of the CURRENT definition.
+
+    A proposal freezes a full candidate snapshot plus the base_rev it was built
+    from. Anything that writes the agent in between — including the copilot's
+    OWN direct-edit tools (update_stage et al) — makes that base_rev stale, and
+    every later apply fails the optimistic-concurrency check with 409. Nothing
+    cleared or refreshed the pending change either, so the diff card stayed on
+    screen and re-failed identically forever (seen in production: seven
+    consecutive 409s on a single card, with no way out but abandoning the edit).
+
+    Replaying only the paths the proposal claims (`expected_paths`) is what
+    makes this safe: an unrelated concurrent edit is preserved instead of being
+    clobbered by the frozen full-definition snapshot.
+
+    Returns (rebased_candidate, fresh_rev). Raises ValueError naming the real
+    conflict when the newer write touched one of the very paths this proposal
+    edits — the only case a human genuinely has to re-decide.
+    """
+    slug = chg["slug"]
+    current, fresh_rev = _read_full_definition(slug)
+    base = chg.get("base")
+    candidate = chg.get("candidate") or {}
+    paths = [p for p in (chg.get("expected_paths") or []) if p]
+    if not isinstance(base, dict) or not paths:
+        raise ValueError(
+            "This proposal was built before the agent changed and can't be "
+            "replayed safely — re-propose it against the current definition.")
+
+    conflicts = sorted(p for p in paths if _get_path(base, p) != _get_path(current, p))
+    if conflicts:
+        raise ValueError(
+            "The agent changed after this was proposed, on the same setting(s) "
+            "it edits: " + ", ".join(conflicts[:5]) +
+            ". Applying it would silently revert that newer edit — re-propose "
+            "against the current definition.")
+
+    rebased = copy.deepcopy(current)
+    for p in paths:
+        val = _get_path(candidate, p)
+        if val is None and _get_path(base, p) is not None:
+            _pop_path(rebased, p)          # the proposal removed this field
+        else:
+            _set_path(rebased, p, copy.deepcopy(val))
+
+    violations = _invariant_violations(rebased)
+    if violations:
+        raise ValueError("Refused — replaying this change would break the "
+                         "agent: " + "; ".join(violations))
+    AgentDefinition.from_dict(rebased)     # dry validation, no write
+    return rebased, fresh_rev
 
 
 def _strip_outranked(changes: dict, draft: dict, provenance: dict,
@@ -3730,7 +3857,9 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         # The document's text IS user input — register it in the corpus so
         # content traced to it ranks above the model's own authorship.
         _interview_state(session).setdefault("input_texts", []).append(extracted)
-        result = extract_fields_from_text(extracted)
+        # extraction runs up to 12 sync OpenAI calls (~30-60s) — keep the
+        # event loop free, same as extract_text above.
+        result = await asyncio.to_thread(extract_fields_from_text, extracted)
         if result.get("status") != "ok":
             raise ValueError(result.get("error") or "extraction failed")
         fields = result.get("fields") or {}
@@ -3797,9 +3926,20 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                 if d["path"] not in ("revision", "updated_at", "updated_by")]
         session = guard.get("session") or {}
         pending = session.setdefault("pending_changes", {})
-        change_id = f"chg_{len(pending) + 1}_{abs(hash(name)) % 9999}"
+        # Monotonic per-session counter, NOT len(pending): discarding a change
+        # shrinks the dict, so len+1 re-issues an id that a still-visible diff
+        # card may already point at — clicking its Apply would then commit a
+        # different change than the one on screen. abs(hash(name)) is no help
+        # either: str hashing is salted per process, so the same agent yields a
+        # different suffix after any restart.
+        seq = int(session.get("change_seq") or 0) + 1
+        session["change_seq"] = seq
+        change_id = f"chg_{seq}_{re.sub(r'[^a-z0-9]+', '', name.lower())[:12] or 'agent'}"
         pending[change_id] = {
             "slug": name, "base_rev": base_rev, "candidate": candidate,
+            # Base snapshot: lets a stale proposal be replayed onto a newer
+            # definition instead of dying on an unrecoverable 409 (_rebase_change).
+            "base": copy.deepcopy(current),
             "expected_paths": list(expected), "reason": reason,
             "diff_human": _render_diff(diff),
             "proposed_at_turn": guard.get("user_turns", 0),
@@ -3828,9 +3968,23 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                 "diff and apply only after they say yes.")
         name = chg["slug"]
         builder._assert_slug_access(name, owner)
-        result = _write_scoped(name, chg["candidate"], chg["base_rev"],
-                               chg.get("reason") or "copilot proposed change",
-                               set(chg.get("expected_paths") or []) or None)
+        try:
+            result = _write_scoped(name, chg["candidate"], chg["base_rev"],
+                                   chg.get("reason") or "copilot proposed change",
+                                   set(chg.get("expected_paths") or []) or None)
+        except agent_store.ConflictError:
+            # The agent moved under us (often the copilot's own direct edit in
+            # the same turn). Replay this proposal's paths onto the current
+            # definition rather than failing — and drop the dead change so a
+            # genuine conflict can't be retried forever.
+            try:
+                rebased, fresh_rev = _rebase_change(chg)
+            except ValueError:
+                pending.pop(change_id, None)
+                raise
+            result = _write_scoped(name, rebased, fresh_rev,
+                                   chg.get("reason") or "copilot proposed change",
+                                   set(chg.get("expected_paths") or []) or None)
         pending.pop(change_id, None)
         res = {"status": "updated", "name": name, "change_id": change_id,
                "revision": result["revision"], "effective": "next_call"}
@@ -3841,10 +3995,15 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         change_id = str(args.get("change_id") or "").strip()
         session = guard.get("session") or {}
         pending = session.get("pending_changes") or {}
-        if pending.pop(change_id, None) is None:
-            raise ValueError(f"No pending change '{change_id}'")
-        return ({"status": "discarded", "change_id": change_id},
-                "Discarded the proposed change", True, False)
+        # Idempotent: "make sure that proposal is gone" is satisfied by it
+        # already being gone. Erroring here made the copilot report a failure
+        # for a no-op and then burn turns trying to recover from it.
+        existed = pending.pop(change_id, None) is not None
+        return ({"status": "discarded", "change_id": change_id,
+                 "already_gone": not existed},
+                "Discarded the proposed change" if existed
+                else "That proposal was already gone — nothing to discard",
+                True, False)
 
     if tool in ("update_stage", "add_stage", "remove_stage", "reorder_stages"):
         name = str(args["name"]).strip()
@@ -4002,11 +4161,14 @@ HOW YOU WORK
 5. RIGHT AFTER create_agent (and after any content edit): read the tool result. If it lists "quality" warnings, the agent is too shallow to run well — fix EVERY warning with update_agent in this SAME turn (richer stage goals, a fuller knowledge paragraph, real objection responses) before you say a word to the user. Only once the result comes back with no quality warnings do you tell the user it's built. Then confirm in one sentence and ASK whether to activate it (activation makes it answer REAL inbound phone calls). CRITICAL: call activate_agent ONLY after the user's explicit yes in their most recent message — never in the same turn as creation, never assumed. If they decline, that's fine — leave the current active agent alone and offer further edits.
 6. EDITS — this must be BULLETPROOF:
    a. Users name agents by their spoken name ("Ananya") — pass that name as-is to tools; resolution to the right agent is automatic. If a tool says no such agent exists, tell the user plainly which agents DO exist and ask which they meant — never guess a different agent and never silently switch to the active one.
+   a2. ONE agent, TWO directions: when a name matches the same agent in both inbound and outbound, do NOT spend a turn asking if the answer is already obvious. Re-call the tool with the direction appended — get_agent("Prakhar (outbound)"). The user talking about dialling out, contacts, or leads means outbound; talking about callers reaching them means inbound. Ask only when the request genuinely fits both, and ask ONCE — never repeat the same failing call.
    b. Call get_agent first if you haven't read that agent THIS conversation, and re-read it before any edit you're not 100% sure about.
    c. RENAMES/SWAPS: when the user changes something that can appear in more than one place — a person (boss, owner, CEO), the company, a product, a city, a price, a phone number, or the agent's own name — you MUST use replace_mentions (find/replace across the whole agent), NOT update_agent. Example: "assistant for Mr. Ben → Mr. Umang" = replace_mentions(find="Mr. Ben", replace="Mr. Umang"). A partial edit that leaves old mentions in the greeting or responses is a FAILURE.
    d. After replace_mentions, if the replaced count seems low for how prominent the thing is, get_agent and check for other spellings/variants of the old text (e.g. "Ben", "Mr Ben", "बेन") and replace those too.
    e. Other edits: update_agent with the MINIMAL partial change (server-side merge keeps everything else). NEVER resend a whole list to edit one item: for one call stage use update_stage/add_stage/remove_stage/reorder_stages; for one collected-info question use update_slot/add_slot/remove_slot — these edit exactly that item on the server.
    e2. For bigger or riskier edits, prefer the two-step flow: propose_update (returns a diff — show it to the user in plain words) → apply_update after they confirm, or discard_update if they decline. Every change is versioned: list_revisions shows history and rollback_agent undoes a change when the user asks.
+   e3. PICK ONE LANE PER AGENT PER TURN. Once you have proposed a change and are waiting on the user, do NOT also edit that same agent directly (update_agent/update_stage/update_slot/...) — the direct write moves the agent underneath your own pending proposal and the user's Apply button then fails. If you decide the direct edit is the right move, discard the proposal first. Never leave a proposal on screen that you have already superseded.
+   e4. If an apply comes back saying the agent changed since the proposal, do NOT retry the same apply — it will fail identically every time. get_agent to see the current state, then either propose_update again from that fresh state, or tell the user plainly what changed underneath. Repeating a failing apply is never progress.
    f. After every successful edit, tell the user in one plain sentence WHAT is different now and that it applies from the next call (quote the revision number when the tool returns one). If nothing was changed in a turn, never claim it was.
    g. If the user says a change didn't take effect on a real call: do NOT speculate about caching or internal mechanisms. First list_agents to confirm the agent you've been editing IS the live one — if a different agent is live, say so plainly and ask whether to activate the right one. Then get_agent, hunt for the old wording, and fix every remaining mention. Special case: if the OLD OPENING LINE still played at connect, the greeting lives ONLY in response_bank.opening_greeting — check and fix THAT field; editing stage goals never changes what plays at connect.
 6. QUESTIONS ("which agent is live?"): use list_agents / get_agent / get_routing. Do NOT call get_agent unless the user asks about that agent or you are about to edit it — during a new-agent interview no tool calls are needed until you create.
@@ -4034,6 +4196,10 @@ THE OPENING LINE & PLACEHOLDERS (get this right — it burned a real user):
   * {{contact_name}} — on outbound calls, replaced with the dialed contact's name from Outbound Calls (fallback "sir/ma'am"). When the user wants the agent to greet whoever it calls by name, write e.g. "Hello, am I speaking with {{contact_name}}?"
   * {{current_time}} — replaced at call time with morning/afternoon/evening (India time). E.g. "Good {{current_time}}, am I speaking with {{contact_name}}?" becomes "Good morning, am I speaking with Rajesh?". If the greeting is written in Hindi or Gujarati script, the word comes out in that language automatically.
 - NEVER invent any other placeholder or syntax — ${{...}}, {{{{...}}}}, [name], <contact>, {{date}} do not exist and would be SPOKEN ALOUD literally. Placeholders in stage goals, knowledge text, or canned responses are never substituted (exception: {{trust_proofs}} inside objection_playbook answers).
+CALL-REPAIR BEHAVIOUR THE PLATFORM APPLIES TO EVERY AGENT (know this before you "fix" a greeting — these are NOT settings and you cannot edit them):
+- Bare "hello?" from the caller within ~25s of the opening line: the agent replays its last utterance (up to twice), on the assumption the caller didn't hear it. This deliberately does NOT fire when the opening line is itself just "Hello?" — a hello answering a hello means contact is established, so the agent moves straight on to its script.
+- ~6s of caller silence: the agent says it couldn't hear and re-asks.
+So if a user reports "it keeps repeating hello" or "it won't start its script", explain what actually happens rather than guessing — and do NOT rewrite their opening line to dodge a platform rule unless they want different words. Changing a greeting they liked, to work around behaviour you misdiagnosed, is a failure.
 If a tool result includes "notes", the platform auto-corrected or DROPPED some of your input — read them; if content was dropped, put it where the note says (usually a stage goal) with update_agent in the SAME turn.
 If a tool result includes non-empty "quality" warnings, the agent is too shallow — you MUST resolve every one with update_agent in the SAME turn before telling the user it's ready. Do not report a hollow agent as done.
 WHEN THE USER SAYS A CHANGE "isn't in the agent" or "wasn't implemented": do not just re-word the same field. get_agent, and translate their intent into the fields the CALL actually reads — the mission/talking points belong in call_flow.stages goals AND knowledge_base.portfolio_prompt_text (both are spoken), the pitch is not "implemented" if it only sits in one thin stage goal. Enrich those, then confirm what specifically changed.
@@ -4160,6 +4326,10 @@ def _load_session(sid: str) -> dict:
             session["meta"] = data.get("meta", {})
             if data.get("pending_changes"):
                 session["pending_changes"] = data["pending_changes"]
+            # Must survive the reload: restarting the counter would re-issue
+            # change ids that diff cards from before the reload still point at.
+            if data.get("change_seq"):
+                session["change_seq"] = data["change_seq"]
             if data.get("interview"):
                 session["interview"] = data["interview"]
             if data.get("documents"):
@@ -4780,18 +4950,28 @@ async def copilot_apply_change(session_id: str, change_id: str, request: Request
         raise HTTPException(status_code=404, detail="no such pending change")
     slug = chg["slug"]
     builder._assert_slug_access(slug, builder._ctx_owner())
-    try:
-        result = agent_store.write_agent(
-            slug, chg["candidate"], actor=_copilot_actor(),
-            base_rev=chg.get("base_rev"),
+    def _commit(definition: dict, rev: str | None) -> dict:
+        return agent_store.write_agent(
+            slug, definition, actor=_copilot_actor(), base_rev=rev,
             reason=chg.get("reason") or "diff-card apply",
             owner=builder._ctx_owner(), is_admin=builder._ctx_is_admin(),
             expected_paths=set(chg.get("expected_paths") or []) or None,
             agents_dir=_AGENTS_DIR)
+
+    try:
+        result = _commit(chg["candidate"], chg.get("base_rev"))
     except agent_store.ConflictError:
-        raise HTTPException(status_code=409, detail=
-                            "This agent changed since the proposal — ask the "
-                            "copilot to re-propose the change.")
+        # Don't dead-end the card. Replay the proposal's own paths onto the
+        # current definition; only a change to those very paths is a real
+        # conflict, and then the card is dropped so the user isn't left
+        # clicking an Apply that can never succeed.
+        try:
+            rebased, fresh_rev = _rebase_change(chg)
+        except ValueError as exc:
+            pending.pop(change_id, None)
+            _save_session(session_id)
+            raise HTTPException(status_code=409, detail=str(exc))
+        result = _commit(rebased, fresh_rev)
     pending.pop(change_id, None)
     session["transcript"].append({
         "role": "assistant",
@@ -4811,8 +4991,9 @@ async def copilot_discard_change(session_id: str, change_id: str) -> dict:
         raise HTTPException(status_code=400, detail="invalid session_id")
     session = _load_session(session_id)
     pending = session.get("pending_changes") or {}
-    if pending.pop(change_id, None) is None:
-        raise HTTPException(status_code=404, detail="no such pending change")
+    # Idempotent — a Discard click on a card that is already gone (double
+    # click, stale tab) is a success, not a 404 the user has to interpret.
+    pending.pop(change_id, None)
     _save_session(session_id)
     return {"status": "discarded", "change_id": change_id}
 

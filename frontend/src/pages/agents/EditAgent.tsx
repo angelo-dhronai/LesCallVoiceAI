@@ -13,6 +13,11 @@ import {
 import { Card, Button, Badge, Spinner, cx, EmptyState } from '../../components/ui'
 import { PageHeader, Field, Input, Select, Textarea, AsyncState } from '../../components/kit'
 import { useToast } from '../../components/Toast'
+import { useConfirm, usePrompt } from '../../components/confirm'
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
+import {
+  Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog'
 import {
   BasicsSection, CallDirectionSection, CalendarSection, LanguagesSection,
   PersonalitySection, KnowledgeSection, CallFlowSection, ResponsesSection,
@@ -27,19 +32,38 @@ import {
 type Tab = 'settings' | 'stages' | 'yaml' | 'routing' | 'documents' | 'voice' | 'history'
 const BCP47: Record<string, string> = { en: 'en-IN', hi: 'hi-IN', gu: 'gu-IN', mr: 'hi-IN' }
 
+/* Three-row loading placeholder for tab bodies — mirrors the list layout the
+   data lands in, replacing the bare centered Spinner. */
+function TabSkeleton() {
+  return (
+    <div className="space-y-2">
+      {[0, 1, 2].map((i) => <div key={i} className="skeleton h-11 w-full" />)}
+    </div>
+  )
+}
+
 export default function EditAgent() {
   const { name = '' } = useParams()
   const nav = useNavigate()
   const toast = useToast()
   const refresh = useRefresh()
+  const confirm = useConfirm()
   const [tab, setTab] = useState<Tab>('settings')
   // Unsaved-edit guard: tabs unmount on switch, so a dirty Settings/YAML tab
   // would silently lose its edits without this.
   const dirtyRef = useRef(false)
   const setDirty = (v: boolean) => { dirtyRef.current = v }
-  const switchTab = (t: Tab) => {
+  const switchTab = async (t: Tab) => {
     if (t === tab) return
-    if (dirtyRef.current && !confirm('You have unsaved changes in this tab. Discard them?')) return
+    if (dirtyRef.current) {
+      const ok = await confirm({
+        title: 'Discard unsaved changes?',
+        description: 'This tab has unsaved changes — switching tabs will discard them.',
+        confirmLabel: 'Discard',
+        destructive: true,
+      })
+      if (!ok) return
+    }
     dirtyRef.current = false
     setTab(t)
   }
@@ -56,7 +80,13 @@ export default function EditAgent() {
   const { data: agent, isLoading, error } = useGet<any>(['agent', name], `/agents/${name}`)
 
   const onArchive = async () => {
-    if (!confirm(`Archive "${name}"?`)) return
+    const ok = await confirm({
+      title: `Archive "${name}"?`,
+      description: 'The agent is moved to agents/_archived and stops being selectable.',
+      confirmLabel: 'Archive',
+      destructive: true,
+    })
+    if (!ok) return
     try { await archiveAgent(name); toast(`Archived "${name}"`, 'success'); nav('/build/agents') }
     catch (e: any) { toast(`Archive failed: ${e.message || e}`, 'error') }
   }
@@ -79,7 +109,7 @@ export default function EditAgent() {
         actions={
           <div className="flex items-center gap-2">
             <Link to="/build/agents"><Button variant="ghost"><ArrowLeft size={15} /> Agents</Button></Link>
-            <Button variant="danger" title="Archive agent" onClick={onArchive}>
+            <Button variant="danger" title="Archive agent" onClick={() => void onArchive()}>
               <Archive size={14} /><span className="hidden sm:inline">Archive</span>
             </Button>
           </div>
@@ -87,23 +117,41 @@ export default function EditAgent() {
       />
 
       <AsyncState loading={isLoading} error={error}>
-        <div className="flex flex-wrap gap-2" role="tablist" aria-label="Agent editor sections">
-          {tabs.map((t) => (
-            <button key={t.id} type="button" role="tab" aria-selected={tab === t.id} onClick={() => switchTab(t.id)}
-              className={cx('flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] font-semibold ring-1 transition',
-                tab === t.id ? 'bg-mint-400/15 text-mint-700 ring-mint-400/30 dark:text-mint-300' : 'bg-[var(--surface-2)] text-soft ring-[var(--border)] hover:text-[var(--text)]')}>
-              <t.icon size={14} /> {t.label}
-            </button>
-          ))}
-        </div>
+        <Tabs value={tab} onValueChange={(v) => { void switchTab(v as Tab) }}>
+          <TabsList aria-label="Agent editor sections" className="h-auto flex-wrap justify-start gap-2 bg-transparent p-0">
+            {tabs.map((t) => (
+              <TabsTrigger
+                key={t.id}
+                value={t.id}
+                className="gap-1.5 rounded-md bg-[var(--surface-2)] px-3 py-1.5 text-sm font-semibold text-soft ring-1 ring-[var(--border)] transition hover:text-[var(--text)] data-[state=active]:bg-mint-400/15 data-[state=active]:text-mint-700 data-[state=active]:shadow-none data-[state=active]:ring-mint-400/30 dark:data-[state=active]:text-mint-300"
+              >
+                <t.icon size={14} /> {t.label}
+              </TabsTrigger>
+            ))}
+          </TabsList>
 
-        {tab === 'settings' && <SettingsTab name={name} onSaved={() => refresh(['agent', name], ['agents'])} onDirtyChange={setDirty} />}
-        {tab === 'stages' && <StagesTab name={name} onSaved={() => refresh(['agent', name], ['agents'])} />}
-        {tab === 'yaml' && <YamlTab name={name} onSaved={() => refresh(['agent', name], ['agents'])} onDirtyChange={setDirty} />}
-        {tab === 'routing' && <RoutingTab name={name} />}
-        {tab === 'documents' && <DocumentsTab name={name} />}
-        {tab === 'voice' && <VoiceTab agent={agent} />}
-        {tab === 'history' && <HistoryTab name={name} onChanged={() => refresh(['agent', name], ['agents'])} />}
+          <TabsContent value="settings" className="mt-6">
+            <SettingsTab name={name} onSaved={() => refresh(['agent', name], ['agents'])} onDirtyChange={setDirty} />
+          </TabsContent>
+          <TabsContent value="stages" className="mt-6">
+            <StagesTab name={name} onSaved={() => refresh(['agent', name], ['agents'])} />
+          </TabsContent>
+          <TabsContent value="yaml" className="mt-6">
+            <YamlTab name={name} onSaved={() => refresh(['agent', name], ['agents'])} onDirtyChange={setDirty} />
+          </TabsContent>
+          <TabsContent value="routing" className="mt-6">
+            <RoutingTab name={name} />
+          </TabsContent>
+          <TabsContent value="documents" className="mt-6">
+            <DocumentsTab name={name} />
+          </TabsContent>
+          <TabsContent value="voice" className="mt-6">
+            <VoiceTab agent={agent} />
+          </TabsContent>
+          <TabsContent value="history" className="mt-6">
+            <HistoryTab name={name} onChanged={() => refresh(['agent', name], ['agents'])} />
+          </TabsContent>
+        </Tabs>
       </AsyncState>
     </div>
   )
@@ -219,7 +267,7 @@ function SettingsTab({ name, onSaved, onDirtyChange }: { name: string; onSaved: 
       {d && (
         <div className="space-y-4 scroll-smooth">
           <Card className="flex flex-wrap items-center gap-3 p-4">
-            <p className="min-w-[240px] flex-1 text-[12px] text-dim">
+            <p className="min-w-[240px] flex-1 text-xs text-dim">
               Structured editor for the common agent fields. Anything not shown here (STT corrections,
               QA signals, per-language register notes, …) is preserved untouched —
               use the <span className="font-semibold text-soft">Advanced (YAML)</span> tab for those.
@@ -231,7 +279,7 @@ function SettingsTab({ name, onSaved, onDirtyChange }: { name: string; onSaved: 
           <nav aria-label="Settings sections" className="sticky top-2 z-10 flex gap-1.5 overflow-x-auto rounded-xl glass px-3 py-2 sm:flex-wrap sm:overflow-visible">
             {SETTINGS_SECTIONS.map((s) => (
               <a key={s.id} href={`#${s.id}`}
-                className="shrink-0 whitespace-nowrap rounded-lg bg-[var(--surface-2)] px-3 py-2 text-[12px] font-semibold text-soft ring-1 ring-[var(--border)] transition hover:text-[var(--text)] sm:px-2.5 sm:py-1">
+                className="shrink-0 whitespace-nowrap rounded-md bg-[var(--surface-2)] px-3 py-2 text-xs font-semibold text-soft ring-1 ring-[var(--border)] transition hover:text-[var(--text)] sm:px-2.5 sm:py-1">
                 {s.label}
               </a>
             ))}
@@ -242,7 +290,7 @@ function SettingsTab({ name, onSaved, onDirtyChange }: { name: string; onSaved: 
           <div id="sec-languages" className={cardCls('sec-languages')}>
             {sectionHead('sec-languages', 'Languages & Voice')}
             <LanguagesSection d={d} set={set} />
-            {showErrors && invalid['sec-languages'] && <span className="mt-2 block text-[11px] text-rose-500">Select at least one language.</span>}
+            {showErrors && invalid['sec-languages'] && <span className="mt-2 block text-2xs text-rose-500">Select at least one language.</span>}
           </div>
           <div id="sec-personality" className="card p-4 sm:p-6 scroll-mt-24"><div className="eyebrow mb-4">Personality</div><PersonalitySection d={d} set={set} /></div>
           <div id="sec-script" className={cardCls('sec-script')}>{sectionHead('sec-script', 'Call Script — Opening & Stages')}<CallFlowSection d={d} set={set} showErrors={showErrors} /></div>
@@ -257,7 +305,7 @@ function SettingsTab({ name, onSaved, onDirtyChange }: { name: string; onSaved: 
           {/* Sticky save bar — reachable from anywhere in the long form */}
           <div className="sticky bottom-4 z-10 flex flex-wrap items-center justify-end gap-3 rounded-2xl glass px-4 py-3">
             {dirty && <Badge tone="amber" soft>Unsaved changes</Badge>}
-            {lastSavedAt && <span className="hidden sm:inline text-[12px] text-dim">Saved {lastSavedAt} — effective on the next call</span>}
+            {lastSavedAt && <span className="hidden sm:inline text-xs text-dim">Saved {lastSavedAt} — effective on the next call</span>}
             {saveBtn}
           </div>
         </div>
@@ -272,11 +320,18 @@ function SettingsTab({ name, onSaved, onDirtyChange }: { name: string; onSaved: 
 function BookingsList({ name }: { name: string }) {
   const toast = useToast()
   const refresh = useRefresh()
+  const confirm = useConfirm()
   const { data } = useGet<{ bookings: Booking[] }>(['bookings', name], `/agents/${name}/bookings`, { refetchInterval: 30000 })
   const bookings = data?.bookings ?? []
 
   const onFree = async (i: number) => {
-    if (!confirm('Free this slot? The agent will start offering it again.')) return
+    const ok = await confirm({
+      title: 'Free this slot?',
+      description: 'The booking is deleted and the agent starts offering the slot again on future calls.',
+      confirmLabel: 'Free slot',
+      destructive: true,
+    })
+    if (!ok) return
     try { await deleteBooking(name, i); toast('Slot freed', 'success'); refresh(['bookings', name]) }
     catch (e: any) { toast(`Failed: ${e.message || e}`, 'error') }
   }
@@ -286,7 +341,7 @@ function BookingsList({ name }: { name: string }) {
     <div className="mt-5">
       <div className="eyebrow mb-2 flex items-center gap-1.5"><CalendarDays size={13} /> Booked slots ({bookings.length})</div>
       {bookings.length === 0 && (
-        <div className="rounded-lg bg-[var(--surface-2)] px-3 py-2 text-[12px] text-dim ring-1 ring-[var(--border)]">
+        <div className="rounded-lg bg-[var(--surface-2)] px-3 py-2 text-xs text-dim ring-1 ring-[var(--border)]">
           No appointments yet — when a caller books a slot on a live call it appears here, and deleting
           it frees the slot for future calls.
         </div>
@@ -294,10 +349,10 @@ function BookingsList({ name }: { name: string }) {
       <div className="space-y-2">
         {bookings.map((b, i) => (
           <div key={`${b.conn_id}-${i}`} className="flex flex-wrap items-center gap-3 rounded-lg bg-[var(--surface-2)] px-3 py-2 ring-1 ring-[var(--border)]">
-            <span className="text-[13px] font-semibold">{b.appointment_time}</span>
-            <span className="text-[12px] text-soft">{b.caller_name || 'Unknown caller'}{b.caller_phone ? ` · ${b.caller_phone}` : ''}</span>
-            <span className="ml-auto text-[11px] text-dim">{b.booked_at?.slice(0, 16).replace('T', ' ') || ''}</span>
-            <Button variant="ghost" size="sm" onClick={() => onFree(i)} title="Free this slot — the agent will offer it again"><Trash2 size={13} /></Button>
+            <span className="text-sm font-semibold">{b.appointment_time}</span>
+            <span className="text-xs text-soft">{b.caller_name || 'Unknown caller'}{b.caller_phone ? ` · ${b.caller_phone}` : ''}</span>
+            <span className="ml-auto text-2xs text-dim">{b.booked_at?.slice(0, 16).replace('T', ' ') || ''}</span>
+            <Button variant="ghost" size="sm" onClick={() => void onFree(i)} title="Free this slot — the agent will offer it again"><Trash2 size={13} /></Button>
           </div>
         ))}
       </div>
@@ -369,7 +424,7 @@ function YamlTab({ name, onSaved, onDirtyChange }: { name: string; onSaved: () =
       {result && (
         <div
           role={result.valid && !stale ? 'status' : 'alert'}
-          className={cx('flex items-start gap-2 rounded-lg px-3 py-2 text-[12px] ring-1',
+          className={cx('flex items-start gap-2 rounded-lg px-3 py-2 text-xs ring-1',
             stale ? 'bg-[var(--surface-2)] text-dim ring-[var(--border)]'
               : result.valid ? 'bg-mint-400/10 text-mint-700 ring-mint-400/20 dark:text-mint-300' : 'bg-rose-500/10 text-rose-600 ring-rose-500/20 dark:text-rose-300')}>
           {stale ? <AlertTriangle size={14} className="mt-0.5" /> : result.valid ? <CheckCircle2 size={14} className="mt-0.5" /> : <AlertTriangle size={14} className="mt-0.5" />}
@@ -382,9 +437,9 @@ function YamlTab({ name, onSaved, onDirtyChange }: { name: string; onSaved: () =
         value={text}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); if (loaded && !saving) onSave() } }}
-        className="font-mono text-[12px] leading-relaxed"
+        className="font-mono text-xs leading-relaxed"
       />
-      <p className="text-[11px] text-dim">Tip: Ctrl/Cmd+S validates and saves.</p>
+      <p className="text-2xs text-dim">Tip: Ctrl/Cmd+S validates and saves.</p>
     </Card>
   )
 }
@@ -425,7 +480,7 @@ function RoutingTab({ name }: { name: string }) {
 
   return (
     <Card className="p-5 space-y-4">
-      <p className="text-[12px] text-dim">
+      <p className="text-xs text-dim">
         Routing decides which agent answers a given inbound number. The platform currently runs a single <span className="font-semibold text-soft">active</span> agent;
         these rules apply once per-DID routing is enabled.
       </p>
@@ -438,6 +493,7 @@ function RoutingTab({ name }: { name: string }) {
 /* ───────────────────────── Documents tab ───────────────────────── */
 function DocumentsTab({ name }: { name: string }) {
   const toast = useToast()
+  const confirm = useConfirm()
   const { data, isLoading, error } = useGet<{ documents: AgentDoc[] }>(['docs', name], `/agents/${name}/documents`)
   const refresh = useRefresh()
   const [busy, setBusy] = useState(false)
@@ -455,7 +511,12 @@ function DocumentsTab({ name }: { name: string }) {
     finally { setBusy(false) }
   }
   const onDelete = async (docId: string, filename?: string) => {
-    if (!confirm(`Delete "${filename || docId}" and its embeddings?`)) return
+    const ok = await confirm({
+      title: `Delete "${filename || docId}"?`,
+      description: 'The document and its embeddings are removed — the agent can no longer draw on it during calls.',
+      destructive: true,
+    })
+    if (!ok) return
     try { await deleteDoc(name, docId); toast('Deleted', 'success'); refresh(['docs', name]) }
     catch (e: any) { toast(`Delete failed: ${e.message || e}`, 'error') }
   }
@@ -484,20 +545,20 @@ function DocumentsTab({ name }: { name: string }) {
         <div className="eyebrow mb-3">Upload knowledge document (PDF / DOCX / TXT)</div>
         <form onSubmit={onUpload} className="grid gap-3 sm:grid-cols-2">
           <Field label="Document file">
-            <input name="file" type="file" accept=".pdf,.docx,.txt" className="w-full text-[13px] text-soft file:mr-3 file:rounded-lg file:border-0 file:bg-[var(--surface-2)] file:px-3 file:py-1.5 file:text-[12px] file:font-semibold" />
+            <input name="file" type="file" accept=".pdf,.docx,.txt" className="w-full text-sm text-soft file:mr-3 file:rounded-md file:border-0 file:bg-[var(--surface-2)] file:px-3 file:py-1.5 file:text-xs file:font-semibold" />
           </Field>
           <Field label="Organisation name">
-            <input name="org_name" placeholder="Organisation name" className="w-full rounded-lg bg-[var(--surface-2)] px-3 py-2 text-[13px] ring-1 ring-[var(--border)]" />
+            <Input name="org_name" placeholder="Organisation name" />
           </Field>
           <Field label="Document type">
-            <input name="doc_type" placeholder="Type (e.g. Brochure)" defaultValue="General" className="w-full rounded-lg bg-[var(--surface-2)] px-3 py-2 text-[13px] ring-1 ring-[var(--border)]" />
+            <Input name="doc_type" placeholder="Type (e.g. Brochure)" defaultValue="General" />
           </Field>
           <Field label="Short description">
-            <input name="description" placeholder="Short description" className="w-full rounded-lg bg-[var(--surface-2)] px-3 py-2 text-[13px] ring-1 ring-[var(--border)]" />
+            <Input name="description" placeholder="Short description" />
           </Field>
           <div className="sm:col-span-2"><Button variant="primary" disabled={busy}><Upload size={14} /> {busy ? 'Uploading & embedding…' : 'Upload'}</Button></div>
         </form>
-        <p className="mt-2 text-[11px] text-dim">Text is extracted, chunked and embedded for in-call RAG. "Extract YAML" then proposes agent fields from a document.</p>
+        <p className="mt-2 text-2xs text-dim">Text is extracted, chunked and embedded for in-call RAG. "Extract YAML" then proposes agent fields from a document.</p>
       </Card>
 
       <AsyncState loading={isLoading} error={error}>
@@ -509,8 +570,8 @@ function DocumentsTab({ name }: { name: string }) {
               <Card key={doc.doc_id} className="flex flex-wrap items-center gap-3 p-4">
                 <FileText size={16} className="text-indigo-400" />
                 <div className="min-w-0">
-                  <div className="truncate text-[13px] font-semibold text-[var(--text)]">{doc.filename || doc.doc_id}</div>
-                  <div className="text-[11px] text-dim">{doc.doc_type || 'General'}{doc.org_name ? ` · ${doc.org_name}` : ''}{doc.chunks ? ` · ${doc.chunks} chunks` : ''}</div>
+                  <div className="truncate text-sm font-semibold text-[var(--text)]">{doc.filename || doc.doc_id}</div>
+                  <div className="text-2xs text-dim">{doc.doc_type || 'General'}{doc.org_name ? ` · ${doc.org_name}` : ''}{doc.chunks ? ` · ${doc.chunks} chunks` : ''}</div>
                 </div>
                 <div className="ml-auto flex items-center gap-2">
                   <Button variant="ghost" onClick={() => onExtract(doc.doc_id)} disabled={busy}>
@@ -518,7 +579,7 @@ function DocumentsTab({ name }: { name: string }) {
                       ? <><Spinner className="h-3.5 w-3.5" /> Extracting…</>
                       : <><Sparkles size={14} /> Extract YAML</>}
                   </Button>
-                  <Button variant="ghost" title={`Delete ${doc.filename || 'document'}`} onClick={() => onDelete(doc.doc_id, doc.filename)}><Trash2 size={14} /></Button>
+                  <Button variant="ghost" title={`Delete ${doc.filename || 'document'}`} onClick={() => void onDelete(doc.doc_id, doc.filename)}><Trash2 size={14} /></Button>
                 </div>
               </Card>
             ))}
@@ -589,6 +650,7 @@ function ExtractReview({ fields, missing, busy, onCancel, onApply }: {
   onCancel: () => void
   onApply: (fields: Record<string, any>) => void
 }) {
+  const confirm = useConfirm()
   const missingKeys = new Set(missing.map((m) => m.key))
   const orderedKeys = [
     ...Object.keys(EXTRACT_LABELS).filter((k) => k in fields || missingKeys.has(k)),
@@ -605,17 +667,18 @@ function ExtractReview({ fields, missing, busy, onCancel, onApply }: {
   const changed = orderedKeys.some((k) => (draft[k] ?? '') !== (initialRef.current?.[k] ?? ''))
   const firstMissingKey = missing.find((m) => !(draft[m.key] ?? '').trim())?.key
 
-  const requestCancel = () => {
-    if (changed && !confirm('Discard the extracted fields and your edits?')) return
+  const requestCancel = async () => {
+    if (changed) {
+      const ok = await confirm({
+        title: 'Discard extracted fields?',
+        description: 'The extracted fields and the edits you typed here will be lost.',
+        confirmLabel: 'Discard',
+        destructive: true,
+      })
+      if (!ok) return
+    }
     onCancel()
   }
-
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') requestCancel() }
-    window.addEventListener('keydown', h)
-    return () => window.removeEventListener('keydown', h)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [changed])
 
   const apply = () => {
     const out: Record<string, any> = {}
@@ -629,25 +692,19 @@ function ExtractReview({ fields, missing, busy, onCancel, onApply }: {
   const stillEmpty = missing.filter((m) => !(draft[m.key] ?? '').trim())
 
   return (
-    <div
-      className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="extract-review-title"
-      onClick={requestCancel}
-    >
-      <Card className="max-h-[85vh] w-full max-w-2xl overflow-auto p-4 sm:p-6" >
-        <div onClick={(e) => e.stopPropagation()}>
-          <div className="sticky top-0 z-10 -mx-4 -mt-4 mb-3 flex flex-wrap items-center gap-2 border-b border-[var(--border)] bg-[var(--surface-solid)] px-4 py-4 sm:-mx-6 sm:-mt-6 sm:px-6">
-            <Sparkles size={16} className="text-mint-500" />
-            <h3 id="extract-review-title" className="font-display text-[15px] font-bold">Review extracted fields</h3>
-            <div className="flex w-full justify-end gap-2 sm:ml-auto sm:w-auto">
-              <Button variant="ghost" onClick={requestCancel}>Cancel</Button>
-              <Button variant="primary" onClick={apply} disabled={busy}>Apply to agent.yaml</Button>
-            </div>
-          </div>
+    <Dialog open onOpenChange={(open) => { if (!open) void requestCancel() }}>
+      <DialogContent
+        aria-describedby={undefined}
+        className="card flex max-h-[85vh] w-full max-w-2xl flex-col gap-0 overflow-hidden border-0 p-0"
+      >
+        <DialogHeader className="border-b border-[var(--border)] px-4 py-4 pr-12 text-left sm:px-6">
+          <DialogTitle className="flex items-center gap-2 font-display text-base font-bold tracking-tight">
+            <Sparkles size={16} className="text-mint-500" /> Review extracted fields
+          </DialogTitle>
+        </DialogHeader>
+        <div className="flex-1 overflow-y-auto px-4 py-4 sm:px-6">
           {stillEmpty.length > 0 && (
-            <div className="mb-3 rounded-lg bg-amber-500/10 px-3 py-2 text-[12px] text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">
+            <div className="mb-3 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">
               <span className="font-semibold">The document didn't contain:</span>{' '}
               {stillEmpty.map((m) => m.label).join(', ')} — please fill them in below (or apply without them and
               set them later in Settings).
@@ -684,14 +741,18 @@ function ExtractReview({ fields, missing, busy, onCancel, onApply }: {
                       />
                     )}
                   </Field>
-                  {k === 'appointment_slots' && <span className="mt-1 block text-[11px] text-dim">One slot per line, e.g. "Tomorrow at 10:00 AM"</span>}
+                  {k === 'appointment_slots' && <span className="mt-1 block text-2xs text-dim">One slot per line, e.g. "Tomorrow at 10:00 AM"</span>}
                 </div>
               )
             })}
           </div>
         </div>
-      </Card>
-    </div>
+        <DialogFooter className="gap-2 border-t border-[var(--border)] px-4 py-3 sm:px-6">
+          <Button variant="ghost" onClick={() => void requestCancel()}>Cancel</Button>
+          <Button variant="primary" onClick={apply} disabled={busy}>Apply to agent.yaml</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -723,8 +784,8 @@ function VoiceTab({ agent }: { agent: any }) {
           <span className={cx('grid h-10 w-10 place-items-center rounded-xl bg-[var(--surface-2)] ring-1 ring-[var(--border)]',
             playingLang === lang ? 'animate-pulse text-mint-500' : 'text-indigo-400')}><Volume2 size={18} /></span>
           <div className="min-w-0">
-            <div className="text-[13px] font-semibold text-[var(--text)]">{lang.toUpperCase()}</div>
-            <div className="truncate text-[11px] text-dim">{v.model} · {v.speaker}</div>
+            <div className="text-sm font-semibold text-[var(--text)]">{lang.toUpperCase()}</div>
+            <div className="truncate text-2xs text-dim">{v.model} · {v.speaker}</div>
           </div>
           <Button variant="ghost" className="ml-auto" onClick={() => play(lang, v)}>
             {playingLang === lang ? <><Spinner className="h-3.5 w-3.5" /> Playing…</> : <><Volume2 size={14} /> Preview</>}
@@ -749,6 +810,8 @@ type StageRow = {
 
 function StagesTab({ name, onSaved }: { name: string; onSaved: () => void }) {
   const toast = useToast()
+  const confirm = useConfirm()
+  const prompt = usePrompt()
   const [stages, setStages] = useState<StageRow[] | null>(null)
   const [busy, setBusy] = useState(false)
   const [editing, setEditing] = useState<number | null>(null)
@@ -792,9 +855,15 @@ function StagesTab({ name, onSaved }: { name: string; onSaved: () => void }) {
       `Moved ${stages[i].id}`)
   }
 
-  const remove = (i: number) => {
+  const remove = async (i: number) => {
     if (!stages || stages.length <= 1) return
-    if (!confirm(`Remove stage ${stages[i].id}?`)) return
+    const ok = await confirm({
+      title: `Remove stage ${stages[i].id}?`,
+      description: 'The stage is removed from the call flow. Every edit is versioned, so it can be restored from History.',
+      confirmLabel: 'Remove',
+      destructive: true,
+    })
+    if (!ok) return
     const renumber: AgentOp[] = stages
       .filter((_, j) => j !== i)
       .map((_, j) => ({ op: 'set' as const, path: `call_flow.stages[${j}].order`, value: j }))
@@ -810,9 +879,19 @@ function StagesTab({ name, onSaved }: { name: string; onSaved: () => void }) {
       `Updated ${stages[i].id}`)
   }
 
-  const addStage = () => {
+  const addStage = async () => {
     if (!stages) return
-    const id = prompt('New stage id (e.g. HANDLE_REJECTION):')?.trim().toUpperCase().replace(/\s+/g, '_')
+    const raw = await prompt({
+      title: 'New stage id',
+      description: 'Stage ids are uppercased, e.g. HANDLE_REJECTION.',
+      placeholder: 'e.g. QUALIFY',
+      validate: (v) =>
+        /^[A-Za-z][A-Za-z0-9_-]*$/.test(v.trim())
+          ? null
+          : 'Letters, numbers, _ and - only; must start with a letter',
+    })
+    if (raw == null) return
+    const id = raw.trim().toUpperCase().replace(/\s+/g, '_')
     if (!id) return
     if (stages.some((s) => s.id === id)) { toast(`Stage ${id} already exists`, 'error'); return }
     void runOps(
@@ -826,12 +905,12 @@ function StagesTab({ name, onSaved }: { name: string; onSaved: () => void }) {
       <div className="flex items-center gap-2">
         <span className="eyebrow">Call stages — surgical edits, versioned</span>
         <div className="ml-auto">
-          <Button variant="ghost" size="sm" disabled={busy || !stages} onClick={addStage}>
+          <Button variant="ghost" size="sm" disabled={busy || !stages} onClick={() => void addStage()}>
             <Plus size={13} /> Add stage
           </Button>
         </div>
       </div>
-      {!stages ? <Spinner /> : stages.length === 0 ? (
+      {!stages ? <TabSkeleton /> : stages.length === 0 ? (
         <EmptyState title="No stages" hint="Add the first stage of the call flow." />
       ) : (
         <div className="space-y-2">
@@ -839,10 +918,10 @@ function StagesTab({ name, onSaved }: { name: string; onSaved: () => void }) {
             <div key={`${s.id}-${i}`} className="rounded-xl bg-[var(--surface-2)] p-3 ring-1 ring-[var(--border)]">
               <div className="flex flex-wrap items-center gap-2">
                 <Badge tone="mint" soft>{i + 1}</Badge>
-                <span className="font-mono text-[12.5px] font-semibold">{s.id}</span>
+                <span className="font-mono text-sm font-semibold">{s.id}</span>
                 {s.role && <Badge soft>{s.role}</Badge>}
                 {s.turns_until_advance != null && (
-                  <span className="text-[11px] text-dim">advance after {s.turns_until_advance} turns</span>
+                  <span className="text-2xs text-dim">advance after {s.turns_until_advance} turns</span>
                 )}
                 <div className="ml-auto flex items-center gap-1">
                   <Button variant="ghost" size="sm" disabled={busy || i === 0} onClick={() => move(i, -1)} title="Move up"><ArrowUp size={13} /></Button>
@@ -852,25 +931,25 @@ function StagesTab({ name, onSaved }: { name: string; onSaved: () => void }) {
                     title="Edit the stage goal">
                     <Code2 size={13} />
                   </Button>
-                  <Button variant="ghost" size="sm" disabled={busy || stages.length <= 1} onClick={() => remove(i)} title="Remove stage"><Trash2 size={13} /></Button>
+                  <Button variant="ghost" size="sm" disabled={busy || stages.length <= 1} onClick={() => void remove(i)} title="Remove stage"><Trash2 size={13} /></Button>
                 </div>
               </div>
               {editing === i ? (
                 <div className="mt-2 space-y-2">
-                  <Textarea rows={3} value={goalDraft} onChange={(e) => setGoalDraft(e.target.value)} className="text-[12.5px]" />
+                  <Textarea rows={3} value={goalDraft} onChange={(e) => setGoalDraft(e.target.value)} className="text-sm" />
                   <div className="flex gap-2">
                     <Button size="sm" disabled={busy || !goalDraft.trim()} onClick={() => saveGoal(i)}><Save size={13} /> Save goal</Button>
                     <Button size="sm" variant="ghost" disabled={busy} onClick={() => setEditing(null)}>Cancel</Button>
                   </div>
                 </div>
               ) : (
-                <p className="mt-1.5 text-[12px] leading-relaxed text-soft">{s.goal}</p>
+                <p className="mt-1.5 text-xs leading-relaxed text-soft">{s.goal}</p>
               )}
             </div>
           ))}
         </div>
       )}
-      <p className="text-[11px] text-dim">
+      <p className="text-2xs text-dim">
         Each edit lands as a single surgical operation — versioned in History and provably touching nothing else.
       </p>
     </Card>
@@ -880,6 +959,7 @@ function StagesTab({ name, onSaved }: { name: string; onSaved: () => void }) {
 /* ───────────────────────── History tab (v2 revisions) ───────────────────── */
 function HistoryTab({ name, onChanged }: { name: string; onChanged: () => void }) {
   const toast = useToast()
+  const confirm = useConfirm()
   const [revs, setRevs] = useState<AgentRevision[] | null>(null)
   const [busy, setBusy] = useState(false)
 
@@ -891,7 +971,13 @@ function HistoryTab({ name, onChanged }: { name: string; onChanged: () => void }
   useEffect(load, [name]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const onRollback = async (rev: AgentRevision) => {
-    if (!confirm(`Restore the agent to how it was BEFORE this change?\n\n${rev.reason || rev.actor || `revision ${rev.rev_id}`}`)) return
+    const ok = await confirm({
+      title: 'Restore this snapshot?',
+      description: `The agent is rolled back to how it was BEFORE "${rev.reason || rev.actor || `revision ${rev.rev_id}`}". Restoring is itself snapshotted, so it can be undone.`,
+      confirmLabel: 'Restore',
+      destructive: true,
+    })
+    if (!ok) return
     setBusy(true)
     try {
       const res = await rollbackAgent(name, rev.rev_id)
@@ -908,7 +994,7 @@ function HistoryTab({ name, onChanged }: { name: string; onChanged: () => void }
   return (
     <Card className="space-y-3 p-5">
       <span className="eyebrow">Edit history — every change is reversible</span>
-      {!revs ? <Spinner /> : revs.length === 0 ? (
+      {!revs ? <TabSkeleton /> : revs.length === 0 ? (
         <EmptyState
           title="No revisions yet"
           hint="Every save (Copilot, Settings, YAML, Stages) snapshots the agent here first."
@@ -919,12 +1005,12 @@ function HistoryTab({ name, onChanged }: { name: string; onChanged: () => void }
             <div key={r.rev_id} className="flex flex-wrap items-center gap-3 rounded-lg bg-[var(--surface-2)] px-3 py-2 ring-1 ring-[var(--border)]">
               <Badge soft>#{r.rev_id}</Badge>
               <div className="min-w-0 flex-1">
-                <div className="truncate text-[12.5px] font-semibold">{r.reason || 'edit'}</div>
-                <div className="text-[11px] text-dim">
+                <div className="truncate text-sm font-semibold">{r.reason || 'edit'}</div>
+                <div className="text-2xs text-dim">
                   {r.actor || 'unknown'} · {String(r.created_at).slice(0, 16).replace('T', ' ')}
                 </div>
               </div>
-              <Button variant="ghost" size="sm" disabled={busy} onClick={() => onRollback(r)}
+              <Button variant="ghost" size="sm" disabled={busy} onClick={() => void onRollback(r)}
                 title="Restore the agent to the state saved in this snapshot">
                 <RotateCcw size={13} /> Restore
               </Button>
@@ -932,7 +1018,7 @@ function HistoryTab({ name, onChanged }: { name: string; onChanged: () => void }
           ))}
         </div>
       )}
-      <p className="text-[11px] text-dim">
+      <p className="text-2xs text-dim">
         Snapshots are taken BEFORE each write (last 50 kept). Restoring is itself snapshotted, so a rollback can be undone.
       </p>
     </Card>

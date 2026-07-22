@@ -64,7 +64,7 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
             onChange={(e) => setFilter(e.target.value)}
             placeholder="Find a panel…"
             aria-label="Find a panel"
-            className="w-full rounded-lg bg-[var(--surface-2)] py-2 pl-9 pr-3 text-[13px] text-[var(--text)] outline-none ring-1 ring-[var(--border)] transition placeholder:text-dim focus:ring-mint-500/40"
+            className="w-full rounded-md bg-[var(--surface-2)] py-2 pl-9 pr-3 text-sm text-[var(--text)] outline-none ring-1 ring-[var(--border)] transition placeholder:text-dim focus:ring-mint-500/40"
           />
         </div>
 
@@ -78,7 +78,7 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
                   <NavLink key={item.to} to={item.to} end={item.to === '/'}
                     title={collapsed ? item.label : undefined}
                     className={({ isActive }) => cx(
-                      'group relative flex items-center gap-2.5 rounded-lg px-2 py-[7px] text-[13px] font-medium transition-colors',
+                      'group relative flex items-center gap-2.5 rounded-md px-2 py-[7px] text-sm font-medium transition-colors',
                       collapsed && 'lg:justify-center lg:px-0',
                       isActive
                         ? 'bg-[var(--surface-2)] text-[var(--text)]'
@@ -91,14 +91,15 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
                           <item.icon size={16} strokeWidth={2} className={cx('shrink-0', isActive ? 'text-mint-600 dark:text-mint-400' : 'text-dim group-hover:text-soft')} />
                           {/* Collapsed rail still shows the live-call count as a dot badge */}
                           {collapsed && item.badge && liveCount > 0 && (
-                            <span className="absolute -right-1.5 -top-1.5 hidden h-3.5 min-w-3.5 items-center justify-center rounded-full bg-rose-500 px-0.5 text-[8px] font-bold text-white lg:inline-flex">{liveCount}</span>
+                            <span aria-label={`${liveCount} live ${liveCount === 1 ? 'call' : 'calls'}`}
+                              className="absolute -right-2 -top-1.5 hidden h-[15px] min-w-[15px] items-center justify-center rounded-full bg-rose-500 px-1 text-2xs font-bold leading-none text-white ring-2 ring-[var(--bg)] lg:inline-flex">{liveCount}</span>
                           )}
                         </span>
                         <span className={cx('truncate', collapsed && 'lg:hidden')}>{item.label}</span>
                         {item.badge && liveCount > 0 && (
                           <span className={cx('relative ml-auto inline-flex', collapsed && 'lg:hidden')}>
                             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-400 opacity-40" />
-                            <span className="relative inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-semibold text-white">{liveCount}</span>
+                            <span className="relative inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-rose-500 px-1 text-2xs font-semibold text-white">{liveCount}</span>
                           </span>
                         )}
                       </>
@@ -119,16 +120,16 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
             <img src={me.picture} alt="" referrerPolicy="no-referrer"
               className="h-8 w-8 shrink-0 rounded-full object-cover ring-1 ring-[var(--border)]" />
           ) : (
-            <div className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-indigo-600 text-[12px] font-semibold text-white">{initial}</div>
+            <div className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-indigo-600 text-xs font-semibold text-white">{initial}</div>
           )}
           <div className={cx('min-w-0 flex-1 leading-tight', collapsed && 'lg:hidden')}>
-            <div className="truncate text-[12.5px] font-medium">{displayName}</div>
-            <div className="truncate text-[11px] text-dim">{email || 'signed in'}</div>
+            <div className="truncate text-xs font-medium">{displayName}</div>
+            <div className="truncate text-2xs text-dim">{email || 'signed in'}</div>
           </div>
           {me?.mode === 'multi-tenant' && (
             // Stays visible in the collapsed rail — signing out must never require expanding the sidebar.
             <a href="/auth/logout" title="Sign out" aria-label="Sign out"
-              className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-dim transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]">
+              className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-dim transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]">
               <LogOut size={14} />
             </a>
           )}

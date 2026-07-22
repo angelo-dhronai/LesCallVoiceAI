@@ -64,11 +64,11 @@ export function Modal({
   if (!open) return null
   return (
     <div role="dialog" aria-modal="true" aria-labelledby={title ? 'modal-title' : undefined}>
-      <div className="fixed inset-0 z-[80] bg-zinc-950/30" onClick={onClose} />
+      <div className="fixed inset-0 z-[80] bg-zinc-950/30" onClick={onClose} aria-hidden="true" />
       <div ref={panelRef} className={cx('card relative z-[90] w-full p-5 shadow-glass-lg animate-fade-up', wide ? 'max-w-2xl' : 'max-w-md')}>
         {title && (
           <div className="mb-3 flex items-center justify-between gap-3">
-            <h3 id="modal-title" className="font-display text-[15px] font-semibold tracking-tight">{title}</h3>
+            <h3 id="modal-title" className="font-display text-lg font-semibold tracking-tight">{title}</h3>
             <button onClick={onClose} aria-label="Close dialog" className="grid h-8 w-8 place-items-center rounded-lg text-dim transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]"><X size={16} /></button>
           </div>
         )}
@@ -96,13 +96,13 @@ export function FullscreenModal({
   if (!open) return null
   return (
     <div role="dialog" aria-modal="true" aria-labelledby={title ? 'fullscreen-modal-title' : undefined}>
-      <div className="fixed inset-0 z-[80] bg-zinc-950/40" onClick={onClose} />
+      <div className="fixed inset-0 z-[80] bg-zinc-950/40" onClick={onClose} aria-hidden="true" />
       <div
         ref={panelRef}
         className="fixed inset-0 z-[90] flex flex-col overflow-hidden bg-[var(--surface-solid)] shadow-glass-lg animate-fade-up"
       >
         <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-[var(--border)] px-4 py-3 sm:px-6">
-          <h3 id="fullscreen-modal-title" className="min-w-0 flex-1 truncate font-display text-[15px] font-bold tracking-tight sm:text-[17px]">
+          <h3 id="fullscreen-modal-title" className="min-w-0 flex-1 truncate font-display text-lg font-bold tracking-tight sm:text-xl">
             {title}
           </h3>
           {headerExtra}
@@ -130,11 +130,11 @@ export function SlideOver({
   if (!open) return null
   return (
     <div className="fixed inset-0 z-[80]" role="dialog" aria-modal="true" aria-labelledby={title ? 'slideover-title' : undefined}>
-      <div className="absolute inset-0 bg-zinc-950/30" onClick={onClose} />
+      <div className="absolute inset-0 bg-zinc-950/30" onClick={onClose} aria-hidden="true" />
       <div ref={panelRef} className="absolute right-0 top-0 flex h-full w-[min(94vw,560px)] flex-col bg-[var(--surface-solid)] shadow-glass-lg animate-slide-in-right">
         <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-5 py-4">
           <div className="min-w-0 flex-1">
-            <h3 id="slideover-title" className="truncate font-display text-[16px] font-bold tracking-tight">{title}</h3>
+            <h3 id="slideover-title" className="truncate font-display text-lg font-bold tracking-tight">{title}</h3>
           </div>
           {headerExtra}
           <button onClick={onClose} aria-label="Close panel" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-dim hover:bg-[var(--surface-2)]"><X size={16} /></button>

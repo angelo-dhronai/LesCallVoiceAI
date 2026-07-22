@@ -4,7 +4,7 @@ import {
 } from 'lucide-react'
 import { useGet } from '../api/hooks/useApi'
 import { useSSE } from '../api/useSSE'
-import { Card, Badge, Button, EmptyState, SkeletonBlock, Spinner, cx } from '../components/ui'
+import { Card, Badge, Button, EmptyState, LiveDot, SkeletonBlock, Spinner, cx } from '../components/ui'
 import { PageHeader } from '../components/kit'
 import { FullscreenModal } from '../components/Modal'
 import { dur, clockTime } from '../lib/format'
@@ -157,7 +157,7 @@ function StageStrip({ stage }: { stage: string }) {
               />
               <div
                 className={cx(
-                  'mt-1 truncate text-center text-[9px] font-semibold uppercase tracking-wide',
+                  'mt-1 truncate text-center text-2xs font-semibold uppercase tracking-wide',
                   active ? 'text-[var(--text)]' : 'text-dim',
                 )}
               >
@@ -182,51 +182,55 @@ function CallCard({ call, now, onView }: { call: AnyCall; now: number; onView: (
 
   return (
     <Card hover glow="mint" className="flex animate-fade-up">
-      <div
-        role="button"
-        tabIndex={0}
-        onClick={onView}
-        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onView() } }}
-        aria-label={`View conversation with ${callPhone(call)}`}
-        className="flex flex-1 cursor-pointer flex-col gap-3 rounded-2xl p-5 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-mint-400/50"
-      >
-        <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5 font-semibold">
-              <Phone size={14} className="shrink-0 text-mint-500" />
-              <span className="truncate">{callPhone(call)}</span>
+      {/* The card body is the click target; the explicit action below is a
+          SIBLING, never a <button> nested inside the role="button" region. */}
+      <div className="flex flex-1 flex-col gap-3 p-5">
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={onView}
+          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onView() } }}
+          aria-label={`View conversation with ${callPhone(call)}`}
+          className="flex cursor-pointer flex-col gap-3 rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-mint-400/50"
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 font-semibold">
+                <Phone size={14} className="shrink-0 text-mint-500" />
+                <span className="truncate">{callPhone(call)}</span>
+              </div>
+              {id && <div className="mt-0.5 truncate font-mono text-2xs text-dim">{id}</div>}
             </div>
-            {id && <div className="mt-0.5 truncate font-mono text-[10px] text-dim">{id}</div>}
+            <div className="flex shrink-0 items-center gap-1 tabular-nums text-sm text-soft">
+              <Clock size={12} className="text-dim" />
+              {dur(seconds)}
+            </div>
           </div>
-          <div className="flex shrink-0 items-center gap-1 tabular-nums text-[13px] text-soft">
-            <Clock size={12} className="text-dim" />
-            {dur(seconds)}
+
+          <div className="flex flex-wrap items-center gap-2">
+            <SpeakingBadge speaking={callSpeaking(call)} />
+            {lang && (
+              <Badge tone="amber"><Languages size={11} className="mr-1 inline" />{lang}</Badge>
+            )}
+          </div>
+
+          <StageStrip stage={callStage(call)} />
+
+          <div>
+            <div className="eyebrow mb-1">Latest</div>
+            {tail ? (
+              <div key={tail} className="line-clamp-2 animate-fade-up rounded-xl surface-2 px-3 py-2 text-xs text-soft">
+                {tail}
+              </div>
+            ) : (
+              <div className="rounded-xl surface-2 px-3 py-2 text-xs italic text-dim">
+                Waiting for first words…
+              </div>
+            )}
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <SpeakingBadge speaking={callSpeaking(call)} />
-          {lang && (
-            <Badge tone="amber"><Languages size={11} className="mr-1 inline" />{lang}</Badge>
-          )}
-        </div>
-
-        <StageStrip stage={callStage(call)} />
-
-        <div>
-          <div className="eyebrow mb-1">Latest</div>
-          {tail ? (
-            <div key={tail} className="line-clamp-2 animate-fade-up rounded-xl surface-2 px-3 py-2 text-[12px] text-soft">
-              {tail}
-            </div>
-          ) : (
-            <div className="rounded-xl surface-2 px-3 py-2 text-[12px] italic text-dim">
-              Waiting for first words…
-            </div>
-          )}
-        </div>
-
-        <div className="mt-auto pt-1" onClick={(e) => e.stopPropagation()}>
+        <div className="mt-auto pt-1">
           <Button variant="soft" size="sm" onClick={onView}>
             <MessageSquare size={13} className="mr-1 inline" />View Conversation
           </Button>
@@ -250,13 +254,13 @@ const Bubble = memo(function Bubble({ speaker, text, animate }: {
     <div className={cx('flex', agent ? 'justify-start' : 'justify-end', animate && 'animate-fade-up')}>
       <div
         className={cx(
-          'max-w-[88%] rounded-2xl px-3.5 py-2.5 text-[13.5px] leading-relaxed sm:max-w-[42rem] sm:text-[15px]',
+          'max-w-[88%] rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed sm:max-w-[42rem] sm:text-base',
           agent
             ? 'bg-[var(--surface-2)] text-soft'
             : 'bg-mint-400/15 text-[var(--text)] ring-1 ring-mint-400/25',
         )}
       >
-        <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-dim">
+        <div className="mb-0.5 text-2xs font-semibold uppercase tracking-wide text-dim">
           {agent ? 'Agent' : 'Caller'}
         </div>
         {text}
@@ -312,12 +316,12 @@ function TranscriptPanel({ call }: { call: AnyCall }) {
         className="min-h-0 flex-1 space-y-2.5 overflow-y-auto overscroll-contain px-4 py-4 sm:px-8 sm:py-5"
       >
         {msgs.length === 0 && !snippet && (
-          <div className="grid h-full place-items-center text-[13.5px] text-dim">
+          <div className="grid h-full place-items-center text-sm text-dim">
             Listening — the conversation will appear here as it happens.
           </div>
         )}
         {msgs.length === 0 && snippet && (
-          <div className="rounded-xl surface-2 px-3.5 py-2.5 text-[13.5px] text-soft sm:text-[15px]">{snippet}</div>
+          <div className="rounded-xl surface-2 px-3.5 py-2.5 text-sm text-soft sm:text-base">{snippet}</div>
         )}
         {msgs.map((m, i) => (
           <Bubble
@@ -331,7 +335,7 @@ function TranscriptPanel({ call }: { call: AnyCall }) {
       {!pinned && (
         <button
           onClick={jumpToLatest}
-          className="absolute bottom-4 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full bg-[var(--surface-solid)] px-3.5 py-2 text-[12px] font-semibold text-soft shadow-glass-lg ring-1 ring-[var(--border)] transition hover:text-[var(--text)]"
+          className="absolute bottom-4 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full bg-[var(--surface-solid)] px-3.5 py-2 text-xs font-semibold text-soft shadow-glass-lg ring-1 ring-[var(--border)] transition hover:text-[var(--text)]"
         >
           <ArrowDown size={13} /> Jump to latest
         </button>
@@ -396,18 +400,15 @@ export default function Live() {
         title="Live Calls"
         sub="Real-time monitoring of in-progress phone calls"
         actions={
-          <div className="flex items-center gap-3 text-[13px]">
+          <div className="flex items-center gap-3 text-sm">
             <span className="flex items-baseline gap-1.5">
               <span className="metric text-xl tabular-nums">{calls.length}</span>
-              <span className="text-[12px] text-dim">active</span>
+              <span className="text-xs text-dim">active</span>
             </span>
             <span className="inline-flex items-center gap-2 font-semibold">
-              <span className="relative flex h-2.5 w-2.5">
-                {live && (
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-mint-400 opacity-60" />
-                )}
-                <span className={cx('relative inline-flex h-2.5 w-2.5 rounded-full', live ? 'bg-mint-400' : 'bg-amber-400')} />
-              </span>
+              {live
+                ? <LiveDot />
+                : <span aria-hidden className="inline-flex h-2 w-2 rounded-full bg-amber-400" />}
               {live ? 'Live' : 'Reconnecting…'}
             </span>
             {updatedLabel && <span className="text-dim">Updated {updatedLabel}</span>}
@@ -416,7 +417,7 @@ export default function Live() {
       />
 
       {status === 'error' && calls.length > 0 && (
-        <div role="alert" className="flex items-center gap-2 rounded-xl bg-amber-400/10 px-4 py-2.5 text-[13px] font-medium text-amber-600 ring-1 ring-amber-400/30 dark:text-amber-300">
+        <div role="alert" className="flex items-center gap-2 rounded-xl bg-amber-400/10 px-4 py-2.5 text-sm font-medium text-amber-600 ring-1 ring-amber-400/30 dark:text-amber-300">
           <Spinner className="!h-3.5 !w-3.5 shrink-0" />
           <span>
             Live stream interrupted — showing last update{updatedLabel ? ` from ${updatedLabel}` : ''}. Reconnecting…
@@ -478,7 +479,7 @@ export default function Live() {
         ) : 'Conversation'}
         headerExtra={openCall ? (
           <div className="flex shrink-0 flex-wrap items-center gap-2">
-            <span className="flex items-center gap-1 tabular-nums text-[13px] text-soft">
+            <span className="flex items-center gap-1 tabular-nums text-sm text-soft">
               <Clock size={12} className="text-dim" />{dur(openSeconds)}
             </span>
             {callLanguage(openCall) && (

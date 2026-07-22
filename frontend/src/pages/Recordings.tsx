@@ -1,9 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
-import { Check, Copy, Download, FileAudio, Link2, RefreshCw, SearchX } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { Check, Copy, Download, FileAudio, Link2, RefreshCw, SearchX, Sparkles } from 'lucide-react'
 import { useGet, useRefresh } from '../api/hooks/useApi'
-import { Badge, Button, Card, EmptyState, Spinner, cx } from '../components/ui'
+import { Badge, Button, Card, EmptyState, IconButton, Spinner, cx } from '../components/ui'
 import { PageHeader, Table, THead, TH, TR, TD, Pagination, SearchInput, AsyncState } from '../components/kit'
 import { AudioPlayer } from '../components/AudioPlayer'
+import { useDebounced, useUrlNumber, useUrlParam } from '../lib/hooks'
+
+/** The shared Button skin (ghost · sm · rounded-md) as a class string, for the
+ *  two link-shaped actions below — ui.Button only renders a <button>, but a
+ *  download must stay an <a> and a cross-link should be a real router Link. */
+const BUTTON_LINK_CLS =
+  'inline-flex min-h-[36px] items-center justify-center gap-1.5 rounded-md bg-[var(--surface-solid)] px-2.5 py-1.5 text-xs font-medium text-soft ring-1 ring-[var(--border)] transition-all hover:bg-[var(--surface-2)] hover:ring-[var(--border-strong)] active:scale-[.98] sm:min-h-0'
 
 type Recording = {
   folder: string
@@ -44,23 +52,19 @@ function formatDay(d: Date): string {
 }
 
 export default function Recordings() {
-  const [page, setPage] = useState(1)
-  const [search, setSearch] = useState('')
-  const [debounced, setDebounced] = useState('')
+  // Search + page live in the URL — deep links like /recordings?q=<call id>
+  // (from Activity's cross-link) land directly on the filtered view.
+  const [page, setPage] = useUrlNumber('page', 1)
+  const [search, setSearch] = useUrlParam('q')
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const copyTimer = useRef<number | null>(null)
   const refresh = useRefresh()
 
   // Debounce keystrokes so the query (and the table) doesn't churn per character.
-  useEffect(() => {
-    const t = setTimeout(() => setDebounced(search), 300)
-    return () => clearTimeout(t)
-  }, [search])
-
-  // Reset to first page whenever the search term changes.
-  useEffect(() => {
-    setPage(1)
-  }, [search])
+  const debounced = useDebounced(search, 300)
+  // Typing a new search resets the page inside the change handler (not an
+  // effect) so URL deep links with an explicit page survive the mount.
+  const changeSearch = (v: string) => { setSearch(v); setPage(1) }
 
   useEffect(() => () => {
     if (copyTimer.current) window.clearTimeout(copyTimer.current)
@@ -111,7 +115,7 @@ export default function Recordings() {
         <div className="mb-4 flex items-center gap-3">
           <SearchInput
             value={search}
-            onChange={setSearch}
+            onChange={changeSearch}
             placeholder="Search by contact / number"
             className="w-full max-w-sm"
           />
@@ -126,7 +130,7 @@ export default function Recordings() {
                 title={`No recordings match "${debounced}"`}
                 hint="Try a shorter name or the last digits of the number."
                 action={
-                  <Button variant="ghost" size="sm" onClick={() => setSearch('')}>
+                  <Button variant="ghost" size="sm" onClick={() => changeSearch('')}>
                     Clear search
                   </Button>
                 }
@@ -146,7 +150,7 @@ export default function Recordings() {
                   <TH>Date</TH>
                   <TH>Call ID</TH>
                   <TH>Play</TH>
-                  <TH>Download</TH>
+                  <TH>Actions</TH>
                 </THead>
                 <tbody>
                   {recordings.map((r) => {
@@ -175,18 +179,17 @@ export default function Recordings() {
                         <TD>
                           <div className="flex items-center gap-1.5">
                             <span
-                              className="max-w-[160px] truncate font-mono text-[12px] text-dim"
+                              className="max-w-[160px] truncate font-mono text-xs text-dim"
                               title={r?.call_id ?? ''}
                             >
                               {r?.call_id || '—'}
                             </span>
                             {r?.call_id && (
-                              <button
+                              <IconButton
+                                label="Copy call ID"
                                 onClick={() => copyCallId(r.call_id!)}
-                                aria-label="Copy call ID"
-                                title="Copy call ID"
                                 className={cx(
-                                  '-m-2.5 shrink-0 p-2.5 text-dim opacity-100 transition-opacity hover:text-soft md:opacity-0 md:focus-visible:opacity-100 md:group-hover:opacity-100',
+                                  '-my-2.5 md:opacity-0 md:focus-visible:opacity-100 md:group-hover:opacity-100',
                                   copiedId === r.call_id && 'md:opacity-100',
                                 )}
                               >
@@ -195,7 +198,7 @@ export default function Recordings() {
                                 ) : (
                                   <Copy size={12} />
                                 )}
-                              </button>
+                              </IconButton>
                             )}
                           </div>
                         </TD>
@@ -204,32 +207,26 @@ export default function Recordings() {
                         </TD>
                         <TD>
                           <div className="flex items-center gap-1.5">
-                            <a
-                              href={downloadUrl}
-                              download
-                              className={cx(
-                                'inline-flex items-center justify-center gap-1.5 rounded-xl px-3 py-1.5 text-[12px] font-semibold transition-all active:scale-[.97]',
-                                'text-soft bg-[var(--surface-2)] hover:bg-[var(--border)] ring-1 ring-[var(--border)]',
-                              )}
-                            >
+                            <a href={downloadUrl} download className={BUTTON_LINK_CLS}>
                               <Download size={14} /> Download
                             </a>
                             {r?.download_url && (
-                              <button
+                              <IconButton
+                                label="Copy public download link"
                                 onClick={() => copyCallId(r.download_url!)}
-                                aria-label="Copy public download link"
-                                title="Copy public download link"
-                                className={cx(
-                                  'inline-flex items-center justify-center rounded-xl p-2.5 text-dim transition-all hover:text-soft md:p-1.5',
-                                  'bg-[var(--surface-2)] hover:bg-[var(--border)] ring-1 ring-[var(--border)] active:scale-[.97]',
-                                )}
                               >
                                 {copiedId === r.download_url ? (
                                   <Check size={14} className="text-mint-500" />
                                 ) : (
                                   <Link2 size={14} />
                                 )}
-                              </button>
+                              </IconButton>
+                            )}
+                            {/* folder IS the call_key — the same id Intelligence rows link with. */}
+                            {folder && (
+                              <Link to={`/intelligence/${encodeURIComponent(folder)}`} className={BUTTON_LINK_CLS}>
+                                <Sparkles size={13} /> AI analysis →
+                              </Link>
                             )}
                           </div>
                         </TD>

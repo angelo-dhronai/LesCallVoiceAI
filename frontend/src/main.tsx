@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import App from './App'
 import { ThemeProvider } from './theme/ThemeProvider'
 import { ToastProvider } from './components/Toast'
+import { ConfirmProvider } from './components/confirm'
 import './index.css'
 
 const queryClient = new QueryClient({
@@ -18,9 +19,11 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>
         <ToastProvider>
-          <BrowserRouter>
-            <App />
-          </BrowserRouter>
+          <ConfirmProvider>
+            <BrowserRouter>
+              <App />
+            </BrowserRouter>
+          </ConfirmProvider>
         </ToastProvider>
       </QueryClientProvider>
     </ThemeProvider>

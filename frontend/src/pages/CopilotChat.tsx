@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useRefresh } from '../api/hooks/useApi'
+import { Link } from 'react-router-dom'
+import { useGet, useRefresh } from '../api/hooks/useApi'
 import {
   copilotChat, copilotSession, copilotSessions, copilotDeleteSession,
   copilotUpload, applyPendingChange, discardPendingChange,
   type CopilotAction, type TranscriptMsg, type SessionSummary,
   type InterviewProgress, type PendingChange,
 } from '../api/copilot'
-import { cx, Button, Spinner } from '../components/ui'
+import { cx, Badge, Button, EmptyState, Spinner } from '../components/ui'
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { TryAgentDialog } from '../components/TryAgent'
+import { ActivateAgentModal, type ActivateTarget } from '../components/ActivateAgent'
 import {
   Sparkles, SendHorizontal, RotateCcw, Check, X, ArrowDown,
   Plus, Pencil, Radio, Bot, Trash2, MessagesSquare, SquarePen, Lightbulb,
-  Paperclip, FileText, ClipboardList, Eye, EyeOff,
+  Paperclip, FileText, ClipboardList, Eye, EyeOff, PlayCircle,
 } from 'lucide-react'
 
 /* ─────────────────────────── session id ─────────────────────────── */
@@ -21,13 +25,35 @@ function newSessionId() {
   return `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
 }
 
+/**
+ * Opening Copilot always starts a BLANK chat, the way ChatGPT does.
+ *
+ * This used to read the last session id out of localStorage and resume it, so
+ * navigating to Copilot dropped you into whatever conversation you happened to
+ * leave open — days later, mid-interview, with no indication of why. Earlier
+ * chats are not lost: they are in the Chats sidebar (and deep links still work,
+ * see the ?session= param below), which is where resuming belongs — a
+ * deliberate choice, not a side effect of a stale key.
+ *
+ * Continuity across a refresh comes from the URL instead: the active session is
+ * mirrored into ?session= (see syncSessionUrl), so reloading keeps your place
+ * while a clean visit to /copilot is always a clean chat. That also makes a
+ * conversation linkable — which is what "open this agent's chat" needs.
+ */
 function loadSessionId() {
-  let sid = localStorage.getItem(SID_KEY)
-  if (!sid || !/^[A-Za-z0-9_-]{1,80}$/.test(sid)) {
-    sid = newSessionId()
-    localStorage.setItem(SID_KEY, sid)
-  }
+  const deepLink = new URLSearchParams(window.location.search).get('session')
+  if (deepLink && /^[A-Za-z0-9_-]{1,80}$/.test(deepLink)) return deepLink
+  const sid = newSessionId()
+  localStorage.setItem(SID_KEY, sid)
   return sid
+}
+
+/** Mirror the active session into the URL without adding a history entry. */
+function syncSessionUrl(sid: string) {
+  const url = new URL(window.location.href)
+  if (url.searchParams.get('session') === sid) return
+  url.searchParams.set('session', sid)
+  window.history.replaceState(null, '', url)
 }
 
 function relTime(iso?: string | null): string {
@@ -69,16 +95,13 @@ function SessionList({ sessions, activeSid, onSelect, onNew, onDelete }: Session
 
   return (
     <>
-      <button
-        onClick={onNew}
-        className="flex items-center gap-2 rounded-xl bg-[var(--surface-2)] px-3 py-2.5 text-[13px] font-semibold ring-1 ring-[var(--border)] transition hover:ring-mint-400/40"
-      >
+      <Button variant="ghost" onClick={onNew} className="justify-start" title="Start a new conversation">
         <SquarePen size={15} className="text-mint-600 dark:text-mint-300" /> New chat
-      </button>
+      </Button>
       <div className="eyebrow mt-2 px-1">Previous chats</div>
       <div className="flex-1 space-y-1 overflow-y-auto pr-0.5">
         {sessions.length === 0 && (
-          <div className="flex items-center gap-2 px-1 py-2 text-[12px] text-dim">
+          <div className="flex items-center gap-2 px-1 py-2 text-xs text-dim">
             <MessagesSquare size={13} /> No conversations yet
           </div>
         )}
@@ -99,40 +122,40 @@ function SessionList({ sessions, activeSid, onSelect, onNew, onDelete }: Session
             >
               <div className="flex items-center gap-1.5">
                 <span className={cx(
-                  'truncate text-[12.5px] font-semibold',
+                  'truncate text-sm font-semibold',
                   s.session_id === activeSid ? 'text-mint-700 dark:text-mint-300' : 'text-[var(--text)]',
                 )}>
                   {s.title || 'New chat'}
                 </span>
-                <span className="ml-auto shrink-0 text-[10.5px] text-dim">{relTime(s.updated_at)}</span>
+                <span className="ml-auto shrink-0 text-2xs text-dim">{relTime(s.updated_at)}</span>
                 {s.message_count != null && (
-                  <span className="shrink-0 pr-7 text-[10.5px] tabular-nums text-dim">· {s.message_count}</span>
+                  <span className="shrink-0 pr-7 text-2xs tabular-nums text-dim">· {s.message_count}</span>
                 )}
               </div>
               {s.agent && (
-                <div className="mt-0.5 flex items-center gap-1 text-[11px] text-dim">
+                <div className="mt-0.5 flex items-center gap-1 text-2xs text-dim">
                   <Bot size={11} /> <span className="truncate">{s.agent_name || s.agent}</span>
                 </div>
               )}
             </button>
             {confirmingId === s.session_id ? (
-              <div className="absolute right-1 top-1 flex items-center gap-2">
-                <button
-                  onClick={(e) => { e.stopPropagation(); setConfirmingId(null); onDelete(s.session_id) }}
+              <div className="absolute inset-y-1 right-1 z-10 flex items-center gap-1.5 rounded-md bg-[var(--surface-solid)] px-1 shadow-glass">
+                <Button
+                  size="sm"
+                  variant="danger"
                   title="Confirm delete"
-                  aria-label="Confirm delete"
-                  className="rounded-md bg-rose-500/15 p-2 text-rose-500 transition hover:bg-rose-500/25"
+                  onClick={() => { setConfirmingId(null); onDelete(s.session_id) }}
                 >
-                  <Check size={14} />
-                </button>
-                <button
-                  onClick={(e) => { e.stopPropagation(); setConfirmingId(null) }}
+                  <Check size={13} /> Delete
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
                   title="Cancel delete"
-                  aria-label="Cancel delete"
-                  className="rounded-md p-2 text-dim transition hover:bg-[var(--surface-2)] hover:text-soft"
+                  onClick={() => setConfirmingId(null)}
                 >
-                  <X size={14} />
-                </button>
+                  <X size={13} />
+                </Button>
               </div>
             ) : (
               <button
@@ -169,29 +192,85 @@ function CopilotAvatar() {
   )
 }
 
+/* The backend tags every action with the agent slug it touched (may be "").
+   The shared CopilotAction type doesn't model it, so widen locally. */
+type ActionWithAgent = CopilotAction & { agent?: string }
+
 function ActionChips({ actions }: { actions?: CopilotAction[] }) {
+  const [trying, setTrying] = useState<string | null>(null)
+  const [activating, setActivating] = useState<ActivateTarget | null>(null)
+  // The agent list is already loaded for the sidebar; it carries call_direction,
+  // which decides whether activating binds the inbound or the outbound slot.
+  const { data: agentsData } = useGet<{ agents?: { name: string; agent_name?: string; call_direction?: string }[] }>(
+    ['agents'], '/agents')
   if (!actions?.length) return null
+  const agents = [...new Set(
+    (actions as ActionWithAgent[]).map((a) => (a.agent || '').trim()).filter(Boolean),
+  )]
   return (
     <div className="mt-2">
-      <span className="eyebrow text-[10px]">Actions taken</span>
+      <span className="eyebrow text-2xs">Actions taken</span>
       <div className="mt-1 flex flex-wrap gap-1.5">
         {actions.map((a, i) => (
           <span
             key={i}
+            className="inline-flex max-w-full"
             title={a.ok ? a.tool : `${a.tool} failed — ask the copilot to retry this step`}
-            className={cx(
-              'inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-semibold ring-1',
-              a.ok
-                ? 'bg-mint-400/12 text-mint-700 ring-mint-400/25 dark:text-mint-300'
-                : 'bg-rose-500/10 text-rose-600 ring-rose-500/25 dark:text-rose-300',
-            )}
           >
-            {a.ok ? <Check size={11} /> : <X size={11} />}
-            <code className="font-mono text-[10px] opacity-70">{a.tool}</code>
-            {a.summary}
+            <Badge tone={a.ok ? 'mint' : 'rose'}>
+              {a.ok ? <Check size={11} /> : <X size={11} />}
+              <code className="font-mono text-2xs opacity-70">{a.tool}</code>
+              <span className="truncate">{a.summary}</span>
+            </Badge>
           </span>
         ))}
       </div>
+      {/* Per-agent quick actions — the copilot just changed this agent, so the
+          next thing you want is to hear it, not to go hunting for it. "Try it"
+          runs a real engine turn in text before anyone dials the number. */}
+      {agents.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
+          {agents.map((slug) => (
+            <span key={slug} className="inline-flex flex-wrap gap-1.5">
+              <button type="button" onClick={() => setTrying(slug)}
+                className="inline-flex max-w-full rounded-full"
+                title={`Try ${slug} — one live engine turn, in text`}>
+                <Badge tone="mint">
+                  <PlayCircle size={11} /> <span className="truncate">Try {slug}</span>
+                </Badge>
+              </button>
+              <Link
+                to={`/build/agents/${slug}`}
+                className="inline-flex max-w-full rounded-full"
+                title={`Open ${slug} in the agent editor`}
+              >
+                <Badge tone="indigo">
+                  <Pencil size={11} /> <span className="truncate">Open {slug} in editor</span>
+                </Badge>
+              </Link>
+              {/* Same modal the Agents panel uses — an agent is only real once
+                  it is on a number, so that step belongs here, not one
+                  navigation away. */}
+              <button type="button"
+                onClick={() => {
+                  const a = (agentsData?.agents ?? []).find((x) => x.name === slug)
+                  setActivating({ slug, title: a?.agent_name || slug,
+                    direction: a?.call_direction })
+                }}
+                className="inline-flex max-w-full rounded-full"
+                title={`Put ${slug} on one of your numbers`}>
+                <Badge tone="amber">
+                  <Radio size={11} /> <span className="truncate">Activate {slug}</span>
+                </Badge>
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+      <TryAgentDialog slug={trying ?? ''} open={!!trying}
+        onOpenChange={(v) => !v && setTrying(null)} />
+      <ActivateAgentModal target={activating} open={!!activating}
+        onClose={() => setActivating(null)} />
     </div>
   )
 }
@@ -207,7 +286,7 @@ function AssistantText({ content }: { content: string }) {
         i % 2 === 1 ? (
           <pre
             key={i}
-            className="mt-2 overflow-x-auto rounded-xl bg-[var(--bg-2)] px-3 py-2 font-mono text-[12px] leading-relaxed ring-1 ring-[var(--border)]"
+            className="mt-2 overflow-x-auto rounded-xl bg-[var(--bg-2)] px-3 py-2 font-mono text-xs leading-relaxed ring-1 ring-[var(--border)]"
           >
             {part.replace(/^[A-Za-z0-9_-]*\n/, '')}
           </pre>
@@ -223,7 +302,7 @@ function Bubble({ msg, onRetry }: { msg: ChatMsg; onRetry?: () => void }) {
   if (msg.role === 'user') {
     return (
       <div className="flex justify-end">
-        <div className="max-w-[82%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-gradient-to-b from-mint-300 to-mint-500 px-4 py-2.5 text-[13.5px] font-medium leading-relaxed text-[#04150d] shadow-glow-mint">
+        <div className="max-w-[82%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-gradient-to-b from-mint-300 to-mint-500 px-4 py-2.5 text-sm font-medium leading-relaxed text-[#04150d] shadow-glow-mint">
           {msg.content}
         </div>
       </div>
@@ -234,7 +313,7 @@ function Bubble({ msg, onRetry }: { msg: ChatMsg; onRetry?: () => void }) {
       <CopilotAvatar />
       <div className="max-w-[82%]">
         <div className={cx(
-          'whitespace-pre-wrap break-words rounded-2xl rounded-tl-md px-4 py-2.5 text-[13.5px] leading-relaxed ring-1',
+          'whitespace-pre-wrap break-words rounded-2xl rounded-tl-md px-4 py-2.5 text-sm leading-relaxed ring-1',
           msg.isError
             ? 'bg-rose-500/10 text-rose-600 ring-rose-500/25 dark:text-rose-300'
             : 'bg-[var(--surface-2)] text-[var(--text)] ring-[var(--border)]',
@@ -279,7 +358,7 @@ function TypingBubble() {
             />
           ))}
         </div>
-        <div className="mt-1 text-[11px] text-dim">{caption}</div>
+        <div className="mt-1 text-2xs text-dim">{caption}</div>
       </div>
     </div>
   )
@@ -293,7 +372,7 @@ function InterviewRail({ progress }: { progress: InterviewProgress }) {
     <div className="mb-2 rounded-xl bg-[var(--surface-2)] px-3 py-2 ring-1 ring-[var(--border)]">
       <div className="flex items-center gap-2">
         <ClipboardList size={13} className="shrink-0 text-mint-600 dark:text-mint-300" />
-        <span className="text-[11.5px] font-semibold text-soft">
+        <span className="text-xs font-semibold text-soft">
           Building your agent — {done}/{progress.layers.length} topics covered
         </span>
       </div>
@@ -302,19 +381,15 @@ function InterviewRail({ progress }: { progress: InterviewProgress }) {
           <span
             key={l.id}
             title={l.skipped ? 'Skipped at your request' : l.done ? 'Covered' : 'Still to cover'}
-            className={cx(
-              'inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10.5px] font-semibold ring-1',
-              l.done
-                ? 'bg-mint-400/12 text-mint-700 ring-mint-400/25 dark:text-mint-300'
-                : l.skipped
-                  ? 'bg-[var(--bg-2)] text-dim ring-[var(--border)] line-through'
-                  : l.id === progress.next_layer_id
-                    ? 'bg-amber-400/15 text-amber-600 ring-amber-400/30 dark:text-amber-300'
-                    : 'bg-transparent text-dim ring-[var(--border)]',
-            )}
+            className={cx('inline-flex max-w-full', l.skipped && 'line-through opacity-70')}
           >
-            {l.done ? <Check size={10} /> : null}
-            {l.title}
+            <Badge
+              tone={l.done ? 'mint' : l.id === progress.next_layer_id ? 'amber' : 'neutral'}
+              soft={!l.done && l.id !== progress.next_layer_id}
+            >
+              {l.done ? <Check size={10} /> : null}
+              {l.title}
+            </Badge>
           </span>
         ))}
       </div>
@@ -378,10 +453,10 @@ function SpecPreview({ progress }: { progress: InterviewProgress }) {
       <div className="eyebrow px-1">Agent so far</div>
       {sections.map((s) => (
         <div key={s.title} className="rounded-xl bg-[var(--surface-2)] p-2.5 ring-1 ring-[var(--border)]">
-          <div className="text-[11px] font-semibold text-mint-700 dark:text-mint-300">{s.title}</div>
+          <div className="text-2xs font-semibold text-mint-700 dark:text-mint-300">{s.title}</div>
           <ul className="mt-1 space-y-0.5">
             {s.rows.map((r, i) => (
-              <li key={i} className="break-words text-[11.5px] leading-snug text-soft">{r}</li>
+              <li key={i} className="break-words text-xs leading-snug text-soft">{r}</li>
             ))}
           </ul>
         </div>
@@ -403,12 +478,12 @@ function DiffCards({ changes, busy, onApply, onDiscard }: {
     <div className="space-y-2">
       {changes.map((c) => (
         <div key={c.change_id} className="rounded-xl bg-amber-400/8 p-3 ring-1 ring-amber-400/25">
-          <div className="flex items-center gap-2 text-[12px] font-semibold text-soft">
+          <div className="flex items-center gap-2 text-xs font-semibold text-soft">
             <Pencil size={13} className="text-amber-500" />
             Proposed change{c.slug ? ` to ${c.slug}` : ''}
             {c.reason ? <span className="font-normal text-dim">— {c.reason}</span> : null}
           </div>
-          <pre className="mt-2 max-h-48 overflow-auto rounded-lg bg-[var(--bg-2)] px-3 py-2 font-mono text-[11px] leading-relaxed ring-1 ring-[var(--border)]">
+          <pre className="mt-2 max-h-48 overflow-auto rounded-lg bg-[var(--bg-2)] px-3 py-2 font-mono text-2xs leading-relaxed ring-1 ring-[var(--border)]">
             {c.diff}
           </pre>
           <div className="mt-2 flex gap-2">
@@ -455,11 +530,11 @@ function PlaceholderTip({ onDismiss }: { onDismiss?: () => void }) {
   return (
     <div className="flex items-start gap-2.5 rounded-xl bg-amber-400/10 px-3 py-2.5 text-left ring-1 ring-amber-400/25">
       <Lightbulb size={15} className="mt-0.5 shrink-0 text-amber-500" />
-      <div className="min-w-0 flex-1 text-[12px] leading-relaxed text-soft">
+      <div className="min-w-0 flex-1 text-xs leading-relaxed text-soft">
         <span className="font-semibold text-[var(--text)]">Tip — smart greeting placeholders:</span>{' '}
-        use <code className="rounded bg-[var(--bg-2)] px-1 py-0.5 font-mono text-[11px]">{'{contact_name}'}</code>{' '}
+        use <code className="rounded bg-[var(--bg-2)] px-1 py-0.5 font-mono text-2xs">{'{contact_name}'}</code>{' '}
         in your opening line and the agent says the dialed contact's name from your contact list, and{' '}
-        <code className="rounded bg-[var(--bg-2)] px-1 py-0.5 font-mono text-[11px]">{'{current_time}'}</code>{' '}
+        <code className="rounded bg-[var(--bg-2)] px-1 py-0.5 font-mono text-2xs">{'{current_time}'}</code>{' '}
         becomes morning, afternoon or evening at call time — e.g.{' '}
         <span className="italic">"Good {'{current_time}'}, am I speaking with {'{contact_name}'}?"</span>
       </div>
@@ -477,37 +552,36 @@ function PlaceholderTip({ onDismiss }: { onDismiss?: () => void }) {
   )
 }
 
-function EmptyState({ onPick }: { onPick: (prompt: string) => void }) {
+/* First-run hero — built on the shared EmptyState, with the suggestion cards
+   and placeholder tip supplied as its action slot. */
+function ChatEmpty({ onPick }: { onPick: (prompt: string) => void }) {
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-6 py-10 text-center">
-      <div className="grid h-14 w-14 place-items-center rounded-2xl bg-gradient-to-br from-mint-300 to-indigo-500 text-[#04150d] shadow-glow-mint">
-        <Sparkles size={26} />
-      </div>
-      <div>
-        <h1 className="font-display text-[24px] font-bold tracking-tight">Agent Copilot</h1>
-        <p className="mx-auto mt-1.5 max-w-md text-[13px] text-dim">
-          Describe the voice agent you need — I'll ask a few questions, then build it,
-          wire it up, and put it on your phone line when you're ready.
-        </p>
-      </div>
-      <div className="grid w-full max-w-2xl gap-3 sm:grid-cols-3">
-        {SUGGESTIONS.map((s) => (
-          <button
-            key={s.title}
-            onClick={() => onPick(s.prompt)}
-            className="card card-hover flex flex-col items-start gap-2 p-4 text-left transition-all"
-          >
-            <div className="grid h-8 w-8 place-items-center rounded-xl bg-[var(--surface-2)] text-mint-600 ring-1 ring-[var(--border)] dark:text-mint-300">
-              <s.icon size={15} />
+    <div className="flex flex-1 flex-col items-center justify-center text-center">
+      <EmptyState
+        icon={<Sparkles size={22} />}
+        title="Agent Copilot"
+        hint="Describe the voice agent you need — I'll ask a few questions, then build it, wire it up, and put it on your phone line when you're ready."
+        action={
+          <div className="w-[min(42rem,88vw)] space-y-4">
+            <div className="grid gap-3 sm:grid-cols-3">
+              {SUGGESTIONS.map((s) => (
+                <button
+                  key={s.title}
+                  onClick={() => onPick(s.prompt)}
+                  className="card card-hover flex flex-col items-start gap-2 p-4 text-left transition-all"
+                >
+                  <div className="grid h-8 w-8 place-items-center rounded-xl bg-[var(--surface-2)] text-mint-600 ring-1 ring-[var(--border)] dark:text-mint-300">
+                    <s.icon size={15} />
+                  </div>
+                  <div className="text-sm font-semibold leading-tight">{s.title}</div>
+                  <div className="text-xs leading-snug text-dim">{s.sub}</div>
+                </button>
+              ))}
             </div>
-            <div className="text-[13px] font-semibold leading-tight">{s.title}</div>
-            <div className="text-[11.5px] leading-snug text-dim">{s.sub}</div>
-          </button>
-        ))}
-      </div>
-      <div className="w-full max-w-2xl">
-        <PlaceholderTip />
-      </div>
+            <PlaceholderTip />
+          </div>
+        }
+      />
     </div>
   )
 }
@@ -549,6 +623,7 @@ export default function CopilotChat() {
   // in send()). Explicit "New chat" clears via newChat().
   useEffect(() => {
     let cancelled = false
+    syncSessionUrl(sid)
     copilotSession(sid)
       .then((res) => {
         if (!cancelled && (res.transcript?.length ?? 0) > 0) setMessages(res.transcript)
@@ -572,14 +647,6 @@ export default function CopilotChat() {
       setShowJump(true)
     }
   }, [messages, busy])
-
-  // Close the mobile chats sheet on Escape
-  useEffect(() => {
-    if (!mobileChatsOpen) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setMobileChatsOpen(false) }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [mobileChatsOpen])
 
   const onMessagesScroll = () => {
     const el = scrollRef.current
@@ -705,9 +772,17 @@ export default function CopilotChat() {
       }])
       refresh(['agents'])
     } catch (e: any) {
+      // 409 = the agent changed underneath this proposal in a way that can't
+      // be replayed, and the server has already dropped it. Clear the card too:
+      // leaving it up invites the user to keep clicking an Apply that can never
+      // succeed (it was clicked seven times in a row in production).
+      const stale = e?.status === 409
+      if (stale) setPendingChanges((p) => p.filter((c) => c.change_id !== changeId))
       setMessages((m) => [...m, {
         role: 'assistant', isError: true, actions: [],
-        content: `Couldn't apply the change (${e?.message || e}).`,
+        content: stale
+          ? `That proposal is out of date — ${e?.message?.replace(/^409:\s*/, '') || 'the agent changed since it was proposed'} Ask me to redo it and I'll rebuild it from the current setup.`
+          : `Couldn't apply the change (${e?.message || e}).`,
       }])
     } finally {
       setBusy(false)
@@ -762,42 +837,38 @@ export default function CopilotChat() {
       />
 
       {/* mobile chat-history sheet (the sidebar is hidden below md) */}
-      {mobileChatsOpen && (
-        <>
-          <div
-            className="fixed inset-0 z-30 bg-black/40 backdrop-blur-sm md:hidden"
-            aria-hidden="true"
-            onClick={() => setMobileChatsOpen(false)}
+      <Sheet open={mobileChatsOpen} onOpenChange={setMobileChatsOpen}>
+        <SheetContent
+          side="left"
+          aria-describedby={undefined}
+          className="flex w-80 max-w-[85vw] flex-col gap-2 p-4 md:hidden"
+        >
+          <SheetHeader className="text-left">
+            <SheetTitle className="font-display text-base font-bold tracking-tight">Previous chats</SheetTitle>
+          </SheetHeader>
+          <SessionList
+            sessions={sessions}
+            activeSid={sid}
+            onSelect={(id) => { setMobileChatsOpen(false); selectChat(id) }}
+            onNew={() => { setMobileChatsOpen(false); newChat() }}
+            onDelete={deleteChat}
           />
-          <div
-            role="dialog"
-            aria-label="Chat history"
-            className="card fixed inset-x-4 top-16 z-40 flex max-h-[60dvh] flex-col gap-2 overflow-y-auto p-3 md:hidden"
-          >
-            <SessionList
-              sessions={sessions}
-              activeSid={sid}
-              onSelect={(id) => { setMobileChatsOpen(false); selectChat(id) }}
-              onNew={() => { setMobileChatsOpen(false); newChat() }}
-              onDelete={deleteChat}
-            />
-          </div>
-        </>
-      )}
+        </SheetContent>
+      </Sheet>
 
       <div className="flex min-w-0 flex-1 flex-col">
       {/* header row */}
-      <div className="mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-2 text-[12px] text-dim">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           {messages.length > 0 && (
             <>
-              <Sparkles size={13} className="text-mint-600 dark:text-mint-300" />
-              <span className="font-semibold text-soft">Agent Copilot</span>
-              <span className="hidden sm:inline">· builds and manages your voice agents</span>
+              <Sparkles size={15} className="shrink-0 text-mint-600 dark:text-mint-300" />
+              <h1 className="truncate font-display text-base font-bold tracking-tight">Agent Copilot</h1>
+              <span className="hidden truncate text-xs text-dim sm:inline">· builds and manages your voice agents</span>
             </>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           <Button
             variant="ghost"
             size="sm"
@@ -830,7 +901,7 @@ export default function CopilotChat() {
               <div className="skeleton h-20 w-3/4 rounded-2xl rounded-tl-md" />
             </div>
           ) : messages.length === 0 && !busy ? (
-            <EmptyState onPick={(p) => send(p)} />
+            <ChatEmpty onPick={(p) => send(p)} />
           ) : (
             <div className="flex flex-col gap-4 py-2">
               {messages.map((m, i) => (
@@ -853,12 +924,11 @@ export default function CopilotChat() {
           )}
         </div>
         {showJump && (
-          <button
-            onClick={jumpToLatest}
-            className="glass absolute bottom-2 left-1/2 z-10 inline-flex -translate-x-1/2 items-center gap-1 rounded-full px-3 py-1.5 text-[12px] font-semibold text-soft"
-          >
-            <ArrowDown size={13} /> Latest
-          </button>
+          <div className="absolute bottom-2 left-1/2 z-10 -translate-x-1/2">
+            <Button variant="ghost" size="sm" onClick={jumpToLatest} title="Jump to the latest message">
+              <ArrowDown size={13} /> Latest
+            </Button>
+          </div>
         )}
       </div>
 
@@ -874,20 +944,17 @@ export default function CopilotChat() {
         {attachments.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-1.5">
             {attachments.map((a) => (
-              <span
-                key={a.doc_id}
-                className="inline-flex items-center gap-1.5 rounded-md bg-indigo-400/10 px-2 py-1 text-[11px] font-semibold text-indigo-600 ring-1 ring-indigo-400/25 dark:text-indigo-300"
-              >
-                <FileText size={12} /> {a.name}
+              <Badge key={a.doc_id} tone="indigo">
+                <FileText size={12} /> <span className="max-w-[40vw] truncate">{a.name}</span>
                 <button
                   onClick={() => setAttachments((x) => x.filter((y) => y.doc_id !== a.doc_id))}
                   title="Remove attachment"
                   aria-label={`Remove ${a.name}`}
-                  className="rounded p-0.5 hover:bg-indigo-400/20"
+                  className="rounded-full p-0.5 hover:bg-indigo-400/20"
                 >
                   <X size={11} />
                 </button>
-              </span>
+              </Badge>
             ))}
           </div>
         )}
@@ -920,15 +987,15 @@ export default function CopilotChat() {
             placeholder={busy ? 'Copilot is working…' : 'Message the copilot — e.g. "Create a salon receptionist agent"'}
             onChange={(e) => { setInput(e.target.value); autoGrow(e.target) }}
             onKeyDown={onKeyDown}
-            className="max-h-40 flex-1 resize-none bg-transparent px-2 py-1.5 text-[13.5px] leading-relaxed text-[var(--text)] outline-none placeholder:text-dim disabled:opacity-50"
+            className="max-h-40 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm leading-relaxed text-[var(--text)] outline-none placeholder:text-dim disabled:opacity-50"
           />
           <Button onClick={() => send()} disabled={busy || !input.trim()} title="Send (Enter)">
             {busy ? <Spinner /> : <SendHorizontal size={15} />}
           </Button>
         </div>
-        <p className="mt-1.5 px-1 text-center text-[11px] text-dim">
+        <p className="mt-1.5 px-1 text-center text-2xs text-dim">
           Enter to send · Shift+Enter for a new line · the copilot writes real agents under{' '}
-          <code className="font-mono text-[10px]">agents/</code>
+          <code className="font-mono text-2xs">agents/</code>
         </p>
       </div>
       </div>
@@ -937,14 +1004,16 @@ export default function CopilotChat() {
       {interview && interview.phase !== 'idle' &&
         Object.keys(interview.draft || {}).length > 0 && (
         <aside className="hidden w-64 shrink-0 flex-col gap-2 xl:flex">
-          <button
+          <Button
+            variant="ghost"
+            size="sm"
+            className="justify-start"
             onClick={() => setShowPreview((v) => !v)}
-            className="flex items-center gap-2 rounded-xl bg-[var(--surface-2)] px-3 py-2 text-[12px] font-semibold ring-1 ring-[var(--border)] transition hover:ring-mint-400/40"
             title={showPreview ? 'Hide the live preview' : 'Show the live preview'}
           >
             {showPreview ? <EyeOff size={13} /> : <Eye size={13} />}
             {showPreview ? 'Hide preview' : 'Show preview'}
-          </button>
+          </Button>
           {showPreview && (
             <div className="flex-1 overflow-y-auto pr-0.5">
               <SpecPreview progress={interview} />

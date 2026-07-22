@@ -26,7 +26,7 @@ export default function IntentTester({ initialAgent = '' }: { initialAgent?: str
   const list = agents?.agents ?? []
   return (
     <div className="space-y-6">
-      <p className="text-[13px] text-dim">
+      <p className="text-sm text-dim">
         See how an agent classifies caller speech — pattern matching only, no LLM call.
       </p>
 
@@ -49,31 +49,31 @@ export default function IntentTester({ initialAgent = '' }: { initialAgent?: str
           </Field>
         </div>
         <div className="flex items-center justify-end gap-2">
-          <span className="text-[11px] text-dim">Ctrl+↵</span>
+          <span className="text-2xs text-dim">Ctrl+↵</span>
           <Button variant="primary" onClick={run} disabled={busy || !text.trim()}><Play size={14} /> {busy ? 'Matching…' : 'Run'}</Button>
         </div>
-        {err && <div role="alert" className="break-words rounded-lg bg-rose-500/10 px-3 py-2 text-[12px] text-rose-600 ring-1 ring-rose-500/20 dark:text-rose-300">{err}</div>}
+        {err && <div role="alert" className="break-words rounded-md bg-rose-500/10 px-3 py-2 text-xs text-rose-600 ring-1 ring-rose-500/20 dark:text-rose-300">{err}</div>}
       </Card>
 
       {res && (
         <Card className="p-5 space-y-4">
-          <p className="break-words text-[13px] italic text-soft">"{res.text}"</p>
+          <p className="break-words text-sm italic text-soft">"{res.text}"</p>
           <div className="flex flex-wrap items-center gap-2">
             <Target size={16} className="text-mint-500" />
-            <span className="text-[13px] text-soft">Top intent</span>
+            <span className="text-sm text-soft">Top intent</span>
             <Badge tone={res.intent === 'none' ? 'neutral' : 'mint'} soft>{res.intent}</Badge>
             {text.trim() !== res.text && <Badge tone="amber" soft>Input changed — run again</Badge>}
-            <span title={res.agent_id} className="ml-auto max-w-full truncate text-[11px] text-dim">{res.agent_id}</span>
+            <span title={res.agent_id} className="ml-auto max-w-full truncate text-2xs text-dim">{res.agent_id}</span>
           </div>
 
           {res.matches.length > 0 ? (
             <div className="space-y-1.5">
               <div className="eyebrow">Matched patterns</div>
               {res.matches.map((m, i) => (
-                <div key={i} className="flex flex-wrap items-center gap-2 rounded-lg bg-[var(--surface-2)] px-3 py-2 text-[12px] ring-1 ring-[var(--border)]">
+                <div key={i} className="flex flex-wrap items-center gap-2 rounded-md bg-[var(--surface-2)] px-3 py-2 text-xs ring-1 ring-[var(--border)]">
                   <Badge tone="indigo" soft>{m.intent}</Badge>
                   <span className="text-soft">matched</span>
-                  <code className="break-all font-mono text-[11px] text-[var(--text)]">{m.pattern}</code>
+                  <code className="break-all font-mono text-2xs text-[var(--text)]">{m.pattern}</code>
                 </div>
               ))}
             </div>
@@ -84,7 +84,7 @@ export default function IntentTester({ initialAgent = '' }: { initialAgent?: str
               <div className="eyebrow">QA signals detected</div>
               <div className="flex flex-wrap gap-1.5">
                 {res.qa_signals.map((q, i) => (
-                  <span key={i} className="rounded-md bg-[var(--surface-2)] px-2 py-1 text-[11px] text-soft ring-1 ring-[var(--border)]">{q.field}: "{q.signal}"</span>
+                  <span key={i} className="rounded-md bg-[var(--surface-2)] px-2 py-1 text-2xs text-soft ring-1 ring-[var(--border)]">{q.field}: "{q.signal}"</span>
                 ))}
               </div>
             </div>
@@ -92,7 +92,7 @@ export default function IntentTester({ initialAgent = '' }: { initialAgent?: str
 
           <div className="border-t border-[var(--border)] pt-3">
             <div className="eyebrow mb-1.5">Patterns checked</div>
-            <div className="flex flex-wrap gap-3 text-[11px] text-dim">
+            <div className="flex flex-wrap gap-3 text-2xs text-dim">
               {Object.entries(res.patterns_checked).map(([k, v]) => <span key={k}>{k}: <span className="font-semibold text-soft">{v}</span></span>)}
             </div>
           </div>

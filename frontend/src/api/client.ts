@@ -12,7 +12,11 @@ export async function api<T>(path: string, opts?: RequestInit): Promise<T> {
       detail = typeof body?.detail === 'string' ? body.detail
         : typeof body?.reason === 'string' ? body.reason : ''
     } catch { /* non-JSON error body */ }
-    throw new Error(detail ? `${res.status}: ${detail}` : `${res.status} ${res.statusText}`)
+    const err = new Error(detail ? `${res.status}: ${detail}` : `${res.status} ${res.statusText}`)
+    // Callers need to branch on the code (e.g. 409 = the server already
+    // dropped the thing you were acting on), not string-match the message.
+    ;(err as Error & { status?: number }).status = res.status
+    throw err
   }
   const ct = res.headers.get('content-type') || ''
   if (ct.includes('application/json')) return res.json()

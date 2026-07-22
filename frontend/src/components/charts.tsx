@@ -42,7 +42,7 @@ export function RadialRing({
           strokeDasharray={c} strokeDashoffset={c * (1 - frac)} strokeLinecap="round"
           style={{ transition: 'stroke-dashoffset .8s cubic-bezier(.22,1,.36,1)' }} />
       </svg>
-      <span className="absolute text-[12px] font-bold metric">{label ?? `${Math.round(frac * 100)}%`}</span>
+      <span className="absolute text-xs font-bold metric">{label ?? `${Math.round(frac * 100)}%`}</span>
     </div>
   )
 }

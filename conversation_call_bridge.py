@@ -44,6 +44,36 @@ logger = logging.getLogger("call_bridge")
 PLAYBACK_HOST = "127.0.0.1"
 PLAYBACK_PORT = 9004
 
+# TTS synthesis/output sample rate. 8000 = Sarvam synthesizes at telephony
+# rate directly and TelephonySink skips the ffmpeg downsample entirely
+# (~100-300ms blocking subprocess per flush). Set 16000 to restore the old
+# 16k-synth + ffmpeg path.
+TTS_OUTPUT_SR = int(os.environ.get("TTS_OUTPUT_SR", "8000"))
+
+# Open the usage-ledger row in the background instead of blocking session
+# start (~hundreds of ms of DB work before the greeting can fire). The row
+# opens ≤~1s later; heartbeats are 15s-granular and close_call is unchanged.
+METERING_OPEN_DEFERRED = os.environ.get(
+    "METERING_OPEN_DEFERRED", "true").lower() == "true"
+
+# Cache preflight verdicts per (slug, sha256, revision): the prompt build is
+# deterministic and the registry watcher bumps sha/revision on any agent.yaml
+# edit, so an edit self-invalidates. Saves a full stage×language prompt render
+# on every call for unchanged agents.
+PREFLIGHT_CACHE_ENABLED = os.environ.get(
+    "PREFLIGHT_CACHE", "true").lower() == "true"
+_preflight_cache: dict[tuple, str] = {}
+_PREFLIGHT_CACHE_MAX = 64
+
+# Pre-call customer context (Customer Intelligence Hub): fetch the returning
+# caller's precomputed digest inside the routing thread. Platform kill-switch;
+# the per-agent opt-out lives in agent.yaml (memory.use_customer_context).
+INTEL_PRECALL_CONTEXT = os.environ.get(
+    "INTEL_PRECALL_CONTEXT", "true").lower() == "true"
+_customer_ctx_cache: dict[tuple, tuple[float, dict | None]] = {}
+_CUSTOMER_CTX_TTL_S = 300.0
+_CUSTOMER_CTX_CACHE_MAX = 512
+
 # ---------------------------------------------------------------------------
 # Active-agent resolution (single-active-agent model)
 # ---------------------------------------------------------------------------
@@ -262,9 +292,129 @@ def _lookup_recent_outbound_dial(caller_number: str = "") -> dict | None:
         return None
 
 
+def _fetch_customer_context(owner: str, phone: str) -> dict | None:
+    """Returning-caller context: one contacts lookup + one customer_memory
+    read (with open-item counts as scalar subqueries). Precomputed at write
+    time by the intel pipeline's digest stage, so this is ~1ms of indexed
+    reads. Any failure returns None — context must NEVER delay or kill a
+    call. In-proc TTL cache absorbs rapid re-calls."""
+    if not owner or not phone:
+        return None
+    try:
+        from shared.phone import significant_digits
+        sig = significant_digits(phone)
+        if not sig:
+            return None
+        key = (owner, sig)
+        now = time.monotonic()
+        hit = _customer_ctx_cache.get(key)
+        if hit is not None and now - hit[0] < _CUSTOMER_CTX_TTL_S:
+            return hit[1]
+
+        from shared.db.database import get_db
+        t0 = time.perf_counter()
+        ctx: dict | None = None
+        with get_db() as db:
+            contact = db.execute(
+                "SELECT id, name FROM contacts WHERE owner=? AND sig_digits=?",
+                (owner, sig)).fetchone()
+            if contact:
+                row = db.execute(
+                    """SELECT cm.context_digest, cm.calls_count, cm.last_call_at,
+                              (SELECT count(*) FROM followups f
+                                WHERE f.contact_id=cm.contact_id
+                                  AND f.status IN ('pending','scheduled')
+                                  AND f.deleted_at IS NULL) AS open_followups,
+                              (SELECT count(*) FROM commitments cc
+                                WHERE cc.contact_id=cm.contact_id
+                                  AND cc.status='open') AS open_commitments,
+                              (SELECT c2.outcome FROM calls c2
+                                WHERE c2.contact_id=cm.contact_id
+                                ORDER BY c2.id DESC LIMIT 1) AS last_outcome
+                         FROM customer_memory cm WHERE cm.contact_id=?""",
+                    (contact["id"],)).fetchone()
+                if row and (row["context_digest"] or row["calls_count"]):
+                    ctx = {
+                        "contact_id": contact["id"],
+                        "name": (contact["name"] or "").strip(),
+                        "calls_count": row["calls_count"],
+                        "last_call_at": row["last_call_at"],
+                        "last_outcome": row["last_outcome"],
+                        "open_followups": row["open_followups"],
+                        "open_commitments": row["open_commitments"],
+                        "digest": row["context_digest"] or "",
+                    }
+        if len(_customer_ctx_cache) >= _CUSTOMER_CTX_CACHE_MAX:
+            _customer_ctx_cache.pop(next(iter(_customer_ctx_cache)))
+        _customer_ctx_cache[key] = (now, ctx)
+        logger.info("[BRIDGE] customer context %s in %.1fms",
+                    "hit" if ctx else "none",
+                    (time.perf_counter() - t0) * 1000)
+        return ctx
+    except Exception as exc:
+        logger.warning("[BRIDGE] customer context fetch failed: %r", exc)
+        return None
+
+
+def _resolve_call_routing(conn_id: str, caller_number: str = "", did: str = "",
+                          campaign_id: int | None = None,
+                          agent_slug: str = "") -> dict:
+    """All blocking routing work for call setup, bundled in one place.
+
+    Runs the serial DB round-trips (recent-dial lookup → agent-slug
+    resolution → owner lookup) that used to execute one-by-one on the event
+    loop inside TelephonySession.__init__ (~250ms measured). The session
+    factory runs this in a worker thread; __init__ falls back to calling it
+    inline for any legacy direct-constructor path.
+    """
+    dial = None
+    try:
+        dial = _lookup_recent_outbound_dial(caller_number)
+    except Exception as exc:
+        logger.warning("[%s] outbound dial lookup failed: %r", conn_id, exc)
+
+    # Routing guard rails:
+    # - The loose most-recent dial match is fine for LABELING a call
+    #   outbound, but may only steer AGENT selection on an exact phone
+    #   match — otherwise an unrelated inbound call arriving during a
+    #   dial burst could inherit the dial's agent.
+    # - On a confident outbound leg, Caller-Destination-Number is the
+    #   CUSTOMER's number, not one of our DIDs — never DID-route on it.
+    dial_phone_match = _dial_matches_phone(caller_number, dial)
+    confident_outbound = campaign_id is not None or dial_phone_match
+    routing_did = "" if confident_outbound else did
+    routing_dial_meta = dial if dial_phone_match else None
+
+    # Direction is decided BEFORE the agent stack is built: it selects which
+    # of the number's two agent bindings (inbound vs outbound) applies.
+    direction = "outbound" if (campaign_id is not None or dial) else "inbound"
+
+    slug = resolve_agent_slug(did=routing_did, campaign_id=campaign_id,
+                              agent_slug=agent_slug, dial_meta=routing_dial_meta,
+                              direction=direction)
+    owner = _lookup_agent_owner(slug)
+
+    # Returning-caller memory: still inside the routing worker thread, so the
+    # greeting path never pays for it. The customer's number is the caller id
+    # inbound and the dialed number outbound.
+    customer = None
+    if INTEL_PRECALL_CONTEXT:
+        customer_phone = ((dial or {}).get("phone") if direction == "outbound"
+                          else caller_number) or caller_number
+        customer = _fetch_customer_context(owner, customer_phone)
+
+    return {
+        "dial": dial,
+        "direction": direction,
+        "slug": slug,
+        "owner": owner,
+        "customer": customer,
+    }
+
+
 def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = None,
                        agent_slug: str = "", dial_meta: dict | None = None,
-                       direction: str = "inbound"):
+                       direction: str = "inbound", resolved_slug: str = ""):
     """Resolve this call's agent and build (slug, conversation, stt, tts, health).
 
     Mirrors backend/run.py so telephony runs the data-driven agent identically
@@ -275,9 +425,10 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
     agent_health (F6): 'ok' | 'load_failed' | 'preflight_failed:<stage>' —
     recorded on the calls row so a degraded call is visible after the fact.
     """
-    slug = resolve_agent_slug(did=did, campaign_id=campaign_id,
-                              agent_slug=agent_slug, dial_meta=dial_meta,
-                              direction=direction)
+    slug = resolved_slug or resolve_agent_slug(
+        did=did, campaign_id=campaign_id,
+        agent_slug=agent_slug, dial_meta=dial_meta,
+        direction=direction)
     agent_def = None
     agent_health = "ok"
     try:
@@ -299,13 +450,30 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
     # router/session state is never touched.
     if (agent_def is not None
             and os.environ.get("PROMPT_PREFLIGHT", "").strip().lower() != "false"):
-        try:
-            from backend.app.agent_definition.preflight import preflight_agent
-            agent_health = preflight_agent(agent_def, slug=slug)
-        except Exception as exc:  # preflight harness itself must never drop a call
-            logger.error("[%s] [PREFLIGHT] harness error for '%s': %r",
-                         conn_id, slug, exc, exc_info=True)
-            agent_health = "ok"
+        cache_key = None
+        if PREFLIGHT_CACHE_ENABLED:
+            try:
+                _pmeta = agent_registry.meta(slug)
+                if _pmeta and _pmeta.get("sha256"):
+                    cache_key = (slug, _pmeta.get("sha256"), _pmeta.get("revision"))
+            except Exception:
+                cache_key = None
+        if cache_key is not None and cache_key in _preflight_cache:
+            agent_health = _preflight_cache[cache_key]
+            logger.info("[%s] [PREFLIGHT] cache hit for '%s' → %s",
+                        conn_id, slug, agent_health)
+        else:
+            try:
+                from backend.app.agent_definition.preflight import preflight_agent
+                agent_health = preflight_agent(agent_def, slug=slug)
+                if cache_key is not None:
+                    if len(_preflight_cache) >= _PREFLIGHT_CACHE_MAX:
+                        _preflight_cache.pop(next(iter(_preflight_cache)))
+                    _preflight_cache[cache_key] = agent_health
+            except Exception as exc:  # preflight harness itself must never drop a call
+                logger.error("[%s] [PREFLIGHT] harness error for '%s': %r",
+                             conn_id, slug, exc, exc_info=True)
+                agent_health = "ok"
         if agent_health != "ok":
             logger.error("[%s] [BRIDGE] preflight FAILED for '%s' (%s) — "
                          "answering with NEUTRAL_FALLBACK_AGENT",
@@ -335,6 +503,7 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
         model=tts_model,
         speaker=tts_speaker,
         pace=tts_pace,
+        sample_rate=TTS_OUTPUT_SR,
     )
     conversation = ConversationRouter(agent_def=agent_def)
     return slug, conversation, stt, tts, agent_health
@@ -343,7 +512,7 @@ class TelephonySession:
     """Manages one AI pipeline per phone call."""
     def __init__(self, conn_id: str, sample_rate: int, caller_number: str = "",
                  skip_greeting: bool = False, did: str = "", campaign_id: int | None = None,
-                 agent_slug: str = ""):
+                 agent_slug: str = "", routing: dict | None = None):
         self.conn_id = conn_id
         self.sample_rate = sample_rate
         self.caller_number = caller_number
@@ -351,41 +520,26 @@ class TelephonySession:
         self.campaign_id = campaign_id
         self.call_key = None  # recording folder basename; set in start()
         self.source = TelephonySource(sample_rate=sample_rate)
-        self.sink = TelephonySink(sample_rate=sample_rate, conn_id=conn_id)
+        # Sink runs at the TTS output rate (8k skips ffmpeg), independent of
+        # the 16k STT-side source rate.
+        self.sink = TelephonySink(sample_rate=TTS_OUTPUT_SR, conn_id=conn_id)
         self.hub = EventHub()
 
-        # Outbound dial linkage BEFORE agent resolution: the dial record can
-        # carry the agent slug bound at dial time (call_link.json fallback when
-        # the channel variable didn't survive the leg).
-        dial = None
-        try:
-            dial = _lookup_recent_outbound_dial(caller_number)
-        except Exception as exc:
-            logger.warning("[%s] outbound dial lookup failed: %r", conn_id, exc)
+        # Routing (dial linkage, direction, agent slug, owner) is normally
+        # pre-resolved in a worker thread by TelephonySession.create() so the
+        # serial DB round-trips never run on the event loop; fall back to
+        # inline resolution for any legacy direct-constructor path.
+        if routing is None:
+            routing = _resolve_call_routing(
+                conn_id, caller_number=caller_number, did=did,
+                campaign_id=campaign_id, agent_slug=agent_slug)
+        dial = routing.get("dial")
         self._dial = dial
+        self.direction = routing.get("direction", "inbound")
 
-        # Routing guard rails:
-        # - The loose most-recent dial match is fine for LABELING a call
-        #   outbound, but may only steer AGENT selection on an exact phone
-        #   match — otherwise an unrelated inbound call arriving during a
-        #   dial burst could inherit the dial's agent.
-        # - On a confident outbound leg, Caller-Destination-Number is the
-        #   CUSTOMER's number, not one of our DIDs — never DID-route on it.
-        dial_phone_match = _dial_matches_phone(caller_number, dial)
-        confident_outbound = campaign_id is not None or dial_phone_match
-        routing_did = "" if confident_outbound else did
-        routing_dial_meta = dial if dial_phone_match else None
-
-        # Direction is decided BEFORE the agent stack is built: it selects which
-        # of the number's two agent bindings (inbound vs outbound) applies.
-        self.direction = "outbound" if (campaign_id is not None or dial) else "inbound"
-
-        # Resolve this call's agent (DID / campaign / explicit slug) and build
-        # its STT/TTS the same way run.py does.
+        # Build the resolved agent's STT/TTS the same way run.py does.
         self.agent_slug, conversation, stt, tts, self.agent_health = _build_agent_stack(
-            conn_id, did=routing_did, campaign_id=campaign_id,
-            agent_slug=agent_slug, dial_meta=routing_dial_meta,
-            direction=self.direction)
+            conn_id, resolved_slug=routing.get("slug", ""))
         self.conversation = conversation
         # F8 per-call fidelity: WHICH agent bytes answered this call. Meta is
         # captured by the registry at load; absent (e.g. neutral fallback or
@@ -397,7 +551,8 @@ class TelephonySession:
             logger.warning("[%s] agent meta lookup failed: %r", conn_id, exc)
         self.agent_revision = int((_meta or {}).get("revision") or 0)
         self.agent_sha = str((_meta or {}).get("sha256") or "")
-        self.owner = _lookup_agent_owner(self.agent_slug)
+        # Owner was resolved with the rest of the routing bundle (off-loop).
+        self.owner = routing.get("owner", "")
         logger.info("[%s] Active agent: %s rev=%s sha=%s (direction=%s did=%s "
                     "campaign=%s owner=%s health=%s)",
                     conn_id, self.agent_slug, self.agent_revision,
@@ -426,6 +581,16 @@ class TelephonySession:
                 conversation.set_call_context(conn_id=conn_id)
         except Exception as exc:
             logger.warning("[%s] set_call_context failed: %r", conn_id, exc)
+
+        # Persistent customer memory: pre-fetched off-loop with the routing
+        # bundle. The router renders it as the KNOWN CUSTOMER prompt band
+        # (and honors the per-agent memory.use_customer_context flag).
+        try:
+            customer = routing.get("customer")
+            if customer and hasattr(conversation, "set_customer_context"):
+                conversation.set_customer_context(customer)
+        except Exception as exc:
+            logger.warning("[%s] set_customer_context failed: %r", conn_id, exc)
 
         # Initialize VoicePipeline with telephony endpoints + data-driven agent
         self.pipeline = VoicePipeline(
@@ -462,6 +627,25 @@ class TelephonySession:
             "start_time": time.time(),
         }
         
+    @classmethod
+    async def create(cls, conn_id: str, sample_rate: int, caller_number: str = "",
+                     skip_greeting: bool = False, did: str = "",
+                     campaign_id: int | None = None,
+                     agent_slug: str = "") -> "TelephonySession":
+        """Async factory: resolve routing in a worker thread, then construct.
+
+        Keeps the serial DB round-trips (dial lookup → slug resolution →
+        owner) off the event loop so buffered inbound audio — and with it the
+        greeting gate — isn't stalled behind blocking sqlite work.
+        """
+        routing = await asyncio.to_thread(
+            _resolve_call_routing, conn_id, caller_number, did,
+            campaign_id, agent_slug)
+        return cls(conn_id, sample_rate, caller_number=caller_number,
+                   skip_greeting=skip_greeting, did=did,
+                   campaign_id=campaign_id, agent_slug=agent_slug,
+                   routing=routing)
+
     async def start(self):
         """Starts the AI pipeline and the playback injection loop."""
         self._running = True
@@ -489,11 +673,26 @@ class TelephonySession:
         # BILLING: open this call's usage-ledger row and start the 15s
         # heartbeat. Metering must never affect call handling — every touch
         # is wrapped and off the event loop. (shared/usage_metering.py)
+        # Deferred by default: the open is DB work the greeting doesn't need
+        # to wait for; the single task preserves open-before-heartbeat order.
+        if METERING_OPEN_DEFERRED:
+            self._metering_task = asyncio.create_task(self._deferred_metering())
+        else:
+            try:
+                await asyncio.to_thread(self._metering_open)
+                self._metering_task = asyncio.create_task(self._metering_beat_loop())
+            except Exception as exc:
+                logger.error("[%s] METERING open failed: %r", self.conn_id, exc)
+
+    async def _deferred_metering(self):
         try:
             await asyncio.to_thread(self._metering_open)
-            self._metering_task = asyncio.create_task(self._metering_beat_loop())
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.error("[%s] METERING open failed: %r", self.conn_id, exc)
+            return
+        await self._metering_beat_loop()
         
     async def stop(self):
         """Stops and cleans up the session."""
@@ -601,6 +800,28 @@ class TelephonySession:
         except Exception as exc:
             logger.warning("[%s] Call row persistence failed: %r", self.conn_id, exc)
 
+        # Capture the FULL two-party recording (agent + caller) from
+        # FreeSWITCH's record_session WAV into the call folder. Must precede
+        # the GCS upload so both files ship together; the recording-sync pass
+        # is the catch-up if this misses. capture_fs_recording never raises —
+        # log its boolean result here so a failure (e.g. EACCES on the
+        # freeswitch-owned staging file) is loudly visible in THIS process,
+        # not just a maybe-suppressed library logger.
+        try:
+            from shared.recording_storage import capture_fs_recording
+            if self.call_key:
+                ok = await asyncio.to_thread(
+                    capture_fs_recording, self.conn_id, self.call_key)
+                if ok:
+                    logger.info("[%s] Full two-party recording captured", self.conn_id)
+                else:
+                    logger.warning("[%s] Full-recording capture DID NOT land "
+                                   "(recsync pass will retry in <=15 min)",
+                                   self.conn_id)
+        except Exception as exc:
+            logger.warning("[%s] Full-recording capture failed (sync pass "
+                           "will retry): %r", self.conn_id, exc)
+
         # Push the finished WAV to GCS (best-effort, off the loop). Failures
         # are retried by the recording-sync pass (shared/recording_storage.py
         # CLI); until then the local file remains the serving copy.
@@ -611,7 +832,28 @@ class TelephonySession:
         except Exception as exc:
             logger.warning("[%s] Recording upload failed: %r", self.conn_id, exc)
 
+        # Hand the finished call to the intelligence pipeline (best-effort;
+        # the worker's sweeper enqueues any call this misses).
+        try:
+            await asyncio.to_thread(self._enqueue_intelligence)
+        except Exception as exc:
+            logger.warning("[%s] Intelligence enqueue failed (sweeper will "
+                           "recover): %r", self.conn_id, exc)
+
         logger.info(f"[{self.conn_id}] Session stopped")
+
+    def _enqueue_intelligence(self) -> None:
+        from shared.db.database import get_db
+        from shared.intelligence import queue
+
+        with get_db() as db:
+            row = db.execute(
+                "SELECT id, owner FROM calls WHERE conn_id=?", (self.conn_id,)
+            ).fetchone()
+        if row:
+            queue.enqueue(queue.KIND_CALL_PROCESS, owner=row["owner"] or "",
+                          call_id=row["id"],
+                          dedupe_key=f"call.process:{self.conn_id}")
 
     # ------------------------------------------------------------------
     # BILLING metering hooks (shared/usage_metering.py). The ledger is the
@@ -814,6 +1056,14 @@ class TelephonySession:
             try:
                 if phone:
                     contact_id = self._resolve_contact_id(db, phone)
+                # Relationship default: the first agent that talked to this
+                # contact becomes its primary agent (never overwrites an
+                # explicit assignment).
+                if contact_id and self.agent_slug:
+                    db.execute(
+                        "UPDATE contacts SET primary_agent_slug=? "
+                        "WHERE id=? AND primary_agent_slug IS NULL",
+                        (self.agent_slug, contact_id))
             except Exception as exc:
                 logger.warning("[%s] contact binding failed: %r", self.conn_id, exc)
             # F8 fidelity fields. llm_models_used / llm_fallback_turns are
@@ -1030,9 +1280,10 @@ class SessionManager:
             if skip_greeting:
                 logger.info("[BRIDGE] Reconnect detected for conn_id=%s — greeting suppressed", conn_id)
 
-            session = TelephonySession(conn_id, sample_rate, caller_number=caller_number,
-                                       skip_greeting=skip_greeting, did=did,
-                                       campaign_id=campaign_id, agent_slug=agent_slug)
+            session = await TelephonySession.create(
+                conn_id, sample_rate, caller_number=caller_number,
+                skip_greeting=skip_greeting, did=did,
+                campaign_id=campaign_id, agent_slug=agent_slug)
             self.sessions[conn_id] = session
 
             # Mark as greeted on first creation (before start so no race)

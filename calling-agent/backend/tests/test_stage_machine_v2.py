@@ -18,6 +18,13 @@ from app.voice.conversation import ConversationRouter
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "seven_step_agent.yaml"
 
 
+@pytest.fixture(autouse=True)
+def _no_network_llm(stub_llm):
+    """Makes the module docstring's "no LLM" claim actually true: three tests
+    here (callback policy, DND, wrong-number) reached a turn that falls through
+    to the model and were opening real network connections."""
+
+
 def _router() -> ConversationRouter:
     agent = AgentDefinition.from_yaml(FIXTURE)
     r = ConversationRouter(agent_def=agent, default_language="hi")

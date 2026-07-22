@@ -261,6 +261,49 @@ def direction_block(
 
 
 # ---------------------------------------------------------------------------
+# Known customer (persistent memory — Customer Intelligence Hub)
+# ---------------------------------------------------------------------------
+
+def customer_context_block(ctx: dict | None) -> list[str]:
+    """━━ KNOWN CUSTOMER ━━ — pre-call context for a returning customer.
+
+    `ctx` is the bridge's pre-fetched bundle: {name, calls_count, last_call_at,
+    last_outcome, open_followups, open_commitments, digest}. Empty/None (new
+    caller, flag off, fetch failed) renders nothing — a brand-new caller's
+    prompt is byte-identical to before this feature."""
+    if not ctx or not (ctx.get("digest") or ctx.get("calls_count")):
+        return []
+    lines: list[str] = ["", "━━ KNOWN CUSTOMER ━━"]
+    head: list[str] = []
+    if ctx.get("name"):
+        head.append(str(ctx["name"]))
+    n = ctx.get("calls_count")
+    if n:
+        head.append(f"{n} previous call(s)")
+    if ctx.get("last_call_at"):
+        last = str(ctx["last_call_at"])[:10]
+        head.append(f"last {last}"
+                    + (f" (outcome: {ctx['last_outcome']})" if ctx.get("last_outcome") else ""))
+    if head:
+        lines.append(" · ".join(head))
+    if ctx.get("digest"):
+        lines.append(str(ctx["digest"]))
+    counters: list[str] = []
+    if ctx.get("open_commitments"):
+        counters.append(f"Open promises: {ctx['open_commitments']}")
+    if ctx.get("open_followups"):
+        counters.append(f"Pending follow-ups: {ctx['open_followups']}")
+    if counters:
+        lines.append(" · ".join(counters))
+    lines += [
+        "▸ Use this history naturally and only when relevant. NEVER recite this list to the customer.",
+        "▸ Do NOT re-ask what you already know here (name, preferences, past discussions).",
+        "▸ If they reference a past conversation, you remember it — respond accordingly.",
+    ]
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Brand (v2 structured render — L2)
 # ---------------------------------------------------------------------------
 

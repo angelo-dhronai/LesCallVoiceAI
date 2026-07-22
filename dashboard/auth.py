@@ -425,6 +425,14 @@ _TENANT_API_PREFIXES = (
     "/api/usage/minutes",   # billing view; owner-scoped inside the endpoint
     "/api/analysis",
     "/api/analytics/conversation",
+    # Homepage KPIs. Was deliberately absent — every figure came from the
+    # credit-log JSONL, which has no owner column, so the page would have shown
+    # platform-wide totals to every tenant. Now sourced from the calls table
+    # via _owner_call_stats() and scoped, so it can be exposed (2026-07-22).
+    "/api/overview",
+    # Intelligence layer (deploy/PLAN-intelligence-layer.md): every endpoint
+    # under /api/intel is owner-scoped via the current_owner dependency.
+    "/api/intel",
     # Shared-infrastructure health (pipeline/telephony up-down) — not tenant
     # data, and every tenant legitimately needs to see whether the platform is
     # up. Returns only service running-flags + ports, no per-call info.

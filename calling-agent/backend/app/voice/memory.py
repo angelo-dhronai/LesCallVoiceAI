@@ -243,6 +243,10 @@ class ConversationMemory:
         self._turns.append(Turn(role="assistant", text=text, language=language))
         self._trim()
 
+    def restore_turns(self, turns: list[Turn]) -> None:
+        """Replace the turn list wholesale (turn-transaction rollback)."""
+        self._turns = list(turns)
+
     def get_history_for_llm(self) -> list[dict[str, str]]:
         return [{"role": t.role, "content": t.text} for t in self._turns]
 

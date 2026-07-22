@@ -1,7 +1,8 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
-  BookUser, FolderPlus, Folder, FolderOpen, Pencil, Plus, Trash2, Upload,
-  Users, X,
+  BookUser, ChevronRight, FolderPlus, Folder, FolderOpen, Pencil, Plus,
+  Trash2, Upload, Users, X,
 } from 'lucide-react'
 import { useGet, useRefresh } from '../api/hooks/useApi'
 import { post, patch, del, postForm } from '../api/mutate'
@@ -12,6 +13,8 @@ import {
 } from '../components/kit'
 import { Modal } from '../components/Modal'
 import { useToast } from '../components/Toast'
+import { useConfirm } from '../components/confirm'
+import { useDebounced, useUrlNumber, useUrlParam } from '../lib/hooks'
 
 type Contact = {
   id: string
@@ -76,10 +79,17 @@ const EMPTY_EDITOR: EditorState = {
 
 export default function Contacts() {
   const toast = useToast()
+  const nav = useNavigate()
   const refresh = useRefresh()
-  const [groupSel, setGroupSel] = useState<'all' | 'none' | number>('all')
-  const [search, setSearch] = useState('')
-  const [page, setPage] = useState(1)
+  const confirm = useConfirm()
+  // Group / search / page live in the URL so refresh & share keep the view.
+  const [groupRaw, setGroupRaw] = useUrlParam('group', 'all')
+  const groupSel: 'all' | 'none' | number =
+    groupRaw === 'all' ? 'all' : groupRaw === 'none' ? 'none' : Number(groupRaw) || 'all'
+  const setGroupSel = (v: 'all' | 'none' | number) => setGroupRaw(String(v))
+  const [search, setSearch] = useUrlParam('search')
+  const [page, setPage] = useUrlNumber('page', 1)
+  const debSearch = useDebounced(search, 300)
   const [editor, setEditor] = useState<EditorState | null>(null)
   const [newGroupOpen, setNewGroupOpen] = useState(false)
   const [newGroupName, setNewGroupName] = useState('')
@@ -87,13 +97,22 @@ export default function Contacts() {
   const [uploading, setUploading] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
+  // Search/group changes reset the page (effect, not a second URL-setter call
+  // in the same tick — those clobber each other); first run keeps deep links.
+  const firstRun = useRef(true)
+  useEffect(() => {
+    if (firstRun.current) { firstRun.current = false; return }
+    if (page !== 1) setPage(1)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debSearch, groupRaw])
+
   const groupsQ = useGet<GroupsResp>(['contact-groups'], '/outbound/groups')
   const groups = groupsQ.data?.groups ?? []
 
   const groupParam = groupSel === 'all' ? 'all' : groupSel === 'none' ? 'none' : String(groupSel)
   const contactsQ = useGet<ContactsResp>(
-    ['contacts-book', groupParam, search],
-    `/outbound/contacts?group=${groupParam}&q=${encodeURIComponent(search)}`,
+    ['contacts-book', groupParam, debSearch],
+    `/outbound/contacts?group=${groupParam}&q=${encodeURIComponent(debSearch)}`,
   )
   const all = contactsQ.data?.contacts ?? []
   const pages = Math.max(1, Math.ceil(all.length / PAGE_SIZE))
@@ -134,7 +153,11 @@ export default function Contacts() {
   }
 
   const removeContact = async (c: Contact) => {
-    if (!window.confirm(`Delete ${c.name || c.phone} from your contacts?`)) return
+    if (!(await confirm({
+      title: 'Delete contact?',
+      description: `${c.name || c.phone} will be removed from your contacts.`,
+      destructive: true,
+    }))) return
     try {
       await del(`/outbound/contacts/${c.id}`)
       toast('Contact deleted', 'success')
@@ -162,7 +185,11 @@ export default function Contacts() {
   }
 
   const removeGroup = async (g: Group) => {
-    if (!window.confirm(`Delete group “${g.name}”? Its ${g.count} contact(s) move to No group.`)) return
+    if (!(await confirm({
+      title: `Delete group “${g.name}”?`,
+      description: `Its ${g.count} contact(s) move to No group.`,
+      destructive: true,
+    }))) return
     try {
       await del(`/outbound/groups/${g.id}`)
       if (groupSel === g.id) setGroupSel('all')
@@ -198,6 +225,8 @@ export default function Contacts() {
     }
   }
 
+  /** Sidebar row: a real <button> (keyboard operable) + optional delete action
+   *  as a sibling — buttons must not nest. */
   const sidebarItem = (
     active: boolean, label: string, count: number | undefined,
     onClick: () => void, icon: React.ReactNode, onDelete?: () => void,
@@ -205,21 +234,27 @@ export default function Contacts() {
     <div
       key={label}
       className={cx(
-        'group flex cursor-pointer items-center gap-2 rounded-xl px-3 py-2 text-[13px] font-medium transition',
+        'group flex items-center rounded-xl text-sm font-medium transition',
         active ? 'bg-[var(--surface-2)] text-[var(--text)] ring-1 ring-[var(--border)]' : 'text-dim hover:bg-[var(--surface-2)] hover:text-soft',
       )}
-      onClick={onClick}
-      role="button"
     >
-      <span className="shrink-0">{icon}</span>
-      <span className="min-w-0 flex-1 truncate">{label}</span>
-      {count != null && <span className="tabular-nums text-[11px] text-dim">{count}</span>}
+      <button
+        type="button"
+        onClick={onClick}
+        aria-current={active ? 'true' : undefined}
+        className="flex min-w-0 flex-1 items-center gap-2 rounded-xl px-3 py-2 text-left"
+      >
+        <span className="shrink-0">{icon}</span>
+        <span className="min-w-0 flex-1 truncate">{label}</span>
+        {count != null && <span className="tabular-nums text-2xs text-dim">{count}</span>}
+      </button>
       {onDelete && (
         <button
-          onClick={(e) => { e.stopPropagation(); onDelete() }}
+          type="button"
+          onClick={onDelete}
           aria-label={`Delete group ${label}`}
           title="Delete group"
-          className="grid h-7 w-7 -my-1 shrink-0 place-items-center rounded-lg text-dim transition-opacity hover:text-rose-400 lg:my-0 lg:h-auto lg:w-auto lg:opacity-0 lg:group-hover:opacity-100"
+          className="mr-1 grid h-7 w-7 shrink-0 place-items-center rounded-md text-dim transition-opacity hover:text-rose-400 lg:opacity-0 lg:group-focus-within:opacity-100 lg:group-hover:opacity-100"
         >
           <X size={13} />
         </button>
@@ -252,20 +287,21 @@ export default function Contacts() {
         {/* Groups sidebar */}
         <Card className="h-fit p-3">
           <div className="mb-2 flex items-center justify-between px-1">
-            <span className="text-[11px] font-bold uppercase tracking-wider text-dim">Groups</span>
+            <span className="eyebrow font-bold uppercase">Groups</span>
             <button
+              type="button"
               onClick={() => setNewGroupOpen(true)}
               aria-label="New group" title="New group"
-              className="grid h-9 w-9 -m-1.5 place-items-center rounded-lg text-dim transition hover:bg-[var(--surface-2)] hover:text-soft lg:m-0 lg:h-6 lg:w-6"
+              className="grid h-9 w-9 -m-1.5 place-items-center rounded-md text-dim transition hover:bg-[var(--surface-2)] hover:text-soft lg:m-0 lg:h-6 lg:w-6"
             >
               <FolderPlus size={14} />
             </button>
           </div>
           <div className="space-y-0.5">
-            {sidebarItem(groupSel === 'all', 'All contacts', groupsQ.data?.total, () => { setGroupSel('all'); setPage(1) }, <Users size={14} />)}
-            {sidebarItem(groupSel === 'none', 'No group', groupsQ.data?.ungrouped, () => { setGroupSel('none'); setPage(1) }, <Folder size={14} />)}
+            {sidebarItem(groupSel === 'all', 'All contacts', groupsQ.data?.total, () => setGroupSel('all'), <Users size={14} />)}
+            {sidebarItem(groupSel === 'none', 'No group', groupsQ.data?.ungrouped, () => setGroupSel('none'), <Folder size={14} />)}
             {groups.map((g) =>
-              sidebarItem(groupSel === g.id, g.name, g.count, () => { setGroupSel(g.id); setPage(1) },
+              sidebarItem(groupSel === g.id, g.name, g.count, () => setGroupSel(g.id),
                 groupSel === g.id ? <FolderOpen size={14} /> : <Folder size={14} />,
                 () => removeGroup(g)),
             )}
@@ -275,7 +311,7 @@ export default function Contacts() {
         {/* Contact list */}
         <Card className="p-5">
           <div className="mb-4 flex flex-wrap items-center gap-3">
-            <SearchInput value={search} onChange={(v) => { setSearch(v); setPage(1) }} placeholder="Search name or number" className="w-full max-w-sm" />
+            <SearchInput value={search} onChange={setSearch} placeholder="Search name or number" className="w-full max-w-sm" />
             {contactsQ.isFetching && <Spinner className="h-4 w-4 shrink-0" />}
             <div className="ml-auto">
               {all.length > 0 && <Badge tone="neutral">{all.length.toLocaleString('en-IN')} contact{all.length === 1 ? '' : 's'}</Badge>}
@@ -300,42 +336,58 @@ export default function Contacts() {
                     <TH>Phone</TH>
                     <TH>Gender</TH>
                     <TH>Group</TH>
+                    <TH>Calls</TH>
+                    <TH>Last called</TH>
                     <TH>Details</TH>
                     <TH className="text-right">Actions</TH>
+                    <TH className="w-6"><span className="sr-only">Open</span></TH>
                   </THead>
                   <tbody>
                     {rows.map((c) => (
-                      <TR key={c.id} className="group">
+                      <TR key={c.id} className="group"
+                        onClick={c.db_id ? () => nav(`/contacts/${c.db_id}`) : undefined}>
                         <TD className="font-medium text-[var(--text)]">{c.name || <span className="text-dim">—</span>}</TD>
-                        <TD className="whitespace-nowrap font-mono text-[12.5px]">{c.phone}</TD>
+                        <TD className="whitespace-nowrap font-mono text-sm">{c.phone}</TD>
                         <TD>{c.gender ? <Badge tone={c.gender === 'female' ? 'rose' : c.gender === 'male' ? 'indigo' : 'neutral'} soft>{c.gender}</Badge> : <span className="text-dim">—</span>}</TD>
-                        <TD>{groupName(c.group_id) ? <Badge tone="mint" soft>{groupName(c.group_id)}</Badge> : <span className="text-[12px] text-dim">No group</span>}</TD>
+                        <TD>{groupName(c.group_id) ? <Badge tone="mint" soft>{groupName(c.group_id)}</Badge> : <span className="text-xs text-dim">No group</span>}</TD>
+                        <TD className="tabular-nums">{c.call_count || <span className="text-dim">—</span>}</TD>
+                        <TD className="whitespace-nowrap text-xs text-dim">
+                          {c.last_called_at ? c.last_called_at.slice(0, 10) : '—'}
+                        </TD>
                         <TD className="max-w-[260px]">
-                          <span className="block truncate text-[12px] text-dim" title={detailsPreview(c.details)}>
+                          <span className="block truncate text-xs text-dim" title={detailsPreview(c.details)}>
                             {detailsPreview(c.details) || (c.notes || '—')}
                           </span>
                         </TD>
                         <TD className="text-right">
                           <div className="flex items-center justify-end gap-1 transition-opacity lg:opacity-0 lg:focus-within:opacity-100 lg:group-hover:opacity-100">
                             <button
-                              onClick={() => setEditor({
+                              type="button"
+                              onClick={(e) => { e.stopPropagation(); setEditor({
                                 mode: 'edit', id: c.id, name: c.name || '', phone: c.phone,
                                 gender: c.gender || '', group_id: c.group_id ?? '',
                                 notes: c.notes || '', detailsText: detailsToText(c.details),
-                              })}
+                              }) }}
                               aria-label="Edit contact" title="Edit"
-                              className="grid h-9 w-9 place-items-center rounded-lg text-dim transition hover:bg-[var(--surface-2)] hover:text-soft lg:h-7 lg:w-7"
+                              className="grid h-9 w-9 place-items-center rounded-md text-dim transition hover:bg-[var(--surface-2)] hover:text-soft lg:h-7 lg:w-7"
                             >
                               <Pencil size={14} />
                             </button>
                             <button
-                              onClick={() => removeContact(c)}
+                              type="button"
+                              onClick={(e) => { e.stopPropagation(); removeContact(c) }}
                               aria-label="Delete contact" title="Delete"
-                              className="grid h-9 w-9 place-items-center rounded-lg text-dim transition hover:bg-[var(--surface-2)] hover:text-rose-400 lg:h-7 lg:w-7"
+                              className="grid h-9 w-9 place-items-center rounded-md text-dim transition hover:bg-[var(--surface-2)] hover:text-rose-400 lg:h-7 lg:w-7"
                             >
                               <Trash2 size={14} />
                             </button>
                           </div>
+                        </TD>
+                        <TD className="w-6 pl-0 text-right">
+                          {c.db_id ? (
+                            <ChevronRight size={14} aria-hidden
+                              className="text-dim transition-colors group-hover:text-soft" />
+                          ) : null}
                         </TD>
                       </TR>
                     ))}

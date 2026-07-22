@@ -21,7 +21,7 @@ export function Badge({ children, tone = 'neutral', soft }: { children: ReactNod
     neutral: 'text-soft bg-[var(--surface-2)] ring-[var(--border)]',
   }
   return (
-    <span className={cx('inline-flex max-w-full items-center gap-1 whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-semibold ring-1', tones[tone], soft && 'opacity-90')}>
+    <span className={cx('inline-flex max-w-full items-center gap-1 whitespace-nowrap rounded-full px-2.5 py-0.5 text-2xs font-semibold ring-1', tones[tone], soft && 'opacity-90')}>
       {children}
     </span>
   )
@@ -40,15 +40,48 @@ export function Button({
     danger: 'text-rose-600 dark:text-rose-300 bg-rose-500/10 hover:bg-rose-500/15 ring-1 ring-rose-500/20',
   }
   return (
-    <button title={title} disabled={disabled} onClick={onClick}
-      className={cx('inline-flex items-center justify-center gap-1.5 rounded-lg font-medium transition-all active:scale-[.98] disabled:opacity-40 disabled:pointer-events-none',
+    <button type="button" title={title} disabled={disabled} onClick={onClick}
+      className={cx('inline-flex items-center justify-center gap-1.5 rounded-md font-medium transition-all active:scale-[.98] disabled:opacity-40 disabled:pointer-events-none',
         // Phones get a >=36px tap target; sm: restores today's exact desktop size.
         size === 'sm'
-          ? 'min-h-[36px] px-2.5 py-1.5 text-[12px] sm:min-h-0'
-          : 'min-h-[36px] px-3.5 py-2 text-[13px] sm:min-h-0',
+          ? 'min-h-[36px] px-2.5 py-1.5 text-xs sm:min-h-0'
+          : 'min-h-[36px] px-3.5 py-2 text-sm sm:min-h-0',
         variants[variant], className)}>
       {children}
     </button>
+  )
+}
+
+/** Square icon-only button with a mandatory accessible name. Replaces the
+ *  hand-rolled `h-9 w-9 place-items-center` pattern (copy buttons, row actions). */
+export function IconButton({
+  label, onClick, children, className, disabled, active,
+}: {
+  /** Accessible name — becomes both aria-label and the tooltip. */
+  label: string
+  /** Receives the event so row-embedded actions can stopPropagation(). */
+  onClick?: (e: React.MouseEvent<HTMLButtonElement>) => void
+  children: ReactNode
+  className?: string; disabled?: boolean; active?: boolean
+}) {
+  return (
+    <button type="button" aria-label={label} title={label} disabled={disabled} onClick={onClick}
+      className={cx('inline-grid h-9 w-9 shrink-0 place-items-center rounded-md text-soft transition-all',
+        'hover:bg-[var(--surface-2)] hover:text-[var(--text)] active:scale-[.96] disabled:opacity-40 disabled:pointer-events-none',
+        active && 'bg-[var(--surface-2)] text-[var(--text)]', className)}>
+      {children}
+    </button>
+  )
+}
+
+/** Pulsing "live" indicator — the one implementation of the ping-dot. */
+export function LiveDot({ tone = 'mint', className }: { tone?: 'mint' | 'rose' | 'amber'; className?: string }) {
+  const color = tone === 'rose' ? 'bg-rose-500' : tone === 'amber' ? 'bg-amber-500' : 'bg-mint-500'
+  return (
+    <span aria-hidden className={cx('relative inline-flex h-2 w-2', className)}>
+      <span className={cx('absolute inline-flex h-full w-full animate-ping rounded-full opacity-60', color)} />
+      <span className={cx('relative inline-flex h-2 w-2 rounded-full', color)} />
+    </span>
   )
 }
 
@@ -74,7 +107,7 @@ export function SectionHead({ title, sub, right }: { title: string; sub?: string
     <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
       <div className="min-w-0">
         <h2 className="font-display text-lg font-bold tracking-tight">{title}</h2>
-        {sub && <p className="mt-0.5 text-[13px] text-dim">{sub}</p>}
+        {sub && <p className="mt-0.5 text-sm text-dim">{sub}</p>}
       </div>
       {right}
     </div>

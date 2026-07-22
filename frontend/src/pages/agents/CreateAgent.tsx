@@ -119,6 +119,7 @@ export default function CreateAgent() {
   const fileRef = useRef<HTMLInputElement>(null)
   const headingRef = useRef<HTMLDivElement>(null)
   const railRef = useRef<HTMLDivElement>(null)
+  const stepBodyRef = useRef<HTMLDivElement>(null)
   const createdRef = useRef(false)
 
   // Unsaved-draft guard: warn on tab close / refresh once anything was typed.
@@ -223,6 +224,27 @@ export default function CreateAgent() {
     return true
   }
 
+  // Next is always enabled (keyboard-reachable): clicking it on an invalid
+  // step surfaces the inline errors and moves focus to the first blocker
+  // instead of silently doing nothing behind a disabled button.
+  const onNext = () => {
+    if (stepValid(step)) {
+      setStep((s) => s + 1)
+      return
+    }
+    setAttemptedNext(true)
+    // Wait a frame so the aria-invalid markers render, then focus the first one.
+    requestAnimationFrame(() => {
+      const el = stepBodyRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]')
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        el.focus({ preventScroll: true })
+      } else {
+        headingRef.current?.focus()
+      }
+    })
+  }
+
   const submit = async () => {
     setSaving(true)
     try {
@@ -297,10 +319,10 @@ export default function CreateAgent() {
           if (f && !extracting) onDocument(f)
         }}
       >
-        <div className="flex items-center gap-2 text-[13px] font-semibold">
+        <div className="flex items-center gap-2 text-sm font-semibold">
           <FileUp size={16} className="text-mint-500" /> Start from a document
         </div>
-        <div className="text-[12px] text-dim">
+        <div className="text-xs text-dim">
           Upload or drop a company profile / brochure (PDF, DOCX or TXT) — every field it contains is
           extracted and prefilled; anything it lacks, you'll be asked for below.
         </div>
@@ -317,7 +339,7 @@ export default function CreateAgent() {
         {extracting && (
           <div className="flex w-full items-center gap-2">
             <div className="skeleton h-2 w-40" />
-            <span className="min-w-0 flex-1 truncate text-[12px] text-dim">Reading {extractingName}…</span>
+            <span className="min-w-0 flex-1 truncate text-xs text-dim">Reading {extractingName}…</span>
           </div>
         )}
         {!extracting && extractedFrom && (
@@ -328,7 +350,7 @@ export default function CreateAgent() {
       {/* Missing-info panel — the "ask the user for the rest" half of extraction */}
       {missing !== null && stillMissing.length > 0 && (
         <div className="rounded-xl bg-amber-500/10 p-4 ring-1 ring-amber-500/20">
-          <div className="mb-2 flex items-start gap-2 text-[13px] font-semibold text-amber-700 sm:items-center dark:text-amber-300">
+          <div className="mb-2 flex items-start gap-2 text-sm font-semibold text-amber-700 sm:items-center dark:text-amber-300">
             <AlertTriangle size={15} className="shrink-0" /> <span className="min-w-0 break-words">{extractedFrom} didn't contain everything — please provide:</span>
           </div>
           <ul className="space-y-1">
@@ -342,7 +364,7 @@ export default function CreateAgent() {
                 </>
               )
               return (
-                <li key={m.key} className="text-[12px] text-amber-700/90 dark:text-amber-300/90">
+                <li key={m.key} className="text-xs text-amber-700/90 dark:text-amber-300/90">
                   {target >= 0 ? (
                     <button
                       type="button"
@@ -359,7 +381,7 @@ export default function CreateAgent() {
         </div>
       )}
       {missing !== null && stillMissing.length === 0 && (
-        <div className="rounded-xl bg-mint-400/10 px-4 py-3 text-[12px] font-medium text-mint-700 ring-1 ring-mint-400/20 dark:text-mint-300">
+        <div className="rounded-xl bg-mint-400/10 px-4 py-3 text-xs font-medium text-mint-700 ring-1 ring-mint-400/20 dark:text-mint-300">
           All essential fields are covered — review each step and create the agent.
         </div>
       )}
@@ -377,7 +399,7 @@ export default function CreateAgent() {
               disabled={i > step && !reachable}
               onClick={() => i !== step && reachable && setStep(i)}
               className={cx(
-                'flex min-h-[34px] shrink-0 snap-start items-center gap-1.5 rounded-full px-3 py-1.5 text-[12px] font-semibold ring-1 transition sm:min-h-0 sm:py-1',
+                'flex min-h-[34px] shrink-0 snap-start items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold ring-1 transition sm:min-h-0 sm:py-1',
                 i === step
                   ? 'bg-mint-400/15 text-mint-700 ring-mint-400/30 dark:text-mint-300'
                   : i < step || reachable
@@ -385,7 +407,7 @@ export default function CreateAgent() {
                   : 'bg-[var(--surface-2)] text-dim ring-[var(--border)] cursor-default',
               )}
             >
-              <span className={cx('grid h-4 w-4 place-items-center rounded-full text-[10px]', i < step ? 'bg-mint-500 text-white' : 'bg-[var(--surface-solid)] ring-1 ring-[var(--border)]')}>
+              <span className={cx('grid h-4 w-4 place-items-center rounded-full text-2xs', i < step ? 'bg-mint-500 text-white' : 'bg-[var(--surface-solid)] ring-1 ring-[var(--border)]')}>
                 {i < step ? <Check size={10} /> : i + 1}
               </span>
               {s}
@@ -395,7 +417,7 @@ export default function CreateAgent() {
       </div>
 
       <Card className="p-4 sm:p-6">
-        <div key={step} className="animate-fade-up">
+        <div key={step} ref={stepBodyRef} className="animate-fade-up">
         <div ref={headingRef} tabIndex={-1} className="mb-1 outline-none">
           <div className="eyebrow mb-1">Step {step + 1} of {STEPS.length}</div>
           <SectionHead title={STEPS[step]} sub={STEP_SUBS[STEPS[step]]} />
@@ -404,12 +426,12 @@ export default function CreateAgent() {
           <div className="space-y-6">
             <div className="flex items-start gap-2 rounded-xl bg-indigo-500/10 px-4 py-3 ring-1 ring-indigo-500/20">
               <Info size={14} className="mt-0.5 shrink-0 text-indigo-500" />
-              <p className="text-[12px] text-soft">
+              <p className="text-xs text-soft">
                 The slug you enter is a <span className="font-semibold">base name</span> — two agents are
                 created from it:{' '}
-                <code className="font-mono text-[11px]">{d.name || 'your-slug'}-inbound</code> (answers
+                <code className="font-mono text-2xs">{d.name || 'your-slug'}-inbound</code> (answers
                 incoming calls) and{' '}
-                <code className="font-mono text-[11px]">{d.name || 'your-slug'}-outbound</code> (speaks on
+                <code className="font-mono text-2xs">{d.name || 'your-slug'}-outbound</code> (speaks on
                 outgoing calls). Both start from what you fill in here and can be edited separately
                 afterwards.
               </p>
@@ -430,7 +452,7 @@ export default function CreateAgent() {
 
         {step === 7 && (
           <div className="space-y-4">
-            <p className="text-[12px] text-dim">
+            <p className="text-xs text-dim">
               Optional — decide which inbound number this agent answers. Leave everything blank to skip;
               you can configure routing later from the agent's Routing tab.
             </p>
@@ -448,8 +470,8 @@ export default function CreateAgent() {
               </Badge>
               <Badge tone="mint" soft><span className="max-w-[60vw] truncate">{d.agent_name}</span></Badge>
               <Badge tone={d.call_direction === 'outbound' ? 'amber' : 'mint'} soft>{d.call_direction}</Badge>
-              <span className="text-[13px] text-soft">{d.company_name}</span>
-              <span className="ml-auto text-[12px] text-dim">
+              <span className="text-sm text-soft">{d.company_name}</span>
+              <span className="ml-auto text-xs text-dim">
                 {d.supported.join(' · ')} · {d.stages.length} stages · {d.products.filter((p) => p.name).length} products
                 {d.calendar_enabled ? ` · ${d.calendar_slots.filter((s) => s.day && s.time).length} slots` : ' · no calendar'}
               </span>
@@ -472,13 +494,13 @@ export default function CreateAgent() {
                     <span className="eyebrow">{t.title}</span>
                     <Button variant="ghost" size="sm" onClick={() => setStep(t.target)}>Edit</Button>
                   </div>
-                  <p className="mt-1 text-[12px] leading-relaxed text-soft line-clamp-2">{t.body}</p>
+                  <p className="mt-1 text-xs leading-relaxed text-soft line-clamp-2">{t.body}</p>
                 </div>
               ))}
             </div>
 
             {!canCreate && (
-              <div className="rounded-lg bg-amber-500/10 px-3 py-2 text-[12px] text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">
+              <div className="rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">
                 Fill in{' '}
                 <button type="button" className="font-semibold underline underline-offset-2" onClick={() => setStep(0)}>slug, agent name, company</button>
                 {' '}and an{' '}
@@ -487,7 +509,7 @@ export default function CreateAgent() {
               </div>
             )}
             {!d.calendar_enabled && (
-              <div className="rounded-lg bg-amber-500/10 px-3 py-2 text-[12px] text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">
+              <div className="rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">
                 No calendar configured — the agent won't be able to offer or book visit slots. Recommended:
                 go back to the{' '}
                 <button type="button" className="font-semibold underline underline-offset-2" onClick={() => setStep(5)}>Calendar step</button>
@@ -495,8 +517,8 @@ export default function CreateAgent() {
               </div>
             )}
             <details className="rounded-xl bg-[var(--surface-2)] p-4 ring-1 ring-[var(--border)]">
-              <summary className="cursor-pointer text-[12px] font-semibold text-soft">Preview generated definition (JSON)</summary>
-              <pre className="mt-3 max-h-80 overflow-auto text-[11px] leading-relaxed text-dim">{JSON.stringify(buildAgentPayload({ ...d, products: d.products.filter((p) => p.name.trim()) }), null, 2)}</pre>
+              <summary className="cursor-pointer text-xs font-semibold text-soft">Preview generated definition (JSON)</summary>
+              <pre className="mt-3 max-h-80 overflow-auto text-2xs leading-relaxed text-dim">{JSON.stringify(buildAgentPayload({ ...d, products: d.products.filter((p) => p.name.trim()) }), null, 2)}</pre>
             </details>
           </div>
         )}
@@ -511,15 +533,13 @@ export default function CreateAgent() {
           {step < STEPS.length - 1 ? (
             <div className="flex flex-wrap items-center justify-end gap-3">
               {!stepValid(step) && (
-                <span className="text-[12px] font-medium text-amber-600 dark:text-amber-300">
+                <span aria-live="polite" className="text-xs font-medium text-amber-600 dark:text-amber-300">
                   Required to continue: {blockers(step).join(', ')}
                 </span>
               )}
-              <span onClick={() => { if (!stepValid(step)) setAttemptedNext(true) }}>
-                <Button variant="primary" onClick={() => setStep((s) => s + 1)} disabled={!stepValid(step)}>
-                  Next: {STEPS[step + 1]} <ChevronRight size={15} />
-                </Button>
-              </span>
+              <Button variant="primary" onClick={onNext}>
+                Next: {STEPS[step + 1]} <ChevronRight size={15} />
+              </Button>
             </div>
           ) : (
             <Button variant="primary" onClick={submit} disabled={!canCreate || saving}>

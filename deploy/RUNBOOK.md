@@ -376,3 +376,180 @@ Manual run: `python -m shared.sentinel --probe`. Disable: SENTINEL_PROBE=off.
 Inbound-silence alerts are per-DID (CDR public-context rows by destination).
 First live run (2026-07-14): caught +912264231897 (alwynantonyben@) inbound
 DEAD (NO_ANSWER via their own trunk) while +918065953160 verified OK.
+
+## 10. Intelligence layer (2026-07-20) — automatic post-call pipeline
+
+Design doc: `deploy/PLAN-intelligence-layer.md`. Every completed call is
+analyzed automatically: extraction (gemini-2.5-flash) → embeddings
+(gemini-embedding-001, pgvector) → follow-up decision → customer memory →
+automation rules → notifications. No manual analysis exists anymore
+(`/api/analysis/run` returns 410; the legacy followup-automation auto-dial
+scheduler is disabled in server.py startup).
+
+**Processes**
+- `shared/intelligence/worker.py` runs as a second, supervised process inside
+  lescall-workers (see deploy/workers_entry.sh) — NEVER fold it into the
+  5-min billing tick. Liveness: `docker logs lescall-workers | grep 'intel:'`
+  and the `settings(owner='', key='intel_worker_beat')` row.
+- Queue = `intel_jobs` table (SKIP LOCKED claims, backoff, DLQ status
+  'failed'). DLQ surface: `GET /api/intel/jobs?status=failed`, re-drive via
+  `POST /api/intel/jobs/{id}/retry`. A sweeper enqueues any call the teardown
+  hook missed — coverage is guaranteed, backfills happen automatically.
+
+**Database**
+- Versioned migrations: `shared/db/migrations/NNNN_*.sql`, applied MANUALLY:
+  `docker exec -w /home/angelo/lescall lescall-workers python -m shared.db.migrate`
+  (`--status`, `--dry-run`, `--down NNNN` for the testing env). Never at boot.
+- pgvector 0.8.1 was compiled from source INSIDE lescall-pg (survives
+  restarts, lost only on container recreation — which is forbidden). Disaster
+  recovery: `bash deploy/pg_provision_pgvector.sh` then re-run migrations.
+- Tests run against a `lescall_test` database in the same instance
+  (`calling-agent/backend/tests/test_intel_*.py`) and rebuild it from scratch
+  — that fixture doubles as the DDL disaster-recovery drill.
+
+**LLM / quota**
+- Extraction + reports: `gemini-2.5-flash` (INTEL_LLM_MODEL) — a different
+  quota bucket from the live-call `gemini-3.1-flash-lite`, keys shared via
+  calling-agent/.env; point INTEL_LLM_API_KEY at a dedicated key to isolate
+  further. reasoning_effort is set explicitly (thinking eats max_tokens).
+- Embeddings: `gemini-embedding-001`, 768-dim, via the same OpenAI-compat
+  endpoint's /embeddings.
+
+**In-call commitment clarification** is per-agent opt-in:
+`follow_up.clarify_commitments.enabled: true` in agents/<slug>/agent.yaml.
+Off by default — existing agents' behavior (and the golden prompt fixtures)
+are untouched.
+
+**Deploy**: api/runtime/workers = `docker compose restart <svc>` (bind mount);
+SPA = `docker compose build spa && up -d spa`. Migrations before restarts.
+
+## 11. Call-experience latency + continuation merge (2026-07-21)
+
+Greeting/turn latency fixes + pause-tolerant turns. All tunables are env vars
+on the **runtime** container (calling-agent/.env or compose environment);
+`docker compose -f deploy/docker-compose.services.yml restart runtime` to apply.
+
+**Greeting path** (was ~2.2s ESL→playback; target ≤0.8s warm)
+- `PREFLIGHT_CACHE=true` — preflight verdict cached per (slug, sha, revision);
+  agent edits self-invalidate via the registry watcher.
+- Session routing DB work (dial lookup → slug → owner) now runs in ONE worker
+  thread (`TelephonySession.create`), not serially on the event loop.
+- `METERING_OPEN_DEFERRED=true` — usage-ledger row opens in background (≤1s
+  later); close/reconcile unchanged.
+- `TTS_CANNED_CACHE=true`, `TTS_CACHE_DIR=<repo>/data/tts_cache`,
+  `TTS_CACHE_MAX_ENTRIES=500` — greeting/fillers/canned lines replay from disk
+  PCM: 0ms synth, 0 Sarvam credits after first synthesis per variant.
+- `TTS_OUTPUT_SR=8000` — Sarvam synthesizes at 8k; TelephonySink skips the
+  blocking ffmpeg downsample entirely. Rollback: `TTS_OUTPUT_SR=16000`.
+
+**Per-turn dead air** (was ~1.25s fixed before STT/LLM even start)
+- `HARD_FLUSH_SILENCE_FRAMES=28` (560ms endpoint; old 35=700ms). Tier-b after
+  continuation merge is validated: `20` (400ms).
+- `TRANSCRIPT_MERGE_SKIP_WHEN_IDLE=true` — the 550ms merge wait now only
+  happens when a follow-on segment can actually exist (`TRANSCRIPT_MERGE_WINDOW_MS`).
+- `TURN_SILENCE_THRESHOLD_MS=1200` (TurnManager backstop; was 1600).
+- `SARVAM_HTTP_SHARED=true`, `SARVAM_KEEPALIVE_EXPIRY_S=300` — one HTTP pool
+  per process for STT/TTS (per-call clients made warmup a no-op after call 1).
+- `BOOT_WARMUP=true` — ws_audio_receiver warms STT/TTS/LLM at process boot.
+- `LANG_LLM_CLASSIFY_FIRST_TURN=false` — first turn never blocks on the
+  language-classify LLM round-trip.
+- `GREETING_ECHO_EARLY_EXIT_FRAMES=3`, `GREETING_ECHO_TAIL_MS=100` — the
+  post-greeting echo gate opens faster for the caller's "hello".
+- Grep `[LATENCY] speech_end→engine` for the per-turn fixed-tax number;
+  `[ENGINE] Merge window skipped (idle)` should be the common case.
+
+**Continuation merge** (pause-tolerant turns; OFF until canary-validated)
+- `ENABLE_CONTINUATION_MERGE=false` → flip `true` to enable. When ON: caller
+  pauses mid-utterance → agent answers the partial input fast → if the caller
+  resumes within `CONTINUATION_WINDOW_MS=2000` of their own speech end, the
+  reply is cut, the router rolls the turn back (memory, slots, stage, audit —
+  see app/voice/turn_transaction.py) and re-runs ONE merged utterance.
+  Calendar bookings defer until turn commit so a superseded turn never writes.
+- Hearing during the window: `CONTINUATION_BARGE_FACTOR=1.3`,
+  `CONTINUATION_BARGE_FRAMES=5`, `CONTINUATION_ECHO_EXIT_FRAMES=4`,
+  `CONTINUATION_MAX_MERGES=3`. Outside the window all barge-in/echo constants
+  are unchanged.
+- Grep `[CONT-MERGE]` (merges) and `[TURN-TXN]` (rollbacks/commits).
+- Tests: `calling-agent/backend/tests/test_continuation_merge.py`; full suite
+  must pass with the flag both unset and set.
+
+## 12. Customer Intelligence Hub — persistent memory in live calls (2026-07-21)
+
+Closes the memory loop: `customer_memory` (written after every call since the
+intelligence layer shipped) is now READ — by the extraction LLM and, crucially,
+by the live-call runtime, so returning customers are greeted as known.
+
+- **Write side (workers):** pipeline stages are now
+  `extract → embed → followup → memory → digest → timeline → automation → notify`.
+  `digest` precomputes `customer_memory.context_digest` (≤600 chars) at write
+  time; `timeline` appends `contact_events` rows (unified per-contact timeline,
+  idempotent via `uq_contact_events_ref`). The sweeper backfilled both across
+  all historical calls automatically. Memory itself upgraded from capped lists
+  to a governed fact lifecycle: `{text, call_id, date, confidence,
+  status: active|superseded|expired, updated_at}` — dedup-by-meaning
+  (similarity ≥0.60 updates in place), slot conflicts supersede (flip, never
+  delete), per-category TTL expiry (promises 45d, objections 240d, …), plus
+  `preferred_language` (from calls.language) and `preferred_call_time`
+  (call-start-hour histogram, IST buckets).
+- **Failed dials:** the intel worker's sweeper runs a CDR read-alongside pass
+  (`shared/intelligence/dial_outcomes.py`, every 5 min) that joins unanswered
+  CDR legs to `call_links` dials and lands classified `call.missed` events
+  (busy|no_answer|rejected|invalid_number|network_failure) with retry hints.
+  Billing/`usage_ledger` untouched.
+- **Read side (runtime):** `_resolve_call_routing` (already off-loop) adds one
+  contacts lookup + one customer_memory read (~1ms, 5-min in-proc TTL cache)
+  and hands the digest to `ConversationRouter.set_customer_context()` → the
+  `━━ KNOWN CUSTOMER ━━` prompt band + `{contact_name}` greeting
+  personalization + no-re-ask name prefill. Fetch failure → None → call
+  proceeds exactly as before. Grep `[BRIDGE] customer context` for fetch
+  timing and `[CONTEXT] known customer` for injection.
+- **Flags:** env `INTEL_PRECALL_CONTEXT=false` kills the fetch platform-wide;
+  per-agent `memory: {use_customer_context: false}` in agent.yaml opts one
+  agent out (default ON). `INTEL_DIAL_OUTCOMES_ENABLED=false` stops the CDR
+  outcome pass.
+- **Hub API/UI:** `GET /api/intel/contacts/{id}` (+`/timeline`, `/calls`),
+  owner-scoped with `contact_grants` sharing (read|edit, owner-only to grant —
+  flattened-roles doctrine, no admin). `PATCH /api/intel/contacts/{id}` sets
+  `contacts.primary_agent_slug` (bridge defaults it to the first agent that
+  talked to the contact). SPA: `/contacts` rows click through to
+  `/contacts/:id` (ContactHub.tsx) — timeline, AI profile, score trend,
+  memory, follow-ups, promises, lifetime stats. SPA is baked: UI changes need
+  `docker compose -f deploy/docker-compose.services.yml up -d --build spa`.
+- **Migrations:** `0006_contact_hub` (+`.down.sql`) — `context_digest`/
+  `digest_updated_at` on customer_memory, `contact_events`, `contact_grants`,
+  contact indexes on followups/commitments. `contacts.primary_agent_slug` is a
+  boot MIGRATIONS ALTER (core table). Never edit 0006 once applied.
+- **Tests:** `test_intel_memory.py`, `test_intel_timeline.py`,
+  `test_precall_context.py`, `test_contact_hub_api.py` + extended
+  `test_intel_stages.py` (8-stage e2e). Full suite: 334 passing.
+
+## 13. Call-repair platform rules — hello-replay + dead-air reprompt (2026-07-21)
+
+Two universal behaviors for EVERY agent (no YAML needed), both in the live
+engine:
+
+- **Early-call "hello?" replay** (`conversation.py`): a bare hello — any
+  supported script (hello/हेलो/હેલો), optionally repeated or with filler
+  ("are hello haan") — within `CALL_REPAIR_HELLO_WINDOW_S` (default 25s) of
+  the greeting means the caller didn't hear us. The agent replays its last
+  utterance verbatim instead of chatting. Capped at 2 replays per call so a
+  deliberate "hello" opener still gets a conversation. Grep `[REPAIR] Early
+  'hello'`. Gotcha encoded in the tokenizer: Python's `\W` shreds Indic
+  matras — the hello matcher keeps the Devanagari/Gujarati blocks whole.
+- **Dead-air reprompt** (`pipeline.py:_silence_watchdog`): agent finished
+  speaking, then NO caller voice activity for `SILENCE_REPROMPT_S` (default
+  6s) with nothing in flight anywhere (no STT segments, no queued
+  transcripts/TTS, no LLM generation, playback fully drained, no farewell/
+  outcome decided) → the agent says "Sorry, I couldn't hear you." (localized
+  en/hi/gu) + repeats the last question. If the caller has not spoken at all
+  yet (turn 0), it replays the utterance plain — no "couldn't hear YOU"
+  accusation. Max `SILENCE_REPROMPT_MAX` (default 2) consecutive reprompts;
+  the cycle resets on any real caller turn. The reprompt is recorded in
+  conversation memory but never overwrites last-response memory, so repeats
+  never compound. Defaults ON in telephony, OFF for CLI mic
+  (`SILENCE_REPROMPT_ENABLED` overrides either way). Grep `[REPAIR] Dead air`.
+- Interplay: the older STT-empty fallback (speech detected but empty
+  transcript, feature 2/2026-05-30) and this watchdog are mutually exclusive
+  by construction — one requires detected speech, the other requires none.
+- Tests: `tests/test_call_repair.py` (14) — replay/cap/window/scripts,
+  reprompt composition per language, and the watchdog decision matrix.

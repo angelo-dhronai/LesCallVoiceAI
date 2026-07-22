@@ -108,3 +108,111 @@ body {
   animation: shimmer 1.4s infinite;
 }
 @keyframes shimmer { 100% { transform: translateX(100%) } }
+
+/* Rendered report documents (Reports page, minimal markdown renderer). */
+.report-doc { color: var(--text-soft); font-size: 13.5px; line-height: 1.65; }
+.report-doc h2 { font-family: 'Plus Jakarta Sans Variable','Plus Jakarta Sans',Inter,sans-serif;
+  font-weight: 700; font-size: 20px; letter-spacing: -0.02em; color: var(--text); margin: 4px 0 12px; }
+.report-doc h3 { font-weight: 700; font-size: 15px; color: var(--text); margin: 20px 0 8px; }
+.report-doc h4, .report-doc h5 { font-weight: 600; font-size: 13.5px; color: var(--text); margin: 14px 0 6px; }
+.report-doc p { margin: 0 0 10px; }
+.report-doc ul { margin: 0 0 12px; padding-left: 20px; list-style: disc; }
+.report-doc li { margin: 3px 0; }
+.report-doc hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+.report-doc code { background: var(--surface-2); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+.report-doc .md-table { overflow-x: auto; margin: 0 0 12px; }
+.report-doc table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+.report-doc th, .report-doc td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+.report-doc th { background: var(--surface-2); color: var(--text); font-weight: 600; }
+
+/* ── shadcn/ui tokens ─────────────────────────────────────────────────────
+   HSL triplets (not full colors): tailwind.config wraps them as
+   hsl(var(--x)), which is what keeps opacity modifiers (bg-primary/90)
+   working on Tailwind v3. --ui-border / --ui-accent are namespaced because
+   the app's :root above already owns --border and --accent (brand emerald) —
+   sharing names would leak the emerald into component hover states.
+   Values are the zinc palette, dark values tuned to sit on the obsidian
+   theme (--bg #070a12 / surfaces #111726) rather than stock zinc. */
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+    --primary: 240 5.9% 10%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --ui-accent: 240 4.8% 95.9%;
+    --ui-accent-foreground: 240 5.9% 10%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --ui-border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    /* Focus ring matches the app's global :focus-visible (indigo accent) so
+       shadcn and native controls speak one focus language. */
+    --ring: 243 75% 59%;
+    /* Brand-aligned categorical palette: 1 mint · 2 indigo · 3 amber · 4 rose
+       · 5 neutral. Consumed only via src/lib/chartColors.ts. */
+    /* chart-3 sits at L 48% not 50%: at 50% (#f59f0a) it measured OKLCH L 0.77,
+       just outside the 0.43–0.77 categorical band. 48% (#eb980a) is inside it
+       and keeps amber↔rose CVD separation at ΔE 20.4 normal / 11.5 protan. */
+    --chart-1: 160 84% 39%;
+    --chart-2: 243 75% 59%;
+    --chart-3: 38 92% 48%;
+    --chart-4: 350 89% 60%;
+    --chart-5: 226 15% 56%;
+    --radius: 0.75rem;
+    --sidebar: 0 0% 98.5%;
+    --sidebar-foreground: 240 10% 3.9%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 240 5.9% 90%;
+    --sidebar-ring: 240 5.9% 10%;
+  }
+  .dark {
+    --background: 225 44% 5%;
+    --foreground: 228 14% 95%;
+    --card: 222 29% 11%;
+    --card-foreground: 228 14% 95%;
+    --popover: 222 29% 11%;
+    --popover-foreground: 228 14% 95%;
+    --primary: 0 0% 98%;
+    --primary-foreground: 240 5.9% 10%;
+    --secondary: 240 5% 16%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 5% 16%;
+    --muted-foreground: 228 8% 58%;
+    --ui-accent: 240 5% 16%;
+    --ui-accent-foreground: 0 0% 98%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --ui-border: 0 0% 100% / 0.09;
+    --input: 0 0% 100% / 0.15;
+    --ring: 243 100% 76%;
+    --chart-1: 158 100% 48%;
+    --chart-2: 243 100% 76%;
+    --chart-3: 43 96% 56%;
+    --chart-4: 351 95% 71%;
+    /* Lightened from 228 8% 58%: against dark rose (--chart-4) the old step
+       measured protanopic ΔE 3.4 — a protanope could not tell "neutral" from
+       "negative" in the sentiment stack at all. 220 10% 66% raises it to 7.3,
+       which the 6-8 band permits given the 2px segment gaps + legend + table
+       view those charts ship with. */
+    --chart-5: 220 10% 66%;
+    --sidebar: 222 29% 11%;
+    --sidebar-foreground: 228 14% 95%;
+    --sidebar-primary: 0 0% 98%;
+    --sidebar-primary-foreground: 240 5.9% 10%;
+    --sidebar-accent: 240 5% 16%;
+    --sidebar-accent-foreground: 0 0% 98%;
+    --sidebar-border: 0 0% 100% / 0.09;
+    --sidebar-ring: 240 4.9% 83.9%;
+  }
+}

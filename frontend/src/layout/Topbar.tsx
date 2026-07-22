@@ -1,12 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Search, Bell, Timer, HelpCircle, Sun, Moon, PanelLeft, Menu, CornerDownLeft, CheckCircle2, XCircle, Keyboard, MessageCircle } from 'lucide-react'
+import {
+  Search, Bell, Timer, HelpCircle, Sun, Moon, PanelLeft, Menu, CornerDownLeft,
+  CheckCircle2, XCircle, Keyboard, MessageCircle, CheckCheck,
+} from 'lucide-react'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { useTheme } from '../theme/ThemeProvider'
 import { HealthPill, type Service } from '../components/HealthPill'
 import { cx } from '../components/ui'
 import { clockTime, num } from '../lib/format'
 import { NAV } from '../lib/nav'
-import { useGet } from '../api/hooks/useApi'
+import { useGet, useRefresh } from '../api/hooks/useApi'
+import { patch, post } from '../api/mutate'
 
 /** Flattened list of navigable pages for the quick-jump search. */
 function usePages() {
@@ -21,30 +26,44 @@ function usePages() {
   }, [])
 }
 
-/** Close a popover on Escape. */
-function useEscClose(open: boolean, close: () => void) {
-  useEffect(() => {
-    if (!open) return
-    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
-    window.addEventListener('keydown', h)
-    return () => window.removeEventListener('keydown', h)
-  }, [open, close])
-}
-
 const IS_MAC = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform)
 
-/** Quiet icon-only utility button (bell, help, theme…). */
-function IconBtn({ onClick, label, className, expanded, children }: {
-  onClick?: () => void; label: string; className?: string; expanded?: boolean; children: React.ReactNode
+const ICON_BTN = 'grid h-8 w-8 place-items-center rounded-md text-dim transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]'
+
+/** Quiet icon-only utility button (sidebar toggle, theme…). */
+function IconBtn({ onClick, label, className, children }: {
+  onClick?: () => void; label: string; className?: string; children: React.ReactNode
 }) {
   return (
-    <button onClick={onClick} aria-label={label} title={label}
-      aria-haspopup={expanded !== undefined ? 'true' : undefined}
-      aria-expanded={expanded}
-      className={cx('grid h-8 w-8 place-items-center rounded-lg text-dim transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]', className)}>
+    <button type="button" onClick={onClick} aria-label={label} title={label}
+      className={cx(ICON_BTN, className)}>
       {children}
     </button>
   )
+}
+
+type Notif = {
+  id: number; kind: string; severity?: string | null
+  title: string; body?: string | null; link?: string | null
+  read_at?: string | null; created_at?: string
+}
+
+function ago(iso?: string): string {
+  if (!iso) return ''
+  const t = new Date(iso).getTime()
+  if (!Number.isFinite(t)) return ''
+  const s = Math.max(0, (Date.now() - t) / 1000)
+  if (s < 60) return 'now'
+  if (s < 3600) return `${Math.floor(s / 60)}m`
+  if (s < 86400) return `${Math.floor(s / 3600)}h`
+  return `${Math.floor(s / 86400)}d`
+}
+
+function severityDot(severity?: string | null): string {
+  const s = (severity ?? '').toLowerCase()
+  if (s === 'critical' || s === 'error' || s === 'urgent') return 'bg-rose-500'
+  if (s === 'warning' || s === 'warn') return 'bg-amber-500'
+  return 'bg-indigo-400'
 }
 
 export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, overall }: {
@@ -54,18 +73,17 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
   const { theme, toggle } = useTheme()
   const navigate = useNavigate()
   const pages = usePages()
+  const refresh = useRefresh()
   const minutes = useGet<{ minutes_month?: number }>(['usage-minutes'], '/usage/minutes', { refetchInterval: 60000 })
+  const notifs = useGet<{ items: Notif[]; unread: number }>(
+    ['intel', 'notifications'], '/intel/notifications?limit=20', { refetchInterval: 30000 })
   const [now, setNow] = useState(clockTime())
   const [q, setQ] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
   const [hi, setHi] = useState(0)
-  const [bellOpen, setBellOpen] = useState(false)
-  const [helpOpen, setHelpOpen] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => { const t = setInterval(() => setNow(clockTime()), 1000); return () => clearInterval(t) }, [])
-  useEscClose(bellOpen, () => setBellOpen(false))
-  useEscClose(helpOpen, () => setHelpOpen(false))
 
   // "/" or Cmd/Ctrl+K focuses the quick-jump search from anywhere.
   useEffect(() => {
@@ -96,16 +114,32 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
   }
 
   const downServices = services.filter((s) => !s.ok)
+  const unread = notifs.data?.unread ?? 0
+  const items = notifs.data?.items ?? []
+  const attention = unread > 0 || downServices.length > 0
+
+  const openNotification = async (n: Notif) => {
+    if (!n.read_at) {
+      try { await patch(`/intel/notifications/${n.id}/read`) } catch { /* non-fatal */ }
+      refresh(['intel', 'notifications'])
+    }
+    if (n.link) navigate(n.link)
+  }
+
+  const markAllRead = async () => {
+    try { await post('/intel/notifications/read-all') } catch { /* non-fatal */ }
+    refresh(['intel', 'notifications'])
+  }
 
   const resultRow = (m: { to: string; label: string; group: string; icon: any }, i: number) => (
-    <button key={m.to}
+    <button key={m.to} type="button"
       onMouseDown={(e) => { e.preventDefault(); go(m.to) }}
       onMouseEnter={() => setHi(i)}
-      className={cx('flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13px] transition-colors',
+      className={cx('flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm transition-colors',
         i === hi ? 'bg-[var(--surface-2)] text-[var(--text)]' : 'text-soft')}>
       <m.icon size={15} className="shrink-0 text-dim" />
       <span className="font-medium">{m.label}</span>
-      <span className="text-[11px] text-dim">{m.group}</span>
+      <span className="text-2xs text-dim">{m.group}</span>
       {i === hi && <CornerDownLeft size={13} className="ml-auto shrink-0 text-dim" />}
     </button>
   )
@@ -116,7 +150,7 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
         {/* Mobile: open the nav drawer. Desktop: collapse the rail. */}
         <IconBtn onClick={onOpenMobileNav} label="Open navigation" className="lg:hidden"><Menu size={17} /></IconBtn>
         <IconBtn onClick={onToggleSidebar} label="Toggle sidebar" className="hidden lg:grid"><PanelLeft size={16} /></IconBtn>
-        <h1 className="truncate text-[13.5px] font-semibold tracking-tight">{title}</h1>
+        <h1 className="truncate text-sm font-semibold tracking-tight">{title}</h1>
         <HealthPill services={services} overall={overall} />
 
         {/* Quick-jump */}
@@ -136,9 +170,9 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
             }}
             placeholder="Jump to a panel…"
             aria-label="Jump to a panel"
-            className="h-8 w-full rounded-lg bg-[var(--surface-2)] pl-9 pr-14 text-[13px] text-[var(--text)] outline-none ring-1 ring-transparent transition placeholder:text-dim focus:bg-[var(--surface-solid)] focus:ring-[var(--border-strong)]"
+            className="h-8 w-full rounded-md bg-[var(--surface-2)] pl-9 pr-14 text-sm text-[var(--text)] outline-none ring-1 ring-transparent transition placeholder:text-dim focus:bg-[var(--surface-solid)] focus:ring-[var(--border-strong)]"
           />
-          <kbd className="pointer-events-none absolute right-2.5 top-1/2 hidden -translate-y-1/2 rounded border border-[var(--border)] bg-[var(--surface-solid)] px-1.5 py-0.5 text-[10px] font-medium text-dim lg:inline-flex">
+          <kbd className="pointer-events-none absolute right-2.5 top-1/2 hidden -translate-y-1/2 rounded border border-[var(--border)] bg-[var(--surface-solid)] px-1.5 py-0.5 text-2xs font-medium text-dim lg:inline-flex">
             {IS_MAC ? '⌘K' : 'Ctrl K'}
           </kbd>
           {searchOpen && (
@@ -146,7 +180,7 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
               {q.trim() ? (
                 <>
                   {matches.length === 0 && (
-                    <div className="px-3 py-2.5 text-[13px] text-dim">No panel matches “{q}”</div>
+                    <div className="px-3 py-2.5 text-sm text-dim">No panel matches “{q}”</div>
                   )}
                   {matches.map((m, i) => resultRow(m, i))}
                 </>
@@ -168,7 +202,7 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
           <span
             title="Call minutes used this month"
             aria-label="Call minutes used this month"
-            className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-[12px] font-medium text-soft ring-1 ring-[var(--border)]"
+            className="flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-soft ring-1 ring-[var(--border)]"
           >
             <Timer size={13} className="text-dim" />
             <span className="tabular-nums">
@@ -176,62 +210,83 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
             </span>
             <span className="hidden text-dim sm:inline">this month</span>
           </span>
-          <span className="hidden px-1.5 text-[12px] font-medium tabular-nums text-dim md:block" title="Live clock">{now}</span>
+          <span className="hidden px-1.5 text-xs font-medium tabular-nums text-dim md:block" title="Live clock">{now}</span>
 
-          <div className="relative">
-            <IconBtn onClick={() => setBellOpen((o) => !o)} label="Notifications" expanded={bellOpen} className="relative">
+          {/* Notification center — real intelligence notifications + service health */}
+          <Popover>
+            <PopoverTrigger aria-label="Notifications" title="Notifications" className={cx(ICON_BTN, 'relative')}>
               <Bell size={16} />
-              {/* Dot only when something actually needs attention */}
-              {downServices.length > 0 && <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-rose-500" />}
-            </IconBtn>
-            {bellOpen && (
-              <>
-                <div className="fixed inset-0 z-30" onClick={() => setBellOpen(false)} />
-                <div className="card absolute right-0 z-40 mt-2 w-72 p-2 shadow-glass-lg animate-fade-up">
-                  <div className="eyebrow px-2 pb-2 pt-1">Notifications</div>
-                  {downServices.length === 0 ? (
-                    <div className="flex items-center gap-2 rounded-lg px-2 py-2 text-[13px] text-soft">
-                      <CheckCircle2 size={15} className="shrink-0 text-mint-600 dark:text-mint-400" />
-                      All clear — every service is online.
-                    </div>
-                  ) : (
-                    downServices.map((s) => (
-                      <div key={s.name} className="flex items-center gap-2 rounded-lg px-2 py-2 text-[13px] text-soft">
-                        <XCircle size={15} className="shrink-0 text-rose-500 dark:text-rose-300" />
-                        <span><span className="font-medium">{s.name}</span> is down</span>
-                      </div>
-                    ))
-                  )}
+              {attention && (
+                unread > 0 ? (
+                  <span className="absolute -right-0.5 -top-0.5 grid min-w-[16px] place-items-center rounded-full bg-rose-500 px-1 py-px text-2xs font-bold leading-none text-white">
+                    {unread > 9 ? '9+' : unread}
+                  </span>
+                ) : (
+                  <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-rose-500" />
+                )
+              )}
+            </PopoverTrigger>
+            <PopoverContent align="end" sideOffset={8} className="card w-80 rounded-2xl border-0 p-2 shadow-glass-lg">
+              <div className="flex items-center justify-between px-2 pb-2 pt-1">
+                <span className="eyebrow">Notifications</span>
+                {unread > 0 && (
+                  <button type="button" onClick={markAllRead}
+                    className="flex items-center gap-1 rounded px-1.5 py-0.5 text-2xs font-semibold text-indigo-600 transition-colors hover:bg-[var(--surface-2)] dark:text-indigo-300">
+                    <CheckCheck size={12} /> Mark all read
+                  </button>
+                )}
+              </div>
+              {downServices.map((s) => (
+                <div key={s.name} className="flex items-center gap-2 rounded-md px-2 py-2 text-sm text-soft">
+                  <XCircle size={15} className="shrink-0 text-rose-500 dark:text-rose-300" />
+                  <span><span className="font-medium">{s.name}</span> is down</span>
                 </div>
-              </>
-            )}
-          </div>
+              ))}
+              {items.length === 0 && downServices.length === 0 && (
+                <div className="flex items-center gap-2 rounded-md px-2 py-2 text-sm text-soft">
+                  <CheckCircle2 size={15} className="shrink-0 text-mint-600 dark:text-mint-400" />
+                  All clear — nothing needs your attention.
+                </div>
+              )}
+              {items.length > 0 && (
+                <div className="max-h-80 overflow-y-auto">
+                  {items.map((n) => (
+                    <button key={n.id} type="button" onClick={() => openNotification(n)}
+                      className={cx('flex w-full items-start gap-2.5 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--surface-2)]',
+                        n.read_at && 'opacity-60')}>
+                      <span aria-hidden className={cx('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', n.read_at ? 'bg-[var(--border-strong)]' : severityDot(n.severity))} />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm font-medium">{n.title}</span>
+                        {n.body && <span className="mt-0.5 line-clamp-2 block text-xs text-dim">{n.body}</span>}
+                      </span>
+                      <span className="shrink-0 pt-0.5 text-2xs tabular-nums text-dim">{ago(n.created_at)}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </PopoverContent>
+          </Popover>
 
-          <div className="relative">
-            <IconBtn onClick={() => setHelpOpen((o) => !o)} label="Help" expanded={helpOpen} className="hidden sm:grid">
+          <Popover>
+            <PopoverTrigger aria-label="Help" title="Help" className={cx(ICON_BTN, 'hidden sm:grid')}>
               <HelpCircle size={16} />
-            </IconBtn>
-            {helpOpen && (
-              <>
-                <div className="fixed inset-0 z-30" onClick={() => setHelpOpen(false)} />
-                <div className="card absolute right-0 z-40 mt-2 w-72 p-2 shadow-glass-lg animate-fade-up">
-                  <div className="eyebrow px-2 pb-2 pt-1">Help</div>
-                  <div className="flex items-start gap-2 rounded-lg px-2 py-2 text-[13px] text-soft">
-                    <MessageCircle size={15} className="mt-0.5 shrink-0 text-indigo-500 dark:text-indigo-300" />
-                    <span>Ask the <button onMouseDown={() => { setHelpOpen(false); navigate('/') }} className="font-medium text-indigo-600 hover:underline dark:text-indigo-300">Copilot</button> anything — it can create and edit agents for you.</span>
-                  </div>
-                  <div className="flex items-start gap-2 rounded-lg px-2 py-2 text-[13px] text-soft">
-                    <Keyboard size={15} className="mt-0.5 shrink-0 text-dim" />
-                    <span>Press <kbd className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-1.5 py-0.5 text-[11px] font-medium">/</kbd> or <kbd className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-1.5 py-0.5 text-[11px] font-medium">{IS_MAC ? '⌘K' : 'Ctrl K'}</kbd> to jump to any panel.</span>
-                  </div>
-                  <div className="flex items-start gap-2 rounded-lg px-2 py-2 text-[13px] text-soft">
-                    <HelpCircle size={15} className="mt-0.5 shrink-0 text-dim" />
-                    <span>Need a human? Write to <a href="mailto:tech@dhronai.com" className="font-medium text-indigo-600 hover:underline dark:text-indigo-300">tech@dhronai.com</a>.</span>
-                  </div>
-                </div>
-              </>
-            )}
-          </div>
+            </PopoverTrigger>
+            <PopoverContent align="end" sideOffset={8} className="card w-72 rounded-2xl border-0 p-2 shadow-glass-lg">
+              <div className="eyebrow px-2 pb-2 pt-1">Help</div>
+              <div className="flex items-start gap-2 rounded-md px-2 py-2 text-sm text-soft">
+                <MessageCircle size={15} className="mt-0.5 shrink-0 text-indigo-500 dark:text-indigo-300" />
+                <span>Ask the <button type="button" onClick={() => navigate('/copilot')} className="font-medium text-indigo-600 hover:underline dark:text-indigo-300">Copilot</button> anything — it can create and edit agents for you.</span>
+              </div>
+              <div className="flex items-start gap-2 rounded-md px-2 py-2 text-sm text-soft">
+                <Keyboard size={15} className="mt-0.5 shrink-0 text-dim" />
+                <span>Press <kbd className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-1.5 py-0.5 text-2xs font-medium">/</kbd> or <kbd className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-1.5 py-0.5 text-2xs font-medium">{IS_MAC ? '⌘K' : 'Ctrl K'}</kbd> to jump to any panel.</span>
+              </div>
+              <div className="flex items-start gap-2 rounded-md px-2 py-2 text-sm text-soft">
+                <HelpCircle size={15} className="mt-0.5 shrink-0 text-dim" />
+                <span>Need a human? Write to <a href="mailto:tech@dhronai.com" className="font-medium text-indigo-600 hover:underline dark:text-indigo-300">tech@dhronai.com</a>.</span>
+              </div>
+            </PopoverContent>
+          </Popover>
 
           <IconBtn onClick={toggle} label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}>
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}

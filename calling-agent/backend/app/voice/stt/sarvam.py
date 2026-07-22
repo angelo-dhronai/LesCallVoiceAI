@@ -19,6 +19,27 @@ logger = logging.getLogger(__name__)
 SARVAM_API_URL = "https://api.sarvam.ai/speech-to-text"
 SARVAM_TIMEOUT = 10.0
 
+# Shared per-process HTTP client: STT instances are created per call, but the
+# warmup flag is per-process — without sharing, every call after the first
+# pays a cold TLS handshake on its first segment. SARVAM_HTTP_SHARED=false
+# restores the old per-instance clients.
+SARVAM_HTTP_SHARED = os.environ.get("SARVAM_HTTP_SHARED", "true").lower() == "true"
+# With a shared pool the connections see cross-call traffic, so a longer
+# keepalive is safe; the stale-connection retry paths remain the backstop.
+SARVAM_KEEPALIVE_EXPIRY_S = float(os.environ.get("SARVAM_KEEPALIVE_EXPIRY_S", "300"))
+
+_shared_client: httpx.AsyncClient | None = None
+
+
+def _make_client(timeout: float) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=timeout,
+        limits=httpx.Limits(
+            max_keepalive_connections=5,
+            keepalive_expiry=SARVAM_KEEPALIVE_EXPIRY_S if SARVAM_HTTP_SHARED else 60,
+        ),
+    )
+
 
 class SarvamRateLimitError(Exception):
     """Raised when Sarvam API returns HTTP 429 (Too Many Requests).
@@ -69,15 +90,25 @@ class SarvamSTT(STTProvider):
             logger.info("[STT:Sarvam] API key loaded: %s", masked)
 
     def _get_client(self) -> httpx.AsyncClient:
+        if SARVAM_HTTP_SHARED:
+            global _shared_client
+            if _shared_client is None or _shared_client.is_closed:
+                _shared_client = _make_client(self._timeout)
+            return _shared_client
         if self._client is None:
             # keepalive_expiry=60: idle connections older than 60s are never
             # reused, so a call after a long pause always gets a fresh TLS
             # handshake instead of dying on a silently-dropped server socket.
-            self._client = httpx.AsyncClient(
-                timeout=self._timeout,
-                limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=60),
-            )
+            self._client = _make_client(self._timeout)
         return self._client
+
+    def _reset_client(self) -> None:
+        """Drop the active client so the next request opens a fresh one."""
+        global _shared_client
+        if SARVAM_HTTP_SHARED:
+            _shared_client = None
+        else:
+            self._client = None
 
     async def transcribe(
         self,
@@ -149,7 +180,7 @@ class SarvamSTT(STTProvider):
             new_key = _rotate_key()
             if new_key:
                 self._api_key = new_key
-                self._client = None
+                self._reset_client()  # force fresh TLS with new key
                 logger.info("[STT:Sarvam] Key rotated — next STT call will use new key")
             raise RuntimeError("[SARVAM:CREDITS] Credits exhausted — refill your Sarvam account.")
 
@@ -198,6 +229,10 @@ class SarvamSTT(STTProvider):
             logger.debug("[STT:Sarvam] Warmup skipped: %s", exc)
 
     async def close(self) -> None:
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        global _shared_client
+        if SARVAM_HTTP_SHARED:
+            client, _shared_client = _shared_client, None
+        else:
+            client, self._client = self._client, None
+        if client:
+            await client.aclose()

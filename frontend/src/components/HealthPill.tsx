@@ -23,7 +23,7 @@ export function HealthPill({ services, overall }: { services: Service[]; overall
   return (
     <div className="relative">
       <button onClick={() => setOpen((o) => !o)} aria-haspopup="true" aria-expanded={open}
-        className={cx('inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11.5px] font-medium ring-1 transition', toneCls[tone])}>
+        className={cx('inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-2xs font-medium ring-1 transition', toneCls[tone])}>
         <span className="relative flex h-2 w-2">
           <span className={cx('absolute inline-flex h-full w-full rounded-full opacity-70 animate-ping', tone === 'mint' ? 'bg-mint-400' : tone === 'amber' ? 'bg-amber-400' : 'bg-rose-400')} />
           <span className={cx('relative inline-flex h-2 w-2 rounded-full', tone === 'mint' ? 'bg-mint-500' : tone === 'amber' ? 'bg-amber-500' : 'bg-rose-500')} />
@@ -39,7 +39,7 @@ export function HealthPill({ services, overall }: { services: Service[]; overall
           <div className="card absolute right-0 z-40 mt-2 w-64 p-2 animate-fade-up">
             <div className="px-2 pb-2 pt-1 eyebrow">Service Status</div>
             {services.map((s) => (
-              <div key={s.name} className="flex items-center justify-between rounded-lg px-2 py-1.5 text-[13px] hover:bg-[var(--surface-2)]">
+              <div key={s.name} className="flex items-center justify-between rounded-lg px-2 py-1.5 text-sm hover:bg-[var(--surface-2)]">
                 <span className="text-soft">{s.name}</span>
                 {s.ok
                   ? <span className="inline-flex items-center gap-1 text-mint-600 dark:text-mint-300"><CheckCircle2 size={14} />Online</span>

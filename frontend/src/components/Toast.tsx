@@ -55,7 +55,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             <div key={t.id}
               onMouseEnter={() => pause(t.id)}
               onMouseLeave={() => resume(t.id)}
-              className={cx('glass pointer-events-auto flex items-start gap-2.5 rounded-xl px-3.5 py-3 text-[13px] font-medium shadow-glass-lg ring-1 animate-fade-up', TONES[t.type])}>
+              className={cx('glass pointer-events-auto flex items-start gap-2.5 rounded-xl px-3.5 py-3 text-sm font-medium shadow-glass-lg ring-1 animate-fade-up', TONES[t.type])}>
               <Icon size={16} className="mt-0.5 shrink-0" />
               <span className="flex-1 text-[var(--text)]">{t.text}</span>
               <button onClick={() => setToasts((all) => all.filter((x) => x.id !== t.id))} aria-label="Dismiss"

@@ -31,16 +31,16 @@ export function StatCard({ label, value, sub, icon, iconTone = 'indigo', spark, 
         <div className="min-w-0">
           <div className="eyebrow truncate">{label}</div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className={cx('metric leading-none', size === 'lg' ? 'text-[32px] sm:text-[40px]' : 'text-[24px] sm:text-[30px]')}>{value}</span>
+            <span className={cx('metric leading-none', size === 'lg' ? 'text-4xl sm:text-5xl' : 'text-3xl sm:text-4xl')}>{value}</span>
             {trend != null && (
               <span title={`${trend >= 0 ? 'Up' : 'Down'} ${Math.abs(trend)}%`}
-                className={cx('inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[11px] font-bold',
+                className={cx('inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-2xs font-bold',
                   trend >= 0 ? 'text-mint-600 dark:text-mint-300 bg-mint-400/15' : 'text-rose-500 dark:text-rose-300 bg-rose-500/12')}>
                 {trend >= 0 ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}{Math.abs(trend)}%
               </span>
             )}
           </div>
-          {sub && <div className="mt-1.5 text-[12px] text-dim">{sub}</div>}
+          {sub && <div className="mt-1.5 text-xs text-dim">{sub}</div>}
         </div>
         {radial ? (
           <RadialRing value={radial.value} max={radial.max} label={radial.label} color={radial.color} size={size === 'lg' ? 76 : 60} />

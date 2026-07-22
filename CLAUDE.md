@@ -141,3 +141,52 @@ When `ENABLE_CALL_AUDIT=true`, each call produces a WAV recording and transcript
 - The greeting fires only after the first audio frame is received (`signal_call_active()` gate), not at WebSocket open, to avoid burning TTS credits on abandoned connections.
 - `socket_server.py` runs under system Python; `ws_audio_receiver.py` (and everything under `calling-agent/`) runs under `calling-agent/venv`. Do not mix them.
 - All audio throughout the AI pipeline is 16-bit PCM at 16 kHz. FreeSWITCH delivers PCMU at 8 kHz; `ws_audio_receiver.py` handles the decode and upsample before forwarding.
+
+---
+
+## Frontend design system (`frontend/`)
+
+React 18 + TS + Vite + Tailwind **v3** + shadcn/ui, redesigned 2026-07-22
+(full record: `deploy/PLAN-ux-redesign.md`). If you touch a page, match these —
+they are the whole point of the redesign, and re-introducing the old patterns
+silently undoes it.
+
+- **shadcn is on Tailwind v3** → add components with `npx shadcn@2 add <c>`
+  (the 3.x CLI targets v4 and will corrupt `tailwind.config.ts`). Primitives
+  live in `src/components/ui/`.
+- **Token namespacing is load-bearing.** shadcn's `--border`/`--accent` are
+  renamed `--ui-border`/`--ui-accent` because the app's `:root` already owns
+  those names (brand emerald). Dark `--ui-border`/`--input` carry baked-in
+  alpha → never use opacity modifiers (`border-border/50`) on them.
+- **Type scale is closed**: `text-2xs` 11 · `xs` 12 · `sm` 13 (body default) ·
+  `base` 14 · `lg` 16 · `xl` 18 · `2xl` 20 · `3xl` 24, plus a display tier
+  `4xl` 30 / `5xl` 40 **for metric values only**. Never write `text-[Npx]`.
+- **Radius law**: controls `rounded-md`, cards `rounded-2xl`, pills
+  `rounded-full`.
+- **One confirm idiom**: `useConfirm()` / `usePrompt()` from
+  `components/confirm.tsx` (awaitable). No `window.confirm`/`prompt`/`alert`.
+- **Chart colour comes from `lib/chartColors.ts`** (`CHART`, `TONE`,
+  `scoreColor`) — never hardcode a hex. This is what fixed the old
+  Negative-vs-Hot collision.
+- **Loading/empty/error go through `AsyncState`** (`variant="rows|cards|text"`,
+  `rows`, or a `skeleton` override). Empty labels state what would put
+  something there, per filter — not "Nothing here".
+- **Icon-only buttons are `IconButton`** with a specific `label` (it becomes
+  both `aria-label` and tooltip): name the row's subject, don't ship four
+  identical "Edit"s.
+- **Shared composites before bespoke markup**: `components/kit.tsx`
+  (PageHeader/Table/Pagination/SearchInput/Segmented/BarList),
+  `components/insight.tsx` (ScoreCell/Chips/FilterChips/CommitmentCard/
+  TimelineList/StatTile), `components/analyticsCharts.tsx`.
+- **List state belongs in the URL** via `useUrlParam`/`useUrlNumber`
+  (`lib/hooks.ts`); debounce text search with `useDebounced`.
+- **All page I/O** goes through `api/client.ts` (`api`, `sse`) and
+  `api/mutate.ts` (`post/patch/put/del/postForm`). Zero raw `fetch` in pages.
+- **Routes are lazy** in `App.tsx` — only Overview + shell are eager. Adding a
+  static page import back re-inflates the entry bundle (it was 740 kB; it is
+  385 kB).
+- **IA**: `/` is the Overview dashboard; the Copilot chat is `/copilot`.
+
+Deploy the SPA with
+`docker compose -f deploy/docker-compose.services.yml up -d --build spa`
+(bind-mounted containers serve stale code until rebuilt).

@@ -7,6 +7,18 @@
 set -uo pipefail
 cd /home/angelo/lescall
 
+# Intelligence worker: a separate long-lived process, NOT a pass in the tick
+# loop below — LLM jobs can take minutes and must never delay the billing
+# reconcile (sentinel restarts this container if 'reconcile:' vanishes from
+# 20 min of logs). Supervised: restarts 30s after any exit.
+(
+    while true; do
+        python -m shared.intelligence.worker || true
+        echo "WARN intel worker exited; restarting in 30s"
+        sleep 30
+    done
+) &
+
 TICK=300
 i=0
 echo "workers loop up (tick=${TICK}s)"

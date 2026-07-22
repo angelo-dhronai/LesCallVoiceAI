@@ -8,7 +8,7 @@ import { api } from '../api/client'
 import { post, patch, del } from '../api/mutate'
 import { useGet, useRefresh } from '../api/hooks/useApi'
 import { useToast } from '../components/Toast'
-import { Card, Button, Badge, Spinner, EmptyState, cx } from '../components/ui'
+import { Card, Button, Badge, IconButton, Spinner, EmptyState, cx } from '../components/ui'
 import {
   PageHeader, Table, THead, TH, TR, TD, Select, Input, Field, AsyncState,
 } from '../components/kit'
@@ -32,6 +32,8 @@ type ServerInfo = {
   rtp_range: string; notes: string[]
 }
 type Instructions = { trunk: string; sip_uri: string; rtp_range: string; steps: string[] }
+/** Slice of the Settings profile we need: where test calls ring. */
+type Profile = { phone?: string }
 type AgentOption = { name: string; call_direction?: 'inbound' | 'outbound' }
 type AgentsResponse = { agents: AgentOption[]; active?: string | null }
 type ConfirmTarget = { kind: 'number'; n: PhoneNumber } | { kind: 'trunk'; t: Trunk }
@@ -72,14 +74,16 @@ function AgentOptions({ agents, want }: { agents: AgentOption[]; want: 'inbound'
 function CopyValue({ label, value, hint, onCopy }: {
   label: string; value: string; hint?: string; onCopy: (v: string) => void
 }) {
+  // Labels can carry a "· context" suffix — the accessible name only needs the value's name.
+  const shortLabel = label.split('·')[0].trim()
   return (
     <div className="flex flex-col gap-1 rounded-xl bg-[var(--surface-2)] p-3">
-      <div className="text-[11px] font-semibold uppercase tracking-wide text-dim">{label}</div>
+      <div className="text-2xs font-semibold uppercase tracking-wide text-dim">{label}</div>
       <div className="flex items-center gap-2">
-        <code className="flex-1 truncate rounded-lg bg-[var(--surface)] px-2.5 py-1.5 text-[13.5px] font-semibold">{value}</code>
-        <Button size="sm" variant="ghost" className="h-9 w-9 shrink-0" onClick={() => onCopy(value)} title={`Copy ${label}`}><Copy size={13} /></Button>
+        <code className="flex-1 truncate rounded-lg bg-[var(--surface)] px-2.5 py-1.5 text-sm font-semibold">{value}</code>
+        <IconButton label={`Copy ${shortLabel}`} onClick={() => onCopy(value)}><Copy size={13} /></IconButton>
       </div>
-      {hint && <div className="text-[11.5px] text-dim">{hint}</div>}
+      {hint && <div className="text-xs text-dim">{hint}</div>}
     </div>
   )
 }
@@ -87,7 +91,7 @@ function CopyValue({ label, value, hint, onCopy }: {
 /* Step-number circle for the two-step wizard. */
 function StepCircle({ n }: { n: number }) {
   return (
-    <span className="grid h-6 w-6 place-items-center rounded-full bg-mint-400/15 text-[12px] font-bold text-mint-700 ring-1 ring-mint-400/30 dark:text-mint-300">
+    <span className="grid h-6 w-6 place-items-center rounded-full bg-mint-400/15 text-xs font-bold text-mint-700 ring-1 ring-mint-400/30 dark:text-mint-300">
       {n}
     </span>
   )
@@ -113,6 +117,9 @@ export default function Telephony() {
   const numbersQ = useGet<{ numbers: PhoneNumber[] }>(['telephony', 'numbers'], '/numbers')
   const infoQ = useGet<ServerInfo>(['telephony', 'server-info'], '/telephony/server-info')
   const agentsQ = useGet<AgentsResponse>(['agents'], '/agents')
+  // Same source Settings edits — shows where "Test call" actually rings.
+  const profileQ = useGet<Profile>(['profile'], '/auth/profile')
+  const testPhone = profileQ.data?.phone ? `+${profileQ.data.phone}` : ''
 
   const [connectForm, setConnectForm] = useState({ ...EMPTY_CONNECT })
   const [showCreds, setShowCreds] = useState(false)
@@ -297,18 +304,18 @@ export default function Telephony() {
       <Card className="p-5">
         <div className="mb-1 flex items-center gap-2">
           <StepCircle n={1} />
-          <span className="text-[14px] font-semibold">In your carrier console (e.g. Plivo Zentrunk)</span>
+          <span className="text-base font-semibold">In your carrier console (e.g. Plivo Zentrunk)</span>
         </div>
         <div className="mb-3 space-y-1 sm:pl-8">
-          <p className="text-[12.5px] text-dim">
+          <p className="text-xs text-dim">
             <b className="text-soft">a.</b> Create an <b>inbound (origination)</b> trunk and an <b>outbound (termination)</b> trunk.
           </p>
-          <p className="text-[12.5px] text-dim">
+          <p className="text-xs text-dim">
             <b className="text-soft">b.</b> Paste these two values <b>into</b> your carrier where it asks for them —
             then <b className="text-soft">c.</b> copy the termination SIP domain back <b>from</b> your outbound trunk:
           </p>
         </div>
-        <AsyncState loading={infoQ.isLoading} error={infoQ.error}>
+        <AsyncState loading={infoQ.isLoading} error={infoQ.error} variant="text" rows={5}>
           {info && (
             <>
               <div className="grid grid-cols-1 gap-3 sm:pl-8 md:grid-cols-3">
@@ -325,26 +332,28 @@ export default function Telephony() {
                   onCopy={copy}
                 />
                 <div className="flex flex-col gap-1 rounded-xl bg-indigo-500/8 p-3 ring-1 ring-indigo-500/20">
-                  <div className="text-[11px] font-semibold uppercase tracking-wide text-indigo-600 dark:text-indigo-300">
+                  <div className="text-2xs font-semibold uppercase tracking-wide text-indigo-600 dark:text-indigo-300">
                     Termination SIP domain · copy FROM your outbound trunk
                   </div>
-                  <code className="rounded-lg bg-[var(--surface)] px-2.5 py-1.5 text-[13.5px] font-semibold">xxxxxxxx.zt.plivo.com</code>
+                  {/* Placeholder pattern, not a copyable value — deliberately not chip-styled. */}
+                  <span className="px-0.5 py-1.5 font-mono text-sm text-dim">xxxxxxxx.zt.plivo.com</span>
                   <div className="flex flex-wrap items-center justify-between gap-1">
-                    <span className="text-[11.5px] text-dim">Find it on your outbound (termination) trunk</span>
-                    <span className="shrink-0 rounded-full bg-indigo-500/12 px-2 py-0.5 text-[10.5px] font-semibold text-indigo-600 ring-1 ring-indigo-500/20 dark:text-indigo-300">
+                    <span className="text-xs text-dim">Find it on your outbound (termination) trunk</span>
+                    <span className="shrink-0 rounded-full bg-indigo-500/12 px-2 py-0.5 text-2xs font-semibold text-indigo-600 ring-1 ring-indigo-500/20 dark:text-indigo-300">
                       paste in step 2 ↓
                     </span>
                   </div>
                 </div>
               </div>
               <div className="mt-3 sm:pl-8">
-                <button className="flex items-center gap-1 text-[12px] font-medium text-dim hover:text-soft"
+                <button className="flex items-center gap-1 text-xs font-medium text-dim hover:text-soft"
+                  aria-expanded={showNetDetails} aria-controls="net-details-panel"
                   onClick={() => setShowNetDetails(!showNetDetails)}>
                   {showNetDetails ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
                   More network details (port, transport, RTP range)
                 </button>
                 {showNetDetails && (
-                  <div className="mt-2 space-y-2">
+                  <div id="net-details-panel" className="mt-2 space-y-2">
                     <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
                       <CopyValue label="SIP port" value={String(info.sip_port)} onCopy={copy} />
                       <CopyValue label="Transport" value={info.transport} onCopy={copy} />
@@ -352,7 +361,7 @@ export default function Telephony() {
                         hint="Open these UDP ports toward us on any firewall" onCopy={copy} />
                     </div>
                     {info.notes?.length > 0 && (
-                      <ul className="list-disc space-y-0.5 pl-4 text-[11.5px] text-dim">
+                      <ul className="list-disc space-y-0.5 pl-4 text-xs text-dim">
                         {info.notes.map((note, i) => <li key={i}>{note}</li>)}
                       </ul>
                     )}
@@ -368,9 +377,9 @@ export default function Telephony() {
       <Card className="p-5">
         <div className="mb-1 flex items-center gap-2">
           <StepCircle n={2} />
-          <span className="text-[14px] font-semibold">Connect your number</span>
+          <span className="text-base font-semibold">Connect your number</span>
         </div>
-        <p className="mb-3 text-[12.5px] text-dim sm:pl-8">
+        <p className="mb-3 text-xs text-dim sm:pl-8">
           One go: this registers the trunk + number, deploys the phone-system config, and routes calls to your agent.
         </p>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:pl-8 lg:grid-cols-4">
@@ -386,7 +395,7 @@ export default function Telephony() {
               onBlur={() => setTouched((t) => ({ ...t, number: true }))}
               className={touched.number && !numberValid ? '!ring-rose-500/40' : undefined} />
             {touched.number && !numberValid && (
-              <span className="mt-1 block text-[11px] text-rose-500">Include the country code, e.g. +918065953160</span>
+              <span className="mt-1 block text-2xs text-rose-500">Include the country code, e.g. +918065953160</span>
             )}
           </Field>
           <Field label="Termination SIP domain (outbound trunk)">
@@ -395,7 +404,7 @@ export default function Telephony() {
               onBlur={() => setTouched((t) => ({ ...t, sip_domain: true }))}
               className={touched.sip_domain && !domainValid ? '!ring-rose-500/40' : undefined} />
             {touched.sip_domain && !domainValid && (
-              <span className="mt-1 block text-[11px] text-rose-500">Should look like xxxxxxxx.zt.plivo.com (no sip: prefix)</span>
+              <span className="mt-1 block text-2xs text-rose-500">Should look like xxxxxxxx.zt.plivo.com (no sip: prefix)</span>
             )}
           </Field>
           <Field label="Agent that answers incoming calls">
@@ -405,7 +414,7 @@ export default function Telephony() {
               <AgentOptions agents={agentList} want="inbound" />
             </Select>
             {agentSlugs.length === 0 && !agentsQ.isLoading && (
-              <span className="mt-1 block text-[11px] text-dim">
+              <span className="mt-1 block text-2xs text-dim">
                 No agents yet —{' '}
                 <Link to="/build/agents/new" className="font-semibold text-mint-600 hover:underline dark:text-mint-300">create one first →</Link>
                 {' '}(you can still connect the number now and bind later)
@@ -418,19 +427,20 @@ export default function Telephony() {
               <option value="">(same as incoming)</option>
               <AgentOptions agents={agentList} want="outbound" />
             </Select>
-            <span className="mt-1 block text-[11px] text-dim">
+            <span className="mt-1 block text-2xs text-dim">
               Optional — leave as is and outgoing calls use the same agent as incoming ones.
             </span>
           </Field>
         </div>
         <div className="mt-2 sm:pl-8">
-          <button className="flex items-center gap-1 text-[12px] font-medium text-dim hover:text-soft"
+          <button className="flex items-center gap-1 text-xs font-medium text-dim hover:text-soft"
+            aria-expanded={showCreds} aria-controls="trunk-creds-panel"
             onClick={() => setShowCreds(!showCreds)}>
             {showCreds ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
             Optional: trunk credentials &amp; carrier signaling IPs
           </button>
           {showCreds && (
-            <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <div id="trunk-creds-panel" className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <Field label="Username (blank = IP auth)">
                 <Input value={connectForm.username}
                   onChange={(e) => setConnectForm({ ...connectForm, username: e.target.value })} />
@@ -455,7 +465,7 @@ export default function Telephony() {
             {busy === 'connect' ? <Spinner /> : <PlugZap size={15} />} Connect number
           </Button>
           {!canConnect && busy !== 'connect' && !connectError && (
-            <span className="text-[12px] text-dim">
+            <span className="text-xs text-dim">
               Enter your number (with country code) and the termination SIP domain from step 1
             </span>
           )}
@@ -466,7 +476,7 @@ export default function Telephony() {
                 const failed = !!connectError && i === connectPhase
                 const current = !connectError && i === connectPhase
                 return (
-                  <span key={label} className={cx('flex items-center gap-1.5 text-[12px]',
+                  <span key={label} className={cx('flex items-center gap-1.5 text-xs',
                     failed ? 'font-medium text-rose-600 dark:text-rose-300'
                       : current ? 'font-medium text-[var(--text)]' : 'text-dim')}>
                     {done ? <CheckCircle2 size={14} className="shrink-0 text-mint-500" />
@@ -482,7 +492,7 @@ export default function Telephony() {
         </div>
         {connectError && (
           <div role="alert"
-            className="mt-3 rounded-xl bg-rose-500/10 px-3 py-2.5 text-[12.5px] text-rose-600 ring-1 ring-rose-500/20 dark:text-rose-300 sm:ml-8">
+            className="mt-3 rounded-xl bg-rose-500/10 px-3 py-2.5 text-sm text-rose-600 ring-1 ring-rose-500/20 dark:text-rose-300 sm:ml-8">
             {connectError}
           </div>
         )}
@@ -491,15 +501,23 @@ export default function Telephony() {
       {/* ------------------------- your numbers ------------------------- */}
       <Card className="p-5">
         <div className="mb-3">
-          <div className="text-[13px] font-semibold">Your numbers</div>
-          <div className="text-[12px] text-dim">
+          <div className="text-sm font-semibold">Your numbers</div>
+          <div className="text-xs text-dim">
             Bind <b>your agents</b> to a number — one for the calls it answers, one for the calls it
-            places — and apply its trunk. Use <b>Test call</b> to ring your own phone (set it in{' '}
-            <Link to="/settings" className="font-semibold text-indigo-600 hover:underline dark:text-indigo-300">Settings</Link>)
-            and hear your agent exactly as callers do.
+            places — and apply its trunk. Use <b>Test call</b> to ring your own phone and hear your
+            agent exactly as callers do.{' '}
+            {testPhone ? (
+              <>Test calls ring <b className="tabular-nums text-soft">{testPhone}</b>{' '}
+                (<Link to="/settings" className="font-semibold text-indigo-600 hover:underline dark:text-indigo-300">change in Settings →</Link>)
+              </>
+            ) : (
+              <Link to="/settings" className="font-semibold text-indigo-600 hover:underline dark:text-indigo-300">
+                Set your phone in Settings →
+              </Link>
+            )}
           </div>
         </div>
-        <AsyncState loading={numbersQ.isLoading} error={numbersQ.error}>
+        <AsyncState loading={numbersQ.isLoading} error={numbersQ.error} variant="cards" rows={3}>
           {numbers.length === 0 ? (
             <EmptyState icon={<PhoneCall size={20} />} title="No numbers connected yet"
               hint="Complete steps 1 and 2 above to connect your first number" />
@@ -557,7 +575,7 @@ export default function Telephony() {
                           const working = busy === `rebind-${key}`
                           return (
                             <label key={slot.field} className="flex flex-col gap-1">
-                              <span className="text-[11px] font-semibold uppercase tracking-wide text-dim">{slot.label}</span>
+                              <span className="text-2xs font-semibold uppercase tracking-wide text-dim">{slot.label}</span>
                               <span className="inline-flex items-center gap-2">
                                 <Select value={n[slot.field] || ''}
                                   disabled={working}
@@ -605,18 +623,19 @@ export default function Telephony() {
                       <TD colSpan={5} className="!py-2">
                         <div className="sticky left-0 max-w-[calc(100vw-6rem)] rounded-xl bg-amber-500/8 px-3 py-2.5 ring-1 ring-amber-500/20">
                           <div className="mb-1.5 flex items-center justify-between gap-2">
-                            <div className="text-[11.5px] font-semibold text-amber-700 dark:text-amber-300">
+                            <div className="text-xs font-semibold text-amber-700 dark:text-amber-300">
                               To make calls from {n.number}, finish these steps:
                             </div>
                             <button onClick={() => toggleChecklist(n.id)}
                               title={collapsed ? 'Expand checklist' : 'Collapse checklist'}
                               aria-label={collapsed ? 'Expand checklist' : 'Collapse checklist'}
-                              className="shrink-0 rounded-lg p-2 -m-1 text-amber-700 hover:bg-amber-500/10 dark:text-amber-300">
+                              aria-expanded={!collapsed}
+                              className="shrink-0 rounded-md p-2 -m-1 text-amber-700 hover:bg-amber-500/10 dark:text-amber-300">
                               {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
                             </button>
                           </div>
                           {collapsed ? (
-                            <div className="text-[12px] text-dim">
+                            <div className="text-xs text-dim">
                               {nextIdx >= 0
                                 ? <>Next: <span className="font-medium text-[var(--text)]">{steps[nextIdx].label}</span> — {steps[nextIdx].hint}</>
                                 : 'All steps done'}
@@ -625,22 +644,22 @@ export default function Telephony() {
                             <>
                               <ol className="flex flex-col gap-1">
                                 {steps.map((s, i) => (
-                                  <li key={i} className={cx('flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[12.5px]',
+                                  <li key={i} className={cx('flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm',
                                     s.done ? 'text-dim' : i === nextIdx ? 'font-medium text-[var(--text)]' : 'text-dim')}>
                                     {s.done
                                       ? <CheckCircle2 size={14} className="shrink-0 text-mint-500" />
                                       : <Circle size={14} className={cx('shrink-0', i === nextIdx ? 'text-amber-500' : 'text-[var(--border)]')} />}
                                     <span className={s.done ? 'line-through opacity-70' : ''}>{i + 1}. {s.label}</span>
                                     {!s.done && i === nextIdx && (
-                                      <span className="text-[11px] text-dim">— {s.hint}</span>
+                                      <span className="text-2xs text-dim">— {s.hint}</span>
                                     )}
                                     {!s.done && i === nextIdx && s.action === 'agent' && (
-                                      <Link to="/build/agents/new" className="ml-1 text-[11.5px] font-semibold text-mint-600 hover:underline dark:text-mint-300">Create agent →</Link>
+                                      <Link to="/build/agents/new" className="ml-1 text-xs font-semibold text-mint-600 hover:underline dark:text-mint-300">Create agent →</Link>
                                     )}
                                   </li>
                                 ))}
                               </ol>
-                              <div className="mt-1.5 text-[11px] text-dim">
+                              <div className="mt-1.5 text-2xs text-dim">
                                 Your caller ID is authorised by your own carrier (the call goes out over your trunk) — no separate number verification needed.
                               </div>
                             </>
@@ -658,15 +677,17 @@ export default function Telephony() {
       </Card>
 
       {/* --------------------------- advanced --------------------------- */}
-      <button className="flex items-center gap-1.5 text-[12.5px] font-medium text-dim hover:text-soft"
+      <button className="flex items-center gap-1.5 text-xs font-medium text-dim hover:text-soft"
+        aria-expanded={showAdvanced} aria-controls="advanced-trunks-panel"
         onClick={() => setShowAdvanced(!showAdvanced)}>
         {showAdvanced ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         Advanced: trunks {trunks.length > 0 && `(${trunks.length})`}
       </button>
       {showAdvanced && (
+        <div id="advanced-trunks-panel">
         <Card className={cx('p-5')}>
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-            <div className="text-[13px] font-semibold">Trunks (carrier connections)</div>
+            <div className="text-sm font-semibold">Trunks (carrier connections)</div>
             <Button size="sm" variant="ghost" onClick={() => setTrunkModal(true)}><Plus size={14} /> Add trunk only</Button>
           </div>
           <AsyncState loading={trunksQ.isLoading} error={trunksQ.error}>
@@ -684,7 +705,7 @@ export default function Telephony() {
                     <TR key={t.id}>
                       <TD className="font-medium">{t.name}</TD>
                       <TD>{t.provider}</TD>
-                      <TD><code className="text-[12px]">{t.sip_domain}</code></TD>
+                      <TD><code className="text-xs">{t.sip_domain}</code></TD>
                       <TD className="max-w-[180px] truncate" title={t.provider_ips}>{t.provider_ips || '—'}</TD>
                       <TD><Badge tone={statusTone(t.config_status)} soft>{t.config_status}</Badge></TD>
                       <TD className="text-dim">{fmtDate(t.last_applied_at)}</TD>
@@ -711,6 +732,7 @@ export default function Telephony() {
             )}
           </AsyncState>
         </Card>
+        </div>
       )}
 
       {/* Confirm disconnect / delete modal */}
@@ -723,19 +745,19 @@ export default function Telephony() {
           </Button>
         </>}>
         {confirmTarget?.kind === 'number' && (
-          <p className="text-[13px] text-soft">
+          <p className="text-sm text-soft">
             Inbound calls to <b>{confirmTarget.n.number}</b> will stop being answered, and outbound calls
             from it will fail. You can reconnect it later via the Connect flow above.
           </p>
         )}
         {confirmTarget?.kind === 'trunk' && (
-          <div className="space-y-3 text-[13px] text-soft">
+          <div className="space-y-3 text-sm text-soft">
             <p>
               The carrier connection <b>{confirmTarget.t.name}</b> ({confirmTarget.t.sip_domain}) will be
               removed from the phone system.
             </p>
             {trunkConfirmNumbers.length > 0 && (
-              <div className="rounded-xl bg-amber-500/8 px-3 py-2.5 text-[12.5px] text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">
+              <div className="rounded-xl bg-amber-500/8 px-3 py-2.5 text-sm text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">
                 {trunkConfirmNumbers.length === 1
                   ? <>1 number still routes through this trunk: <b>{trunkConfirmNumbers[0].number}</b> — calls on it will stop working.</>
                   : <>{trunkConfirmNumbers.length} numbers still route through this trunk: <b>{trunkConfirmNumbers.map((n) => n.number).join(', ')}</b> — calls on them will stop working.</>}
@@ -781,22 +803,22 @@ export default function Telephony() {
       {/* Carrier instructions modal */}
       <Modal open={!!instructions} onClose={() => setInstructions(null)} title="Carrier setup" wide>
         {instructions && (
-          <div className="space-y-3 text-[13px]">
+          <div className="space-y-3 text-sm">
             <div>Trunk:{' '}
               <code className="break-all rounded bg-[var(--surface-2)] px-1.5 py-0.5">{instructions.trunk}</code>
-              <button className="ml-0.5 inline-grid h-9 w-9 place-items-center rounded-lg align-middle text-dim hover:bg-[var(--surface-2)] hover:text-soft" title="Copy trunk name"
-                aria-label="Copy trunk name" onClick={() => copy(instructions.trunk)}><Copy size={13} /></button>
+              <IconButton label="Copy trunk name" className="ml-0.5 align-middle"
+                onClick={() => copy(instructions.trunk)}><Copy size={13} /></IconButton>
             </div>
             <div>Origination URI:{' '}
               <code className="break-all rounded bg-[var(--surface-2)] px-1.5 py-0.5">{instructions.sip_uri}</code>
-              <button className="ml-0.5 inline-grid h-9 w-9 place-items-center rounded-lg align-middle text-dim hover:bg-[var(--surface-2)] hover:text-soft" title="Copy origination URI"
-                aria-label="Copy origination URI" onClick={() => copy(instructions.sip_uri)}><Copy size={13} /></button>
+              <IconButton label="Copy origination URI" className="ml-0.5 align-middle"
+                onClick={() => copy(instructions.sip_uri)}><Copy size={13} /></IconButton>
             </div>
             {instructions.rtp_range && (
               <div>RTP media range:{' '}
                 <code className="break-all rounded bg-[var(--surface-2)] px-1.5 py-0.5">{instructions.rtp_range}</code>
-                <button className="ml-0.5 inline-grid h-9 w-9 place-items-center rounded-lg align-middle text-dim hover:bg-[var(--surface-2)] hover:text-soft" title="Copy RTP media range"
-                  aria-label="Copy RTP media range" onClick={() => copy(instructions.rtp_range)}><Copy size={13} /></button>
+                <IconButton label="Copy RTP media range" className="ml-0.5 align-middle"
+                  onClick={() => copy(instructions.rtp_range)}><Copy size={13} /></IconButton>
               </div>
             )}
             <ol className="list-decimal space-y-1.5 pl-5">

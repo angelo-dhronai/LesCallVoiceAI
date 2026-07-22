@@ -175,6 +175,16 @@ try:
 except Exception as _tel_exc:  # pragma: no cover - never take down the dashboard
     logging.getLogger("dashboard").error("Telephony API NOT mounted: %r", _tel_exc)
 
+# Intelligence layer (automatic post-call pipeline: unified dashboard,
+# semantic search, follow-ups, reports, notifications, customer memory).
+# See deploy/PLAN-intelligence-layer.md.
+try:
+    from intel_api import router as intel_router
+    app.include_router(intel_router)
+    logging.getLogger("dashboard").info("Intelligence API mounted")
+except Exception as _intel_exc:  # pragma: no cover - never take down the dashboard
+    logging.getLogger("dashboard").error("Intelligence API NOT mounted: %r", _intel_exc)
+
 _img_dir = STATIC_DIR / "img"
 _img_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -424,24 +434,19 @@ def _in_range(ts: str, start_date: datetime.date, end_date: datetime.date) -> bo
         return False
 
 
-def _compute_kpis(events: list[dict], contacts: list[dict],
+def _compute_kpis(call_stats: dict, contacts: list[dict],
                    start_date: datetime.date, end_date: datetime.date) -> dict:
     """KPIs for the Overview tab. Every number here is derived from real
     stored data; where the data genuinely doesn't exist (inbound missed
     calls — the pipeline only ever logs calls that connected), the field is
     explicitly flagged rather than estimated.
+
+    `call_stats` is one owner-scoped aggregate row from _owner_call_stats
+    (calls table). It replaced a scan of credit-log events, which carried no
+    owner and so made every tenant's Overview show platform-wide totals.
     """
-    calls = _aggregate_calls(events)
-    inbound_calls = 0
-    outbound_connected = 0
-    minutes_used = 0.0
-    for c in calls:
-        minutes_used += c.get("duration_seconds", 0.0) / 60.0
-        direction = _classify_direction(c.get("start_time", ""))["direction"]
-        if direction == "outbound":
-            outbound_connected += 1
-        else:
-            inbound_calls += 1
+    inbound_calls = int(call_stats.get("inbound") or 0)
+    minutes_used = float(call_stats.get("seconds") or 0) / 60.0
 
     outbound_attempts_in_range = []
     for c in contacts:
@@ -518,16 +523,18 @@ def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
         # it into the WHY-YOU-ARE-CALLING-BACK prompt block.
         "context_note": context_note,
     }
+    link_id = None
     try:
         from shared.db.database import get_db
         from shared.phone import significant_digits
         with get_db() as db:
-            db.execute(
+            row = db.execute(
                 "INSERT INTO call_links (owner, phone, sig_digits, contact_id,"
                 " name, agent_slug, dialed_at, context_note)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                " VALUES (?,?,?,?,?,?,?,?) RETURNING id",
                 (owner, phone, significant_digits(phone), contact_id, name,
-                 agent_slug, entry["dialed_at"], context_note or None))
+                 agent_slug, entry["dialed_at"], context_note or None)).fetchone()
+            link_id = row["id"] if row else None
             # Dial records only matter inside the matching windows; prune
             # anything older than a week (replaces the file's last-5000 cap).
             cutoff = (datetime.datetime.utcnow()
@@ -535,11 +542,85 @@ def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
             db.execute("DELETE FROM call_links WHERE dialed_at < ?", (cutoff,))
     except Exception as exc:
         logger.error("call_links insert failed: %r", exc)
+    # Contact timeline: every dial attempt lands as an event (append-only,
+    # best-effort — a timeline failure must never block a dial).
+    if link_id is not None and owner:
+        try:
+            from shared.db.database import get_db
+            from shared.intelligence import timeline
+            from shared.phone import significant_digits
+            with get_db() as db:
+                cid = timeline.resolve_contact(
+                    db, owner, contact_id, significant_digits(phone))
+            if cid is not None:
+                timeline.emit(cid, owner, "dial.attempted",
+                              ref_table="call_links", ref_id=link_id,
+                              occurred_at=entry["dialed_at"],
+                              payload={"phone": phone, "agent_slug": agent_slug,
+                                       "name": name})
+        except Exception as exc:
+            logger.warning("dial timeline event failed: %r", exc)
     # Legacy dual-write: the runtime bridge read call_link.json until its DB
     # path soaked — remove together with CALL_LINK_FILE once verified.
     entries = _load_call_link()
     entries.append(entry)
     _save_call_link(entries[-5000:])
+
+
+# How long after a dial a second dial to the same number is treated as a
+# double-click rather than a deliberate retry. Matches originate_timeout (45s)
+# plus carrier ring setup, so a leg that is still ringing is always covered.
+_DUPLICATE_DIAL_WINDOW_S = 60
+
+
+def _recent_dial_for(phone: str, owner: str, within_s: int) -> float | None:
+    """Seconds since this owner last dialled this number, or None if longer
+    ago than `within_s`. Compares on significant digits so +91/0 prefix
+    variants of the same handset still collide."""
+    try:
+        from shared.db.database import get_db
+        from shared.phone import significant_digits
+        sig = significant_digits(phone)
+        with get_db() as db:
+            row = db.execute(
+                "SELECT dialed_at FROM call_links WHERE sig_digits = ? AND owner = ?"
+                " ORDER BY dialed_at DESC LIMIT 1", (sig, owner)).fetchone()
+        if row is None:
+            return None
+        # Rows come back dict-like (mapping by column name), not as tuples.
+        try:
+            raw_val = row["dialed_at"]
+        except (TypeError, KeyError, IndexError):
+            raw_val = row[0]
+        if raw_val is None:
+            return None
+        # dialed_at comes back as a datetime from Postgres but as a string from
+        # the legacy loader, and the string form has varied between
+        # '...T..:..:..Z' and '... ..:..:..(.ms)'. Normalise all of them rather
+        # than trusting one layout — a parse failure here would silently
+        # disable the guard.
+        raw = raw_val
+        if isinstance(raw, datetime.datetime):
+            prev = raw
+        else:
+            txt = str(raw).strip().replace("T", " ").rstrip("Z")
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    prev = datetime.datetime.strptime(txt, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                logger.error("duplicate-dial: unparseable dialed_at %r", raw)
+                return None
+        delta = (datetime.datetime.utcnow() - prev).total_seconds()
+        if delta < 0 or delta > within_s:
+            return None
+        return delta
+    except Exception as exc:
+        # Never let the guard block a legitimate call if the lookup breaks.
+        logger.error("duplicate-dial lookup failed (allowing dial): %r", exc)
+        return None
 
 
 def _classify_direction(start_time_iso: str, owner: str | None = None) -> dict:
@@ -1160,39 +1241,77 @@ async def health() -> JSONResponse:
     return JSONResponse(_get_runtime_health())
 
 
+def _owner_call_stats(owner: str, start: datetime.date,
+                      end: datetime.date) -> dict[str, Any]:
+    """Per-tenant call counts straight from the `calls` table.
+
+    The Overview used to build every one of its numbers from the credit-log
+    JSONL, which has no owner attribution — so the page could only ever show
+    PLATFORM-WIDE totals. That is why /api/overview is not in the tenancy
+    allowlist and the page 403'd: the gate was right to block it. The calls
+    table carries `owner` and a real `direction` column, so the same figures
+    come out correctly scoped (and without the old time-of-day direction
+    guess in _classify_direction).
+    """
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            row = db.execute(
+                """SELECT count(*) AS total,
+                          count(*) FILTER (WHERE direction='inbound')  AS inbound,
+                          count(*) FILTER (WHERE direction='outbound') AS outbound,
+                          COALESCE(sum(duration_s), 0) AS seconds,
+                          count(*) FILTER (WHERE COALESCE(duration_s,0) >= 5) AS answered
+                     FROM calls
+                    WHERE owner = ? AND started_at::date BETWEEN ? AND ?""",
+                (owner, start.isoformat(), end.isoformat()),
+            ).fetchone()
+            daily = {r["d"]: r["n"] for r in db.execute(
+                """SELECT started_at::date::text AS d, count(*) AS n
+                     FROM calls
+                    WHERE owner = ? AND started_at::date BETWEEN ? AND ?
+                    GROUP BY 1""",
+                (owner, (end - datetime.timedelta(days=13)).isoformat(), end.isoformat()),
+            ).fetchall()}
+            hourly_rows = {r["h"]: r["n"] for r in db.execute(
+                """SELECT extract(hour from started_at)::int AS h, count(*) AS n
+                     FROM calls
+                    WHERE owner = ? AND started_at::date = ?
+                    GROUP BY 1""",
+                (owner, end.isoformat()),
+            ).fetchall()}
+        return {"row": dict(row), "daily": daily, "hourly": hourly_rows}
+    except Exception as exc:
+        logger.error("overview call stats failed: %r", exc)
+        return {"row": {"total": 0, "inbound": 0, "outbound": 0,
+                        "seconds": 0, "answered": 0},
+                "daily": {}, "hourly": {}}
+
+
 @app.get("/api/overview")
 async def overview(request: Request, period: str = Query("today")) -> JSONResponse:
     today = datetime.date.today()
     week_start  = today - datetime.timedelta(days=6)
     month_start = today - datetime.timedelta(days=29)
-
-    today_events = _load_credit_log(today)
-    week_events  = _load_credit_range(week_start, today)
-    month_events = _load_credit_range(month_start, today)
-
-    hourly: dict[int, int] = {h: 0 for h in range(24)}
-    for ev in today_events:
-        if ev.get("type") == "call_end":
-            try:
-                dt = datetime.datetime.fromisoformat(
-                    ev.get("ts", "").replace("Z", "+00:00"))
-                hourly[dt.hour] += 1
-            except Exception:
-                pass
+    _ov_owner = _acting_owner(request)
 
     period_starts = {"today": today, "week": week_start, "month": month_start}
     kpi_start = period_starts.get(period, today)
-    contacts = _load_outbound(_acting_owner(request))
-    period_events = {"today": today_events, "week": week_events, "month": month_events}.get(period, today_events)
+    contacts = _load_outbound(_ov_owner)
 
-    # Calls Over Time — daily volume, last 14 days, all-pipeline calls (inbound + outbound-connected)
-    daily_calls = []
-    for i in range(13, -1, -1):
-        d = today - datetime.timedelta(days=i)
-        daily_calls.append({"date": d.isoformat(), "count": len(_aggregate_calls(_load_credit_log(d)))})
+    stats = _owner_call_stats(_ov_owner, kpi_start, today)
+    srow = stats["row"]
+    hourly = {h: stats["hourly"].get(h, 0) for h in range(24)}
+
+    # Calls Over Time — this tenant's daily volume, last 14 days.
+    daily_calls = [
+        {"date": (today - datetime.timedelta(days=i)).isoformat(),
+         "count": stats["daily"].get((today - datetime.timedelta(days=i)).isoformat(), 0)}
+        for i in range(13, -1, -1)
+    ]
 
     # Call Type / Status Distribution for the selected period
-    kpis = _compute_kpis(period_events, contacts, kpi_start, today)
+    kpis = _compute_kpis(srow, contacts, kpi_start, today)
     call_type_distribution = {"inbound": kpis["inbound_calls"], "outbound": kpis["outbound_calls"]}
     call_status_distribution = {
         "answered": kpis["answered_calls"], "missed": kpis["missed_calls"], "failed": 0,
@@ -1203,11 +1322,19 @@ async def overview(request: Request, period: str = Query("today")) -> JSONRespon
     remaining_minutes = (round(total_minutes - kpis["minutes_used"], 1)
                           if total_minutes is not None else None)
 
+    # Call counts per window, owner-scoped. The old shape carried credit-log
+    # cost estimates here too (est_stt_cost / tts_chars / …); those are
+    # platform-wide, unattributable to a tenant, and nothing in the UI read
+    # them — billing lives in /api/usage/minutes off the usage_ledger.
+    def _window(start: datetime.date) -> dict:
+        return {"call_count": _owner_call_stats(_ov_owner, start, today)["row"]["total"]}
+
     return JSONResponse({
-        "today":        _summarize_range(today_events),
-        "week":         _summarize_range(week_events),
-        "month":        _summarize_range(month_events),
-        "active_calls": len(_get_active_calls_from_log(today_events)),
+        "today":        _window(today),
+        "week":         _window(week_start),
+        "month":        _window(month_start),
+        # Already owner-scoped via _scope_live_state.
+        "active_calls": len(_scope_live_state(_read_live_state(), _ov_owner)["calls"]),
         "runtime_status": _get_runtime_health()["overall"],
         "hourly_calls": [{"hour": h, "count": hourly[h]} for h in range(24)],
         "kpis": kpis,
@@ -1586,29 +1713,14 @@ async def _analyze_transcript(folder: str) -> dict:
     return result
 
 
+# RETIRED (intelligence layer, deploy/PLAN-intelligence-layer.md): analysis is
+# automatic for every call — there is no manual "eligible list + run" workflow.
+# 410 keeps stale clients from silently reviving the old flow.
 @app.get("/api/analysis/eligible")
-async def analysis_eligible(
-    request: Request,
-    page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le=200),
-    search: str = Query(""),
-) -> JSONResponse:
-    """Calls that have finished (metadata.json exists) and so are safe to
-    analyze, annotated with whether an analysis already exists."""
-    records = _filter_history(
-        [r for r in _scan_recordings(limit=2000) if _is_recording_complete(r["folder"])],
-        _acting_owner(request))
-    analyses = _scan_analyses()
-    for r in records:
-        r["analyzed"] = r["folder"] in analyses
-    if search:
-        s = search.lower()
-        records = [r for r in records if s in r.get("folder", "").lower() or s in r.get("caller", "").lower()]
-    total = len(records)
-    return JSONResponse({
-        "recordings": records[(page - 1) * limit: page * limit],
-        "total": total, "page": page, "limit": limit,
-        "pages": math.ceil(total / limit) if total else 1,
-    })
+async def analysis_eligible(request: Request) -> JSONResponse:
+    return JSONResponse(
+        {"error": "retired", "detail": "Analysis is automatic now — see /api/intel/calls"},
+        status_code=410)
 
 
 @app.get("/api/calls/recordings/{folder}/analysis")
@@ -1625,37 +1737,14 @@ async def get_analysis(folder: str, request: Request) -> JSONResponse:
 
 @app.post("/api/analysis/run")
 async def run_analysis(request: Request) -> JSONResponse:
-    body = await request.json()
-    folders = body.get("folders") or []
-    force = bool(body.get("force", False))
-    if not isinstance(folders, list) or not folders:
-        return JSONResponse({"ok": False, "reason": "folders (list) is required"}, status_code=400)
-
-    _an_owner = _acting_owner(request)
-    store = _load_analysis_store()
-    results: dict[str, Any] = {}
-    for folder in folders:
-        if "/" in folder or ".." in folder:
-            results[folder] = {"ok": False, "error": "invalid folder"}
-            continue
-        if not _can_see_folder(folder, _an_owner):
-            results[folder] = {"ok": False, "error": "not found"}
-            continue
-        if not _is_recording_complete(folder):
-            results[folder] = {"ok": False, "error": "call not yet complete"}
-            continue
-        if folder in store and not force:
-            results[folder] = {"ok": True, "analysis": store[folder], "cached": True}
-            continue
-        try:
-            analysis = await _analyze_transcript(folder)
-            store[folder] = analysis
-            _store_analysis(folder, analysis, _an_owner)
-            results[folder] = {"ok": True, "analysis": analysis, "cached": False}
-        except Exception as exc:
-            logger.error("analysis failed for %s: %r", folder, exc)
-            results[folder] = {"ok": False, "error": str(exc)}
-    return JSONResponse({"ok": True, "results": results})
+    """RETIRED: every call is analyzed automatically by the intelligence
+    pipeline the moment it ends (shared/intelligence/). Re-analysis, when
+    genuinely needed, is POST /api/intel/calls/{call_key}/reanalyze."""
+    return JSONResponse(
+        {"error": "retired",
+         "detail": "Analysis is automatic now. Use /api/intel/calls/"
+                   "{call_key}/reanalyze to re-run a specific call."},
+        status_code=410)
 
 
 # ---------------------------------------------------------------------------
@@ -1822,19 +1911,37 @@ async def conversation_analytics(request: Request, folders: str = Query("")) -> 
 
 @app.get("/api/calls/transcripts/search")
 async def transcripts_search(request: Request, q: str = Query(..., min_length=1), limit: int = Query(50, ge=1, le=200)) -> JSONResponse:
-    """Full-text search across transcript.txt files. Owner-scoped: a tenant
-    only searches transcripts of calls whose folder they own."""
+    """Full-text search across transcript.txt files, plus caller/contact/call-id
+    metadata. Owner-scoped: a tenant only searches calls whose folder they own."""
     _ts_owner = _acting_owner(request)
     ql = q.lower()
-    matches = []
-    for r in _filter_history(_scan_recordings(limit=2000), _ts_owner):
-        messages = _read_transcript(r["folder"])
-        text = " ".join(m["text"] for m in messages).lower()
-        if ql in text:
-            matches.append(r)
-        if len(matches) >= limit:
-            break
-    return JSONResponse({"recordings": matches, "total": len(matches), "query": q})
+    digits = "".join(ch for ch in q if ch.isdigit())
+
+    def _scan() -> tuple[list[dict], int]:
+        matches: list[dict] = []
+        total = 0
+        for r in _filter_history(_scan_recordings(limit=2000), _ts_owner):
+            # Metadata first — it needs no file read, and it is what makes a
+            # pasted call ID or a caller's name/number resolve here at all.
+            meta = " ".join(str(r.get(k) or "") for k in
+                            ("folder", "call_id", "conn_id", "caller", "phone",
+                             "contact_name", "agent_slug")).lower()
+            hit = ql in meta or (len(digits) >= 4 and digits in meta)
+            if not hit:
+                messages = _read_transcript(r["folder"])
+                hit = ql in " ".join(m["text"] for m in messages).lower()
+            if hit:
+                total += 1
+                if len(matches) < limit:
+                    matches.append(r)
+        return matches, total
+
+    # Sync fs walk over up to 2000 folders: off the event loop, or every other
+    # request on the API stalls behind it (same failure mode as the copilot
+    # upload 502). `total` is the true match count, not the truncated page —
+    # the UI showed "50 results" for any query with more than 50 hits.
+    matches, total = await asyncio.to_thread(_scan)
+    return JSONResponse({"recordings": matches, "total": total, "query": q})
 
 
 def _gcs_object_for(call_key: str) -> str | None:
@@ -1850,29 +1957,38 @@ def _gcs_object_for(call_key: str) -> str | None:
 
 
 def _stream_recording(call_key: str, gcs_object: str | None, download: bool):
-    """Serve a call's WAV: local file while it exists, GCS object after the
-    retention cleanup has removed the local copy."""
+    """Serve a call's WAV: the FULL two-party recording (call_audio.wav,
+    agent + caller) when it exists, the legacy caller-only file otherwise;
+    local file first, GCS object after the retention cleanup."""
     headers = {}
     if download:
         headers["Content-Disposition"] = f'attachment; filename="{call_key}.wav"'
-    audio_path = RECORDINGS_DIR / call_key / "caller_audio.wav"
-    if audio_path.exists():
-        return FileResponse(str(audio_path), media_type="audio/wav", headers=headers)
+    for filename in ("call_audio.wav", "caller_audio.wav"):
+        audio_path = RECORDINGS_DIR / call_key / filename
+        if audio_path.exists():
+            return FileResponse(str(audio_path), media_type="audio/wav", headers=headers)
     if gcs_object:
-        try:
-            from shared.recording_storage import open_gcs_stream
-            stream = open_gcs_stream(gcs_object)
+        # Prefer the full-recording object; fall back to the stamped legacy
+        # object (old calls have no call_audio.wav in the bucket).
+        full_object = gcs_object.rsplit("/", 1)[0] + "/call_audio.wav"
+        for obj in (full_object, gcs_object):
+            try:
+                from shared.recording_storage import open_gcs_stream
+                stream = open_gcs_stream(obj)
+                stream.read(1)  # force existence check before we commit
+                stream.seek(0)
 
-            def _iter():
-                try:
-                    while chunk := stream.read(256 * 1024):
-                        yield chunk
-                finally:
-                    stream.close()
+                def _iter(s=stream):
+                    try:
+                        while chunk := s.read(256 * 1024):
+                            yield chunk
+                    finally:
+                        s.close()
 
-            return StreamingResponse(_iter(), media_type="audio/wav", headers=headers)
-        except Exception as exc:
-            logger.error("GCS stream failed for %s (%s): %r", call_key, gcs_object, exc)
+                return StreamingResponse(_iter(), media_type="audio/wav", headers=headers)
+            except Exception as exc:
+                logger.debug("GCS stream miss for %s (%s): %r", call_key, obj, exc)
+        logger.error("GCS stream failed for %s (%s)", call_key, gcs_object)
     return JSONResponse({"error": "no audio for this recording"}, status_code=404)
 
 
@@ -2853,6 +2969,24 @@ async def outbound_update(contact_id: str, request: Request) -> JSONResponse:
     else:
         return JSONResponse({"ok": False, "reason": "not found"}, status_code=404)
     _save_outbound(contacts, owner)
+    # Contact timeline: record the edit (note.added when only notes changed).
+    try:
+        from shared.db.database import get_db
+        from shared.intelligence import timeline
+        from shared.phone import significant_digits
+        changed = [k for k in ("name", "notes", "call_status", "disposition",
+                               "call_notes", "gender", "details", "group_id")
+                   if k in body]
+        if changed:
+            with get_db() as db:
+                cid = timeline.resolve_contact(
+                    db, owner, c.get("id"), significant_digits(c.get("phone") or ""))
+            if cid is not None:
+                kind = ("note.added" if set(changed) <= {"notes", "call_notes"}
+                        else "contact.updated")
+                timeline.emit(cid, owner, kind, payload={"fields": changed})
+    except Exception as exc:
+        logger.warning("contact timeline event failed: %r", exc)
     return JSONResponse({"ok": True})
 
 
@@ -3512,7 +3646,170 @@ async def _automation_scheduler_loop() -> None:
 
 @app.on_event("startup")
 async def _start_automation_scheduler() -> None:
-    asyncio.create_task(_automation_scheduler_loop())
+    # RETIRED (intelligence layer): the legacy followup_automations auto-dial
+    # scheduler served the deleted Follow-Up Automation page; its endpoints
+    # are 403-gated and its only remaining DB rows are stale. It dialed REAL
+    # phones for any 'scheduled' row with a past time, so it stays off. The
+    # replacement is the followups engine + automation rules
+    # (deploy/PLAN-intelligence-layer.md). Re-enable deliberately if ever
+    # needed: asyncio.create_task(_automation_scheduler_loop())
+    logger.info("legacy followup-automation scheduler DISABLED (intelligence layer)")
+
+
+# ---------------------------------------------------------------------------
+# Follow-up auto-dialer
+#
+# Lives in the API process, not the intel worker, because everything a real
+# call needs is here: _outbound_identity (caller ID + trunk + agent, fully
+# tenancy-checked), the duplicate-dial guard, _record_dial, and the ESL
+# channel. The worker would have to reimplement all of it or punch through the
+# auth wall; both are worse than a 2-minute loop next to the code that already
+# does this correctly.
+#
+# Guardrails and the kill switch are in shared/intelligence/autodial.py +
+# config.py, and are re-read every tick so INTEL_AUTODIAL_ENABLED=false stops
+# it within one poll interval without a restart.
+# ---------------------------------------------------------------------------
+
+async def _autodial_once() -> int:
+    """One sweep. Returns the number of calls actually placed."""
+    from shared.intelligence import autodial, config as intel_config
+    from shared.intelligence import notify as intel_notify
+
+    if not intel_config.AUTODIAL_ENABLED:
+        return 0
+
+    now = autodial.now_local()
+    rows = await asyncio.to_thread(autodial.due_candidates, 200)
+    if not rows:
+        return 0
+
+    placed = 0
+    # Per-owner caches so one sweep issues a single count query and a single
+    # identity resolution per tenant.
+    day_counts: dict[str, int] = {}
+    identities: dict[str, Any] = {}
+    unroutable: dict[str, list] = {}
+    # The batch is PER TENANT: `rows` is ordered oldest-first across all
+    # tenants, so a global cap would let one account's 30-row backlog stand in
+    # front of another account's 3 for an hour. Each tenant gets its own slice
+    # of every sweep; AUTODIAL_MAX_PER_DAY is still the hard per-tenant ceiling.
+    placed_by_owner: dict[str, int] = {}
+
+    for row in rows:
+        owner = row["owner"]
+        if placed_by_owner.get(owner, 0) >= intel_config.AUTODIAL_BATCH:
+            continue
+        if owner not in day_counts:
+            day_counts[owner] = await asyncio.to_thread(autodial.placed_today, owner)
+
+        reason = autodial.blocked_reason(row, now=now, placed_today=day_counts[owner])
+        if reason:
+            if reason in autodial.PERMANENT:
+                await asyncio.to_thread(
+                    autodial.record_attempt, row["id"], ok=False,
+                    detail=autodial.explain(reason, now), permanent=True)
+                intel_notify.notify_autodial_blocked(
+                    owner, row["id"], row.get("contact_name") or row.get("dial_phone") or "contact",
+                    autodial.explain(reason, now))
+            elif reason != "not_due":
+                # Transient: record WHY so the row explains itself in the UI,
+                # but leave it eligible for the next sweep.
+                await asyncio.to_thread(
+                    autodial.record_attempt, row["id"], ok=False,
+                    detail=autodial.explain(reason, now), permanent=False)
+            continue
+
+        # The account must have somewhere to call FROM. This is the failure the
+        # user cannot otherwise see: without it every follow-up silently ages
+        # into 'missed' as though the customer never picked up.
+        if owner not in identities:
+            try:
+                identities[owner] = _outbound_identity(owner)
+            except OutboundIdentityError as exc:
+                identities[owner] = None
+                unroutable[owner] = [str(exc), 0]
+        ident = identities[owner]
+        if ident is None:
+            unroutable[owner][1] += 1
+            await asyncio.to_thread(
+                autodial.record_attempt, row["id"], ok=False,
+                detail=autodial.explain("no_identity"), permanent=False)
+            continue
+
+        phone = re.sub(r"[^\d]", "", row.get("dial_phone") or "")
+        if len(phone) < 7:
+            await asyncio.to_thread(
+                autodial.record_attempt, row["id"], ok=False,
+                detail="Contact has no usable phone number", permanent=True)
+            continue
+        # Same guard the manual button gets: a still-ringing leg must not be
+        # dialled a second time.
+        if _recent_dial_for(phone, owner, within_s=_DUPLICATE_DIAL_WINDOW_S) is not None:
+            continue
+
+        slug = ident["agent_slug"]
+        _record_dial(phone, str(row.get("contact_handle") or ""),
+                     row.get("contact_name") or "", agent_slug=slug, owner=owner)
+        await asyncio.to_thread(
+            autodial.record_attempt, row["id"], ok=True,
+            detail=f"auto-dialled {phone} as {slug}")
+        day_counts[owner] += 1
+        placed_by_owner[owner] = placed_by_owner.get(owner, 0) + 1
+        placed += 1
+
+        async def _place(p=phone, s=slug, i=ident, o=owner, h=row.get("contact_handle")):
+            try:
+                out = await _fs_esl_exec(_fs_originate_cmd(
+                    p, agent_slug=s, caller_id=i["caller_id"],
+                    gateway_name=i["gateway_name"]), timeout=55)
+                cs = _parse_fs_result(out, "")
+            except Exception as exc:
+                logger.error("autodial %s error: %r", p, exc)
+                cs = "failed"
+            if h:
+                _update_contact_after_call(h, cs, o)
+            logger.info("AUTODIAL %s from %s → %s", p, i["caller_id"], cs)
+
+        asyncio.create_task(_place())
+
+    for owner, (detail, count) in unroutable.items():
+        if count:
+            await asyncio.to_thread(
+                intel_notify.notify_autodial_unroutable, owner, detail, count)
+    return placed
+
+
+async def _autodial_loop() -> None:
+    from shared.intelligence import config as intel_config
+
+    # Stagger the first pass so a restart storm never dials in lockstep.
+    await asyncio.sleep(30)
+    while True:
+        try:
+            n = await _autodial_once()
+            if n:
+                logger.info("autodial: placed %d follow-up call(s)", n)
+        except Exception as exc:
+            logger.error("autodial sweep failed: %r", exc)
+        await asyncio.sleep(max(30, intel_config.AUTODIAL_POLL_S))
+
+
+@app.on_event("startup")
+async def _start_autodialer() -> None:
+    from shared.intelligence import config as intel_config
+
+    if not intel_config.AUTODIAL_ENABLED:
+        logger.info("follow-up auto-dialer DISABLED (INTEL_AUTODIAL_ENABLED=false)")
+        return
+    logger.info(
+        "follow-up auto-dialer ON — %02d:00-%02d:00 IST, days=%s, "
+        "max %d/day, %d attempts, %dmin gap, batch %d",
+        intel_config.AUTODIAL_HOUR_START, intel_config.AUTODIAL_HOUR_END,
+        sorted(intel_config.autodial_weekdays()), intel_config.AUTODIAL_MAX_PER_DAY,
+        intel_config.AUTODIAL_MAX_ATTEMPTS, intel_config.AUTODIAL_RETRY_GAP_MIN,
+        intel_config.AUTODIAL_BATCH)
+    asyncio.create_task(_autodial_loop())
 
 
 @app.get("/api/outbound/stats")
@@ -3773,6 +4070,26 @@ async def outbound_dial(contact_id: str, request: Request) -> JSONResponse:
     phone = re.sub(r"[^\d]", "", contact.get("phone", ""))
     if len(phone) < 7:
         return JSONResponse({"ok": False, "reason": "invalid phone number"})
+
+    # Duplicate-dial guard. This endpoint returns "dialing" instantly but the
+    # handset does not ring for 15-30s, so an operator who sees nothing happen
+    # clicks Call again. Both originates then land on the same handset as two
+    # concurrent legs, and the carrier/handset drops one mid-conversation —
+    # which reads to everyone as the call being cut for no reason.
+    # Window tracks originate_timeout (45s) so a still-ringing leg is covered.
+    # ?force=1 re-dials anyway, for a genuine immediate retry.
+    if request.query_params.get("force") not in ("1", "true", "yes"):
+        _recent = _recent_dial_for(phone, dial_owner, within_s=_DUPLICATE_DIAL_WINDOW_S)
+        if _recent is not None:
+            logger.info("DIAL blocked as duplicate: %s (previous dial %.0fs ago)",
+                        phone, _recent)
+            return JSONResponse({
+                "ok": False, "duplicate": True,
+                "reason": f"A call to this contact was already placed "
+                          f"{int(_recent)}s ago and may still be connecting. "
+                          f"Wait for it to finish, or use Force call to dial anyway.",
+                "seconds_ago": int(_recent),
+            }, status_code=409)
 
     try:
         ident = _outbound_identity(dial_owner)

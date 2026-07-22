@@ -16,6 +16,11 @@ export type AgentSummary = {
   call_direction?: 'inbound' | 'outbound'
   /** Twin grouping key — `acme-inbound` and `acme-outbound` share family `acme`. */
   family?: string
+  /** Slug the opposite-direction twin would occupy. */
+  counterpart?: string
+  counterpart_direction?: 'inbound' | 'outbound'
+  /** Whether that twin already exists on disk. */
+  has_counterpart?: boolean
   calendar_slots?: number
 }
 export type AgentsList = { agents: AgentSummary[]; active: string | null }
@@ -99,6 +104,13 @@ export const updateAgent = (name: string, payload: any, rev?: string) =>
     headers: rev ? { 'If-Match': rev } : undefined,
   })
 export const archiveAgent = (name: string) => del(`/agents/${name}`)
+
+/** Create the opposite-direction counterpart of an existing agent. The copy is
+ *  adapted server-side (greeting, opening stage, name slot, objections) — the
+ *  two records are independent from creation and are edited separately. */
+export const createTwin = (name: string) =>
+  post<{ name: string; direction: 'inbound' | 'outbound'; source: string }>(
+    `/agents/${name}/twin`, {})
 
 export const putRawYaml = (name: string, yamlText: string, rev?: string) =>
   api<{ status: string; revision?: number; rev?: string }>(`/agents/${name}/raw`, {

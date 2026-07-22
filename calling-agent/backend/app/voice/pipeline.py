@@ -49,6 +49,10 @@ class AudioSegment:
     audio: bytes
     duration_ms: float
     timestamp: float
+    # Monotonic timestamps of the caller's actual speech onset/end for this
+    # segment (continuation-merge timing anchors; 0.0 = unknown).
+    speech_start_ts: float = 0.0
+    speech_end_ts: float = 0.0
 
 
 @dataclass
@@ -58,6 +62,9 @@ class Transcript:
     duration_ms: float
     timestamp: float
     stt_latency_ms: float = 0.0
+    # Carried through from AudioSegment (continuation-merge timing anchors).
+    speech_start_ts: float = 0.0
+    speech_end_ts: float = 0.0
 
 
 @dataclass
@@ -114,12 +121,21 @@ FILLER_ECHO_GRACE_MS = 1500.0
 # Real acoustic echo decays within 100-300ms in headphone/normal setups.
 # The echo gate now also exits early if sustained real speech is detected
 # (see ECHO_EARLY_EXIT_FRAMES below), providing a second layer of protection.
-TTS_ECHO_COOLDOWN_MS = 400.0 if TELEPHONY_MODE else 600.0
+TTS_ECHO_COOLDOWN_MS = float(os.environ.get(
+    "TTS_ECHO_COOLDOWN_MS", "400" if TELEPHONY_MODE else "600"))
 
 # Minimum consecutive loud frames during the echo cooldown window that signal
 # real caller speech rather than echo. Echo is short-lived (1-3 frames);
 # a human speaking produces sustained energy well above this threshold.
-ECHO_EARLY_EXIT_FRAMES = 5
+ECHO_EARLY_EXIT_FRAMES = int(os.environ.get("ECHO_EARLY_EXIT_FRAMES", "5"))
+
+# Greeting-window softening: the caller's post-greeting "hello" is the most
+# predictable sustained-speech event of the call, so while the greeting is the
+# utterance being guarded (not _greeting_done yet) the echo gate exits earlier
+# and the mute tail is shorter. All later windows keep the defaults above.
+GREETING_ECHO_EARLY_EXIT_FRAMES = int(os.environ.get(
+    "GREETING_ECHO_EARLY_EXIT_FRAMES", "3"))
+GREETING_ECHO_TAIL_MS = float(os.environ.get("GREETING_ECHO_TAIL_MS", "100"))
 
 # Onset lowered 3→2 frames: catch speech sooner so the very first word after
 # a pause isn't clipped. Hold kept at 10 for noise immunity.
@@ -128,25 +144,51 @@ SPEECH_HOLD_MIN_FRAMES = 10
 
 # Hard-flush silence gate (frames of consecutive silence after hold expires).
 # LATENCY: this is dead air the caller hears after they stop talking before the
-# agent even begins to think. 700 ms (35 frames) is the balance point — low
-# enough to feel snappy, high enough to tolerate a natural breath pause. Any
-# mid-sentence split it does cause is re-merged by TRANSCRIPT_MERGE_WINDOW_MS
-# below, so we get responsiveness without splitting one utterance into two turns.
-# (History: 30→45→55 crept up to fight splits; the merge window makes that moot.)
-HARD_FLUSH_SILENCE_FRAMES = 35
+# agent even begins to think. 560 ms (28 frames) still tolerates a breath
+# pause; any mid-sentence split it does cause is re-merged by
+# TRANSCRIPT_MERGE_WINDOW_MS below (which now only waits when a follow-on can
+# actually exist), and the continuation-merge feature (when enabled) recovers
+# genuinely long pauses. With ENABLE_CONTINUATION_MERGE live, 20 (400 ms) is
+# the intended tier-b value.
+# (History: 30→45→55 crept up to fight splits, then 35; env-tunable now.)
+HARD_FLUSH_SILENCE_FRAMES = int(os.environ.get("HARD_FLUSH_SILENCE_FRAMES", "28"))
+
+# TurnManager backstop threshold (see __init__); hard-flush usually wins.
+TURN_SILENCE_THRESHOLD_MS = float(os.environ.get("TURN_SILENCE_THRESHOLD_MS", "1200"))
 
 # Debounce window (ms) after the first transcript arrives before firing the LLM.
 # Catches follow-on STT segments from the same split utterance so they can be
 # merged into one turn rather than generating two separate agent responses.
-# 800 ms gives STT enough time to return the second segment when the caller
-# paused briefly mid-sentence.
-TRANSCRIPT_MERGE_WINDOW_MS = 550.0
+TRANSCRIPT_MERGE_WINDOW_MS = float(os.environ.get("TRANSCRIPT_MERGE_WINDOW_MS", "550"))
+# Skip the merge wait entirely when no follow-on segment can exist (nothing
+# queued, nothing in STT, caller silent) — removes a fixed ~550ms per turn.
+TRANSCRIPT_MERGE_SKIP_WHEN_IDLE = os.environ.get(
+    "TRANSCRIPT_MERGE_SKIP_WHEN_IDLE", "true").lower() == "true"
 
 # Post-response continuation window (ms). If TTS completed cleanly and a short
 # fragment (≤ 4 words) arrives within this window, it is likely a trailing
 # clause of the previous caller turn ("for that", "yes, and also..."). Prepend
 # the previous turn's text so the LLM has full context.
 POST_RESPONSE_MERGE_MS = 800.0
+
+# ── Continuation merge (pause-tolerant turns) ─────────────────────────────
+# A caller who pauses mid-utterance gets a fast reply to the partial input;
+# if they resume speaking within CONTINUATION_WINDOW_MS of their own speech
+# end, the reply is cut, the router rolls the turn back, and ONE merged
+# utterance is re-run (see conversation.begin_turn_transaction). OFF by
+# default until validated on live calls; when OFF, behavior is identical to
+# before, including the legacy Case-B fragment merge.
+ENABLE_CONTINUATION_MERGE = os.environ.get(
+    "ENABLE_CONTINUATION_MERGE", "false").lower() == "true"
+CONTINUATION_WINDOW_MS = float(os.environ.get("CONTINUATION_WINDOW_MS", "2000"))
+# Relaxed hearing during the bounded post-endpoint window: barge-in energy
+# factor (vs the normal 2.0× echo-reject threshold) and sustained-frame
+# requirements. Outside the window today's constants apply unchanged.
+CONTINUATION_BARGE_FACTOR = float(os.environ.get("CONTINUATION_BARGE_FACTOR", "1.3"))
+CONTINUATION_BARGE_FRAMES = int(os.environ.get("CONTINUATION_BARGE_FRAMES", "5"))
+CONTINUATION_ECHO_EXIT_FRAMES = int(os.environ.get("CONTINUATION_ECHO_EXIT_FRAMES", "4"))
+# Cap on consecutive rollback-merges per chain (background-noise guard).
+CONTINUATION_MAX_MERGES = int(os.environ.get("CONTINUATION_MAX_MERGES", "3"))
 
 # Fallback phrases played when STT returns empty on substantial speech,
 # or when TTS receives an empty string or fails to play (feature 2 & 5).
@@ -157,6 +199,19 @@ _STT_FALLBACK_PHRASES: dict[str, str] = {
 }
 # Minimum speech duration that triggers a language-fallback response on empty STT
 _STT_FALLBACK_MIN_SPEECH_MS = 800.0
+
+# Dead-air repair (platform rule, every agent): when the agent has finished
+# speaking and the caller produces NO voice activity for this long, the most
+# likely explanations on a phone line are "they answered and STT/VAD missed
+# it" or "they never heard us" — so the agent says it couldn't hear them and
+# re-asks (ConversationRouter.generate_silence_reprompt). Capped so a caller
+# who is deliberately silent isn't nagged forever. Defaults ON in telephony;
+# CLI/dev mic sessions idle at a desk, so it's opt-in there.
+SILENCE_REPROMPT_ENABLED = os.environ.get(
+    "SILENCE_REPROMPT_ENABLED",
+    "true" if TELEPHONY_MODE else "false").lower() == "true"
+SILENCE_REPROMPT_S = float(os.environ.get("SILENCE_REPROMPT_S", "6.0"))
+SILENCE_REPROMPT_MAX = int(os.environ.get("SILENCE_REPROMPT_MAX", "2"))
 
 
 class VoicePipeline:
@@ -234,6 +289,19 @@ class VoicePipeline:
         # a clean TTS completion and should be merged with the previous turn.
         self._last_user_text: str = ""
         self._last_tts_end: float = 0.0
+        # Continuation-merge state (see ENABLE_CONTINUATION_MERGE):
+        # window during which resumed caller speech is a probable
+        # continuation, timing anchors, and the per-chain merge counter.
+        self._continuation_likely_until: float = 0.0
+        self._cur_speech_start_ts: float = 0.0
+        self._turn_txn_speech_end: float = 0.0
+        self._merge_chain_count: int = 0
+        # Number of segments currently being transcribed (merge-window skip
+        # signal: a follow-on transcript can only arrive if audio is queued,
+        # in flight through STT, or the caller is speaking right now).
+        self._stt_inflight: int = 0
+        # True while the ACTIVE echo-mute window follows the greeting.
+        self._greeting_echo_window: bool = False
         # Issue 4: skip greeting on reconnect — caller already heard it
         self._skip_greeting: bool = skip_greeting
         # Warmup gate — set after all provider warmups complete (feature 6)
@@ -249,6 +317,12 @@ class VoicePipeline:
         # pipeline plays the agent's graceful-close phrase and stops queuing
         # more fallbacks — preventing an infinite "sorry I couldn't hear you" loop.
         self._stt_consecutive_fallbacks: int = 0
+        # Dead-air repair state (see _silence_watchdog): last time the VAD saw
+        # caller speech, consecutive reprompts without a real caller turn, and
+        # when the last reprompt fired.
+        self._last_voice_activity: float = 0.0
+        self._reprompt_count: int = 0
+        self._last_reprompt_ts: float = 0.0
 
         # VAD + buffering state
         self._audio_buffer = bytearray()
@@ -296,7 +370,7 @@ class VoicePipeline:
         # trailing syllables.  min_words raised so single-frame noise doesn't
         # trigger a turn.
         self._turn = TurnManager(TurnManagerConfig(
-            silence_threshold_ms=1600.0,
+            silence_threshold_ms=TURN_SILENCE_THRESHOLD_MS,
             grace_window_ms=300.0,
             min_words_short=2,
             min_words_long=3,
@@ -356,6 +430,7 @@ class VoicePipeline:
             asyncio.create_task(self._stt_worker(), name="stt_worker"),
             asyncio.create_task(self._conversation_layer(), name="conversation"),
             asyncio.create_task(self._tts_layer(), name="tts"),
+            asyncio.create_task(self._silence_watchdog(), name="silence_watchdog"),
         ]
 
         # Issue 4: skip greeting on reconnect — caller already heard it.
@@ -400,6 +475,14 @@ class VoicePipeline:
 
     async def stop(self) -> None:
         self._running = False
+        # Finalize any pending turn transaction BEFORE teardown so deferred
+        # side effects (calendar booking) flush and the bridge's persistence
+        # reads fully-committed state.
+        if hasattr(self.conversation, "commit_pending_turn"):
+            try:
+                self.conversation.commit_pending_turn()
+            except Exception:
+                logger.exception("[PIPELINE] commit_pending_turn at stop failed")
         await self.audio.stop()
         for task in self._tasks:
             task.cancel()
@@ -510,7 +593,22 @@ class VoicePipeline:
                     logger.debug("[BARGE-IN] Suppressed — greeting not yet complete")
                 return
                     
-            loud = self.vad.last_energy > self.vad.barge_in_threshold
+            # Continuation-likely window: right after a fast endpoint the
+            # caller may still be finishing their sentence — hear a soft
+            # continuation that the 2× echo-reject threshold would drop.
+            # Bounded to CONTINUATION_WINDOW_MS past their speech end; outside
+            # it, today's constants apply unchanged.
+            in_cont_window = (
+                ENABLE_CONTINUATION_MERGE
+                and self._greeting_done
+                and time.monotonic() < self._continuation_likely_until
+            )
+            if in_cont_window:
+                barge_threshold = max(
+                    self.vad.threshold * CONTINUATION_BARGE_FACTOR, 300.0)
+            else:
+                barge_threshold = self.vad.barge_in_threshold
+            loud = self.vad.last_energy > barge_threshold
 
             if loud:
                 self._speech_frame_streak += 1
@@ -528,7 +626,9 @@ class VoicePipeline:
             # ~200ms; LocalSpeakerSink has no playback_busy_until, so CLI
             # mode is unaffected.
             min_frames = BARGE_IN_MIN_FRAMES
-            if time.monotonic() < getattr(self.sink, 'playback_busy_until', 0.0):
+            if in_cont_window:
+                min_frames = CONTINUATION_BARGE_FRAMES
+            elif time.monotonic() < getattr(self.sink, 'playback_busy_until', 0.0):
                 min_frames = BARGE_IN_MIN_FRAMES * 2
 
             if (
@@ -537,10 +637,11 @@ class VoicePipeline:
             ):
                 logger.info(
                     "[BARGE-IN] Interrupting TTS "
-                    "frames=%d energy=%.0f threshold=%.0f",
+                    "frames=%d energy=%.0f threshold=%.0f cont_window=%s",
                     self._speech_frame_streak,
                     self.vad.last_energy,
-                    self.vad.barge_in_threshold,
+                    barge_threshold,
+                    in_cont_window,
                 )
 
                 await self.tts.stop()
@@ -596,7 +697,17 @@ class VoicePipeline:
             else:
                 self._echo_gate_speech_frames = 0
 
-            if self._echo_gate_speech_frames >= ECHO_EARLY_EXIT_FRAMES:
+            # Post-greeting window exits earliest ("hello" is the most
+            # predictable speech event of the call); continuation-likely
+            # windows exit slightly early; everything else keeps the default.
+            exit_frames = ECHO_EARLY_EXIT_FRAMES
+            if self._greeting_echo_window:
+                exit_frames = GREETING_ECHO_EARLY_EXIT_FRAMES
+            elif (ENABLE_CONTINUATION_MERGE
+                    and time.monotonic() < self._continuation_likely_until):
+                exit_frames = CONTINUATION_ECHO_EXIT_FRAMES
+
+            if self._echo_gate_speech_frames >= exit_frames:
                 # Sustained loud speech during cooldown — this is a real caller,
                 # not echo. Exit the mute window early and let speech through.
                 logger.info(
@@ -629,6 +740,7 @@ class VoicePipeline:
         if raw_speech:
             self._speech_onset_frames += 1
             self._silence_frames = 0
+            self._last_voice_activity = time.monotonic()
         else:
             self._silence_frames += 1
             self._speech_onset_frames = 0
@@ -647,6 +759,11 @@ class VoicePipeline:
         if speech:
             if not self._prev_speech:
                 logger.info("[VAD] Speech start")
+                # Continuation-merge anchor: when the caller actually began
+                # speaking (accounting for the recovered pre-onset frames).
+                self._cur_speech_start_ts = (
+                    time.monotonic() - 0.02 * len(self._pre_speech_buffer)
+                )
                 # Prepend buffered pre-onset frames to recover clipped onset
                 if self._pre_speech_buffer:
                     for pre_frame in self._pre_speech_buffer:
@@ -704,12 +821,25 @@ class VoicePipeline:
                 self._turn.flush()
                 return
 
+            _now_flush = time.monotonic()
+            _speech_end_ts = _now_flush - self._silence_frames * 0.02
             segment = AudioSegment(
                 audio=bytes(self._audio_buffer),
                 duration_ms=self._speech_duration_ms,
-                timestamp=time.monotonic(),
+                timestamp=_now_flush,
+                speech_start_ts=self._cur_speech_start_ts,
+                speech_end_ts=_speech_end_ts,
             )
             self._segments_created += 1
+
+            # Arm the continuation-likely window: for CONTINUATION_WINDOW_MS
+            # past the caller's speech end, resumed speech is treated as a
+            # probable continuation (relaxed hearing above; merge decision in
+            # the conversation layer).
+            if ENABLE_CONTINUATION_MERGE:
+                self._continuation_likely_until = (
+                    _speech_end_ts + CONTINUATION_WINDOW_MS / 1000.0
+                )
 
             self._audio_buffer.clear()
             self._speech_duration_ms = 0.0
@@ -737,6 +867,35 @@ class VoicePipeline:
         self._speech_frame_streak = 0
         self._pre_speech_buffer.clear()
         self._turn.flush()
+
+    def _maybe_commit_pending_turn(self) -> None:
+        """Lazily commit the pending turn transaction once the continuation
+        window has clearly expired and no caller input is in flight.
+
+        The in-flight guard matters: committing flushes deferred side effects
+        (calendar booking), which must not happen while a just-spoken
+        continuation is still on its way through STT.
+        """
+        if not ENABLE_CONTINUATION_MERGE:
+            return
+        conv = self.conversation
+        if not hasattr(conv, "has_pending_turn") or not conv.has_pending_turn():
+            return
+        if self._turn_txn_speech_end <= 0.0:
+            return
+        expired = (
+            time.monotonic() - self._turn_txn_speech_end
+            > (CONTINUATION_WINDOW_MS + 1000.0) / 1000.0
+        )
+        quiescent = (
+            not self._prev_speech
+            and self._stt_queue.empty()
+            and self._stt_inflight == 0
+            and self._transcript_queue.empty()
+        )
+        if expired and quiescent:
+            conv.commit_pending_turn()
+            self._merge_chain_count = 0
 
     def _flush_pipeline_queues(self) -> None:
         drained = 0
@@ -769,6 +928,7 @@ class VoicePipeline:
             except asyncio.CancelledError:
                 break
 
+            self._stt_inflight += 1
             try:
                 latency_start = time.monotonic()
                 # Pass the locked conversation language to Sarvam to prevent
@@ -869,13 +1029,17 @@ class VoicePipeline:
                 # that could spuriously trigger location/name/budget extraction.
                 # Segments < 700ms yielding a single word are more likely noise than
                 # meaningful input — unless the segment is clearly an affirmation/negation
-                # (yes/no/haan/ji etc.) which must pass through for flow logic to work.
+                # (yes/no/haan/ji etc.) or a greeting reply, which must pass through
+                # for flow logic to work.
                 if (
                     transcript_text
                     and len(transcript_text.split()) == 1
                     and segment.duration_ms < 700.0
                 ):
-                    _single = transcript_text.strip().lower()
+                    # Sarvam punctuates single words ('Hello.'), so trailing marks
+                    # must come off before the allowlist lookup — otherwise even
+                    # 'Yes.' falls through and the turn is lost.
+                    _single = transcript_text.strip().lower().strip(".,!?;:।॥'\"")
                     _affirmation_negation = {
                         "yes", "yeah", "yep", "ok", "okay", "sure",
                         "haan", "ha", "ji", "haan", "na", "nahi", "no",
@@ -883,7 +1047,17 @@ class VoicePipeline:
                         "हां", "हाँ", "जी", "ठीक", "हा", "ना", "नहीं",
                         "હા", "જી", "ઠીક", "ના", "નહીં",
                     }
-                    if _single not in _affirmation_negation:
+                    # A caller answering the agent's greeting with a bare greeting is
+                    # the most predictable turn of the call — it must never be dropped,
+                    # or the agent goes silent and the call stalls before stage 1.
+                    _greetings = {
+                        "hello", "hallo", "helo", "hi", "hey", "yello",
+                        "namaste", "namaskar", "salaam", "salam",
+                        "kemcho", "kem", "bolo", "boliye", "haanji", "hanji",
+                        "नमस्ते", "नमस्कार", "हैलो", "हलो", "बोलो", "बोलिए",
+                        "નમસ્તે", "નમસ્કાર", "હેલો", "કેમ", "બોલો",
+                    }
+                    if _single not in _affirmation_negation and _single not in _greetings:
                         logger.info(
                             "[STT-WORKER] Single-word fragment %r from %.0fms segment — "
                             "below duration threshold, skipping",
@@ -988,6 +1162,8 @@ class VoicePipeline:
                     duration_ms=segment.duration_ms,
                     timestamp=time.monotonic(),
                     stt_latency_ms=stt_latency,
+                    speech_start_ts=segment.speech_start_ts,
+                    speech_end_ts=segment.speech_end_ts,
                 )
 
                 try:
@@ -997,12 +1173,83 @@ class VoicePipeline:
 
             except Exception:
                 logger.exception("[STT] Transcription failed")
+            finally:
+                self._stt_inflight -= 1
 
         logger.info("[STT] Worker stopped")
 
     # -----------------------------------------------------------------------
     # Layer 3: Conversation Engine
     # -----------------------------------------------------------------------
+
+    def _silence_reprompt_due(self, now: float) -> bool:
+        """Pure decision: is the call in genuine dead air the agent should
+        repair? True only when the agent has spoken, nothing is playing or
+        in flight anywhere in the pipeline, the caller has produced no voice
+        activity for SILENCE_REPROMPT_S, and the repair cap isn't spent."""
+        if not self._greeting_done or self._tts_playing:
+            return False
+        if self._reprompt_count >= SILENCE_REPROMPT_MAX:
+            return False
+        # Call is wrapping up (farewell/outcome decided) — silence is normal.
+        if getattr(self.conversation, "call_outcome", ""):
+            return False
+        gen = self._current_generation_task
+        if gen is not None and not gen.done():
+            return False
+        if (self._stt_inflight or self._user_speaking or self._prev_speech
+                or not self._stt_queue.empty()
+                or not self._transcript_queue.empty()
+                or not self._tts_queue.empty()):
+            return False
+        busy_until = getattr(self.sink, 'playback_busy_until', 0.0)
+        if now < busy_until + 0.5:
+            return False
+        anchor = max(self._tts_end_time, busy_until,
+                     self._last_voice_activity, self._last_reprompt_ts)
+        return anchor > 0.0 and now - anchor >= SILENCE_REPROMPT_S
+
+    async def _silence_watchdog(self) -> None:
+        """Dead-air repair (platform rule): the caller went quiet past their
+        turn — most likely STT missed their reply. Say we couldn't hear them
+        and re-ask, at most SILENCE_REPROMPT_MAX times per silence."""
+        if not SILENCE_REPROMPT_ENABLED:
+            return
+        while self._running:
+            try:
+                await asyncio.sleep(0.5)
+                now = time.monotonic()
+                if not self._silence_reprompt_due(now):
+                    continue
+                text = ""
+                if hasattr(self.conversation, "generate_silence_reprompt"):
+                    try:
+                        text = self.conversation.generate_silence_reprompt() or ""
+                    except Exception:
+                        logger.exception("[REPAIR] reprompt build failed")
+                if not text:
+                    lang = (getattr(self.conversation.state, "language", "en")
+                            or "en")[:2]
+                    text = _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
+                self._reprompt_count += 1
+                self._last_reprompt_ts = now
+                anchor = max(self._tts_end_time, self._last_voice_activity)
+                logger.info("[REPAIR] Dead air %.1fs — reprompt %d/%d: %r",
+                            now - anchor if anchor else 0.0,
+                            self._reprompt_count, SILENCE_REPROMPT_MAX,
+                            text[:80])
+                self._tts_queue.put_nowait(Response(
+                    text=text, is_shortcut=True, timestamp=now))
+                if self._hub is not None:
+                    self._hub.emit_nowait({
+                        "type": "agent", "text": text,
+                        "llm_latency_ms": 0, "first_chunk_ms": 0,
+                        "total_latency_ms": 0,
+                    })
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[REPAIR] silence watchdog error")
 
     async def _conversation_layer(self) -> None:
         """
@@ -1015,41 +1262,72 @@ class VoicePipeline:
                     self._transcript_queue.get(), timeout=1.0
                 )
             except asyncio.TimeoutError:
+                # Idle tick: a pending turn transaction whose continuation
+                # window has clearly expired can now be committed safely.
+                self._maybe_commit_pending_turn()
                 continue
             except asyncio.CancelledError:
                 break
+
+            # A real caller turn arrived — the dead-air repair cycle resets.
+            self._reprompt_count = 0
 
             # Debounce: wait a short window for a follow-on segment from the same
             # utterance. VAD may split one sentence at a natural pause and fire
             # two STT results in quick succession. Merging them prevents two
             # separate LLM calls and two back-to-back agent responses.
-            try:
-                follow_on = await asyncio.wait_for(
-                    self._transcript_queue.get(),
-                    timeout=TRANSCRIPT_MERGE_WINDOW_MS / 1000.0,
+            # LATENCY: a follow-on can only exist if another transcript is
+            # queued, a segment is in STT, or the caller is speaking right
+            # now — when none of those hold, the wait is pure dead air and is
+            # skipped (was an unconditional ~550ms tax on every turn).
+            merge_wait_s = TRANSCRIPT_MERGE_WINDOW_MS / 1000.0
+            if (
+                TRANSCRIPT_MERGE_SKIP_WHEN_IDLE
+                and self._transcript_queue.empty()
+                and self._stt_queue.empty()
+                and self._stt_inflight == 0
+                and not self._prev_speech
+            ):
+                merge_wait_s = 0.0
+                logger.info("[ENGINE] Merge window skipped (idle)")
+            elif merge_wait_s > 0.0:
+                logger.info(
+                    "[ENGINE] Merge window %.0fms (queued=%d stt_q=%d inflight=%d speaking=%s)",
+                    merge_wait_s * 1000.0,
+                    self._transcript_queue.qsize(), self._stt_queue.qsize(),
+                    self._stt_inflight, self._prev_speech,
                 )
-                time_gap = follow_on.timestamp - transcript.timestamp
-                if time_gap < 3.0:
-                    # Close in time — continuation of the same utterance; merge.
-                    merged_text = transcript.text.rstrip(" .,") + " " + follow_on.text.lstrip()
-                    logger.info(
-                        "[ENGINE] Merging split segments (%.1fs gap): %r + %r",
-                        time_gap, transcript.text[:35], follow_on.text[:35],
+            if merge_wait_s > 0.0:
+                try:
+                    follow_on = await asyncio.wait_for(
+                        self._transcript_queue.get(),
+                        timeout=merge_wait_s,
                     )
-                    transcript = Transcript(
-                        text=merged_text,
-                        duration_ms=transcript.duration_ms + follow_on.duration_ms,
-                        timestamp=follow_on.timestamp,
-                        stt_latency_ms=follow_on.stt_latency_ms,
-                    )
-                else:
-                    # Gap too large — from a genuinely separate prior turn; discard.
-                    logger.info(
-                        "[ENGINE] Dropping old segment (%.1fs gap): %r",
-                        time_gap, follow_on.text[:40],
-                    )
-            except asyncio.TimeoutError:
-                pass  # No follow-on within window — proceed with single transcript
+                    time_gap = follow_on.timestamp - transcript.timestamp
+                    if time_gap < 3.0:
+                        # Close in time — continuation of the same utterance; merge.
+                        merged_text = transcript.text.rstrip(" .,") + " " + follow_on.text.lstrip()
+                        logger.info(
+                            "[ENGINE] Merging split segments (%.1fs gap): %r + %r",
+                            time_gap, transcript.text[:35], follow_on.text[:35],
+                        )
+                        transcript = Transcript(
+                            text=merged_text,
+                            duration_ms=transcript.duration_ms + follow_on.duration_ms,
+                            timestamp=follow_on.timestamp,
+                            stt_latency_ms=follow_on.stt_latency_ms,
+                            # First fragment's onset, last fragment's end.
+                            speech_start_ts=transcript.speech_start_ts,
+                            speech_end_ts=follow_on.speech_end_ts,
+                        )
+                    else:
+                        # Gap too large — from a genuinely separate prior turn; discard.
+                        logger.info(
+                            "[ENGINE] Dropping old segment (%.1fs gap): %r",
+                            time_gap, follow_on.text[:40],
+                        )
+                except asyncio.TimeoutError:
+                    pass  # No follow-on within window — proceed with single transcript
 
             # Drain any remaining queued transcripts.
             # Transcripts that arrived recently (within 3 s) are very likely
@@ -1070,6 +1348,8 @@ class VoicePipeline:
                             duration_ms=transcript.duration_ms + candidate.duration_ms,
                             timestamp=candidate.timestamp,
                             stt_latency_ms=candidate.stt_latency_ms,
+                            speech_start_ts=transcript.speech_start_ts,
+                            speech_end_ts=candidate.speech_end_ts,
                         )
                         logger.info(
                             "[ENGINE] Merging late continuation (%.1fs): %r + %r",
@@ -1083,6 +1363,71 @@ class VoicePipeline:
                 except asyncio.QueueEmpty:
                     break
 
+            # ── Continuation merge (pause-tolerant turns) ────────────────────
+            # The caller paused mid-utterance, got a fast reply to the partial
+            # input, and resumed within the continuation window of their OWN
+            # speech end: cut the reply, roll the router back to before the
+            # partial turn, and re-run ONE merged utterance.
+            now = time.monotonic()
+            effective_text = transcript.text
+            merged_from_rollback = False
+            if ENABLE_CONTINUATION_MERGE and self._greeting_done:
+                conv = self.conversation
+                if (hasattr(conv, "has_pending_turn") and conv.has_pending_turn()):
+                    gap_ms = (
+                        transcript.speech_start_ts - self._turn_txn_speech_end
+                    ) * 1000.0
+                    if (
+                        transcript.speech_start_ts > 0.0
+                        and self._turn_txn_speech_end > 0.0
+                        and 0.0 <= gap_ms <= CONTINUATION_WINDOW_MS
+                        and self._merge_chain_count < CONTINUATION_MAX_MERGES
+                    ):
+                        # Cut the agent's superseded reply wherever it is:
+                        # still generating, queued for TTS, or playing.
+                        if self._tts_playing:
+                            await self.tts.stop()
+                            self._tts_playing = False
+                        if (
+                            self._current_generation_task
+                            and not self._current_generation_task.done()
+                        ):
+                            self._current_generation_task.cancel()
+                        while not self._tts_queue.empty():
+                            try:
+                                self._tts_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                        prev_text = conv.rollback_pending_turn()
+                        if prev_text:
+                            effective_text = (
+                                prev_text.rstrip(" .,") + " "
+                                + transcript.text.lstrip()
+                            )
+                            merged_from_rollback = True
+                            self._merge_chain_count += 1
+                            # The rollback owns the merge — no Case-A prepend,
+                            # and the superseded reply must not anchor the
+                            # accumulator-keeping barge-in path.
+                            self._turn_accumulator = ""
+                            self._barge_in_occurred = False
+                            logger.info(
+                                "[CONT-MERGE] gap=%.0fms chain=%d: %r + %r → %r",
+                                gap_ms, self._merge_chain_count,
+                                prev_text[:40], transcript.text[:40],
+                                effective_text[:80],
+                            )
+                            if self._hub is not None:
+                                self._hub.emit_nowait({
+                                    "type": "turn_merged",
+                                    "merged_text": effective_text,
+                                    "gap_ms": round(gap_ms),
+                                })
+                    else:
+                        # Genuinely new turn — the previous one is final.
+                        conv.commit_pending_turn()
+                        self._merge_chain_count = 0
+
             # ── Turn accumulator (Change 3) ──────────────────────────────────
             # Determine the effective text the LLM will receive this turn.
             #
@@ -1091,13 +1436,15 @@ class VoicePipeline:
             # interruption. Prepend it so the LLM sees the complete caller turn,
             # not just the barge-in fragment.
             #
-            # Case B — post-response continuation: if TTS finished cleanly a
-            # moment ago and the new transcript is very short (≤ 4 words), it is
-            # likely a trailing clause ("for that", "yes, and...") that arrived
-            # just after the VAD split. Prepend the previous turn's text.
-            now = time.monotonic()
-            effective_text = transcript.text
-            if self._turn_accumulator:
+            # Case B — post-response continuation (legacy, subsumed by the
+            # continuation merge when that feature is ON): if TTS finished
+            # cleanly a moment ago and the new transcript is very short
+            # (≤ 4 words), it is likely a trailing clause ("for that",
+            # "yes, and...") that arrived just after the VAD split. Prepend
+            # the previous turn's text.
+            if merged_from_rollback:
+                pass  # effective_text already merged with full state rollback
+            elif self._turn_accumulator:
                 effective_text = (
                     self._turn_accumulator.rstrip(" .,") + " " + transcript.text.lstrip()
                 )
@@ -1106,7 +1453,8 @@ class VoicePipeline:
                     self._turn_accumulator[:40], transcript.text[:40], effective_text[:60],
                 )
             elif (
-                self._last_user_text
+                not ENABLE_CONTINUATION_MERGE
+                and self._last_user_text
                 and (now - self._last_tts_end) < POST_RESPONSE_MERGE_MS / 1000.0
                 and len(transcript.text.split()) <= 4
             ):
@@ -1120,6 +1468,18 @@ class VoicePipeline:
             # Save for potential next barge-in
             self._turn_accumulator = effective_text
             self._last_user_text = effective_text
+            # Anchor for the next continuation-gap measurement: when the
+            # caller's speech for THIS turn actually ended.
+            if transcript.speech_end_ts > 0.0:
+                self._turn_txn_speech_end = transcript.speech_end_ts
+                # Single-grep latency instrument: total dead air between the
+                # caller falling silent and the engine starting (endpoint
+                # gate + STT + merge window + queue time).
+                logger.info(
+                    "[LATENCY] speech_end→engine %.0fms (stt=%.0fms)",
+                    (time.monotonic() - transcript.speech_end_ts) * 1000.0,
+                    transcript.stt_latency_ms,
+                )
 
             try:
                 async def _run_generation():
@@ -1390,7 +1750,13 @@ class VoicePipeline:
                     except Exception:
                         pass
 
-                await self.tts.speak(tts_text)
+                # Canned lines (greeting, fillers, response-bank phrases) go
+                # through the disk cache: repeat plays cost zero synthesis
+                # time and zero Sarvam credits. LLM output is never cached.
+                if response.is_shortcut and hasattr(self.tts, "speak_cached"):
+                    await self.tts.speak_cached(tts_text)
+                else:
+                    await self.tts.speak(tts_text)
 
             except asyncio.CancelledError:
                 logger.info("[TTS] Interrupted")
@@ -1416,6 +1782,7 @@ class VoicePipeline:
                 # Issue 4 / Issue 1: mark greeting as done after the very first
                 # TTS utterance finishes.  From this point barge-in and STT
                 # fallback phrases are permitted.
+                was_greeting = not self._greeting_done
                 if not self._greeting_done:
                     self._greeting_done = True
                     logger.info("[PIPELINE] Greeting complete — barge-in and STT fallback now active")
@@ -1440,6 +1807,11 @@ class VoicePipeline:
                     now = time.monotonic()
                     busy_until = getattr(self.sink, 'playback_busy_until', 0.0)
                     audio_dur = getattr(self.sink, 'last_flush_duration', 0.0)
+                    # Post-greeting mute gets a shorter echo tail and an
+                    # earlier speech exit (see GREETING_ECHO_* constants).
+                    self._greeting_echo_window = was_greeting
+                    tail_s = (GREETING_ECHO_TAIL_MS / 1000.0
+                              if was_greeting else 0.2)
                     if busy_until > 0.0:
                         # With incremental flushing, earlier parts of the
                         # utterance already played on the call WHILE speak()
@@ -1452,13 +1824,14 @@ class VoicePipeline:
                         # played; mute only until it says playback ends,
                         # plus a short echo tail.
                         mute_s = max(
-                            max(busy_until - now, 0.0) + 0.2,
+                            max(busy_until - now, 0.0) + tail_s,
                             TTS_ECHO_COOLDOWN_MS / 1000.0,
                         )
                         logger.info(
                             "[ECHO-MUTE] Window %.1fs (playback ends in %.1fs "
-                            "+ 0.2s tail)",
-                            mute_s, max(busy_until - now, 0.0),
+                            "+ %.1fs tail%s)",
+                            mute_s, max(busy_until - now, 0.0), tail_s,
+                            ", greeting" if was_greeting else "",
                         )
                     elif audio_dur > 0.0:
                         # Sink tracks flush duration but not a playback

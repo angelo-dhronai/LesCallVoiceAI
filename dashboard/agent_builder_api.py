@@ -208,6 +208,106 @@ def counterpart_of(slug: str) -> str | None:
     return None
 
 
+# ── direction adaptation ────────────────────────────────────────────────────
+#
+# A twin is NOT a copy with one field flipped. Who speaks first changes the
+# script: an inbound agent answers a ringing phone and has no idea who is
+# calling, while an outbound agent opens the conversation and already knows the
+# contact's name. Copying an inbound definition into the outbound slot is
+# exactly what produces the "the outbound agent behaves like a receptionist"
+# reports that _warn_direction_mismatch was added to explain.
+#
+# Measured against the hand-built outbound_lead_qualifier pair, the differences
+# that actually matter are: the opening greeting, the first stage's goal, the
+# name slot (ask vs already-known), and cold-call objection handling. Those four
+# are what this transform rewrites; everything else — knowledge base, later
+# stages, languages, calendar — is direction-neutral and carried over intact.
+#
+# The rewrite is deterministic on purpose. It runs instantly, costs no LLM
+# quota, and is testable; the result is a working starting point the user then
+# refines in the editor or via Copilot, not a finished script.
+
+_OUTBOUND_GREETING = ("Hello, hope you're having a very good {current_time}. "
+                      "Am I speaking with {contact_name}?")
+_INBOUND_GREETING = "Hello"
+
+_OUTBOUND_OBJECTIONS = {
+    "en": [
+        "I understand your time is valuable. I will keep this very brief, or if "
+        "you prefer, I can call back at a better time.",
+        "No problem at all. If you change your mind, feel free to reach out to "
+        "us anytime. Thank you!",
+    ],
+}
+
+
+def _first_stage_goal(direction: str, company: str) -> str:
+    if direction == "outbound":
+        return (f"Greet the caller warmly by saying: 'Hello, hope you're having a "
+                f"very good {{current_time}}. Am I speaking with {{contact_name}}?' "
+                f"and confirm you are speaking to the right person. Then introduce "
+                f"yourself and {company or 'the company'}, and check this is a good "
+                f"time to talk.")
+    return ("Ask 'Could I please know who is calling?' to get the caller's name. "
+            "Once they provide their name, store it and ask how you can help them "
+            "today.")
+
+
+def adapt_direction(spec: dict, direction: str) -> dict:
+    """Return `spec` rewritten to work as a `direction` agent.
+
+    Pure and non-mutating: the caller keeps its original dict. Only the four
+    direction-sensitive areas above are touched.
+    """
+    import copy
+
+    out = copy.deepcopy(spec)
+    out["call_direction"] = direction
+    outbound = direction == "outbound"
+    company = ((out.get("identity") or {}).get("company_name") or "").strip()
+
+    # 1. Opening greeting — outbound speaks first and names the contact.
+    bank = out.setdefault("response_bank", {})
+    if isinstance(bank, dict):
+        bank["opening_greeting"] = _OUTBOUND_GREETING if outbound else _INBOUND_GREETING
+        # 4. Cold-call objections only make sense when WE placed the call.
+        if outbound:
+            if not (bank.get("objection_responses") or {}):
+                bank["objection_responses"] = copy.deepcopy(_OUTBOUND_OBJECTIONS)
+        else:
+            bank["objection_responses"] = {}
+
+    # 2. First stage goal — greet-and-confirm vs ask-who-is-calling.
+    stages = ((out.get("call_flow") or {}).get("stages") or [])
+    if stages and isinstance(stages[0], dict):
+        stages[0]["goal"] = _first_stage_goal(direction, company)
+
+    # 3. The name slot. Outbound already has the name from the contact record
+    #    ({contact_name}), so asking for it sounds like the agent wasn't paying
+    #    attention; max_asks=0 keeps the slot for storage without interrogating.
+    for slot in (out.get("slots") or []):
+        if not isinstance(slot, dict):
+            continue
+        if str(slot.get("name") or "").strip().lower() not in _NAME_SLOTS:
+            continue
+        if outbound:
+            slot["question"] = {}
+            slot["reask_question"] = {}
+            slot["max_asks"] = 0
+        else:
+            if not (slot.get("question") or {}):
+                slot["question"] = {"en": "Could I please know who is calling?"}
+            if not (slot.get("reask_question") or {}):
+                slot["reask_question"] = {"en": "Could I please get your name?"}
+            if not slot.get("max_asks"):
+                slot["max_asks"] = 2
+    return out
+
+
+_NAME_SLOTS = {"caller_name", "customer_name", "contact_name", "name",
+               "full_name", "person_name"}
+
+
 def _agent_summary(name: str, agent: AgentDefinition) -> dict:
     return {
         "name": name,
@@ -236,6 +336,7 @@ async def list_agents() -> dict:
     is_admin = visible is None
     active = _read_active() if is_admin else None
     result = []
+    on_disk = {p.parent.name for p in _AGENTS_DIR.glob("*/agent.yaml")}
     for yaml_path in sorted(_AGENTS_DIR.glob("*/agent.yaml")):
         name = yaml_path.parent.name
         if visible is not None and name not in visible:
@@ -244,6 +345,17 @@ async def list_agents() -> dict:
             agent = AgentDefinition.from_yaml(yaml_path)
             summary = _agent_summary(name, agent)
             summary["active"] = (name == active)
+            # Which slug the opposite direction would live under, and whether it
+            # exists yet — drives the "Add the twin" affordance. Computed
+            # against every slug on disk (not just visible ones) so a name
+            # collision with another tenant's agent surfaces as "taken" rather
+            # than offering a create that would 409.
+            direction = summary.get("call_direction") or "inbound"
+            other = "outbound" if direction == "inbound" else "inbound"
+            twin = twin_slug(name, other)
+            summary["counterpart"] = twin
+            summary["counterpart_direction"] = other
+            summary["has_counterpart"] = twin in on_disk
             result.append(summary)
         except Exception as exc:
             result.append({"name": name, "error": str(exc), "active": name == active})
@@ -356,8 +468,12 @@ async def create_agent(request: Request) -> dict:
     try:
         agents = {}
         for direction, slug in slugs.items():
+            # adapt_direction, not a bare call_direction flip: the halves used
+            # to be byte-identical apart from that one field, so whichever
+            # direction the author did NOT have in mind got the other one's
+            # greeting and opening stage.
             agents[direction] = write_agent_dir(
-                slug, {**body, "call_direction": direction}, owner)
+                slug, adapt_direction(body, direction), owner)
             created.append(slug)
     except Exception:
         # Half a pair is worse than none: a number could bind to the survivor
@@ -373,6 +489,53 @@ async def create_agent(request: Request) -> dict:
     return {"status": "created", "name": primary,
             "agent_id": agents[primary_direction].agent_id,
             "family": family, "twins": slugs}
+
+
+@router.post("/api/agents/{name}/twin")
+async def create_twin(name: str) -> dict:
+    """Create the opposite-direction counterpart of an existing agent.
+
+    For the agents that predate the twin convention (a standalone slug with no
+    `-inbound`/`-outbound` suffix) and for any pair where one half was archived.
+    The source agent is left untouched; the new one is an INDEPENDENT record
+    from creation — editing one never changes the other.
+
+    The copy is run through adapt_direction(), so the twin opens the call the
+    way its direction requires instead of inheriting a greeting written for the
+    other one. It is a starting point: refine it in the editor or via Copilot.
+    """
+    src_path = _AGENTS_DIR / name / "agent.yaml"
+    if not src_path.exists():
+        raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
+    owner = _ctx_owner()
+    _assert_slug_access(name, owner)
+
+    src = AgentDefinition.from_yaml(src_path)
+    src_direction = str(getattr(src, "call_direction", "inbound") or "inbound")
+    if src_direction not in DIRECTIONS:
+        src_direction = "inbound"
+    direction = "outbound" if src_direction == "inbound" else "inbound"
+
+    family = agent_family(name)
+    target = twin_slug(family, direction)
+    if (_AGENTS_DIR / target).exists():
+        raise HTTPException(status_code=409, detail={
+            "error": "exists", "name": target,
+            "message": f"'{target}' already exists — open it instead."})
+    _assert_slug_free(target, owner)
+
+    import yaml as _yaml
+    with src_path.open(encoding="utf-8") as fh:
+        spec = _yaml.safe_load(fh) or {}
+    # Revision/audit fields belong to the SOURCE's history, not the new record.
+    for k in ("revision", "updated_at", "created_at", "_rev", "audit"):
+        spec.pop(k, None)
+
+    agent = write_agent_dir(target, adapt_direction(spec, direction), owner)
+    logger.info("[builder] twin created: %s -> %s (%s, owner=%s)",
+                name, target, direction, owner)
+    return {"status": "created", "name": target, "direction": direction,
+            "family": family, "source": name, "agent_id": agent.agent_id}
 
 
 @router.put("/api/agents/{name}")

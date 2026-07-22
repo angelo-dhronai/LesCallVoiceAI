@@ -39,6 +39,15 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 RECORDINGS_DIR = Path(os.environ.get("CALL_AUDIT_DIR", _REPO_ROOT / "recordings"))
 
 AUDIO_FILENAME = "caller_audio.wav"
+# The full two-party recording (agent + caller), captured from FreeSWITCH's
+# record_session WAV at call teardown (see capture_fs_recording). Serving
+# prefers this file; caller_audio.wav stays as the STT-side debug artifact.
+FULL_AUDIO_FILENAME = "call_audio.wav"
+# Where FreeSWITCH's record_session writes (one <channel-uuid>.wav per call).
+# Deliberately /tmp: writable by the freeswitch user without permission
+# games; files are copied out seconds after hangup, and a janitor in
+# cleanup_local prunes stragglers.
+FS_RECORDINGS_DIR = Path(os.environ.get("FS_RECORDING_DIR", "/tmp/esl_recordings"))
 # Small sidecar files sync too so the bucket holds the complete call artifact.
 SIDECAR_FILENAMES = ("transcript.txt", "metadata.json")
 
@@ -74,6 +83,51 @@ def public_download_url(token: str) -> str:
 
 def local_audio_path(call_key: str) -> Path:
     return RECORDINGS_DIR / call_key / AUDIO_FILENAME
+
+
+def local_full_audio_path(call_key: str) -> Path:
+    return RECORDINGS_DIR / call_key / FULL_AUDIO_FILENAME
+
+
+def capture_fs_recording(conn_id: str, call_key: str,
+                         wait_s: float = 4.0) -> bool:
+    """Copy FreeSWITCH's two-party record_session WAV into the call folder.
+
+    Copy-overwrite, NEVER delete the source: on a mid-call WS reconnect the
+    session teardown runs while FS is still recording the channel, so an
+    early copy may be partial — the final teardown's copy simply overwrites
+    it with the full file. Stragglers in FS_RECORDINGS_DIR are pruned by the
+    cleanup_local janitor. Never raises; returns True when a copy landed.
+    """
+    import shutil
+
+    if not (conn_id and call_key):
+        return False
+    src = FS_RECORDINGS_DIR / f"{conn_id}.wav"
+    dst_dir = RECORDINGS_DIR / call_key
+    try:
+        # Wait briefly for FS to finalize the header after stop_record_session
+        # (size-stability check; ~700ms is the observed drain window).
+        last_size = -1
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            if src.exists():
+                size = src.stat().st_size
+                if size > 44 and size == last_size:
+                    break
+                last_size = size
+            time.sleep(0.3)
+        if not src.exists() or src.stat().st_size <= 44:
+            return False
+        if not dst_dir.is_dir():
+            return False
+        shutil.copy2(src, dst_dir / FULL_AUDIO_FILENAME)
+        logger.info("captured full recording for %s (%d bytes)",
+                    call_key, src.stat().st_size)
+        return True
+    except Exception as exc:
+        logger.warning("full-recording capture failed for %s: %r", call_key, exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +184,11 @@ def upload_recording(call_key: str) -> bool:
         blob = bucket.blob(audio_obj)
         if not blob.exists():
             blob.upload_from_filename(str(wav), content_type="audio/wav")
+        full = local_full_audio_path(call_key)
+        if full.exists():
+            fblob = bucket.blob(_object_name(call_key, FULL_AUDIO_FILENAME))
+            if not fblob.exists():
+                fblob.upload_from_filename(str(full), content_type="audio/wav")
         for name in SIDECAR_FILENAMES:
             side = RECORDINGS_DIR / call_key / name
             if side.exists():
@@ -187,7 +246,7 @@ def sync_pending(limit: int = 200) -> int:
 
     with get_db() as db:
         rows = db.execute(
-            "SELECT call_key, download_token FROM calls "
+            "SELECT call_key, conn_id, download_token FROM calls "
             "WHERE call_key IS NOT NULL AND gcs_uploaded_at IS NULL "
             "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     uploaded = 0
@@ -195,6 +254,10 @@ def sync_pending(limit: int = 200) -> int:
         call_key = r["call_key"]
         if not r["download_token"]:
             ensure_download_token(call_key)
+        # Catch-up for the full two-party recording: if the teardown copy was
+        # missed (crash, race) and the FS WAV still exists, grab it now.
+        if r["conn_id"] and not local_full_audio_path(call_key).exists():
+            capture_fs_recording(r["conn_id"], call_key, wait_s=0.5)
         if local_audio_path(call_key).exists() and upload_recording(call_key):
             uploaded += 1
     return uploaded
@@ -219,14 +282,25 @@ def cleanup_local(max_age_days: float | None = None) -> int:
         return 0
     deleted = 0
     for r in rows:
-        wav = local_audio_path(r["call_key"])
-        try:
-            if wav.exists() and wav.stat().st_mtime < cutoff:
-                wav.unlink()
-                deleted += 1
-                logger.info("cleanup: removed local %s", wav)
-        except Exception as exc:
-            logger.warning("cleanup: could not remove %s: %r", wav, exc)
+        for wav in (local_audio_path(r["call_key"]),
+                    local_full_audio_path(r["call_key"])):
+            try:
+                if wav.exists() and wav.stat().st_mtime < cutoff:
+                    wav.unlink()
+                    deleted += 1
+                    logger.info("cleanup: removed local %s", wav)
+            except Exception as exc:
+                logger.warning("cleanup: could not remove %s: %r", wav, exc)
+    # Janitor for the FreeSWITCH staging dir: anything older than 2 days has
+    # either been captured into its call folder or belongs to no known call.
+    try:
+        fs_cutoff = time.time() - 2 * 86400
+        for f in FS_RECORDINGS_DIR.glob("*.wav"):
+            if f.stat().st_mtime < fs_cutoff:
+                f.unlink()
+                logger.info("cleanup: pruned FS staging file %s", f.name)
+    except Exception as exc:
+        logger.warning("cleanup: FS staging prune failed: %r", exc)
     return deleted
 
 

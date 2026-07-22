@@ -1,4 +1,4 @@
-import { Card, Button, cx } from '../../components/ui'
+import { Card, Button, IconButton, cx } from '../../components/ui'
 import { Field, Input, Textarea, Select } from '../../components/kit'
 import type { Routing, WizardData } from '../../api/agents'
 import { CalendarDays, ChevronDown, ChevronUp, PhoneIncoming, PhoneOutgoing, Plus, Trash2 } from 'lucide-react'
@@ -40,8 +40,8 @@ export function BasicsSection({ d, set, showSlug = true, showErrors = false }: S
             className={cx(showErrors && (!d.name || !slugOk) && 'ring-rose-400/50')}
             onChange={(e) => set({ name: e.target.value.trim() })}
           />
-          {!slugOk && d.name && <span className="mt-1 block text-[11px] text-rose-500">Use letters, digits, _ or - only.</span>}
-          {showErrors && !d.name && <span className="mt-1 block text-[11px] text-rose-500">Required</span>}
+          {!slugOk && d.name && <span className="mt-1 block text-2xs text-rose-500">Use letters, digits, _ or - only.</span>}
+          {showErrors && !d.name && <span className="mt-1 block text-2xs text-rose-500">Required</span>}
         </Field>
       )}
       <Field label="Agent display name *">
@@ -52,7 +52,7 @@ export function BasicsSection({ d, set, showSlug = true, showErrors = false }: S
           className={cx(showErrors && !d.agent_name && 'ring-rose-400/50')}
           onChange={(e) => set({ agent_name: e.target.value })}
         />
-        {showErrors && !d.agent_name && <span className="mt-1 block text-[11px] text-rose-500">Required</span>}
+        {showErrors && !d.agent_name && <span className="mt-1 block text-2xs text-rose-500">Required</span>}
       </Field>
       <Field label="Company name *">
         <Input
@@ -62,7 +62,7 @@ export function BasicsSection({ d, set, showSlug = true, showErrors = false }: S
           className={cx(showErrors && !d.company_name && 'ring-rose-400/50')}
           onChange={(e) => set({ company_name: e.target.value })}
         />
-        {showErrors && !d.company_name && <span className="mt-1 block text-[11px] text-rose-500">Required</span>}
+        {showErrors && !d.company_name && <span className="mt-1 block text-2xs text-rose-500">Required</span>}
       </Field>
       <Field label="Company tagline">
         <Input value={d.company_tagline} placeholder="Homes you'll love" onChange={(e) => set({ company_tagline: e.target.value })} />
@@ -113,6 +113,7 @@ export function CallDirectionSection({ d, set }: SectionProps) {
           <button
             key={o.value}
             type="button"
+            aria-pressed={active}
             onClick={() => set({ call_direction: o.value })}
             className={cx(
               'rounded-xl p-4 text-left ring-1 transition',
@@ -121,10 +122,10 @@ export function CallDirectionSection({ d, set }: SectionProps) {
                 : 'bg-[var(--surface-2)] ring-[var(--border)] hover:ring-mint-400/20',
             )}
           >
-            <div className={cx('mb-1.5 flex items-center gap-2 text-[13px] font-semibold', active ? 'text-mint-700 dark:text-mint-300' : '')}>
+            <div className={cx('mb-1.5 flex items-center gap-2 text-sm font-semibold', active ? 'text-mint-700 dark:text-mint-300' : '')}>
               <Icon size={16} /> {o.label}
             </div>
-            <div className="text-[12px] leading-relaxed text-soft">{o.desc}</div>
+            <div className="text-xs leading-relaxed text-soft">{o.desc}</div>
           </button>
         )
       })}
@@ -144,13 +145,14 @@ export function CalendarSection({ d, set }: SectionProps) {
   }
   return (
     <div className="space-y-4">
-      <div className="rounded-xl bg-mint-400/10 p-3 text-[12px] leading-relaxed text-mint-700 ring-1 ring-mint-400/20 dark:text-mint-300">
+      <div className="rounded-xl bg-mint-400/10 p-3 text-xs leading-relaxed text-mint-700 ring-1 ring-mint-400/20 dark:text-mint-300">
         <span className="font-semibold">Recommended:</span> give the agent a calendar. It will mention free
         slots when callers ask about availability, offer at most two options at a time, and book the caller
         into a slot — booked slots are stored and no longer offered on later calls.
       </div>
       <button
         type="button"
+        aria-pressed={d.calendar_enabled}
         onClick={() => {
           if (!d.calendar_enabled && d.calendar_slots.length === 0) {
             set({
@@ -165,7 +167,7 @@ export function CalendarSection({ d, set }: SectionProps) {
           }
         }}
         className={cx(
-          'flex items-center gap-2 rounded-lg px-3 py-1.5 text-[13px] font-semibold ring-1 transition',
+          'flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-semibold ring-1 transition',
           d.calendar_enabled
             ? 'bg-mint-400/15 text-mint-700 ring-mint-400/30 dark:text-mint-300'
             : 'bg-[var(--surface-2)] text-soft ring-[var(--border)]',
@@ -197,7 +199,7 @@ export function CalendarSection({ d, set }: SectionProps) {
               </Card>
             ))}
             {d.calendar_slots.length === 0 && (
-              <div className="text-[12px] text-dim">No slots yet — add at least one so the agent has availability to offer.</div>
+              <div className="text-xs text-dim">No slots yet — add at least one so the agent has availability to offer.</div>
             )}
           </div>
         </div>
@@ -222,9 +224,11 @@ export function LanguagesSection({ d, set }: SectionProps) {
           {LANGS.map((l) => (
             <button
               key={l.code}
+              type="button"
+              aria-pressed={d.supported.includes(l.code)}
               onClick={() => toggleLang(l.code)}
               className={cx(
-                'rounded-lg px-3 py-1.5 text-[13px] font-semibold ring-1 transition',
+                'rounded-md px-3 py-1.5 text-sm font-semibold ring-1 transition',
                 d.supported.includes(l.code)
                   ? 'bg-mint-400/15 text-mint-700 ring-mint-400/30 dark:text-mint-300'
                   : 'bg-[var(--surface-2)] text-soft ring-[var(--border)]',
@@ -313,8 +317,8 @@ export function KnowledgeSection({ d, set }: SectionProps) {
           {d.products.map((p, i) => (
             <Card key={i} className="grid gap-3 p-4 sm:grid-cols-2">
               <div className="sm:col-span-2 flex items-center gap-2">
-                <span className="grid h-5 w-5 place-items-center rounded-full bg-indigo-500/12 text-[11px] font-bold text-indigo-500 dark:text-indigo-300">{i + 1}</span>
-                <span className="text-[11px] font-semibold text-dim">Product {i + 1}</span>
+                <span className="grid h-5 w-5 place-items-center rounded-full bg-indigo-500/12 text-2xs font-bold text-indigo-500 dark:text-indigo-300">{i + 1}</span>
+                <span className="text-2xs font-semibold text-dim">Product {i + 1}</span>
               </div>
               <Field label="Name"><Input value={p.name} onChange={(e) => { const x = [...d.products]; x[i] = { ...x[i], name: e.target.value }; set({ products: x }) }} /></Field>
               <Field label="Price / tier"><Input value={p.price} onChange={(e) => { const x = [...d.products]; x[i] = { ...x[i], price: e.target.value }; set({ products: x }) }} /></Field>
@@ -327,7 +331,7 @@ export function KnowledgeSection({ d, set }: SectionProps) {
           ))}
           {d.products.length === 0 && (
             <div className="rounded-xl bg-[var(--surface-2)] p-4 ring-1 ring-[var(--border)]">
-              <p className="text-[12px] text-dim">
+              <p className="text-xs text-dim">
                 No products yet — each product's name, price and features become talking points the agent
                 can quote on calls. Add at least one so it has something concrete to pitch.
               </p>
@@ -388,8 +392,8 @@ export function CallFlowSection({ d, set, showErrors = false }: SectionProps & {
             onChange={(e) => set({ opening_greeting: e.target.value })}
           />
         </Field>
-        {showErrors && !d.opening_greeting && <span className="mt-1 block text-[11px] text-rose-500">Required</span>}
-        <span className="mt-1 block text-[11px] text-dim">
+        {showErrors && !d.opening_greeting && <span className="mt-1 block text-2xs text-rose-500">Required</span>}
+        <span className="mt-1 block text-2xs text-dim">
           This exact sentence opens every call — the AI does not rephrase it.
           {outbound && (
             <> Write <span className="font-mono text-soft">{'{contact_name}'}</span> where the
@@ -414,7 +418,7 @@ export function CallFlowSection({ d, set, showErrors = false }: SectionProps & {
             <Plus size={14} /> Add stage
           </Button>
         </div>
-        <p className="text-[12px] leading-relaxed text-dim">
+        <p className="text-xs leading-relaxed text-dim">
           Stages are <span className="font-semibold text-soft">instructions the AI follows</span> as the call
           progresses — write each goal as directions ("Confirm you're speaking with the right person, then explain
           why you're calling"), not as a word-for-word line. The exact first sentence lives in the Opening line
@@ -422,7 +426,7 @@ export function CallFlowSection({ d, set, showErrors = false }: SectionProps & {
         </p>
         {d.stages.map((s, i) => (
           <Card key={i} className="grid gap-3 p-4 lg:grid-cols-[auto_150px_1fr_100px_auto] lg:items-start">
-            <span className="grid h-5 w-5 place-items-center rounded-full bg-indigo-500/12 text-[11px] font-bold text-indigo-500 dark:text-indigo-300 lg:mt-7">{i + 1}</span>
+            <span className="grid h-5 w-5 place-items-center rounded-full bg-indigo-500/12 text-2xs font-bold text-indigo-500 dark:text-indigo-300 lg:mt-7">{i + 1}</span>
             <Field label="Stage ID"><Input value={s.id} onChange={(e) => { const x = [...d.stages]; x[i] = { ...x[i], id: e.target.value }; set({ stages: x }) }} /></Field>
             <Field label="Goal — instructions for this part of the call">
               <Textarea
@@ -434,17 +438,17 @@ export function CallFlowSection({ d, set, showErrors = false }: SectionProps & {
             </Field>
             <div>
               <Field label="Max turns"><Input value={s.turns} onChange={(e) => { const x = [...d.stages]; x[i] = { ...x[i], turns: e.target.value }; set({ stages: x }) }} /></Field>
-              <span className="mt-1 block text-[11px] text-dim">99 = stay until the goal is met</span>
+              <span className="mt-1 block text-2xs text-dim">99 = stay until the goal is met</span>
             </div>
             <div className="flex items-center gap-1.5 lg:mt-6 lg:gap-1">
-              <Button variant="ghost" size="sm" className="h-9 w-9 lg:h-auto lg:w-auto" title={`Move stage ${i + 1} up`} disabled={i === 0} onClick={() => moveStage(i, -1)}><ChevronUp size={13} /></Button>
-              <Button variant="ghost" size="sm" className="h-9 w-9 lg:h-auto lg:w-auto" title={`Move stage ${i + 1} down`} disabled={i === d.stages.length - 1} onClick={() => moveStage(i, 1)}><ChevronDown size={13} /></Button>
-              <Button variant="ghost" size="sm" className="h-9 w-9 lg:h-auto lg:w-auto" title={`Remove stage ${i + 1}`} onClick={() => set({ stages: d.stages.filter((_, j) => j !== i) })}><Trash2 size={13} /></Button>
+              <IconButton label="Move up" disabled={i === 0} onClick={() => moveStage(i, -1)}><ChevronUp size={13} /></IconButton>
+              <IconButton label="Move down" disabled={i === d.stages.length - 1} onClick={() => moveStage(i, 1)}><ChevronDown size={13} /></IconButton>
+              <IconButton label="Remove stage" onClick={() => set({ stages: d.stages.filter((_, j) => j !== i) })}><Trash2 size={13} /></IconButton>
             </div>
           </Card>
         ))}
         {showErrors && d.stages.length === 0 && (
-          <div className="rounded-lg bg-rose-500/10 px-3 py-2 text-[12px] text-rose-600 ring-1 ring-rose-500/20 dark:text-rose-300">
+          <div className="rounded-lg bg-rose-500/10 px-3 py-2 text-xs text-rose-600 ring-1 ring-rose-500/20 dark:text-rose-300">
             At least one call stage is required.
           </div>
         )}
@@ -459,7 +463,7 @@ export function CallFlowSection({ d, set, showErrors = false }: SectionProps & {
 export function ResponsesSection({ d, set }: SectionProps) {
   return (
     <div className="space-y-4">
-      <p className="text-[12px] text-dim">
+      <p className="text-xs text-dim">
         Fixed responses the agent uses at specific moments. The call's opening line is configured
         under <span className="font-semibold text-soft">Call Script</span>.
       </p>

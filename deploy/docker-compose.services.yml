@@ -48,6 +48,11 @@ services:
     container_name: lescall-runtime
     network_mode: host
     user: "1000:1000"
+    # freeswitch group: the record_session WAVs in /tmp/esl_recordings are
+    # freeswitch:freeswitch 0660; without this the teardown capture of the
+    # two-party recording fails with EACCES (recsync in workers then catches
+    # up ~15 min later — recordings appear caller-only in the meantime).
+    group_add: ["994"]
     working_dir: /home/angelo/lescall
     command: ["bash", "deploy/runtime_entry.sh"]
     env_file: [.pg_env]
@@ -92,6 +97,9 @@ services:
       - /home/angelo/lescall:/home/angelo/lescall
       - /home/angelo/.config/gcloud:/gcloud:ro
       - /var/log/freeswitch/cdr-csv:/var/log/freeswitch/cdr-csv:ro
+      # FS record_session staging: recsync catch-up copies full two-party
+      # recordings from here; cleanup_local prunes stragglers (needs rw).
+      - /tmp/esl_recordings:/tmp/esl_recordings
     restart: unless-stopped
     logging: *log
 

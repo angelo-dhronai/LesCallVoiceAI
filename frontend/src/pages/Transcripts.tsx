@@ -1,11 +1,19 @@
 import { useState, useEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
-import { MessageSquare, Search, User, Bot, Phone, Copy, Check, RefreshCw } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { MessageSquare, Search, User, Bot, Phone, Copy, Check, FileSearch, RefreshCw, Sparkles } from 'lucide-react'
 import { api } from '../api/client'
 import { useGet, useRefresh } from '../api/hooks/useApi'
 import { Card, Badge, Button, Spinner, EmptyState, cx } from '../components/ui'
-import { PageHeader, SearchInput, AsyncState } from '../components/kit'
+import { PageHeader, SearchInput, AsyncState, Field } from '../components/kit'
+import { useDebounced, useUrlParam } from '../lib/hooks'
 import { dur } from '../lib/format'
+
+/** The shared Button skin (ghost · sm · rounded-md) for a real router Link —
+ *  ui.Button only renders <button>, and the cross-link to the intelligence
+ *  workspace should be a link the browser can open in a new tab. */
+const BUTTON_LINK_CLS =
+  'inline-flex min-h-[36px] items-center justify-center gap-1.5 rounded-md bg-[var(--surface-solid)] px-2.5 py-1.5 text-xs font-medium text-soft ring-1 ring-[var(--border)] transition-all hover:bg-[var(--surface-2)] hover:ring-[var(--border-strong)] active:scale-[.98] lg:min-h-0'
 
 /* ------------------------------------------------------------------ Types */
 
@@ -196,16 +204,20 @@ function TranscriptPanel({ recording, highlight }: { recording: Recording | null
       <div className="-mx-4 -mt-4 mb-3 shrink-0 border-b border-[var(--border)] px-4 py-3">
         <div className="flex flex-wrap items-center gap-2">
           <div className="min-w-0">
-            <div className="truncate font-display text-[15px] font-bold">
+            <div className="truncate font-display text-base font-bold">
               {recording?.caller || recording?.call_id || folder}
             </div>
-            <div className="text-[12px] tabular-nums text-dim">{fmtDate(recording?.folder_dt)}</div>
+            <div className="text-xs tabular-nums text-dim">{fmtDate(recording?.folder_dt)}</div>
           </div>
           <div className="ml-auto flex flex-wrap items-center gap-2">
             <Badge>{messages.length} turns</Badge>
             <Button variant="ghost" size="sm" className="min-h-9 lg:min-h-0" onClick={copyTranscript} title="Copy full transcript to clipboard">
               {copied ? <><Check size={13} /> Copied</> : <><Copy size={13} /> Copy transcript</>}
             </Button>
+            {/* folder IS the call_key — the same id Intelligence rows link with. */}
+            <Link to={`/intelligence/${encodeURIComponent(folder)}`} className={BUTTON_LINK_CLS}>
+              <Sparkles size={13} /> AI analysis →
+            </Link>
           </div>
         </div>
         {meta.length > 0 && (
@@ -250,11 +262,11 @@ function TranscriptPanel({ recording, highlight }: { recording: Recording | null
                 <div className="mb-1 flex items-center justify-between gap-2">
                   <span className="flex min-w-0 items-center gap-1.5" title={rawSpeaker || undefined}>
                     <Badge tone={agent ? 'mint' : 'indigo'}>{agent ? 'Agent' : 'Caller'}</Badge>
-                    {showRaw && <span className="min-w-0 truncate text-[10px] text-dim">· {rawSpeaker}</span>}
+                    {showRaw && <span className="min-w-0 truncate text-2xs text-dim">· {rawSpeaker}</span>}
                     {lang && <Badge tone="neutral">{lang.toUpperCase()}</Badge>}
                   </span>
                   {m?.timestamp && (
-                    <span className="shrink-0 text-[11px] tabular-nums text-dim" title={m.timestamp}>
+                    <span className="shrink-0 text-2xs tabular-nums text-dim" title={m.timestamp}>
                       {fmtMsgTime(m.timestamp)}
                     </span>
                   )}
@@ -263,7 +275,7 @@ function TranscriptPanel({ recording, highlight }: { recording: Recording | null
                   lang={lang ?? undefined}
                   className={cx(
                     'whitespace-pre-wrap break-words text-soft',
-                    lang ? 'text-[14px] leading-6' : 'text-[13px]',
+                    lang ? 'text-base leading-6' : 'text-sm',
                   )}
                 >
                   {hl ? highlightText(m?.text ?? '', hl) : (m?.text ?? '')}
@@ -281,18 +293,16 @@ function TranscriptPanel({ recording, highlight }: { recording: Recording | null
 
 export default function Transcripts() {
   const [callerFilter, setCallerFilter] = useState('')
-  const [keyword, setKeyword] = useState('')
-  const [debouncedKeyword, setDebouncedKeyword] = useState('')
-  const [selected, setSelected] = useState<string | null>(null)
+  // Search + selected call live in the URL, so a refresh (or a shared link)
+  // reopens the exact same thread. '' means "nothing selected".
+  const [keyword, setKeyword] = useUrlParam('q')
+  const [selected, setSelected] = useUrlParam('call')
   const refresh = useRefresh()
   const transcriptRef = useRef<HTMLDivElement | null>(null)
   const selectedRowRef = useRef<HTMLButtonElement | null>(null)
 
-  // Debounce keyword for search endpoint
-  useEffect(() => {
-    const t = setTimeout(() => setDebouncedKeyword(keyword.trim()), 300)
-    return () => clearTimeout(t)
-  }, [keyword])
+  // Debounced so the search endpoint fires once per pause, not per keystroke.
+  const debouncedKeyword = useDebounced(keyword, 300).trim()
 
   const searchActive = debouncedKeyword.length >= 2
 
@@ -321,9 +331,9 @@ export default function Transcripts() {
   // Default-select first item when list loads / changes
   useEffect(() => {
     if (recordings.length === 0) return
-    const stillPresent = selected != null && recordings.some((r) => r?.folder === selected)
+    const stillPresent = selected !== '' && recordings.some((r) => r?.folder === selected)
     if (!stillPresent) {
-      setSelected(recordings[0]?.folder ?? null)
+      setSelected(recordings[0]?.folder ?? '')
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recordings])
@@ -351,24 +361,27 @@ export default function Transcripts() {
       <div className="grid gap-4 lg:grid-cols-[320px_1fr]">
         {/* LEFT — list + filters */}
         <Card className="flex flex-col gap-3 p-4 lg:sticky lg:top-4 lg:self-start">
-          <div>
-            <div className="eyebrow mb-1.5">Filter list</div>
+          {/* Two different searches, two different anatomies: a plain list
+              filter vs a content search with its own icon + real labels. */}
+          <Field label="Filter calls">
             <SearchInput
               value={callerFilter}
               onChange={setCallerFilter}
-              placeholder="Filter by phone / name…"
+              placeholder="Filter calls…"
+              ariaLabel="Filter calls by phone or name"
             />
-          </div>
-          <div>
-            <div className="eyebrow mb-1.5">Search inside calls</div>
+          </Field>
+          <Field label="Search inside conversations">
             <SearchInput
               value={keyword}
               onChange={setKeyword}
-              placeholder="Search words in transcripts"
+              icon={<FileSearch size={15} />}
+              placeholder="Search inside conversations…"
+              ariaLabel="Search inside conversations"
             />
-          </div>
+          </Field>
 
-          <div className="flex items-center justify-between text-[11px] text-dim">
+          <div className="flex items-center justify-between text-2xs text-dim">
             <span aria-live="polite">
               {searchActive
                 ? `${recordings.length} matches for "${debouncedKeyword}"`
@@ -408,13 +421,13 @@ export default function Transcripts() {
                       ref={isSel ? selectedRowRef : undefined}
                       aria-current={isSel ? 'true' : undefined}
                       onClick={() => {
-                        setSelected(r?.folder ?? null)
+                        setSelected(r?.folder ?? '')
                         if (window.innerWidth < 1024) {
                           transcriptRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
                         }
                       }}
                       className={cx(
-                        'w-full rounded-xl px-3 py-2.5 text-left transition ring-1',
+                        'w-full rounded-md px-3 py-2.5 text-left transition ring-1',
                         isSel
                           ? 'bg-mint-400/12 ring-mint-400/40 shadow-[inset_2px_0_0_0_theme(colors.mint.400)]'
                           : 'bg-[var(--surface-2)] ring-[var(--border)] hover:bg-[var(--border)]',
@@ -422,11 +435,11 @@ export default function Transcripts() {
                     >
                       <div className="flex items-center gap-2">
                         <Phone size={13} className="shrink-0 text-dim" />
-                        <span className="truncate text-[13px] font-semibold text-soft">
+                        <span className="truncate text-sm font-semibold text-soft">
                           {r?.caller || r?.call_id || r?.folder || 'Unknown'}
                         </span>
                       </div>
-                      <div className="mt-0.5 pl-5 text-[11px] tabular-nums text-dim">
+                      <div className="mt-0.5 pl-5 text-2xs tabular-nums text-dim">
                         {fmtDate(r?.folder_dt)}
                       </div>
                     </button>

@@ -528,6 +528,8 @@ async def handle_connection(websocket, path: str, args):
 
     resample_state = None
 
+    resample_count = 0
+
     # --------------------------------------------------------------
     # OPTIONAL STT FORWARDER
     # --------------------------------------------------------------
@@ -653,28 +655,29 @@ async def handle_connection(websocket, path: str, args):
 
                 try:
 
-                    pre_rms = -1
+                    if log.isEnabledFor(logging.DEBUG):
+                        pre_rms = -1
 
-                    if (
-                        len(norm_msg) >= 2
-                        and len(norm_msg) % 2 == 0
-                    ):
+                        if (
+                            len(norm_msg) >= 2
+                            and len(norm_msg) % 2 == 0
+                        ):
 
-                        try:
-                            pre_rms = audioop.rms(
-                                norm_msg,
-                                2,
-                            )
-                        except Exception:
-                            pass
+                            try:
+                                pre_rms = audioop.rms(
+                                    norm_msg,
+                                    2,
+                                )
+                            except Exception:
+                                pass
 
-                    log.debug(
-                        "[DECODE_PRE] conn=%s bytes=%d rms=%d codec=%s",
-                        conn_id,
-                        len(norm_msg),
-                        pre_rms,
-                        INPUT_CODEC,
-                    )
+                        log.debug(
+                            "[DECODE_PRE] conn=%s bytes=%d rms=%d codec=%s",
+                            conn_id,
+                            len(norm_msg),
+                            pre_rms,
+                            INPUT_CODEC,
+                        )
 
                     performed_ulaw_decode = False
 
@@ -747,28 +750,49 @@ async def handle_connection(websocket, path: str, args):
                             )
                         )
 
-                        log.info(
-                            "[RESAMPLE] conn=%s %dB -> %dB",
-                            conn_id,
-                            before_resample,
-                            len(norm_msg),
+                        # Hot path: one frame every 20ms. Per-frame lines go to
+                        # DEBUG; INFO gets a summary every 500 frames (~10s).
+                        resample_count += 1
+                        if resample_count % 500 == 1:
+                            log.info(
+                                "[RESAMPLE] conn=%s %dB -> %dB (frame %d)",
+                                conn_id,
+                                before_resample,
+                                len(norm_msg),
+                                resample_count,
+                            )
+                        elif log.isEnabledFor(logging.DEBUG):
+                            log.debug(
+                                "[RESAMPLE] conn=%s %dB -> %dB",
+                                conn_id,
+                                before_resample,
+                                len(norm_msg),
+                            )
+
+                    # ------------------------------------------
+                    # FINAL RMS (debug only — skip the per-frame
+                    # rms computation entirely when not logging it)
+                    # ------------------------------------------
+
+                    # NOTE: final_rms must be bound unconditionally — it is read
+                    # again by the [AUDIO_PIPE] log call below, and logging
+                    # evaluates its arguments eagerly regardless of level. When
+                    # this was assigned only under the DEBUG guard, every frame
+                    # raised UnboundLocalError into [NORMALIZATION_FATAL].
+                    final_rms = -1
+
+                    if log.isEnabledFor(logging.DEBUG):
+                        final_rms = audioop.rms(
+                            norm_msg,
+                            2,
                         )
 
-                    # ------------------------------------------
-                    # FINAL RMS
-                    # ------------------------------------------
-
-                    final_rms = audioop.rms(
-                        norm_msg,
-                        2,
-                    )
-
-                    log.debug(
-                        "[PCM_LEVEL] conn=%s rms=%d bytes=%d",
-                        conn_id,
-                        final_rms,
-                        len(norm_msg),
-                    )
+                        log.debug(
+                            "[PCM_LEVEL] conn=%s rms=%d bytes=%d",
+                            conn_id,
+                            final_rms,
+                            len(norm_msg),
+                        )
 
                     # ------------------------------------------
                     # STT FORWARD
@@ -934,11 +958,52 @@ async def _live_state_writer_loop():
         await asyncio.sleep(LIVE_STATE_INTERVAL_S)
 
 
+async def _boot_warmup():
+    """Warm the shared Sarvam STT/TTS connection pools and the LLM endpoint
+    at process boot instead of racing the first call's first utterance.
+
+    With SARVAM_HTTP_SHARED (default on) the pools opened here are the exact
+    clients every call reuses. Best-effort: any failure is logged and the
+    per-call background warmup remains as fallback. BOOT_WARMUP=false skips.
+    """
+    if os.environ.get("BOOT_WARMUP", "true").lower() != "true":
+        return
+    try:
+        from backend.app.voice.stt.sarvam import SarvamSTT
+        from backend.app.voice.tts_sarvam import SarvamTTS
+        from backend.app.audio_transport.telephony_sink import TelephonySink
+
+        async def _llm_warm():
+            from backend.app.voice.conversation import ConversationRouter
+            from backend.app.agent_definition.fallback_agent import (
+                get_neutral_fallback_agent,
+            )
+            await ConversationRouter(
+                agent_def=get_neutral_fallback_agent()).warmup()
+
+        stt = SarvamSTT()
+        # Throwaway sink: SarvamTTS's default LocalSpeakerSink may probe an
+        # audio device that headless servers lack.
+        tts = SarvamTTS(audio_sink=TelephonySink(conn_id="boot-warmup"))
+        await asyncio.wait_for(
+            asyncio.gather(
+                stt.warmup(), tts.warmup(), _llm_warm(),
+                return_exceptions=True,
+            ),
+            timeout=10.0,
+        )
+        log.info("[BOOT-WARMUP] STT/TTS/LLM warmup complete")
+    except Exception as exc:
+        log.warning("[BOOT-WARMUP] failed (per-call warmup remains): %r", exc)
+
+
 async def main_async(args):
 
     import websockets
 
     asyncio.create_task(_live_state_writer_loop())
+
+    asyncio.create_task(_boot_warmup())
 
     log.info(
         "ws_audio_receiver listening on ws://%s:%d",

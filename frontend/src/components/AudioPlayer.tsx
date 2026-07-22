@@ -158,7 +158,7 @@ export function AudioPlayer({ src, caller }: { src: string; caller?: string }) {
             )}
             style={{ background: `linear-gradient(to right, var(--accent) ${pct}%, var(--surface-2) ${pct}%)` }}
           />
-          <span className="shrink-0 whitespace-nowrap text-[11px] tabular-nums text-dim">
+          <span className="shrink-0 whitespace-nowrap text-2xs tabular-nums text-dim">
             {fmtTime(time)} / {dur ? fmtTime(dur) : '--:--'}
           </span>
         </>

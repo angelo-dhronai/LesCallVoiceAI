@@ -8,6 +8,10 @@ const BACKEND = process.env.VITE_BACKEND ?? 'http://localhost:8080'
 
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    // Mirrors tsconfig's "@/*" → "src/*" so shadcn imports resolve at build time.
+    alias: { '@': new URL('./src', import.meta.url).pathname },
+  },
   server: {
     port: 5173,
     proxy: {

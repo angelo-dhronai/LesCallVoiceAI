@@ -68,6 +68,13 @@ FILLER_TIMEOUT_S = 1.0
 LLM_STREAM_TIMEOUT_S = 7.0
 INTENT_CLASSIFY_TIMEOUT_S = 1.0
 
+# First-turn ambiguous-language handling: the LLM classify round-trip used to
+# run SEQUENTIALLY before the main LLM on the caller's very first utterance.
+# Default off = first turn trusts STT's detection (already mirrored into
+# state.language by the pipeline) / agent default; later turns keep the LLM.
+LANG_LLM_CLASSIFY_FIRST_TURN = os.environ.get(
+    "LANG_LLM_CLASSIFY_FIRST_TURN", "false").lower() == "true"
+
 logger = logging.getLogger(__name__)
 
 _MARKDOWN_RE = re.compile(r"[*#`~_\[\]()>|]")
@@ -455,6 +462,29 @@ def _slot_period(time_str: str) -> str:
     return "evening"
 
 
+# --- Call repair (platform rules — every agent, every call) ---------------
+# Early-call "hello?" window: a bare hello inside this many seconds of the
+# greeting means the caller didn't hear us — replay the last utterance
+# instead of chatting. Tunable via env; see ConversationRouter._is_early_hello.
+EARLY_HELLO_WINDOW_S = float(os.environ.get("CALL_REPAIR_HELLO_WINDOW_S", "25"))
+# Hello words across the platform's scripts (en / Devanagari / Gujarati).
+_HELLO_CORE = {"hello", "hallo", "helo", "hullo", "hellow",
+               "हेलो", "हैलो", "हलो", "हॅलो", "હેલો", "હલો", "હૅલો"}
+# Filler that may ride along with a bare hello without changing its meaning.
+_HELLO_FILLER = {"haan", "haa", "han", "ha", "ji", "are", "arey", "arre",
+                 "हां", "हाँ", "जी", "अरे", "હા", "જી", "અરે"}
+# Dead-air reprompt phrases (used with the last question re-asked after them).
+_COULDNT_HEAR = {
+    "en": "Sorry, I couldn't hear you.",
+    "hi": "माफ़ कीजिए, मुझे आपकी आवाज़ नहीं आई।",
+    "gu": "માફ કરશો, મને તમારો અવાજ સંભળાયો નહીં.",
+}
+_SAY_AGAIN = {
+    "en": "Could you please say that again?",
+    "hi": "कृपया दोबारा बताइए।",
+    "gu": "કૃપા કરીને ફરી કહેશો?",
+}
+
 # Localized time-of-day words for the {current_time} greeting placeholder.
 _TIME_OF_DAY_WORDS = {
     "en": {"morning": "morning", "afternoon": "afternoon", "evening": "evening"},
@@ -608,6 +638,10 @@ class ConversationRouter:
         # Last-response memory (feature 3)
         self.last_agent_response: str = ""
         self.last_agent_language: str = ""
+        # Call-repair state (platform rules, all agents): early-call "hello?"
+        # replay window anchor + replay counter, see _is_early_hello().
+        self._opening_ts: float = 0.0
+        self._hello_replays: int = 0
         # Name-capture confirmation mode (feature 4)
         self._name_pending: str | None = None
         self._name_confirmed: bool = False
@@ -625,6 +659,9 @@ class ConversationRouter:
         # from the original call's notes (call_links.context_note). Rendered
         # as a WHY-YOU-ARE-CALLING-BACK prompt block when non-empty.
         self.callback_context: str = ""
+        # Persistent customer memory (returning caller), set by the bridge via
+        # set_customer_context(). Empty dict = unknown caller = no band.
+        self.customer_context: dict = {}
         # v2 branch bookkeeping: per-call take counters (loop prevention) and
         # deterministic side effects queued by branch actions.
         self._branch_takes: dict = {}
@@ -632,6 +669,17 @@ class ConversationRouter:
         self._whatsapp_promised: bool = False
         self._callback_requested: str = ""
         self.call_outcome: str = ""
+        # v3 in-call commitment clarification (flag-gated per agent via
+        # follow_up.clarify_commitments.enabled; PLAN-intelligence-layer §2.8).
+        # Typed commitments ride extra_flags["commitments"] → collected_data →
+        # the post-call pipeline, which schedules clarified ones precisely.
+        self._commitments: list[dict] = []
+        self._clarify_asked: bool = False
+        self._pending_clarify: dict | None = None
+        # While > 0, _extract_time_preference is suppressed: the answer to
+        # "what day works?" must refine the commitment, NOT create a calendar
+        # booking (phantom-booking doctrine).
+        self._suppress_time_match_turns: int = 0
 
         # Conversation State Management layer — per-call structured memory:
         # extraction, merge, audit trail, missing-slot detection, and the
@@ -658,6 +706,15 @@ class ConversationRouter:
         self._slot_extract_enabled = (
             os.environ.get("ENABLE_LLM_SLOT_EXTRACTOR", "true").lower() != "false"
         )
+        # Turn transaction (continuation merge): snapshot of pre-turn state,
+        # open from process_stream entry until commit or rollback. See
+        # turn_transaction.py — new per-turn-mutable fields must be added to
+        # its capture surface.
+        self._continuation_enabled = (
+            os.environ.get("ENABLE_CONTINUATION_MERGE", "false").lower() == "true"
+        )
+        self._pending_turn = None
+        self._deferred_bookings: list[str] = []
 
         if not self._api_key:
             logger.warning("[CONV] OPENAI_API_KEY not set -- LLM calls will fail")
@@ -731,6 +788,28 @@ class ConversationRouter:
         rendered as a WHY-YOU-ARE-CALLING-BACK block in the system prompt."""
         self.callback_context = (context_note or "").strip()
 
+    def set_customer_context(self, ctx: dict | None) -> None:
+        """Persistent customer memory for a RETURNING caller, pre-fetched by
+        the telephony bridge (customer_memory.context_digest + thin header).
+        Rendered as the ━━ KNOWN CUSTOMER ━━ prompt band; the known name also
+        prefills the no-re-ask slot and the {contact_name} greeting
+        placeholder. Per-agent opt-out: memory.use_customer_context: false."""
+        if not ctx:
+            return
+        if not (getattr(self._def, "memory", None) or {}).get(
+                "use_customer_context", True):
+            logger.info("[CONTEXT] customer context suppressed by agent flag")
+            return
+        self.customer_context = dict(ctx)
+        name = (ctx.get("name") or "").strip()
+        if name and not self.outbound_contact_name:
+            self.outbound_contact_name = name
+            if not self.memory.call_state.customer_name:
+                self.memory.call_state.customer_name = name
+        logger.info("[CONTEXT] known customer: name=%r calls=%s digest=%dch",
+                    name or None, ctx.get("calls_count"),
+                    len(ctx.get("digest") or ""))
+
     def _stage_def(self, stage_id: str | None = None):
         """StageDefinition for a stage id (default: the current stage)."""
         sid = stage_id if stage_id is not None else self.state.stage
@@ -766,7 +845,23 @@ class ConversationRouter:
             return list(self._def.calendar.mock_slots or [])
 
     def _record_calendar_booking(self, appointment_time: str) -> None:
-        """Persist a booked slot so later calls see it as taken. Best-effort."""
+        """Persist a booked slot so later calls see it as taken. Best-effort.
+
+        While a turn transaction is open (continuation merge), the write is
+        DEFERRED to commit_pending_turn(): a continuation may roll this turn
+        back, and add_booking has no undo. memory.booking is set immediately
+        either way, so the in-call flow never re-offers slots.
+        """
+        if self._continuation_enabled and self._pending_turn is not None:
+            self._deferred_bookings.append(appointment_time)
+            logger.info(
+                "[CALENDAR] Booking %r deferred until turn commit "
+                "(continuation window open)", appointment_time,
+            )
+            return
+        self._write_calendar_booking(appointment_time)
+
+    def _write_calendar_booking(self, appointment_time: str) -> None:
         try:
             from ..agent_definition.calendar_store import add_booking
             folder = self._agent_folder()
@@ -788,8 +883,113 @@ class ConversationRouter:
             logger.warning("[CALENDAR] booking persistence failed: %r", exc)
 
     # ------------------------------------------------------------------
+    # Turn transactions (continuation merge)
+    # ------------------------------------------------------------------
+    # The pipeline drives these: begin_turn_transaction at every
+    # process_stream entry; rollback_pending_turn when a continuation of the
+    # previous utterance arrives; commit_pending_turn when the turn is final
+    # (next distinct turn, window expiry, closing shortcut, pipeline stop).
+
+    def begin_turn_transaction(self, text: str) -> None:
+        if not self._continuation_enabled:
+            return
+        if self._pending_turn is not None:
+            self.commit_pending_turn()
+        try:
+            from .turn_transaction import capture
+            self._pending_turn = capture(self, text)
+        except Exception:
+            logger.exception("[TURN-TXN] capture failed — turn not supersedable")
+            self._pending_turn = None
+
+    def has_pending_turn(self) -> bool:
+        return self._pending_turn is not None
+
+    def rollback_pending_turn(self) -> str | None:
+        """Rewind the provisional turn; returns its user text for merging."""
+        snap = self._pending_turn
+        if snap is None:
+            return None
+        self._pending_turn = None
+        # A stale extractor completion must not land after the restore.
+        task = self._slot_extract_task
+        if task is not None and not task.done():
+            task.cancel()
+        try:
+            from .turn_transaction import restore
+            restore(self, snap)
+        except Exception:
+            logger.exception("[TURN-TXN] restore failed — keeping current state")
+            return None
+        return snap.user_text
+
+    def commit_pending_turn(self) -> None:
+        self._pending_turn = None
+        if self._deferred_bookings:
+            pending, self._deferred_bookings = self._deferred_bookings, []
+            for t in pending:
+                self._write_calendar_booking(t)
+                logger.info("[TURN-TXN] Committed deferred booking %r", t)
+
+    # ------------------------------------------------------------------
     # Opening greeting (outbound call starts here)
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Call repair (platform rules — every agent, every call)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_bare_hello_text(text: str) -> bool:
+        """Is this utterance nothing but hello(s) plus filler, in any supported
+        script? Script-safe tokenisation, no time window."""
+        # NOT [\W_]: re's \W matches Indic combining vowel signs (category
+        # Mn), which would shred "हेलो" into bare consonants. Keep the
+        # Devanagari + Gujarati blocks whole.
+        toks = re.sub(r"[^0-9a-zऀ-ॿ઀-૿]+", " ",
+                      (text or "").lower()).split()
+        if not toks or len(toks) > 4:
+            return False
+        if not any(t in _HELLO_CORE for t in toks):
+            return False
+        return all(t in _HELLO_CORE or t in _HELLO_FILLER for t in toks)
+
+    def _is_early_hello(self, text: str) -> bool:
+        """True when this utterance is a bare "hello?" (any supported script,
+        optionally repeated / with filler) inside the early-call window.
+
+        On a phone call that pattern means the caller did not hear what we
+        just said — the right response is to say it again, not to treat
+        "hello" as a conversational turn."""
+        if self._opening_ts <= 0.0:
+            return False
+        if time.monotonic() - self._opening_ts > EARLY_HELLO_WINDOW_S:
+            return False
+        return self._is_bare_hello_text(text)
+
+    def generate_silence_reprompt(self) -> str:
+        """Dead-air repair: the caller has been silent well past their turn —
+        most likely STT missed their reply (or they never heard us). Say we
+        couldn't hear them and repeat the question; if they have not spoken
+        at all yet, replay the last utterance plain (saying "I couldn't hear
+        you" to someone who said nothing would be wrong). Returns "" when
+        there is nothing sensible to say. Called by the pipeline watchdog."""
+        last = (self.last_agent_response or "").strip()
+        if not last:
+            return ""
+        if self.state.turn_count == 0:
+            text = last
+        else:
+            phrase = _COULDNT_HEAR.get(self.state.language, _COULDNT_HEAR["en"])
+            if len(last) <= 220:
+                text = f"{phrase} {last}"
+            else:
+                text = f"{phrase} {_SAY_AGAIN.get(self.state.language, _SAY_AGAIN['en'])}"
+        # Record the reprompt so the LLM knows it happened — but do NOT
+        # overwrite last_agent_response: a second reprompt must repeat the
+        # original question, not compound "couldn't hear you" prefixes.
+        self.memory.add_assistant(text, language=self.state.language)
+        return text
 
     async def generate_opening(self) -> EngineResult:
         """Inbound warm welcome — agent answers the call.
@@ -832,6 +1032,8 @@ class ConversationRouter:
         # Store for last-response memory (feature 3)
         self.last_agent_response = greeting
         self.last_agent_language = self.state.language
+        # Anchor for the early-call "hello?" repair window.
+        self._opening_ts = time.monotonic()
         self.memory.qa_tracker.observe_agent_turn(greeting, self.memory.turn_index)
         logger.info("[OPENING] Inbound welcome delivered")
         return EngineResult(text=greeting, is_shortcut=True, intent="greeting")
@@ -857,6 +1059,15 @@ class ConversationRouter:
         Extracts structured data, advances the booking flow, and falls back
         to LLM for questions and natural phrasing.
         """
+        # Turn transaction: snapshot BEFORE any mutation so a continuation of
+        # the caller's previous utterance can supersede this whole turn.
+        self.begin_turn_transaction(text)
+
+        # v3 commitment clarification: the suppression window (armed when we
+        # ask "what day works?") decays one notch per user turn.
+        if self._suppress_time_match_turns > 0:
+            self._suppress_time_match_turns -= 1
+
         # Save name state before add_user may auto-extract a name (feature 4)
         _prev_booking_name = self.memory.booking.user_name
 
@@ -1095,6 +1306,28 @@ class ConversationRouter:
         # STAGE-AWARE ROUTING
         # =============================================================
 
+        # --- Early-call "hello?" — caller didn't hear us; say it again ---
+        # (platform rule, all agents). Capped at 2 replays so a caller who
+        # actually wants to open with "hello" still gets a conversation.
+        # Never replay a greeting that is ITSELF just "hello?" — the rule
+        # assumes the caller missed something worth hearing again, and a bare
+        # hello carries nothing. Replaying it produces the exact parrot loop
+        # users report: agent "Hello?" → caller "hello" → agent "Hello?".
+        # A hello answering a hello IS contact established; fall through to the
+        # normal stage routing so the agent gets on with its script.
+        if (self.last_agent_response and self._hello_replays < 2
+                and not self._is_bare_hello_text(self.last_agent_response)
+                and self._is_early_hello(text)):
+            _cancel_llm()
+            self._hello_replays += 1
+            resp = self.last_agent_response
+            logger.info("[REPAIR] Early 'hello' #%d — replaying last response: %r",
+                        self._hello_replays, resp[:60])
+            self.memory.add_assistant(resp, language=self.state.language)
+            self._store_last_response(resp)
+            yield EngineResult(text=resp, is_shortcut=True, intent="repeat")
+            return
+
         # --- Repeat request (feature 3) — replay or re-render last agent response ---
         if self._is_repeat_request(text) and self.last_agent_response:
             # Check if caller also requested a language change (e.g. "repeat in Gujarati")
@@ -1131,7 +1364,19 @@ class ConversationRouter:
         # --- Farewell at any stage ---
         if intent == "farewell":
             _cancel_llm()
+            # v3 last-chance commitment checkpoint: if the caller is leaving
+            # with a vague promise on the table ("ok bye, call me next week"),
+            # ask the ONE clarification instead of the closing line — once.
+            _cc_ask = self._commitment_checkpoint(text)
+            if _cc_ask is not None:
+                self.memory.add_assistant(_cc_ask, language=self.state.language)
+                self._store_last_response(_cc_ask)
+                yield EngineResult(text=_cc_ask, is_shortcut=True, intent="objection")
+                return
             self.state.is_closing = True
+            # Closing turns are final: the bridge may hang up right after the
+            # farewell line, so never leave this turn open to rollback.
+            self.commit_pending_turn()
             # D9: response_bank.closing_responses is the real farewell line
             # when present ({} = today's localized/hardcoded chain).
             _close_lang = self._closing_language()
@@ -1155,6 +1400,7 @@ class ConversationRouter:
             if _wn_patterns and any(p and p in text.lower() for p in _wn_patterns):
                 _cancel_llm()
                 self.state.is_closing = True
+                self.commit_pending_turn()  # closing turn — never rolled back
                 self.state.stage = STAGE_CLOSING
                 self.call_outcome = self.call_outcome or "wrong_number"
                 self.state_mgr.extra_flags["wrong_number"] = True
@@ -1167,6 +1413,25 @@ class ConversationRouter:
                 return
 
         # --- Objection at any stage (except GREETING, which has its own handler) ---
+        # --- v3 commitment clarification (flag-gated; runs on ANY intent so
+        # "call me next week" — classified time_preference, not objection —
+        # is captured too). Resolution of a pending clarification answer wins
+        # over everything below; fresh detection asks at most one question
+        # per call and otherwise records + acknowledges like the callback
+        # policy always did.
+        if self._clarify_cfg().get("enabled"):
+            _cc_resp = None
+            if self._pending_clarify is not None:
+                _cc_resp = self._resolve_clarification(text)
+            elif self._detect_callback_request(text):
+                _cc_resp = self._maybe_ask_clarification(text)
+            if _cc_resp is not None:
+                _cancel_llm()
+                self.memory.add_assistant(_cc_resp, language=self.state.language)
+                self._store_last_response(_cc_resp)
+                yield EngineResult(text=_cc_resp, is_shortcut=True, intent="objection")
+                return
+
         if intent == "objection" and self.state.stage != STAGE_GREETING:
             _cancel_llm()
             self.state.objection_handled = True
@@ -1197,6 +1462,7 @@ class ConversationRouter:
             _threshold = self._def.call_flow.decline_threshold or 2
             if _is_dnd or self.state.decline_count >= _threshold:
                 self.state.is_closing = True
+                self.commit_pending_turn()  # closing turn — never rolled back
                 self.state.stage = STAGE_CLOSING
                 # Escalation handoff replaces the farewell only when enabled.
                 esc = self._def.guardrails.escalation or {}
@@ -1408,11 +1674,16 @@ class ConversationRouter:
                 logger.info("[DISCOVERY] Config extracted: %s", bhk)
 
         if not self.memory.booking.appointment_time:
-            t = self._extract_time_preference(text, stage=self.state.stage)
-            if t:
-                self.memory.booking.appointment_time = t
-                self._record_calendar_booking(t)
-                logger.info("[DISCOVERY] Time extracted: %s", t)
+            # v3: while a commitment clarification is in flight, day/time words
+            # refine the commitment — they must never book a calendar slot.
+            if self._suppress_time_match_turns > 0:
+                logger.info("[COMMITMENT] time-slot matching suppressed this turn")
+            else:
+                t = self._extract_time_preference(text, stage=self.state.stage)
+                if t:
+                    self.memory.booking.appointment_time = t
+                    self._record_calendar_booking(t)
+                    logger.info("[DISCOVERY] Time extracted: %s", t)
 
         if not self.state.purpose and "purpose" not in cs.domain_fields:
             # Multi-word / script phrases: safe to use substring matching (rare false positives)
@@ -2707,6 +2978,7 @@ class ConversationRouter:
             *pb.mission_block(self._def),
             *_direction_lines,
             *pb.brand_block(self._def),
+            *pb.customer_context_block(self.customer_context),
             "",
             "━━ CALL STATE ━━",
             f"Stage: {self.state.stage}  |  Language: {lang_name}  |  Turn: {self.state.turn_count}",
@@ -2813,9 +3085,16 @@ class ConversationRouter:
                 # English. Defaulting to "hi" here forced English speakers into
                 # Devanagari STT on the next turn.
                 result = ("en", 0.5, "default")
-            else:
+            elif self.state.language_history or LANG_LLM_CLASSIFY_FIRST_TURN:
                 lang = await self._classify_language_llm(text_lower)
                 result = (lang, 0.9, "llm")
+            else:
+                # First turn: never block the caller's first reply on an
+                # extra LLM round-trip. STT's own detection has already been
+                # mirrored into state.language by the pipeline; fall back to
+                # the agent default. The en/hi/gu hard guard below still runs.
+                lang = self.state.language or "hi"
+                result = (lang, 0.6, "stt_or_default_first_turn")
 
         # Hard guard: only the three supported languages may be returned.
         # If the LLM fallback returned something unexpected (or a new script
@@ -3075,9 +3354,10 @@ class ConversationRouter:
             bool(self._CALLBACK_TIME_RE.search(text))
             and bool(re.search(r"\b(call|baat|phone)\b", text, re.IGNORECASE)))
 
-    def _handle_callback_request(self, text: str, policy: dict) -> str | None:
-        """Capture a callback time preference WITHOUT booking a calendar slot
-        (never _record_calendar_booking) and reply from the policy bank."""
+    @staticmethod
+    def _parse_day_time(text: str) -> tuple[str, str]:
+        """Deterministic (day, time) extraction from a callback phrase —
+        shared by the callback policy and the v3 commitment clarifier."""
         lower = text.lower()
         day = ""
         if re.search(r"\b(today|aaj)\b", lower) or "आज" in text:
@@ -3100,6 +3380,12 @@ class ConversationRouter:
             tm = "afternoon"
         elif re.search(r"(evening|shaam|शाम)", lower):
             tm = "evening"
+        return day, tm
+
+    def _handle_callback_request(self, text: str, policy: dict) -> str | None:
+        """Capture a callback time preference WITHOUT booking a calendar slot
+        (never _record_calendar_booking) and reply from the policy bank."""
+        day, tm = self._parse_day_time(text)
         preference = " ".join(x for x in (day, tm) if x) or "later"
         slot_name = str(policy.get("capture_slot") or "callback_time")
         if slot_name in self.state_mgr.slots:
@@ -3111,6 +3397,132 @@ class ConversationRouter:
         resp = self._lang_response(policy.get("responses") or {})
         return resp or (
             f"No problem at all — we'll call you back {preference}. Thank you!")
+
+    # ── v3 in-call commitment clarification (PLAN-intelligence-layer §2.8) ──
+
+    def _clarify_cfg(self) -> dict:
+        try:
+            return self._def.follow_up.clarify_commitments or {}
+        except Exception:
+            return {}
+
+    def _sync_commitments(self) -> None:
+        """extra_flags["commitments"] → collected_data → post-call pipeline."""
+        self.state_mgr.extra_flags["commitments"] = list(self._commitments)
+
+    def _record_commitment(self, quote: str, day: str, tm: str,
+                           clarified: bool) -> dict:
+        c = {
+            "kind": "callback", "made_by": "customer",
+            "description": ("Customer asked to be called "
+                            + (" ".join(x for x in (day, tm) if x) or "later")),
+            "quote": quote[:300], "day": day, "time": tm,
+            "vague": not (day and tm), "clarified": clarified,
+            "turn": self.state.turn_count,
+        }
+        self._commitments.append(c)
+        self._sync_commitments()
+        return c
+
+    def _capture_callback_flags(self, day: str, tm: str) -> None:
+        """The same side effects _handle_callback_request produces, so the
+        outcome taxonomy and dashboard snapshots keep working unchanged."""
+        preference = " ".join(x for x in (day, tm) if x) or "later"
+        cb_policy = self._def.call_flow.callback_policy or {}
+        slot_name = str(cb_policy.get("capture_slot") or "callback_time")
+        if slot_name in self.state_mgr.slots:
+            self.state_mgr.set_externally(slot_name, preference, source="system")
+        self.state_mgr.extra_flags["callback_requested"] = True
+        self.state_mgr.extra_flags["callback_time"] = preference
+        self.call_outcome = self.call_outcome or "callback_requested"
+
+    def _clarify_question(self, day: str, tm: str) -> str:
+        lang = (self.state.language or "en")[:2]
+        if day and not tm:
+            bank = {"en": f"Sure — what time on {day.lower()} works best for you?",
+                    "hi": f"Zaroor — {day.lower()} ko kitne baje call karna theek rahega?",
+                    "gu": f"Chokkas — {day.lower()} na roj ketla vage call karvo thik rahese?"}
+        elif tm and not day:
+            bank = {"en": "Sure — which day works best for you?",
+                    "hi": "Zaroor — kis din call karna theek rahega?",
+                    "gu": "Chokkas — kya divse call karvo thik rahese?"}
+        else:
+            bank = {"en": "Sure — which day and what time would work best for us to call you?",
+                    "hi": "Zaroor — kis din aur kitne baje call karna theek rahega?",
+                    "gu": "Chokkas — kya divse ane ketla vage call karvo thik rahese?"}
+        return bank.get(lang, bank["en"])
+
+    def _clarify_confirmation(self, day: str, tm: str) -> str:
+        preference = " ".join(x for x in (day, tm) if x) or "soon"
+        lang = (self.state.language or "en")[:2]
+        bank = {"en": f"Perfect — we'll call you {preference}. Thank you!",
+                "hi": f"Bilkul — hum aapko {preference} call karenge. Dhanyavaad!",
+                "gu": f"Saras — ame tamne {preference} call karishu. Aabhar!"}
+        return bank.get(lang, bank["en"])
+
+    def _maybe_ask_clarification(self, text: str) -> str | None:
+        """Fresh commitment detected. Vague + not yet asked → ask the ONE
+        clarification; otherwise record it and acknowledge politely."""
+        day, tm = self._parse_day_time(text)
+        self._capture_callback_flags(day, tm)
+        if day and tm:
+            self._record_commitment(text, day, tm, clarified=True)
+            logger.info("[COMMITMENT] precise commitment captured: %s %s", day, tm)
+            return self._clarify_confirmation(day, tm)
+        commitment = self._record_commitment(text, day, tm, clarified=False)
+        if self._clarify_asked:
+            # One question per call, ever — never interrogate the caller.
+            return self._clarify_confirmation(day, tm)
+        self._clarify_asked = True
+        self._pending_clarify = commitment
+        self._suppress_time_match_turns = 2  # this turn + the answer turn
+        logger.info("[COMMITMENT] vague commitment (%r) — asking clarification",
+                    " ".join(x for x in (day, tm) if x) or "later")
+        return self._clarify_question(day, tm)
+
+    def _resolve_clarification(self, text: str) -> str | None:
+        """The turn after our clarification question: fold the answer into the
+        pending commitment. Unparseable answers give up gracefully — the
+        commitment stays vague and the post-call engine schedules a default."""
+        pending = self._pending_clarify
+        self._pending_clarify = None
+        if pending is None:
+            return None
+        day, tm = self._parse_day_time(text)
+        day = day or pending.get("day", "")
+        tm = tm or pending.get("time", "")
+        if not day and not tm:
+            logger.info("[COMMITMENT] clarification answer unparseable — keeping vague")
+            return None  # let the normal engine handle whatever this turn was
+        pending["day"], pending["time"] = day, tm
+        pending["vague"] = not (day and tm)
+        pending["clarified"] = True
+        pending["description"] = ("Customer asked to be called "
+                                  + " ".join(x for x in (day, tm) if x))
+        self._sync_commitments()
+        self._capture_callback_flags(day, tm)
+        self._suppress_time_match_turns = 1  # cover this turn's extraction too
+        logger.info("[COMMITMENT] clarified: %s %s", day, tm)
+        return self._clarify_confirmation(day, tm)
+
+    def _commitment_checkpoint(self, farewell_text: str) -> str | None:
+        """Farewell-time last chance: a vague unclarified commitment (either
+        detected earlier or embedded in the farewell itself) gets the one
+        clarification question instead of the closing line."""
+        if not self._clarify_cfg().get("enabled") or self._clarify_asked:
+            return None
+        if self._detect_callback_request(farewell_text):
+            return self._maybe_ask_clarification(farewell_text)
+        vague = [c for c in self._commitments
+                 if c.get("vague") and not c.get("clarified")]
+        if not vague:
+            return None
+        self._clarify_asked = True
+        self._pending_clarify = vague[-1]
+        self._suppress_time_match_turns = 2
+        logger.info("[COMMITMENT] farewell checkpoint — asking clarification")
+        return self._clarify_question(vague[-1].get("day", ""),
+                                      vague[-1].get("time", ""))
 
     def _pick_filler(self) -> str:
         """Return one filler phrase, chosen by input type.

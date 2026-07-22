@@ -82,6 +82,11 @@ MIGRATIONS: list[str] = [
     # be its inbound agent. Backfilled once (see POST_MIGRATIONS) so existing
     # numbers keep placing calls with exactly the agent they used before.
     "ALTER TABLE phone_numbers ADD COLUMN outbound_agent_slug TEXT",
+    # Customer Intelligence Hub ownership: which of the owner's agents "owns"
+    # the relationship. Set by the bridge at call end when NULL (first agent
+    # that talked to the contact); editable via the hub API. Cross-owner
+    # sharing lives in contact_grants (versioned migration 0006).
+    "ALTER TABLE contacts ADD COLUMN primary_agent_slug TEXT",
 ]
 
 # Follow-up statements run ONLY on the migration run that actually added the

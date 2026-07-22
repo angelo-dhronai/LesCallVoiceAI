@@ -10,11 +10,13 @@ minimizing time-to-first-audio.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import queue as _queue
 import re
 import threading
+from pathlib import Path
 
 import httpx
 import numpy as np
@@ -38,6 +40,36 @@ DEFAULT_SAMPLE_RATE = 16_000
 STREAM_TIMEOUT = 10.0
 CONNECT_TIMEOUT = 5.0
 CHUNK_READ_SIZE = 4096
+
+# Shared per-process HTTP client: TTS instances are created per call, but the
+# warmup flag is per-process — without sharing, every call after the first
+# pays a cold TLS handshake on its first utterance. SARVAM_HTTP_SHARED=false
+# restores the old per-instance clients.
+SARVAM_HTTP_SHARED = os.environ.get("SARVAM_HTTP_SHARED", "true").lower() == "true"
+SARVAM_KEEPALIVE_EXPIRY_S = float(os.environ.get("SARVAM_KEEPALIVE_EXPIRY_S", "300"))
+
+_shared_client: httpx.AsyncClient | None = None
+
+
+def _make_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(STREAM_TIMEOUT, connect=CONNECT_TIMEOUT),
+        limits=httpx.Limits(
+            max_keepalive_connections=5,
+            keepalive_expiry=SARVAM_KEEPALIVE_EXPIRY_S if SARVAM_HTTP_SHARED else 60,
+        ),
+    )
+
+
+# Canned-audio disk cache (greeting, fillers, response-bank lines). A cache
+# hit replays stored PCM through the exact same sink path as live synthesis —
+# zero Sarvam credits, ~0ms synthesis latency. TTS_CANNED_CACHE=false disables.
+TTS_CANNED_CACHE = os.environ.get("TTS_CANNED_CACHE", "true").lower() == "true"
+TTS_CACHE_DIR = Path(
+    os.environ.get("TTS_CACHE_DIR")
+    or Path(__file__).resolve().parents[4] / "data" / "tts_cache"
+)
+TTS_CACHE_MAX_ENTRIES = int(os.environ.get("TTS_CACHE_MAX_ENTRIES", "500"))
 
 _LANG_CODE_MAP = {
     "en": "en-IN",
@@ -106,6 +138,10 @@ class SarvamTTS(StreamingTTS):
     # Counter for empty/near-empty text attempts (for metrics)
     _empty_text_count = 0
 
+    # Class-level flag: warmup runs at most once per process regardless of
+    # how many calls / pipeline instances are created.
+    _warmup_done_flag: bool = False
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -133,6 +169,9 @@ class SarvamTTS(StreamingTTS):
         self._client: httpx.AsyncClient | None = None
         self._language = "en"
         self._output_device = output_device
+        # Canned-audio cache capture (see speak_cached)
+        self._capture_buf: bytearray | None = None
+        self._last_speak_clean = False
 
         if not self._api_key:
             logger.warning("[TTS:Sarvam] SARVAM_API_KEY not set — calls will fail")
@@ -163,15 +202,44 @@ class SarvamTTS(StreamingTTS):
                 pass
 
     def _get_client(self) -> httpx.AsyncClient:
+        if SARVAM_HTTP_SHARED:
+            global _shared_client
+            if _shared_client is None or _shared_client.is_closed:
+                _shared_client = _make_client()
+            return _shared_client
         if self._client is None:
             # keepalive_expiry=60: idle connections older than 60s are never
             # reused, so a call after a long pause always gets a fresh TLS
             # handshake instead of dying on a silently-dropped server socket.
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(STREAM_TIMEOUT, connect=CONNECT_TIMEOUT),
-                limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=60),
-            )
+            self._client = _make_client()
         return self._client
+
+    def _reset_client(self) -> None:
+        """Drop the active client so the next request opens a fresh one."""
+        global _shared_client
+        if SARVAM_HTTP_SHARED:
+            _shared_client = None
+        else:
+            self._client = None
+
+    async def warmup(self) -> None:
+        """Pre-open a TLS connection to the Sarvam host so the first real
+        speak() call doesn't pay DNS+TCP+TLS cost (~300ms cold start).
+
+        Mirrors SarvamSTT.warmup(): a cheap HEAD lands the connection in the
+        httpx per-host pool; errors are silently ignored. Runs at most once
+        per process (class flag).
+        """
+        if SarvamTTS._warmup_done_flag:
+            logger.debug("[TTS:Sarvam] Warmup skipped — already done this process")
+            return
+        try:
+            client = self._get_client()
+            await asyncio.wait_for(client.head(SARVAM_TTS_STREAM_URL), timeout=3.0)
+            SarvamTTS._warmup_done_flag = True
+            logger.info("[TTS:Sarvam] Connection warmed (first time this process)")
+        except Exception as exc:
+            logger.debug("[TTS:Sarvam] Warmup skipped: %s", exc)
 
     async def speak(self, text: str) -> None:
         self._reset()
@@ -220,6 +288,8 @@ class SarvamTTS(StreamingTTS):
                         break
 
                     await self._sink.write_frame(chunk.audio)
+                    if self._capture_buf is not None:
+                        self._capture_buf += chunk.audio
                     chunk_count += 1
                     if chunk_count == 1:
                         logger.info("[TTS:Sarvam] First chunk sent to sink")
@@ -253,7 +323,111 @@ class SarvamTTS(StreamingTTS):
                     "[TTS:Sarvam] Playback complete (%d chunks, %d parts)",
                     chunk_count, flushed_parts or 1,
                 )
+            # _reset() clears _cancelled — preserve completion state for
+            # speak_cached's cache-write decision.
+            self._last_speak_clean = not self._cancelled and chunk_count > 0
             self._reset()
+
+    # ------------------------------------------------------------------
+    # Canned-audio cache
+    # ------------------------------------------------------------------
+
+    def _cache_path(self, text: str) -> Path | None:
+        if not TTS_CANNED_CACHE:
+            return None
+        lang_code = _LANG_CODE_MAP.get(self._language, "en-IN")
+        key = (
+            f"{self._model}|{self._speaker}|{self._pace}|{lang_code}|"
+            f"{self._sample_rate}|{text}"
+        )
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return TTS_CACHE_DIR / f"{digest}.pcm"
+
+    def _write_cache(self, path: Path, pcm: bytes) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.{id(self)}.tmp")
+            tmp.write_bytes(pcm)
+            os.replace(tmp, path)
+            logger.info(
+                "[TTS:Sarvam] Cached utterance (%.1fs, %d bytes)",
+                len(pcm) / (self._sample_rate * 2), len(pcm),
+            )
+            self._prune_cache(path.parent)
+        except Exception:
+            logger.warning("[TTS:Sarvam] Cache write failed", exc_info=True)
+
+    @staticmethod
+    def _prune_cache(cache_dir: Path) -> None:
+        try:
+            entries = sorted(
+                cache_dir.glob("*.pcm"), key=lambda p: p.stat().st_mtime
+            )
+            excess = len(entries) - TTS_CACHE_MAX_ENTRIES
+            for stale in entries[: max(excess, 0)]:
+                stale.unlink(missing_ok=True)
+        except Exception:
+            logger.debug("[TTS:Sarvam] Cache prune failed", exc_info=True)
+
+    async def speak_cached(self, text: str) -> None:
+        """speak() with a disk cache for canned lines (greeting, fillers,
+        response-bank phrases).
+
+        Hit: replay stored PCM through the normal sink path — flush,
+        playback_busy_until, and echo-mute sizing behave exactly as live
+        synthesis, and zero Sarvam credits are consumed (no API call, so
+        the Tracking subclass correctly records nothing). Miss: synthesize
+        live via self.speak() (polymorphic — credit tracking unchanged) and
+        store the PCM on clean completion. Any cache error falls through to
+        live synthesis.
+        """
+        path = self._cache_path(text)
+        if path is not None:
+            pcm = b""
+            try:
+                pcm = path.read_bytes()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                logger.warning(
+                    "[TTS:Sarvam] Cache read failed for %r — synthesizing live",
+                    text[:40], exc_info=True,
+                )
+            # Sanity floor: anything under 150ms of audio is a corrupt entry.
+            if len(pcm) >= int(self._sample_rate * 2 * 0.15):
+                self._reset()
+                self._playing = True
+                try:
+                    await self._sink.start()
+                    logger.info(
+                        "[TTS:Sarvam] Cache HIT (%.1fs) for %r",
+                        len(pcm) / (self._sample_rate * 2), text[:50],
+                    )
+                    try:
+                        os.utime(path)  # LRU touch
+                    except OSError:
+                        pass
+                    await self._sink.write_frame(pcm)
+                    if hasattr(self._sink, "flush"):
+                        await self._sink.flush()
+                    self._playing = False
+                    self._reset()
+                    return
+                except Exception:
+                    logger.exception(
+                        "[TTS:Sarvam] Cache replay failed — synthesizing live"
+                    )
+                    self._playing = False
+                    self._reset()
+        # Miss (or cache disabled/error) — synthesize live, capturing chunks.
+        self._capture_buf = bytearray() if path is not None else None
+        self._last_speak_clean = False
+        try:
+            await self.speak(text)
+        finally:
+            buf, self._capture_buf = self._capture_buf, None
+            if path is not None and buf and self._last_speak_clean:
+                self._write_cache(path, bytes(buf))
 
     async def _stream_audio(self, text: str):
         lang_code = _LANG_CODE_MAP.get(self._language, "en-IN")
@@ -299,7 +473,7 @@ class SarvamTTS(StreamingTTS):
                         new_key = _rotate_key()
                         if new_key:
                             self._api_key = new_key
-                            self._client = None  # force fresh TLS with new key
+                            self._reset_client()  # force fresh TLS with new key
                             logger.info(
                                 "[TTS:Sarvam] Key rotated — retrying speak() with new key"
                             )
@@ -336,7 +510,7 @@ class SarvamTTS(StreamingTTS):
                                attempt + 1, max_retries, text[:50])
                 # Force new client on next attempt — timeout may mean the
                 # connection is in a bad state (partially sent request).
-                self._client = None
+                self._reset_client()
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
                 # Stale or dropped connection — always reset so the retry
                 # opens a fresh TLS socket.  ConnectError was previously
@@ -345,7 +519,7 @@ class SarvamTTS(StreamingTTS):
                 # from a corrupted partial stream).
                 logger.warning("[TTS:Sarvam] Stale/dropped connection (attempt %d/%d): %s — resetting client",
                                attempt + 1, max_retries, exc)
-                self._client = None
+                self._reset_client()
             except Exception:
                 logger.exception("[TTS:Sarvam] Stream error (attempt %d/%d)",
                                  attempt + 1, max_retries)
@@ -359,7 +533,11 @@ class SarvamTTS(StreamingTTS):
         await self._sink.stop()
 
     async def close(self) -> None:
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        global _shared_client
+        if SARVAM_HTTP_SHARED:
+            client, _shared_client = _shared_client, None
+        else:
+            client, self._client = self._client, None
+        if client:
+            await client.aclose()
             logger.info("[TTS:Sarvam] Client closed")

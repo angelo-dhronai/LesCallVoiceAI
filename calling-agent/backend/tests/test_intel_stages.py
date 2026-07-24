@@ -178,16 +178,21 @@ def test_sweep_overdue_marks_missed(pg_test_db):
     from shared.db.database import get_db
     from shared.intelligence import followup
 
+    # Assert on OUR row, never on the global count: earlier tests in this
+    # session leave legitimately-scheduled rows whose times age past sweep's
+    # 1-hour grace as the wall clock advances (a "== 1" here went red at
+    # exactly 12:30 IST on 2026-07-24 while passing all morning).
     with get_db() as db:
-        db.execute(
+        row_id = db.execute(
             """INSERT INTO followups (owner, decision, status, scheduled_at, source)
                VALUES ('t@x.com', 'yes', 'scheduled',
-                       now() - interval '3 hours', 'pipeline')""",
-        )
-    assert followup.sweep_overdue() == 1
+                       now() - interval '3 hours', 'pipeline')
+               RETURNING id""",
+        ).fetchone()["id"]
+    assert followup.sweep_overdue() >= 1
     with get_db() as db:
         status = db.execute(
-            "SELECT status FROM followups ORDER BY id DESC LIMIT 1"
+            "SELECT status FROM followups WHERE id=?", (row_id,)
         ).fetchone()["status"]
     assert status == "missed"
 

@@ -22,6 +22,9 @@ credit_log/
 recordings/
 *.wav
 *.mp3
+# …except the pre-generated TTS voice previews (product assets — each
+# regeneration costs real Sarvam credits; deploy/generate_voice_samples.py)
+!data/voice_samples/*.wav
 
 # Environment
 .env

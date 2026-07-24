@@ -5,7 +5,7 @@ import {
   copilotChat, copilotSession, copilotSessions, copilotDeleteSession,
   copilotUpload, applyPendingChange, discardPendingChange,
   type CopilotAction, type TranscriptMsg, type SessionSummary,
-  type InterviewProgress, type PendingChange,
+  type InterviewProgress, type PendingChange, type VoiceSample,
 } from '../api/copilot'
 import { cx, Badge, Button, EmptyState, Spinner } from '../components/ui'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
@@ -14,7 +14,7 @@ import { ActivateAgentModal, type ActivateTarget } from '../components/ActivateA
 import {
   Sparkles, SendHorizontal, RotateCcw, Check, X, ArrowDown,
   Plus, Pencil, Radio, Bot, Trash2, MessagesSquare, SquarePen, Lightbulb,
-  Paperclip, FileText, ClipboardList, Eye, EyeOff, PlayCircle,
+  Paperclip, FileText, ClipboardList, Eye, EyeOff, PlayCircle, Volume2,
 } from 'lucide-react'
 
 /* ─────────────────────────── session id ─────────────────────────── */
@@ -199,6 +199,10 @@ type ActionWithAgent = CopilotAction & { agent?: string }
 function ActionChips({ actions }: { actions?: CopilotAction[] }) {
   const [trying, setTrying] = useState<string | null>(null)
   const [activating, setActivating] = useState<ActivateTarget | null>(null)
+  // Failed chips carry the full refusal/error text but render one line —
+  // click toggles the full message so "Refused: the user has not…" is
+  // actually readable (a real support complaint, 2026-07-24).
+  const [expanded, setExpanded] = useState<Set<number>>(new Set())
   // The agent list is already loaded for the sidebar; it carries call_direction,
   // which decides whether activating binds the inbound or the outbound slot.
   const { data: agentsData } = useGet<{ agents?: { name: string; agent_name?: string; call_direction?: string }[] }>(
@@ -212,17 +216,25 @@ function ActionChips({ actions }: { actions?: CopilotAction[] }) {
       <span className="eyebrow text-2xs">Actions taken</span>
       <div className="mt-1 flex flex-wrap gap-1.5">
         {actions.map((a, i) => (
-          <span
+          <button
             key={i}
-            className="inline-flex max-w-full"
-            title={a.ok ? a.tool : `${a.tool} failed — ask the copilot to retry this step`}
+            type="button"
+            className="inline-flex max-w-full text-left"
+            title={a.ok ? a.tool : a.summary}
+            onClick={() => setExpanded((s) => {
+              const n = new Set(s)
+              n.has(i) ? n.delete(i) : n.add(i)
+              return n
+            })}
           >
             <Badge tone={a.ok ? 'mint' : 'rose'}>
               {a.ok ? <Check size={11} /> : <X size={11} />}
               <code className="font-mono text-2xs opacity-70">{a.tool}</code>
-              <span className="truncate">{a.summary}</span>
+              <span className={expanded.has(i)
+                ? 'whitespace-normal break-words'
+                : 'truncate'}>{a.summary}</span>
             </Badge>
-          </span>
+          </button>
         ))}
       </div>
       {/* Per-agent quick actions — the copilot just changed this agent, so the
@@ -298,6 +310,49 @@ function AssistantText({ content }: { content: string }) {
   )
 }
 
+/* Playable voice previews — rendered when the copilot names TTS voices while
+   discussing them, so the user hears a voice before committing to it. One
+   shared <audio> element: starting a sample stops the previous one. */
+function VoicePreviewRow({ samples }: { samples?: VoiceSample[] }) {
+  const [playing, setPlaying] = useState<string | null>(null)
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  useEffect(() => () => { audioRef.current?.pause() }, [])
+  if (!samples?.length) return null
+  const toggle = (s: VoiceSample) => {
+    const a = audioRef.current
+    if (playing === s.speaker && a) {
+      a.pause()
+      setPlaying(null)
+      return
+    }
+    a?.pause()
+    const next = new Audio(s.url)
+    audioRef.current = next
+    next.onended = () => setPlaying(null)
+    next.onerror = () => setPlaying(null)
+    next.play().then(() => setPlaying(s.speaker)).catch(() => setPlaying(null))
+  }
+  return (
+    <div className="mt-2 flex flex-wrap gap-1.5">
+      {samples.map((s) => (
+        <button
+          key={s.speaker}
+          type="button"
+          onClick={() => toggle(s)}
+          className="inline-flex rounded-full"
+          title={`Play a sample of ${s.speaker} (${s.gender} voice)`}
+        >
+          <Badge tone={playing === s.speaker ? 'mint' : 'indigo'}>
+            {playing === s.speaker ? <Volume2 size={11} /> : <PlayCircle size={11} />}
+            <span className="capitalize">{s.speaker}</span>
+            <span className="opacity-60">{s.gender === 'female' ? '♀' : '♂'}</span>
+          </Badge>
+        </button>
+      ))}
+    </div>
+  )
+}
+
 function Bubble({ msg, onRetry }: { msg: ChatMsg; onRetry?: () => void }) {
   if (msg.role === 'user') {
     return (
@@ -327,6 +382,7 @@ function Bubble({ msg, onRetry }: { msg: ChatMsg; onRetry?: () => void }) {
             </Button>
           </div>
         )}
+        <VoicePreviewRow samples={msg.voice_samples} />
         <ActionChips actions={msg.actions} />
       </div>
     </div>
@@ -700,7 +756,7 @@ export default function CopilotChat() {
         localStorage.setItem(SID_KEY, realSid)
         setSid(realSid)
       }
-      setMessages((m) => [...m, { role: 'assistant', content: res.reply, actions: res.actions }])
+      setMessages((m) => [...m, { role: 'assistant', content: res.reply, actions: res.actions, voice_samples: res.voice_samples }])
       setInterview(res.interview ?? null)
       setPendingChanges(res.pending_changes ?? [])
       if (res.agents_changed) refresh(['agents'])

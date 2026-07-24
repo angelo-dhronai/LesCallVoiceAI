@@ -287,8 +287,15 @@ INTERVIEW_LAYERS: list[InterviewLayer] = [
     InterviewLayer(
         "call_flow", "Call flow", True,
         ["call_flow.stages"],
-        "Walk me through the ideal call, step by step — I'll turn each step into "
-        "a stage. What must be true before moving past each step?",
+        "Let's map the ideal call in 3-5 steps — I'll turn each into a stage. "
+        "Three specific things: (1) right after the hello, what should the "
+        "agent ask or say first? (2) what comes in the middle — pitch first or "
+        "questions first, and in what order? (3) how should the call end when "
+        "the person is interested, and when they're not?",
+        followup_hint="For each step: what must be TRUE before moving to the "
+                      "next one (e.g. 'budget confirmed', 'interest shown')? "
+                      "Propose defaults from the business type instead of "
+                      "making the user invent them.",
         done=_done_call_flow),
     InterviewLayer(
         "data_capture", "Data capture", True,

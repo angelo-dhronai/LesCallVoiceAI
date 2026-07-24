@@ -27,6 +27,8 @@ from .voice_catalog import (  # single source of truth — re-exported here
     DEFAULT_TTS_SPEAKER,
     PLATFORM_LANGUAGES,
     VALID_TTS_MODELS,
+    speaker_gender,
+    speaker_models,
 )
 
 logger = logging.getLogger(__name__)
@@ -159,6 +161,22 @@ class TTSVoiceConfig:
             self.model = DEFAULT_TTS_MODEL
         if not (self.speaker or "").strip():
             self.speaker = DEFAULT_TTS_SPEAKER
+        # Speaker↔model compatibility (dead-air prevention, 2026-07-24): the
+        # bulbul:v3 roster is verified against the live API — a legacy v2-only
+        # speaker (abhilash, anushka, …) riding a v3 model 400s every
+        # utterance and the call goes silent. Repair to the same-gender v3
+        # default. UNKNOWN speakers pass through untouched (warn-only
+        # doctrine), and non-v3 models are left alone (v2 roster unverified).
+        _spk = self.speaker.strip().lower()
+        _known_models = speaker_models(_spk)
+        if (_known_models is not None
+                and self.model in ("bulbul:v3", "bulbul:v3-beta")
+                and self.model not in _known_models):
+            _fb = "simran" if speaker_gender(_spk) == "female" else "shubh"
+            logging.getLogger(__name__).warning(
+                "[TTSVoiceConfig] speaker %r is not available on %s — using %s",
+                _spk, self.model, _fb)
+            self.speaker = _fb
         try:
             self.pace = float(self.pace)
         except (TypeError, ValueError):

@@ -36,6 +36,9 @@ export type PendingChange = {
   reason?: string
 }
 
+/** A playable TTS voice preview (served from /api/voices/sample/<speaker>). */
+export type VoiceSample = { speaker: string; gender: string; url: string }
+
 export type ChatResponse = {
   reply: string
   actions: CopilotAction[]
@@ -43,12 +46,14 @@ export type ChatResponse = {
   session?: SessionSummary
   interview?: InterviewProgress
   pending_changes?: PendingChange[]
+  voice_samples?: VoiceSample[]
 }
 
 export type TranscriptMsg = {
   role: 'user' | 'assistant'
   content: string
   actions?: CopilotAction[]
+  voice_samples?: VoiceSample[]
 }
 
 /* ───────────────────────── calls ───────────────────────── */

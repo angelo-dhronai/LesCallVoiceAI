@@ -39,6 +39,8 @@ from fastapi.staticfiles import StaticFiles
 LESCALL_ROOT  = Path("/home/angelo/lescall")
 CREDIT_LOG_DIR = LESCALL_ROOT / "credit_log"
 RECORDINGS_DIR = LESCALL_ROOT / "recordings"
+# Pre-generated TTS voice previews (deploy/generate_voice_samples.py).
+VOICE_SAMPLES_DIR = LESCALL_ROOT / "data" / "voice_samples"
 RUNTIME_DIR   = LESCALL_ROOT / "phase14_runtime"
 LOGS_LATEST   = RUNTIME_DIR / "logs" / "latest"
 STATIC_DIR    = Path(__file__).parent / "static"
@@ -2007,6 +2009,37 @@ async def recording_audio(folder: str, request: Request, download: int = Query(0
     if not _can_see_folder(folder, _acting_owner(request)):
         return JSONResponse({"error": "not found"}, status_code=404)
     return _stream_recording(folder, _gcs_object_for(folder), bool(download))
+
+
+# ── TTS voice previews ──────────────────────────────────────────────────────
+# Platform-wide samples (no tenant scoping — behind the login wall like every
+# other route). The copilot names voices during the interview; the chat UI
+# renders these as play buttons so users hear a voice before choosing it.
+
+@app.get("/api/voices")
+async def list_voice_samples():
+    try:
+        index = json.loads((VOICE_SAMPLES_DIR / "index.json").read_text())
+    except Exception:
+        index = []
+    voices = [
+        {**v, "sample_url": f"/api/voices/sample/{v['speaker']}"}
+        for v in index
+        if isinstance(v, dict) and re.fullmatch(r"[a-z]+", str(v.get("speaker", "")))
+        and (VOICE_SAMPLES_DIR / f"{v['speaker']}.wav").exists()
+    ]
+    return {"voices": voices}
+
+
+@app.get("/api/voices/sample/{speaker}")
+async def voice_sample(speaker: str):
+    if not re.fullmatch(r"[a-z]+", speaker):
+        return JSONResponse({"error": "invalid speaker"}, status_code=400)
+    path = VOICE_SAMPLES_DIR / f"{speaker}.wav"
+    if not path.exists():
+        return JSONResponse({"error": "no sample for this voice"}, status_code=404)
+    return FileResponse(str(path), media_type="audio/wav",
+                        headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/api/recordings/dl/{token}")

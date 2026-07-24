@@ -217,7 +217,7 @@ def test_create_refused_without_explicit_build_instruction(cop):
     guard = {"user_turns": 4, "created_this_turn": False, "session": session,
              "user_message": "here is our brochure text about the clinic",
              "sid": "sg1"}
-    with pytest.raises(ValueError, match="not explicitly asked to build"):
+    with pytest.raises(ValueError, match="Held until the user says yes"):
         _run(cop_mod._execute_tool("create_agent",
                                    {"name": "gate_test", "definition": {}},
                                    guard))
@@ -231,7 +231,7 @@ def test_long_paste_with_incidental_verb_is_not_consent(cop):
     paste = ("we build lasting smiles for families. " * 60)
     guard = {"user_turns": 4, "created_this_turn": False, "session": session,
              "user_message": paste, "sid": "sg2"}
-    with pytest.raises(ValueError, match="not explicitly asked to build"):
+    with pytest.raises(ValueError, match="Held until the user says yes"):
         _run(cop_mod._execute_tool("create_agent",
                                    {"name": "gate_test2", "definition": {}},
                                    guard))

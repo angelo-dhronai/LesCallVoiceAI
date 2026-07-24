@@ -97,9 +97,51 @@ def test_filler_defaults_are_ungoverned():
 
 def test_filler_max_per_call_caps():
     router = make_router(llm_config={"filler_max_per_call": 1})
+    router.state.turn_count = 5   # past the greeting-turn suppression
     assert router._filler_allowed() is True
     router._fillers_played = 1
     assert router._filler_allowed() is False
+
+
+# ── stage suppression (2026-07-23): no filler before the agent has even
+#    introduced itself, none glued onto the goodbye ────────────────────────
+
+def test_filler_suppressed_on_first_llm_turn():
+    router = make_router()
+    router.state.turn_count = 0
+    assert router._filler_allowed() is False
+    router.state.turn_count = 1
+    assert router._filler_allowed() is False
+    router.state.turn_count = 2
+    assert router._filler_allowed() is True
+
+
+def test_filler_suppressed_while_closing():
+    router = make_router()
+    router.state.turn_count = 8
+    router.state.is_closing = True
+    assert router._filler_allowed() is False
+
+
+# ── platform floor: per-agent filler_timeout_s can never undercut the
+#    measured-LLM-latency floor (fillers below it ADD delay) ───────────────
+
+def test_filler_timeout_floored(monkeypatch):
+    monkeypatch.delenv("FILLER_TIMEOUT_FLOOR_S", raising=False)
+    router = make_router(llm_config={"filler_timeout_s": 0.6})
+    assert router._effective_filler_timeout() == 1.5
+
+
+def test_filler_timeout_agent_value_above_floor_wins(monkeypatch):
+    monkeypatch.delenv("FILLER_TIMEOUT_FLOOR_S", raising=False)
+    router = make_router(llm_config={"filler_timeout_s": 2.5})
+    assert router._effective_filler_timeout() == 2.5
+
+
+def test_filler_timeout_floor_env_override(monkeypatch):
+    monkeypatch.setenv("FILLER_TIMEOUT_FLOOR_S", "0.8")
+    router = make_router(llm_config={"filler_timeout_s": 0.6})
+    assert router._effective_filler_timeout() == 0.8
 
 
 def test_filler_min_gap_turns():

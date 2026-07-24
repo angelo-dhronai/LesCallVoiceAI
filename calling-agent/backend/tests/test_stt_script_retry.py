@@ -270,3 +270,32 @@ def test_validate_transcript_ex_reason_codes():
     assert validate_transcript_ex(GURMUKHI_ACK) == ("", SCRIPT_REJECT_REASON)
     assert validate_transcript_ex("thank you for watching")[1] == "hallucination"
     assert validate_transcript_ex("")[1] == "empty"
+
+
+# ── digit exemption on the repetition filter (2026-07-23) ───────────────────
+# A real caller read out their phone number — "Nain Nain Nain 9810068133",
+# confidence 1.00 — and the repetition heuristic (3/4 words identical = 0.75)
+# rejected it, so the agent said "couldn't hear you" to the most valuable
+# utterance on the call. Number read-outs are inherently repetitive; a
+# transcript carrying ≥5 digits must never be dropped by that heuristic.
+
+def test_repetition_waived_for_digit_bearing_transcripts():
+    from app.voice.stt.router import validate_transcript_ex
+    text, reason = validate_transcript_ex("Nain Nain Nain 9810068133")
+    assert text != ""
+    assert reason is None
+
+
+def test_repetition_still_rejects_digitless_repeats():
+    from app.voice.stt.router import validate_transcript_ex
+    text, reason = validate_transcript_ex("okay okay okay okay")
+    assert text == ""
+    assert reason == "repetition"
+
+
+def test_repetition_not_waived_below_five_digits():
+    from app.voice.stt.router import validate_transcript_ex
+    # "na na na 42" — repetitive noise with an incidental number
+    text, reason = validate_transcript_ex("yes yes yes 42")
+    assert text == ""
+    assert reason == "repetition"

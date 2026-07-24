@@ -200,8 +200,10 @@ def test_unscheduled_row_is_never_dialled():
 
 # ── contact linkage ─────────────────────────────────────────────────────────
 
-def test_no_contact_handle_is_not_dialable():
-    r = row(contact_handle=None)
+def test_no_dial_phone_is_not_dialable():
+    # 0008 change: the requirement is a dialable NUMBER, not a live contacts
+    # row — dial_phone falls back to calls.phone, so only its absence blocks.
+    r = row(contact_handle=None, dial_phone=None)
     assert autodial.blocked_reason(r, now=at(0, 12), placed_today=0) == "no_contact"
 
 
@@ -249,3 +251,70 @@ def test_kill_switch_defaults_on_but_is_overridable():
     assert config.AUTODIAL_HOUR_START < config.AUTODIAL_HOUR_END
     assert config.AUTODIAL_MAX_ATTEMPTS >= 1
     assert 6 not in config.autodial_weekdays()  # Sunday off by default
+
+
+# ── 0008: execution modes — auto-dialling is opt-in ─────────────────────────
+# The 0007 executor dialled EVERY decision='yes' row; mode='auto' (default
+# 'manual') restores the product intent. The filter lives in SQL, so pin the
+# SQL itself; the guardrail deltas are pure and tested directly.
+
+def test_due_sql_selects_only_opted_in_rows():
+    assert "f.mode = 'auto'" in autodial._DUE_SQL
+    assert "f.decision = 'yes'" in autodial._DUE_SQL
+
+
+def test_due_sql_carries_outcome_loop_fields():
+    for col in ("f.max_attempts", "f.next_attempt_at", "f.created_at",
+                "last_contact_call_at", "commitment_text"):
+        assert col in autodial._DUE_SQL
+
+
+def test_superseded_when_a_newer_call_already_happened():
+    r = row(created_at=at(0, 8), last_contact_call_at=at(0, 12))
+    reason = autodial.blocked_reason(r, now=at(0, 14), placed_today=0)
+    assert reason == "superseded"
+    assert "superseded" in autodial.PERMANENT
+
+
+def test_not_superseded_by_the_originating_call():
+    # The call that CREATED the follow-up precedes it — must not supersede.
+    r = row(created_at=at(0, 8), last_attempt_at=None,
+            last_contact_call_at=at(0, 7, 30))
+    assert autodial.blocked_reason(r, now=at(0, 14), placed_today=0) is None
+
+
+def test_per_row_max_attempts_overrides_config():
+    r = row(attempts=1, max_attempts=1)
+    assert autodial.blocked_reason(r, now=at(0, 14), placed_today=0) == "retry_cap"
+    # NULL max_attempts falls back to the platform default
+    r2 = row(attempts=1, max_attempts=None)
+    assert autodial.blocked_reason(r2, now=at(0, 14), placed_today=0) is None
+
+
+def test_explicit_next_attempt_at_wins_over_implicit_gap():
+    # last attempt long ago (implicit gap satisfied) but explicit backoff
+    # still in the future → blocked
+    r = row(attempts=1, last_attempt_at=at(0, 10),
+            next_attempt_at=at(0, 15))
+    assert autodial.blocked_reason(r, now=at(0, 14), placed_today=0) == "retry_gap"
+    # explicit backoff elapsed → clear
+    assert autodial.blocked_reason(r, now=at(0, 15, 30), placed_today=0) is None
+
+
+def test_deleted_contact_no_longer_blocks_when_phone_resolves():
+    """The 38-followups incident: users delete/recreate contacts routinely;
+    a dangling contact_id with a dialable phone from the calls join must not
+    be a permanent block."""
+    r = row(contact_handle=None, dial_phone="+919876543210")
+    assert autodial.blocked_reason(r, now=at(0, 14), placed_today=0) is None
+
+
+def test_no_phone_anywhere_is_still_permanent():
+    r = row(contact_handle=None, dial_phone=None)
+    assert autodial.blocked_reason(r, now=at(0, 14), placed_today=0) == "no_contact"
+    assert "no_contact" in autodial.PERMANENT
+
+
+def test_explain_covers_superseded():
+    text = autodial.explain("superseded")
+    assert "newer call" in text

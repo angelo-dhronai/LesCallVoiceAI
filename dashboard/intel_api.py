@@ -268,15 +268,31 @@ async def intel_search_calls(request: Request, q: str = "",
         return {"items": [], "degraded": result["degraded"], "query": q}
 
     def _hydrate():
+        # Column list mirrors intel_calls (including the follow-up LATERAL):
+        # search results render in the SAME frontend table, and the slimmer
+        # list this used to select made every AI-filtered row show a blank
+        # Opp score and Follow-up "no" — even for calls with one scheduled.
         with get_db() as db:
             rows = [dict(r) for r in db.execute(
                 """SELECT c.id AS call_id, c.call_key, c.phone, c.direction,
                           c.agent_slug, c.started_at, c.duration_s, c.contact_id,
+                          c.language, c.outcome,
                           ct.name AS contact_name,
                           ci.summary, ci.customer_intent, ci.sentiment,
-                          ci.lead_score, ci.risk_score, ci.tags
+                          ci.urgency, ci.lead_score, ci.opportunity_score,
+                          ci.risk_score, ci.compliance_score, ci.confidence,
+                          ci.low_confidence, ci.tags, ci.processed_at,
+                          f.id AS followup_id, f.decision AS followup_decision,
+                          f.status AS followup_status,
+                          f.scheduled_at AS followup_at,
+                          f.priority AS followup_priority
                      FROM calls c
                      LEFT JOIN call_intelligence ci ON ci.call_id = c.id
+                     LEFT JOIN LATERAL (
+                           SELECT * FROM followups f2
+                            WHERE f2.call_id = c.id AND f2.deleted_at IS NULL
+                            ORDER BY f2.id DESC LIMIT 1
+                     ) f ON true
                      LEFT JOIN contacts ct ON ct.id = c.contact_id
                     WHERE c.owner = ? AND c.id = ANY(?)""",
                 (owner, ids),
@@ -506,20 +522,23 @@ def followups_list(owner: str = Depends(current_owner), bucket: str = "",
 def followup_create(body: dict, owner: str = Depends(current_owner)):
     if not body.get("reason") and not body.get("summary"):
         raise HTTPException(status_code=422, detail="reason or summary required")
+    mode = body.get("mode") or "manual"
+    if mode not in ("manual", "auto"):
+        raise HTTPException(status_code=422, detail="bad mode")
     with get_db() as db:
         row = db.execute(
             """INSERT INTO followups
                    (owner, call_id, contact_id, decision, confidence, explanation,
                     reason, summary, followup_type, promised_by, scheduled_at,
-                    priority, status, assigned_to, source, audit)
+                    priority, status, assigned_to, source, mode, audit)
                VALUES (?, ?, ?, 'yes', 1.0, 'Created manually', ?, ?, ?, NULL,
-                       ?, ?, 'scheduled', ?, 'manual', ?)
+                       ?, ?, 'scheduled', ?, 'manual', ?, ?)
                RETURNING id""",
             (owner, body.get("call_id"), body.get("contact_id"),
              body.get("reason"), body.get("summary"),
              body.get("followup_type") or "callback",
              body.get("scheduled_at"), body.get("priority") or "medium",
-             body.get("assigned_to"),
+             body.get("assigned_to"), mode,
              json.dumps([_now_audit(owner, "created", "manual")])),
         ).fetchone()
     if body.get("contact_id"):
@@ -533,7 +552,7 @@ def followup_create(body: dict, owner: str = Depends(current_owner)):
 
 
 _FU_PATCHABLE = ("status", "scheduled_at", "priority", "assigned_to",
-                 "followup_type", "reason", "summary")
+                 "followup_type", "reason", "summary", "mode", "max_attempts")
 
 
 @router.patch("/followups/{fid}")
@@ -543,8 +562,25 @@ def followup_patch(fid: int, body: dict, owner: str = Depends(current_owner)):
         if field in body:
             if field == "status" and body["status"] not in _FU_STATUSES:
                 raise HTTPException(status_code=422, detail="bad status")
+            # mode flips are the human override on auto-dialling; validated
+            # here so a typo can never mean "the platform calls people".
+            if field == "mode" and body["mode"] not in ("manual", "auto"):
+                raise HTTPException(status_code=422, detail="bad mode")
+            if field == "max_attempts":
+                try:
+                    body["max_attempts"] = (
+                        None if body["max_attempts"] in (None, "")
+                        else max(0, min(10, int(body["max_attempts"]))))
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=422,
+                                        detail="max_attempts must be 0-10")
             sets.append(f"{field}=?")
             params.append(body[field])
+    # Re-arming a follow-up for auto-dialling clears a previous permanent
+    # block — otherwise the toggle is a no-op the user can't see past.
+    if body.get("mode") == "auto":
+        sets.append("autodial_blocked_at=NULL")
+        sets.append("last_attempt_error=NULL")
     note = (body.get("note") or "").strip()
     if not sets and not note:
         raise HTTPException(status_code=422, detail="nothing to update")
@@ -911,10 +947,15 @@ def contact_timeline(contact_id: int, owner: str = Depends(current_owner),
             where.append("kind = ANY(?)")
             params.append(kind_list)
         rows = [dict(r) for r in db.execute(
+            # ORDER BY must match the cursor key. This sorted by occurred_at
+            # while paginating on id — a late-inserted event with an older
+            # occurred_at (missed-call backfills do this) could be skipped or
+            # duplicated across pages. ids are assigned in emit order and the
+            # UI labels rows from payload timestamps, so id alone is correct.
             f"""SELECT id, kind, ref_table, ref_id, occurred_at, payload
                   FROM contact_events
                  WHERE {' AND '.join(where)}
-                 ORDER BY occurred_at DESC, id DESC LIMIT ?""",
+                 ORDER BY id DESC LIMIT ?""",
             (*params, limit)).fetchall()]
     for r in rows:
         r["payload"] = _j(r.get("payload"), "{}")

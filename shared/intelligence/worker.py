@@ -69,12 +69,24 @@ def _beat(extra: dict | None = None) -> None:
     try:
         from shared.db.database import get_db
 
+        import datetime as _dt
+
         with get_db() as db:
+            # A real timestamp, and updated_at bumped on every upsert: the
+            # old payload wrote the literal string "now" and updated_at only
+            # got its INSERT default, so a dead worker was indistinguishable
+            # from a live one — the dashboard would show a fresh-looking
+            # beat forever.
             db.execute(
                 """INSERT INTO settings (owner, key, value)
                    VALUES ('', 'intel_worker_beat', ?)
-                   ON CONFLICT (owner, key) DO UPDATE SET value=EXCLUDED.value""",
-                (json.dumps({"worker": WORKER_ID, "at": "now", "queue": counts}),),
+                   ON CONFLICT (owner, key)
+                   DO UPDATE SET value=EXCLUDED.value, updated_at=now()""",
+                (json.dumps({
+                    "worker": WORKER_ID,
+                    "at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                    "queue": counts,
+                }),),
             )
     except Exception:
         pass

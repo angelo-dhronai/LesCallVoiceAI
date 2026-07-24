@@ -6,12 +6,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  Check, ExternalLink, Info, Pencil, PhoneCall, Plus, RefreshCw, X,
+  Check, ExternalLink, Info, Pencil, PhoneCall, Plus, RefreshCw, X, Zap,
 } from 'lucide-react'
 import { useGet, useRefresh } from '../api/hooks/useApi'
 import { patch, post } from '../api/mutate'
 import type { Followup } from '../api/intel'
-import { Button, Card, cx, IconButton, Spinner } from '../components/ui'
+import { Badge, Button, Card, cx, IconButton, Spinner } from '../components/ui'
 import {
   AsyncState, Field, Input, PageHeader, Pagination, Segmented, Select,
   StatusBadge, Table, TD, TH, THead, TR, Textarea,
@@ -84,6 +84,7 @@ export default function FollowUps() {
   const [editPriority, setEditPriority] = useState('medium')
   const [editAssignee, setEditAssignee] = useState('')
   const [editNote, setEditNote] = useState('')
+  const [editMode, setEditMode] = useState<'manual' | 'auto'>('manual')
   const [busy, setBusy] = useState(false)
   const [callingId, setCallingId] = useState<number | null>(null)
 
@@ -96,6 +97,7 @@ export default function FollowUps() {
     setEditWhen(toLocalInput(f.scheduled_at))
     setEditPriority(f.priority)
     setEditAssignee(f.assigned_to ?? '')
+    setEditMode(f.mode === 'auto' ? 'auto' : 'manual')
     setEditNote('')
   }
 
@@ -168,6 +170,8 @@ export default function FollowUps() {
         priority: editPriority,
         assigned_to: editAssignee || undefined,
         status: editWhen ? 'scheduled' : undefined,
+        mode: editMode !== (editing.mode === 'auto' ? 'auto' : 'manual')
+          ? editMode : undefined,
         note: editNote || undefined,
       })
       toast('Follow-up updated', 'success')
@@ -273,7 +277,18 @@ export default function FollowUps() {
                     </TD>
                     <TD>{f.followup_type?.replace(/_/g, ' ') ?? '—'}</TD>
                     <TD><StatusBadge value={f.priority} /></TD>
-                    <TD><StatusBadge value={f.status} /></TD>
+                    <TD>
+                      <div className="flex flex-wrap items-center gap-1">
+                        <StatusBadge value={f.status} />
+                        {/* Auto = the platform itself places this call at the
+                            scheduled time. Manual rows never auto-dial. */}
+                        {f.mode === 'auto' && (
+                          <Badge tone="indigo" soft>
+                            <Zap size={10} /> auto
+                          </Badge>
+                        )}
+                      </div>
+                    </TD>
                     <TD className="max-w-[320px]">
                       <span className="line-clamp-2 text-xs text-dim"
                         title={f.explanation ?? ''}>
@@ -296,6 +311,9 @@ export default function FollowUps() {
                           Auto-called {f.attempts}×
                           {f.last_attempt_at
                             ? ` · last ${f.last_attempt_at.slice(0, 16).replace('T', ' ')}` : ''}
+                          {f.execution_outcome ? ` · ${f.execution_outcome.replace(/_/g, ' ')}` : ''}
+                          {f.next_attempt_at && !['completed', 'cancelled'].includes(f.status)
+                            ? ` · next try ${f.next_attempt_at.slice(5, 16).replace('T', ' ')}` : ''}
                         </span>
                       )}
                     </TD>
@@ -375,6 +393,26 @@ export default function FollowUps() {
                 onChange={(e) => setEditAssignee(e.target.value)} />
             </Field>
           </div>
+          <Field label="Execution">
+            <Segmented<'manual' | 'auto'>
+              value={editMode}
+              onChange={setEditMode}
+              options={[
+                { value: 'manual', label: 'Manual — I call' },
+                { value: 'auto', label: 'Auto — platform calls' },
+              ]} />
+            <p className="mt-1.5 text-2xs text-dim">
+              {editMode === 'auto'
+                ? 'The platform places this call itself at the scheduled time (10:00–19:00 IST, Mon–Sat, retry with backoff). The agent opens the call remembering the previous conversation and this follow-up’s reason.'
+                : 'Stays on your list — use the call button when you’re ready.'}
+            </p>
+            {editing?.autodial_blocked_at && editMode === 'auto' && (
+              <p className="mt-1 text-2xs text-amber-600 dark:text-amber-300">
+                Auto-calling was previously stopped ({editing.last_attempt_error ?? 'blocked'}).
+                Saving re-arms it.
+              </p>
+            )}
+          </Field>
           <Field label="Add note">
             <Textarea rows={2} value={editNote}
               onChange={(e) => setEditNote(e.target.value)} />

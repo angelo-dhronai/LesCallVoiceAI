@@ -546,6 +546,14 @@ class FollowUpConfig:
     # ONE polite clarifying question so the follow-up can be scheduled
     # precisely. {enabled: false} — off by default; existing agents unchanged.
     clarify_commitments: dict = field(default_factory=dict)
+    # Follow-up execution default for THIS agent's calls: {enabled: false}.
+    # When true, yes-decision follow-ups are created with mode='auto' and the
+    # platform's auto-dialer places the call at the scheduled time (subject
+    # to every autodial guardrail + the INTEL_AUTODIAL_ENABLED kill switch).
+    # Off by default — auto-calling a customer is opt-in, per follow-up or
+    # per agent, never platform-imposed. Same shape/precedent as
+    # clarify_commitments.
+    auto_execute: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -958,6 +966,7 @@ class AgentDefinition:
             whatsapp_promise=_as_dict(fu_d, "whatsapp_promise"),
             callback=_as_dict(fu_d, "callback"),
             clarify_commitments=_as_dict(fu_d, "clarify_commitments"),
+            auto_execute=_as_dict(fu_d, "auto_execute"),
         )
 
         pc_d = _as_dict(d, "post_call")

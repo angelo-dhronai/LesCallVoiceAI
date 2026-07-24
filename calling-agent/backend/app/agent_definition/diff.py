@@ -157,8 +157,22 @@ def changed_top_paths(diff: list[dict]) -> set[str]:
 
 
 def is_within(leaf_path: str, allowed_prefixes: set[str]) -> bool:
-    """True when `leaf_path` is equal to or nested under any allowed prefix."""
+    """True when `leaf_path` is equal to, nested under, or an ANCESTOR of any
+    allowed prefix.
+
+    The ancestor direction matters for adds: a proposal allowing
+    `response_bank.localized_responses.hi.opening_greeting` on an agent with
+    no `localized_responses` yet makes compute_diff emit op=add at the new
+    subtree ROOT (`response_bank.localized_responses.hi`) — a PREFIX of the
+    allowed leaf. Without the ancestor rule that legitimate add tripped the
+    scope check and 500'd every diff-card Apply that introduced a new nested
+    section (2026-07-23 copilot audit).
+    """
     for p in allowed_prefixes:
         if leaf_path == p or leaf_path.startswith(p + ".") or leaf_path.startswith(p + "["):
+            return True
+        # leaf_path is an ancestor of an allowed leaf → the write cannot touch
+        # anything outside that leaf's own subtree.
+        if p.startswith(leaf_path + ".") or p.startswith(leaf_path + "["):
             return True
     return False

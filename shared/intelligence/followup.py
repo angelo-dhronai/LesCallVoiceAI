@@ -22,9 +22,12 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 from typing import Any
 
 from shared.db.database import get_db
+
+log = logging.getLogger("intel.followup")
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
@@ -148,6 +151,21 @@ def decide(call: dict[str, Any], judgment: dict[str, Any],
     except Exception:
         pass
 
+    # DND outranks EVERYTHING — including a clarified commitment. A caller who
+    # said "stop calling me" and also happened to utter a time never gets a
+    # follow-up, whatever the extraction LLM concluded.
+    if flags.get("dnd_requested"):
+        return {
+            "decision": "no", "confidence": 1.0,
+            "explanation": "Customer asked not to be contacted again (DND).",
+            "reason": (str(flags.get("dnd_quote") or ""))[:200] or
+                      "Do-not-disturb request during the call",
+            "followup_type": None, "promised_by": None,
+            "scheduled_at": None, "auto_scheduled": 0,
+            "priority": _PRIORITY_DEFAULT, "status": "archived",
+            "source": "pipeline", "commitment_id": None,
+        }
+
     clarified = [c for c in commitments
                  if c.get("source") == "in_call" and c.get("clarified")
                  and c.get("deadline_at")]
@@ -217,8 +235,155 @@ def decide(call: dict[str, Any], judgment: dict[str, Any],
     }
 
 
+def _agent_auto_execute(agent_slug: str | None) -> bool:
+    """Whether this agent's YAML opts its follow-ups into auto-dialling.
+
+    follow_up.auto_execute.enabled — same per-agent-flag pattern as
+    clarify_commitments. Missing agent/file/key all mean False: auto-calling
+    a customer is opt-in, never inferred.
+    """
+    if not agent_slug:
+        return False
+    try:
+        from shared.intelligence.pipeline import _agent_yaml
+
+        ay = _agent_yaml(agent_slug) or {}
+        return bool(((ay.get("follow_up") or {}).get("auto_execute") or {})
+                    .get("enabled"))
+    except Exception:
+        return False
+
+
+def _complete_executed_followup(call: dict[str, Any]) -> None:
+    """Outcome loop: when the analyzed call IS a follow-up's auto-dial,
+    complete that follow-up.
+
+    Join key is call_links.followup_id — stamped by the executor at dial
+    time — matched by owner+digits with the dial preceding the call by at
+    most 30 minutes. Completion additionally requires a non-agent transcript
+    turn so a dead pickup can't complete anything. (A voicemail greeting DOES
+    transcribe as a caller turn — that residual false-complete is accepted
+    because the voicemail call's own analysis creates a successor follow-up.)
+    """
+    started = call.get("started_at")
+    phone = call.get("phone") or ""
+    owner = call.get("owner") or ""
+    if not (started and phone and owner):
+        return
+    transcript = call.get("transcript") or ""
+    caller_spoke = any(
+        line.strip() and not line.strip().lower().startswith(("agent", "["))
+        for line in transcript.splitlines()
+    )
+    if not caller_spoke:
+        return
+    try:
+        from shared.phone import significant_digits
+
+        sig = significant_digits(phone)
+        with get_db() as db:
+            link = db.execute(
+                """SELECT followup_id FROM call_links
+                    WHERE owner = ? AND sig_digits = ?
+                      AND followup_id IS NOT NULL
+                      AND dialed_at::timestamptz
+                          BETWEEN ?::timestamptz - interval '30 minutes'
+                              AND ?::timestamptz + interval '5 minutes'
+                    ORDER BY dialed_at DESC LIMIT 1""",
+                (owner, sig, started, started),
+            ).fetchone()
+            if not link:
+                return
+            fid = link["followup_id"]
+            updated = db.execute(
+                """UPDATE followups
+                       SET status = 'completed', executed_call_id = ?,
+                           execution_outcome = 'answered',
+                           completed_at = now(), updated_at = now()
+                     WHERE id = ? AND owner = ? AND deleted_at IS NULL
+                       AND mode = 'auto'
+                       AND status IN ('pending', 'scheduled', 'missed')
+                 RETURNING id, contact_id""",
+                (call["id"], fid, owner),
+            ).fetchone()
+        if updated:
+            log.info("followup %s completed by auto-dialled call %s",
+                     fid, call["id"])
+            try:
+                from shared.intelligence import timeline
+
+                if updated["contact_id"]:
+                    timeline.emit(updated["contact_id"], owner,
+                                  "followup.completed",
+                                  ref_table="followups", ref_id=fid,
+                                  payload={"call_id": call["id"],
+                                           "by": "autodial"})
+            except Exception:
+                pass
+    except Exception:
+        log.warning("followup completion hook failed for call %s",
+                    call.get("id"), exc_info=True)
+
+
+def _apply_dnd(call: dict[str, Any]) -> None:
+    """Enforce an in-call 'stop calling me': disposition → rejected (the
+    autodial guardrail that is never overridden), every open follow-up for
+    the contact cancelled + permanently blocked, timeline + notification so
+    a human sees it happened. Idempotent."""
+    try:
+        flags = (json.loads(call.get("collected_data") or "{}") or {}).get(
+            "flags", {}) or {}
+    except Exception:
+        return
+    if not flags.get("dnd_requested"):
+        return
+    owner = call.get("owner") or ""
+    contact_id = call.get("contact_id")
+    quote = str(flags.get("dnd_quote") or "")[:200]
+    with get_db() as db:
+        if contact_id:
+            db.execute(
+                "UPDATE contacts SET disposition='rejected', "
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?", (contact_id,))
+            cancelled = [dict(r) for r in db.execute(
+                """UPDATE followups
+                       SET status='cancelled', autodial_blocked_at=now(),
+                           last_attempt_error='Customer asked not to be contacted (DND).',
+                           updated_at=now()
+                     WHERE contact_id=? AND owner=? AND deleted_at IS NULL
+                       AND status IN ('pending','scheduled','missed')
+                 RETURNING id""",
+                (contact_id, owner),
+            ).fetchall()]
+        else:
+            cancelled = []
+    log.info("DND enforced for call %s (contact=%s): %d open follow-up(s) "
+             "cancelled", call.get("id"), contact_id, len(cancelled))
+    try:
+        from shared.intelligence import notify, timeline
+
+        if contact_id:
+            timeline.emit(contact_id, owner, "contact.dnd",
+                          ref_table="calls", ref_id=call.get("id"),
+                          payload={"quote": quote,
+                                   "cancelled_followups": len(cancelled)})
+        notify._emit(
+            owner, "contact.dnd", "warning",
+            "Customer asked to stop calls",
+            (f"{call.get('phone') or 'A customer'} asked not to be "
+             f"contacted again — marked DND, {len(cancelled)} open "
+             f"follow-up(s) cancelled. Quote: “{quote}”"),
+            f"/intelligence/{call.get('call_key') or call.get('id')}",
+            f"dnd:{call.get('id')}")
+    except Exception:
+        log.warning("DND notify/timeline failed for call %s", call.get("id"),
+                    exc_info=True)
+
+
 async def stage_followup(call: dict[str, Any]) -> None:
     call_id = call["id"]
+    _complete_executed_followup(call)
+    _apply_dnd(call)
     ingest_in_call_commitments(call)
     with get_db() as db:
         ci = db.execute(
@@ -242,12 +407,17 @@ async def stage_followup(call: dict[str, Any]) -> None:
             "DELETE FROM followups WHERE call_id=? AND source IN ('pipeline','in_call')",
             (call_id,),
         )
+        # mode: 'auto' only when the agent's YAML opts in AND the decision is
+        # an actionable yes — a human toggle on the row can override later.
+        mode = ("auto" if row["decision"] == "yes"
+                and _agent_auto_execute(call.get("agent_slug")) else "manual")
         db.execute(
             """INSERT INTO followups
                    (owner, call_id, contact_id, commitment_id, decision, confidence,
                     explanation, reason, summary, followup_type, promised_by,
-                    scheduled_at, auto_scheduled, priority, status, source, audit)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    scheduled_at, auto_scheduled, priority, status, source, mode,
+                    audit)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (call.get("owner") or "", call_id, call.get("contact_id"),
              row.get("commitment_id"), row["decision"], row.get("confidence"),
              row.get("explanation"), row.get("reason"),
@@ -255,6 +425,7 @@ async def stage_followup(call: dict[str, Any]) -> None:
              row.get("followup_type"), row.get("promised_by"),
              row.get("scheduled_at"), row.get("auto_scheduled", 0),
              row.get("priority") or _PRIORITY_DEFAULT, row["status"], row["source"],
+             mode,
              json.dumps([{"at": _now().isoformat(), "by": "pipeline",
                           "action": "decision", "detail": row["decision"]}])),
         )
@@ -265,12 +436,18 @@ def sweep_overdue() -> int:
     followup.overdue automation events for each."""
     with get_db() as db:
         rows = [dict(r) for r in db.execute(
+            # mode='auto' rows still inside their retry budget belong to the
+            # executor — flipping them 'missed' an hour past schedule made
+            # the UI disagree with reality (row shown missed, then dialled
+            # anyway, then flipped back). They age into 'missed' only once
+            # permanently blocked.
             """UPDATE followups
                    SET status='missed', updated_at=now()
                  WHERE status IN ('pending', 'scheduled')
                    AND scheduled_at IS NOT NULL
                    AND scheduled_at < now() - interval '1 hour'
                    AND deleted_at IS NULL
+                   AND NOT (mode = 'auto' AND autodial_blocked_at IS NULL)
              RETURNING id, owner, call_id, priority, reason""",
         ).fetchall()]
     if rows:

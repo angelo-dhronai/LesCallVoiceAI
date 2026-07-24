@@ -279,15 +279,27 @@ def validate_transcript_ex(text: str) -> tuple[str, str | None]:
                         text, hallucination)
             return "", "devanagari_hallucination"
 
-    # Repetition check: if >60% of words are the same word
+    # Repetition check: if >60% of words are the same word.
+    # Digit exemption (2026-07-23): number read-outs are inherently
+    # repetitive — a real caller spoke "Nain Nain Nain 9810068133"
+    # (confidence 1.00) and the ratio 0.75 rejection made the agent say
+    # "couldn't hear you" to the highest-value utterance on the call. A
+    # transcript carrying ≥5 total digits is passed through: phone numbers,
+    # budgets and pincodes are exactly what we must never drop.
     words = cleaned.split()
     if len(words) >= 3:
+        digit_count = sum(ch.isdigit() for ch in cleaned)
         counts = Counter(words)
         most_common_count = counts.most_common(1)[0][1]
         if most_common_count / len(words) > _REPETITION_THRESHOLD:
-            logger.info("[STT-FILTER] reason=repetition text=%r ratio=%.2f",
-                        text, most_common_count / len(words))
-            return "", "repetition"
+            if digit_count >= 5:
+                logger.info(
+                    "[STT-FILTER] repetition waived (digits=%d) text=%r",
+                    digit_count, text)
+            else:
+                logger.info("[STT-FILTER] reason=repetition text=%r ratio=%.2f",
+                            text, most_common_count / len(words))
+                return "", "repetition"
 
     # Single-word garbage: common misrecognitions from noise
     if len(words) == 1 and cleaned in _GARBAGE_SINGLE_WORDS:

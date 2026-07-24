@@ -64,7 +64,6 @@ LLM_MAX_TOKENS = 160
 # acknowledgment ("One moment…") plays ~1s after the caller stops, masking the
 # LLM round-trip and cutting *perceived* turn latency without touching the
 # turn-end wait or the model itself.
-FILLER_TIMEOUT_S = 1.0
 LLM_STREAM_TIMEOUT_S = 7.0
 INTENT_CLASSIFY_TIMEOUT_S = 1.0
 
@@ -138,6 +137,42 @@ _DEFAULT_OBJECTION_PATTERNS = (
     "baad mein baat", "baad me baat", "phir baat", "phir baat karenge",
     "abhi nahi", "abhi nai", "abhi busy", "fursat nahi",
 )
+
+
+# "Stop calling me" — the compliance opt-out, distinct from an objection or a
+# "call me later" preference. Every pattern requires the never/again/stop/
+# remove semantics, so scheduling talk ("don't call me today", "abhi call mat
+# karna", "call me after 8") never trips it. Pure + module-level: unit-tested
+# against both directions in tests.
+_DND_PATTERNS = tuple(re.compile(p, re.I) for p in (
+    r"\b(?:do\s*n[o']t|never)\s+(?:call|phone|contact)\s+me\s+(?:again|any\s*more|ever)",
+    r"\bnever\s+(?:call|phone|contact)\s+me\b",
+    r"\bstop\s+(?:calling|phoning|contacting)\b",
+    r"\b(?:remove|delete|take)\s+(?:my|me)\s+(?:number|off)\b",
+    r"\btake\s+me\s+off\s+(?:your|the|this)\s+list\b",
+    r"\bunsubscribe\b",
+    r"\bdo\s+not\s+disturb\b",
+    # Hindi (romanized): dobara/phir kabhi + call/phone + mat/na, band karo
+    r"\b(?:dobara|dubara|phir\s+kabhi)\s+(?:call|phone|फ़ोन|फोन|कॉल)\s*(?:mat|na|नहीं|मत)",
+    r"\b(?:call|phone)\s+karna\s+band\s+kar",
+    r"\bmera\s+number\s+(?:hata|delete|nikal)",
+    # Hindi (Devanagari)
+    r"दोबारा\s*(?:कॉल|फोन|फ़ोन)\s*(?:मत|न(?:हीं)?\s*कर)",
+    r"फिर\s*कभी\s*(?:कॉल|फोन|फ़ोन)\s*(?:मत|न)",
+    r"(?:कॉल|फोन|फ़ोन)\s*करना\s*बंद\s*कर",
+    r"मेरा\s*नंबर\s*(?:हटा|निकाल|डिलीट)",
+    # Gujarati
+    r"ફરી\s*(?:ફોન|કૉલ|કોલ)\s*(?:ન\s*કર|કરશો\s*નહીં|ના\s*કર)",
+    r"મારો\s*નંબર\s*(?:કાઢી|હટાવ|ડિલીટ)",
+))
+
+
+def _detect_dnd_request(text: str) -> bool:
+    """True when the caller asked us to stop contacting them — ever."""
+    t = (text or "").strip()
+    if len(t) < 8:  # too short to carry the semantics; avoids noise tokens
+        return False
+    return any(p.search(t) for p in _DND_PATTERNS)
 
 
 def detect_intent(
@@ -1295,6 +1330,21 @@ class ConversationRouter:
 
         self.state.last_intent = intent
         logger.info('[INTENT] "%s" -> %s (stage=%s)', text, intent, self.state.stage)
+
+        # ── DND: "stop calling me" is a compliance event, not an objection ──
+        # Detected deterministically (platform-wide, all agents) and STORED:
+        # the flag rides collected_data into the intel pipeline, which sets
+        # the contact's disposition to 'rejected' (never auto-dialled again),
+        # cancels open follow-ups, and forces the follow-up decision to NO.
+        # The reply itself stays with the LLM — the prompt already handles
+        # polite disengagement; what must never depend on the model is the
+        # RECORD of the request.
+        if _detect_dnd_request(text):
+            if not self.state_mgr.extra_flags.get("dnd_requested"):
+                self.state_mgr.extra_flags["dnd_requested"] = True
+                self.state_mgr.extra_flags["dnd_quote"] = text[:200]
+                logger.info("[DND] caller asked not to be contacted: %r",
+                            text[:80])
 
         # Reset decline counter when the user re-engages with a non-objection
         # intent — we don't want a stale "1 prior decline" to trip the 2-strike
@@ -2606,6 +2656,14 @@ class ConversationRouter:
         filler_min_gap_turns; 0 = ungoverned = today's behaviour: a filler on
         every turn whose first LLM chunk beats filler_timeout_s — which on
         the Kaapd call was every turn). Suppressed filler = wait silently."""
+        # Stage suppression (2026-07-23 filler audit): a filler before the
+        # agent has even introduced itself ("One moment please... Hi, I'm
+        # Prakhar from...") or glued onto the goodbye ("एक मिनट... [farewell]")
+        # is pure awkwardness with no latency worth masking — both were
+        # observed on real calls. First LLM turn and closing turns never
+        # play a filler.
+        if self.state.turn_count <= 1 or self.state.is_closing:
+            return False
         cfg = self._def.llm_config
         max_per_call = int(getattr(cfg, "filler_max_per_call", 0) or 0)
         if max_per_call and self._fillers_played >= max_per_call:
@@ -2614,6 +2672,25 @@ class ConversationRouter:
         if min_gap and (self.state.turn_count - self._last_filler_turn) < min_gap:
             return False
         return True
+
+    def _effective_filler_timeout(self) -> float:
+        """Per-agent filler_timeout_s, floored platform-wide.
+
+        Production measurement (2026-07-23 latency audit, n=12 turns): LLM
+        first-chunk spans 730-1228ms, yet 8 agents configure 0.6s — so their
+        fillers fired on essentially EVERY turn and, because the caller must
+        sit through ~1.1-1.3s of filler audio before the (usually already
+        finished) answer, each one ADDED ~a second of delay instead of
+        masking any. At 1.5s, zero of the sampled turns would have played a
+        filler; it fires only on genuine outliers, which is the whole point.
+        The floor is env-tunable (FILLER_TIMEOUT_FLOOR_S) and never LOWERS an
+        agent's own configured value.
+        """
+        try:
+            floor = float(os.environ.get("FILLER_TIMEOUT_FLOOR_S", "1.5"))
+        except ValueError:
+            floor = 1.5
+        return max(float(self._def.llm_config.filler_timeout_s), floor)
 
     async def _consume_llm_with_filler(
         self,
@@ -2634,7 +2711,7 @@ class ConversationRouter:
         first_chunk = None
         try:
             first_chunk = await asyncio.wait_for(
-                llm_queue.get(), timeout=self._def.llm_config.filler_timeout_s,
+                llm_queue.get(), timeout=self._effective_filler_timeout(),
             )
         except asyncio.TimeoutError:
             if self._filler_allowed():
@@ -2643,9 +2720,31 @@ class ConversationRouter:
                 self._fillers_played += 1
                 self._last_filler_turn = self.state.turn_count
                 yield EngineResult(text=filler, is_shortcut=True, intent="filler")
-            first_chunk = await llm_queue.get()
+            # Post-filler wait is BOUNDED (it used to be a bare get()): a
+            # stalled-but-open LLM stream previously meant "one moment
+            # please…" followed by up to ~7s of open-ended silence until the
+            # httpx timeout. Cap it at stream_timeout_s and fall back to the
+            # language-appropriate canned line instead. The fallback replaces
+            # the stream entirely — we must not fall through into the
+            # chunk loop, which would block on the same stalled queue.
+            try:
+                first_chunk = await asyncio.wait_for(
+                    llm_queue.get(),
+                    timeout=float(self._def.llm_config.stream_timeout_s),
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[LLM] Post-filler wait exhausted "
+                               "stream_timeout_s — canned fallback")
+                fallback = self._def.response_bank.lang_fallbacks.get(
+                    self.state.language,
+                    self._def.response_bank.response_fallback)
+                full_parts.append(fallback)
+                yield EngineResult(text=fallback, is_shortcut=False,
+                                   intent=intent)
+                first_chunk = None
+                llm_queue = None  # sentinel: skip the streaming loop
 
-        if first_chunk is not None:
+        if first_chunk is not None and llm_queue is not None:
             full_parts.append(first_chunk)
             yield EngineResult(text=first_chunk, is_shortcut=False, intent=intent)
 
@@ -2836,6 +2935,13 @@ class ConversationRouter:
 
             buffer = ""
             timed_out = False
+            # Raw model TTFT, distinct from the engine-level first_chunk metric
+            # (which also includes the clause-gating below). The latency audit
+            # had to reconstruct this split from a single httpx log line —
+            # never again. Anchored to the pre-create timestamp (deadline was
+            # computed from it) so connection+request time is included.
+            _ttft_t0 = deadline - self._def.llm_config.stream_timeout_s
+            _ttft_logged = False
             async for chunk in stream:
                 if time.monotonic() > deadline:
                     logger.warning("[LLM-TIMEOUT] fallback triggered after %.0fs",
@@ -2844,6 +2950,10 @@ class ConversationRouter:
                     break
                 delta = chunk.choices[0].delta
                 if delta.content:
+                    if not _ttft_logged:
+                        _ttft_logged = True
+                        logger.info("[LLM] TTFT %.0fms",
+                                    (time.monotonic() - _ttft_t0) * 1000)
                     buffer += delta.content
                     while True:
                         # First chunk: break at the earliest clause pause (>=4
@@ -3591,10 +3701,15 @@ class ConversationRouter:
         }
 
         # ── Thinking pool — implies retrieving / reasoning ───────────────────
-        # Use the YAML bank when the agent has branded thinking phrases;
-        # fall back to the built-in pool otherwise.
+        # Use the YAML bank when the agent has branded thinking phrases IN THE
+        # CALLER'S LANGUAGE; otherwise prefer the built-in pool for that
+        # language over another language's YAML bank. The old lookup was
+        # bank.get(lang, bank.get("en")) — so a Gujarati caller of an agent
+        # whose YAML had only en/hi banks got an ENGLISH filler mid-Gujarati
+        # conversation, and the built-in Gujarati pool below was unreachable
+        # (observed live: "हाँ, एक सेकंड... ચોક્કસ, 12:00 વાગ્યેનો...").
         bank = self._def.response_bank.filler_responses
-        yaml_thinking = bank.get(lang, bank.get("en", []))
+        yaml_thinking = bank.get(lang, [])
         _THINKING_BUILTIN: dict[str, list[str]] = {
             "en": [
                 "One moment please...",

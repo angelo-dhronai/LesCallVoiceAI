@@ -508,7 +508,9 @@ def _save_call_link(entries: list[dict]) -> None:
 
 
 def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
-                 owner: str = "", context_note: str = "") -> None:
+                 owner: str = "", context_note: str = "",
+                 followup_id: int | None = None,
+                 placed_by: str = "user") -> None:
     entry = {
         "phone": phone, "contact_id": contact_id, "name": name,
         "dialed_at": _now_iso(),
@@ -522,6 +524,10 @@ def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
         # Why we are calling (callback aim / past context) — the bridge feeds
         # it into the WHY-YOU-ARE-CALLING-BACK prompt block.
         "context_note": context_note,
+        # Billing transparency: who initiated this dial (user | autodial |
+        # automation). Stamped onto calls.placed_by by the bridge so tenants
+        # can audit platform-placed spend.
+        "placed_by": placed_by,
     }
     link_id = None
     try:
@@ -530,10 +536,12 @@ def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
         with get_db() as db:
             row = db.execute(
                 "INSERT INTO call_links (owner, phone, sig_digits, contact_id,"
-                " name, agent_slug, dialed_at, context_note)"
-                " VALUES (?,?,?,?,?,?,?,?) RETURNING id",
+                " name, agent_slug, dialed_at, context_note, followup_id,"
+                " placed_by)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING id",
                 (owner, phone, significant_digits(phone), contact_id, name,
-                 agent_slug, entry["dialed_at"], context_note or None)).fetchone()
+                 agent_slug, entry["dialed_at"], context_note or None,
+                 followup_id, placed_by)).fetchone()
             link_id = row["id"] if row else None
             # Dial records only matter inside the matching windows; prune
             # anything older than a week (replaces the file's last-5000 cap).
@@ -2491,7 +2499,54 @@ def _save_outbound(contacts: list[dict], owner: str) -> None:
                     (handle, owner) + vals)
         for handle, pk in existing.items():
             if handle not in keep:
+                _detach_contact_references(db, pk)
                 db.execute("DELETE FROM contacts WHERE id=?", (pk,))
+
+
+def _detach_contact_references(db, pk: int) -> None:
+    """Re-home intelligence rows before a contact row is deleted.
+
+    Deleting a contact used to strand every row that referenced it: 90 of 154
+    contact-linked followups pointed at nonexistent contacts after one
+    phone-book cleanup (2026-07-23 audit) — the hub 404'd for the owner's
+    most-called number and the follow-up auto-dialer permanently blocked 38
+    live follow-ups with 'no_contact'. Deletion is normal user behavior, so
+    the delete path must leave the data coherent:
+
+      * if another contact with the same significant digits survives (the
+        delete-and-recreate pattern), references move to it;
+      * otherwise they detach to NULL — lists fall back to the raw phone
+        number instead of linking to a 404.
+
+    contact_events and customer_memory are only reachable through a live
+    contact id, so they move on re-bind and are left in place on detach
+    (ids are serial and never reused — the rows are inert, not dangling).
+    """
+    row = db.execute(
+        "SELECT owner, sig_digits FROM contacts WHERE id=?", (pk,)).fetchone()
+    if not row:
+        return
+    survivor = db.execute(
+        "SELECT id FROM contacts WHERE owner=? AND sig_digits=? AND id<>? "
+        "ORDER BY id DESC LIMIT 1",
+        (row["owner"], row["sig_digits"], pk)).fetchone()
+    new_id = survivor["id"] if survivor else None
+    for table in ("calls", "call_intelligence", "commitments", "followups"):
+        db.execute(f"UPDATE {table} SET contact_id=? WHERE contact_id=?",
+                   (new_id, pk))
+    if new_id is not None:
+        db.execute("UPDATE contact_events SET contact_id=? WHERE contact_id=?",
+                   (new_id, pk))
+        # keep at most one memory row: prefer the survivor's if both exist
+        has_target = db.execute(
+            "SELECT 1 FROM customer_memory WHERE contact_id=?",
+            (new_id,)).fetchone()
+        if has_target:
+            db.execute("DELETE FROM customer_memory WHERE contact_id=?", (pk,))
+        else:
+            db.execute(
+                "UPDATE customer_memory SET contact_id=? WHERE contact_id=?",
+                (new_id, pk))
 
 
 def _normalize_gender(value: str) -> str:
@@ -3554,7 +3609,7 @@ async def _dial_automation_entry(automation_id: str) -> None:
     _ctx_bits = [entry.get("call_aim") or "", entry.get("past_call_context") or ""]
     _context_note = ". ".join(b.strip().rstrip(".") for b in _ctx_bits if b.strip())[:800]
     _record_dial(phone, entry["id"], entry.get("contact_name", ""), agent_slug=_dial_slug,
-                 owner=_cb_owner, context_note=_context_note)
+                 owner=_cb_owner, context_note=_context_note, placed_by="automation")
 
     try:
         fs_out = await _fs_esl_exec(_fs_originate_cmd(
@@ -3749,8 +3804,22 @@ async def _autodial_once() -> int:
             continue
 
         slug = ident["agent_slug"]
+        # The agent on this call must open like someone who remembers the
+        # last conversation: the follow-up reason (and the commitment being
+        # chased) travels via call_links.context_note into the bridge's
+        # WHY-YOU-ARE-CALLING-BACK prompt band. The prior-call digest is NOT
+        # duplicated here — the KNOWN CUSTOMER band already injects it from
+        # customer_memory on every outbound call. Cap mirrors the automation
+        # path's (server.py _dial_automation_entry).
+        ctx = f"Scheduled follow-up call: {row.get('reason') or 'follow up on the previous conversation'}"
+        if row.get("commitment_text"):
+            ctx += f" Commitment to fulfil: {row['commitment_text']}."
+        if row.get("summary"):
+            ctx += f" Previous call: {row['summary']}"
         _record_dial(phone, str(row.get("contact_handle") or ""),
-                     row.get("contact_name") or "", agent_slug=slug, owner=owner)
+                     row.get("contact_name") or "", agent_slug=slug, owner=owner,
+                     context_note=ctx[:800], followup_id=row["id"],
+                     placed_by="autodial")
         await asyncio.to_thread(
             autodial.record_attempt, row["id"], ok=True,
             detail=f"auto-dialled {phone} as {slug}")
@@ -3758,7 +3827,8 @@ async def _autodial_once() -> int:
         placed_by_owner[owner] = placed_by_owner.get(owner, 0) + 1
         placed += 1
 
-        async def _place(p=phone, s=slug, i=ident, o=owner, h=row.get("contact_handle")):
+        async def _place(p=phone, s=slug, i=ident, o=owner,
+                         h=row.get("contact_handle"), fid=row["id"]):
             try:
                 out = await _fs_esl_exec(_fs_originate_cmd(
                     p, agent_slug=s, caller_id=i["caller_id"],
@@ -3769,6 +3839,15 @@ async def _autodial_once() -> int:
                 cs = "failed"
             if h:
                 _update_contact_after_call(h, cs, o)
+            # Outcome loop: stamp the originate result. 'answered' stays
+            # provisional — stage_followup's completion hook (which sees the
+            # analyzed call) is what marks the row completed, because +OK
+            # also fires for voicemail pickups.
+            try:
+                await asyncio.to_thread(autodial.record_result, fid, cs)
+            except Exception:
+                logger.warning("autodial: result stamp failed for %s", fid,
+                               exc_info=True)
             logger.info("AUTODIAL %s from %s → %s", p, i["caller_id"], cs)
 
         asyncio.create_task(_place())

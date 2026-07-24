@@ -50,6 +50,13 @@ export type Followup = {
   last_attempt_at?: string | null
   last_attempt_error?: string | null
   autodial_blocked_at?: string | null
+  /** Execution mode (0008): 'auto' = the platform places the call at the
+   *  scheduled time; 'manual' (default) = a human does. */
+  mode?: 'manual' | 'auto'
+  max_attempts?: number | null
+  next_attempt_at?: string | null
+  executed_call_id?: number | null
+  execution_outcome?: string | null
 }
 
 export type IntelDetail = {

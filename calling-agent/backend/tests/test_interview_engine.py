@@ -81,7 +81,7 @@ def test_interview_flow_create_gate(cop):
     cop_mod, agents_dir, tmp = cop
     session: dict = {"messages": [], "transcript": [], "meta": {}}
     guard = {"user_turns": 4, "created_this_turn": False,
-             "session": session, "user_message": "here's everything", "sid": "s1"}
+             "session": session, "user_message": "use defaults where needed — build it now", "sid": "s1"}
 
     # 1. Create with an empty draft → refused, naming open layers.
     with pytest.raises(ValueError, match="interview is not finished"):
@@ -144,6 +144,7 @@ def test_interview_flow_create_gate(cop):
     progress = cop_mod.interview_progress(session["interview"]["draft"],
                                           session["interview"]["skipped"])
     for open_id in list(progress["open_layers"]):
+        guard.pop("skips_this_turn", None)  # each skip on its own turn
         _run(cop_mod._execute_tool("skip_layer", {
             "layer_id": open_id,
             "user_words": "skip that, just use defaults"}, guard))
@@ -203,3 +204,59 @@ def test_old_session_replay_unaffected(cop):
     prompt2 = cop_mod._system_prompt(session)
     assert "INTERVIEW STATE (server-tracked" in prompt2
     assert "NEXT: ask exactly this ONE question" in prompt2
+
+
+# ── server-verified consent gates (2026-07-23 copilot audit) ────────────────
+# Two "don't ask me anything" messages used to mass-skip 9 layers and ship a
+# fully fabricated agent; a brochure paste triggered an unsolicited create;
+# one skip cited BROCHURE text as the user's words. These pin the gates.
+
+def test_create_refused_without_explicit_build_instruction(cop):
+    cop_mod, _agents_dir, _tmp = cop
+    session = {"messages": [], "transcript": [], "meta": {}}
+    guard = {"user_turns": 4, "created_this_turn": False, "session": session,
+             "user_message": "here is our brochure text about the clinic",
+             "sid": "sg1"}
+    with pytest.raises(ValueError, match="not explicitly asked to build"):
+        _run(cop_mod._execute_tool("create_agent",
+                                   {"name": "gate_test", "definition": {}},
+                                   guard))
+
+
+def test_long_paste_with_incidental_verb_is_not_consent(cop):
+    cop_mod, _agents_dir, _tmp = cop
+    session = {"messages": [], "transcript": [], "meta": {}}
+    # 1500+ chars containing "build" far from any agent-noun — a paste, not
+    # an instruction.
+    paste = ("we build lasting smiles for families. " * 60)
+    guard = {"user_turns": 4, "created_this_turn": False, "session": session,
+             "user_message": paste, "sid": "sg2"}
+    with pytest.raises(ValueError, match="not explicitly asked to build"):
+        _run(cop_mod._execute_tool("create_agent",
+                                   {"name": "gate_test2", "definition": {}},
+                                   guard))
+
+
+def test_skip_refused_when_words_are_not_the_users(cop):
+    cop_mod, _agents_dir, _tmp = cop
+    session = {"messages": [], "transcript": [], "meta": {}}
+    guard = {"user_turns": 3, "session": session,
+             "user_message": "tell me about pricing", "sid": "sg3"}
+    with pytest.raises(ValueError, match="don't appear in anything the user"):
+        _run(cop_mod._execute_tool("skip_layer", {
+            "layer_id": "business_identity",
+            "user_words": "patients should share their name"}, guard))
+
+
+def test_skip_capped_at_three_per_turn(cop):
+    cop_mod, _agents_dir, _tmp = cop
+    session = {"messages": [], "transcript": [], "meta": {}}
+    guard = {"user_turns": 3, "session": session,
+             "user_message": "skip everything, use defaults", "sid": "sg4"}
+    layers = [l.id for l in cop_mod.INTERVIEW_LAYERS][:4]
+    for lid in layers[:3]:
+        _run(cop_mod._execute_tool("skip_layer", {
+            "layer_id": lid, "user_words": "skip everything"}, guard))
+    with pytest.raises(ValueError, match="3 layers already skipped"):
+        _run(cop_mod._execute_tool("skip_layer", {
+            "layer_id": layers[3], "user_words": "skip everything"}, guard))

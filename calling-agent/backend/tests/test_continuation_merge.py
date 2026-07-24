@@ -246,3 +246,22 @@ def test_begin_commits_previous_pending(monkeypatch):
     assert len(writes) == 1
     assert r.has_pending_turn()
     assert r._pending_turn.user_text == "turn two"
+
+
+def test_rollback_never_replays_a_filler():
+    """Pre-canary invariant (2026-07-23): filler audio is a side effect that
+    already happened — rolling back the turn must NOT rewind the filler
+    governors, or the merged re-run plays a second 'one moment please'
+    back-to-back and played fillers stop counting toward the per-call cap."""
+    r = make_router()
+    r.state.turn_count = 5
+    r.begin_turn_transaction("first half of the sentence")
+    # the provisional turn played a filler
+    r._fillers_played += 1
+    r._filler_counter += 1
+    r._last_filler_turn = r.state.turn_count
+    played, counter, last = r._fillers_played, r._filler_counter, r._last_filler_turn
+    assert r.rollback_pending_turn() is not None
+    assert r._fillers_played == played        # audio happened; stays counted
+    assert r._filler_counter == counter
+    assert r._last_filler_turn == last

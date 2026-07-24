@@ -60,6 +60,15 @@ services:
       GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
       GOOGLE_CLOUD_PROJECT: lescall
       TELEPHONY_MODE: "true"
+      # ── Continuation-merge canary (2026-07-23, RUNBOOK §11) ──────────────
+      # Pause-tolerant turns + the faster 400ms silence endpoint they enable
+      # (was 560ms — a guaranteed 160ms saved per turn). Owner-approved
+      # canary; validate on the next test call by grepping ws_audio_receiver
+      # for [CONT-MERGE] lines and clean rollbacks. ROLLBACK: delete these
+      # two lines and `docker compose up -d runtime` — behavior returns to
+      # exactly pre-canary (10 rollback tests + no-filler-replay pin green).
+      ENABLE_CONTINUATION_MERGE: "true"
+      HARD_FLUSH_SILENCE_FRAMES: "20"
     volumes:
       - /home/angelo/lescall:/home/angelo/lescall
       - /home/angelo/.config/gcloud:/gcloud:ro

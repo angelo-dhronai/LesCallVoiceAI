@@ -7,8 +7,12 @@ venv/
 
 # Logs / runtime artifacts
 *.log
+*.log.[0-9]*
 logs/
 *.pid
+
+# Dependencies (restore with npm install)
+node_modules/
 
 # Runtime data
 build/
@@ -38,8 +42,16 @@ calling-agent/agents/active_agent.json
 calling-agent/backend/logs/
 frontend/tsconfig.tsbuildinfo
 
-# Copilot chat session persistence
+# Copilot chat session persistence + tenant document uploads (user data)
 dashboard/copilot_sessions/
+dashboard/copilot_uploads/
+
+# Runtime dial-linkage fallback store (DB is primary; this is live state)
+dashboard/call_link.json
+
+# TTS PCM greeting cache + cleanup staging (runtime artifacts)
+data/tts_cache/
+data/cleanup/
 
 dashboard/sarvam_key_status.json
 

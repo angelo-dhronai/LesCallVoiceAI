@@ -93,7 +93,8 @@ MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_SPEECH_SECONDS
 # valid single-word answers that must reach STT. 300ms is enough audio to
 # distinguish real speech from a click/breath without missing short replies.
 MIN_SPEECH_MS = 300.0
-BARGE_IN_COOLDOWN_MS = 400.0
+# (removed 2026-07-23: BARGE_IN_COOLDOWN_MS was dead — the live guard is
+# BARGE_IN_MIN_ELAPSED_MS below; audits kept grabbing the wrong knob)
 # 5 sustained frames (100ms) before barge-in fires. 3 frames (60ms) was
 # too hair-trigger: brief noise or the tail of a TTS echo could satisfy it
 # and cut the agent mid-sentence. 5 frames still catches a genuine
@@ -650,6 +651,12 @@ class VoicePipeline:
                 self._barge_in_occurred = True
                 self._vad_mute_until = 0.0
                 self._speech_frame_streak = 0
+                # The extended post-filler barge-in guard must not outlive the
+                # filler/response pair it protects: without this reset, the
+                # NEXT unrelated utterance after a barge-in inherited the
+                # 1500ms FILLER_ECHO_GRACE window and was deaf to
+                # interruption for 1.5s on a turn that had no filler.
+                self._last_was_filler = False
 
                 self._flush_pipeline_queues()
                 if (
@@ -1480,6 +1487,13 @@ class VoicePipeline:
                     (time.monotonic() - transcript.speech_end_ts) * 1000.0,
                     transcript.stt_latency_ms,
                 )
+                # Companion instrument: arm the sink so its FIRST flush of
+                # this turn logs speech_end→first_audio — the number the
+                # whole latency effort optimizes, previously reconstructible
+                # only by hand-joining log timestamps.
+                sink = getattr(self.tts, "_sink", None)
+                if sink is not None and hasattr(sink, "flush"):
+                    sink.turn_speech_end_ts = transcript.speech_end_ts
 
             try:
                 async def _run_generation():
@@ -1506,7 +1520,16 @@ class VoicePipeline:
                                 time.monotonic() - latency_start
                             ) * 1000
 
-                        full_text_parts.append(result.text)
+                        # Fillers play on the call but are NOT part of what the
+                        # agent said: excluding them here keeps them out of the
+                        # stored transcript, and therefore out of the
+                        # intelligence pipeline's extraction and embedding
+                        # input (audit: every stored filler was fused onto the
+                        # real reply — "One moment please... Hi, hope you're…" —
+                        # polluting summaries and vectors). The LLM's own
+                        # memory already excluded them.
+                        if result.intent != "filler":
+                            full_text_parts.append(result.text)
 
                         if result.is_shortcut:
                             # Fillers, shortcuts, language-switch confirmations

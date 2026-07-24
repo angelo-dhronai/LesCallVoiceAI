@@ -2367,7 +2367,13 @@ def handle(conn: socket.socket, addr) -> None:
         from urllib.parse import unquote as _unquote
         _resp_decoded = _unquote(last_execute_app_resp or "").upper()
         playback_played = playback_executed and "FILE PLAYED" in _resp_decoded
-        if not playback_executed:
+        if counters.get("events_total", 0) == 0 and counters.get("frames_total", 0) == 0:
+            # Zero-event connection = health probe, not a call. Emitting
+            # CRITICAL here buried the real regression alarm in noise (two
+            # probe CRITICALs per hour, zero real ones — 2026-07-23 audit).
+            log.info("PHASE-5 check skipped: no events/frames on this "
+                     "connection (health probe)")
+        elif not playback_executed:
             log.critical(
                 "PHASE-5 REGRESSION: no CHANNEL_EXECUTE for "
                 "Application=playback was observed. The validated "

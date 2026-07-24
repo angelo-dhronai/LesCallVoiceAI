@@ -45,7 +45,7 @@ def cop(tmp_path, monkeypatch):
 
 def _guard(session):
     return {"user_turns": 4, "created_this_turn": False,
-            "session": session, "user_message": "build it", "sid": "s1"}
+            "session": session, "user_message": "use defaults for the rest and build it", "sid": "s1"}
 
 
 # A complete-enough interview draft (mirrors the pramukh session's real data).
@@ -110,6 +110,7 @@ def _build(cop_mod, session):
     progress = cop_mod.interview_progress(session["interview"]["draft"],
                                           session["interview"]["skipped"])
     for open_id in list(progress["open_layers"]):
+        guard.pop("skips_this_turn", None)  # each skip on its own turn
         _run(cop_mod._execute_tool("skip_layer", {
             "layer_id": open_id, "user_words": "defaults are fine"}, guard))
     return guard

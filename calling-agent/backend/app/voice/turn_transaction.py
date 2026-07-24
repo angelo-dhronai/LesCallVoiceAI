@@ -29,6 +29,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Router attributes restored verbatim (immutable values).
+#
+# Filler counters (_filler_counter/_fillers_played/_last_filler_turn) are
+# deliberately NOT here: the filler AUDIO already played on the call and
+# cannot be rolled back with the text state. Restoring the counters made the
+# merged re-run pass _filler_allowed() again → a second filler back-to-back
+# for what the caller experiences as one utterance, and played fillers
+# stopped counting toward filler_max_per_call.
 _ROUTER_SCALARS = (
     "last_agent_response",
     "last_agent_language",
@@ -41,9 +48,6 @@ _ROUTER_SCALARS = (
     "_clarify_asked",
     "_suppress_time_match_turns",
     "_response_counter",
-    "_filler_counter",
-    "_fillers_played",
-    "_last_filler_turn",
     "_last_nudge_stage",
     "_llm_failure_streak",
     "llm_fallback_turns",

@@ -48,7 +48,7 @@ def test_seven_step_agent_via_copilot(cop):
     cop_mod, agents_dir = cop
     session: dict = {"messages": [], "transcript": [], "meta": {}}
     guard = {"user_turns": 5, "created_this_turn": False,
-             "session": session, "user_message": "build it", "sid": "s7"}
+             "session": session, "user_message": "use defaults for the rest and build it", "sid": "s7"}
 
     # Interview: the owner's answers land in the draft (multiple turns
     # compressed into one dump — the engine doesn't care how they arrived).
@@ -61,6 +61,7 @@ def test_seven_step_agent_via_copilot(cop):
     progress = cop_mod.interview_progress(session["interview"]["draft"],
                                           session["interview"]["skipped"])
     for open_id in list(progress["open_layers"]):
+        guard.pop("skips_this_turn", None)  # each skip on its own turn
         _run(cop_mod._execute_tool("skip_layer", {
             "layer_id": open_id, "user_words": "defaults are fine, build it"}, guard))
 

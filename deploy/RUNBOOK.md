@@ -553,3 +553,37 @@ engine:
   by construction — one requires detected speech, the other requires none.
 - Tests: `tests/test_call_repair.py` (14) — replay/cap/window/scripts,
   reprompt composition per language, and the watchdog decision matrix.
+
+## 14. Follow-up execution modes — opt-in auto-dialling (2026-07-23)
+
+The 0007 auto-dialer dialled EVERY decision='yes' follow-up (it placed its
+first 12 real calls the moment the Thu 10:00 IST window opened). Migration
+0008 makes auto-dialling **opt-in**:
+
+- `followups.mode` `manual` (default) | `auto` — only `auto` rows are dial
+  candidates (`autodial._DUE_SQL`). Per-row toggle in FollowUps → Edit
+  (re-arming clears a previous permanent block); also settable at create.
+- Per-agent default: `follow_up.auto_execute: {enabled: true}` in agent.yaml
+  → yes-decision follow-ups from that agent's calls are born `auto`
+  (consumed in `stage_followup`; same pattern as `clarify_commitments`).
+  `INTEL_AUTODIAL_ENABLED` stays the platform kill switch above everything.
+- New guardrails: `superseded` (a newer call to the contact after the
+  follow-up was created — permanent), per-row `max_attempts` (NULL =
+  platform default 3), explicit `next_attempt_at` linear backoff
+  (gap × attempt#). A dangling contact no longer blocks: the dial phone
+  falls back to the originating call's number (the 38-blocked-rows
+  incident).
+- Memory on the call: the executor writes the follow-up reason + chased
+  commitment + prior-call summary into `call_links.context_note`
+  (→ WHY-YOU-ARE-CALLING-BACK prompt band); the KNOWN CUSTOMER band already
+  carries the customer digest. `call_links.followup_id` links the dial.
+- Outcome loop: originate result → `followups.execution_outcome`
+  (provisional); when the placed call is ANALYZED with a real caller turn,
+  `stage_followup`'s completion hook marks the follow-up completed with
+  `executed_call_id` (voicemail nuance documented in code). `sweep_overdue`
+  no longer flips in-retry auto rows to 'missed'.
+- Tests: `test_autodial_guardrails.py` (57) — mode gate, superseded,
+  per-row caps, backoff, phone-fallback.
+- Open product items (deliberately NOT built): in-call "stop calling me" →
+  DND disposition; TRAI NDNC scrubbing; billing stamp for platform-placed
+  calls.

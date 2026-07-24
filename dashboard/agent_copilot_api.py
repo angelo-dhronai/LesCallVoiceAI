@@ -3252,6 +3252,24 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                 "Ask ONE short clarifying question (persona, voice, greeting, or what "
                 "the agent must know), and only create after they've answered and agreed."
             )
+        # Server-verified create consent (2026-07-23 audit): a brochure paste
+        # triggered an unsolicited create_agent under a model-chosen slug.
+        # The LATEST user message must actually instruct a build. Long
+        # messages (pastes) additionally need the verb near an agent-ish
+        # noun, so "we build smiles since 1998" in a document can't count.
+        _umsg = str(guard.get("user_message") or "")
+        _verb = re.compile(
+            r"\b(create|build|make|ship|launch|deploy|generate|set\s*it\s*up|"
+            r"go\s*ahead)\b|बना|तैयार\s*कर|બનાવ", re.I)
+        _near = re.compile(
+            r"(create|build|make|ship|launch|deploy|generate)\W{0,80}"
+            r"(agent|bot|receptionist|assistant|it|this|one|एजेंट)", re.I | re.S)
+        if not (_verb.search(_umsg) and (len(_umsg) < 1200 or _near.search(_umsg))):
+            raise ValueError(
+                "Refused: the user has not explicitly asked to build yet. "
+                "Summarize the plan in 3-5 short lines and ask 'shall I "
+                "build it?' — create only after they say yes."
+            )
         # v2 hardened create gate (plan §6.2): every compulsory interview
         # layer must be complete or EXPLICITLY skipped. Dump-and-done is
         # mechanically impossible; "just build it" = per-layer skip_layer.
@@ -3815,6 +3833,34 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
             raise ValueError(
                 "skip_layer needs the user's own words declining this topic "
                 "(quote them) — it is auditable, not a shortcut for you.")
+        # Consent must be real (2026-07-23 audit: two "don't ask me anything"
+        # messages mass-skipped 9 layers and shipped a fully fabricated
+        # agent, and one skip cited BROCHURE text as the user's words).
+        # (a) the quoted words must come from an actual USER message, or the
+        # latest user message must itself express skip intent; (b) at most 3
+        # skips per turn, so "skip everything" still takes deliberate,
+        # repeated instruction rather than one impatient sentence.
+        _latest = str(guard.get("user_message") or "").lower()
+        _skip_intent = re.compile(
+            r"skip|don'?t ask|no more question|just (build|create|make)|"
+            r"your (call|choice)|defaults?|whatever you think|"
+            r"मत पूछ|जो ठीक लगे|પૂછ", re.I)
+        _user_texts = " \n".join(
+            str(m.get("content") or "").lower()
+            for m in (session.get("messages") or []) if m.get("role") == "user")
+        _quoted_ok = user_words[:80].lower() in _user_texts
+        if not (_quoted_ok or _skip_intent.search(_latest)):
+            raise ValueError(
+                "Refused: those words don't appear in anything the user "
+                "typed. A layer is skipped only when the USER declines it — "
+                "ask the layer's question instead.")
+        _skips = int(guard.get("skips_this_turn") or 0) + 1
+        guard["skips_this_turn"] = _skips
+        if _skips > 3:
+            raise ValueError(
+                "Refused: 3 layers already skipped this turn. Ask the next "
+                "open question — if the user really wants everything "
+                "skipped, they can say so again.")
         if layer_id not in iv["skipped"]:
             iv["skipped"].append(layer_id)
         iv["provenance"][f"skip:{layer_id}"] = user_words[:200]
@@ -4154,6 +4200,15 @@ def _system_prompt(session: dict | None = None) -> str:
     return f"""You are the LesCall Agent Copilot — an expert voice-agent designer built into the LesCall dashboard. LesCall runs real-time AI phone agents for Indian businesses (Sarvam STT/TTS + an LLM). An agent is a YAML definition: identity, personality, languages (hi/en/gu), TTS voice, a staged call flow with branching, a knowledge base + product catalog, data-capture slots, canned responses, guardrails, and calendar slots. Inbound calls are answered by the agent bound to the dialed number (currently: {active}).
 
 HOW YOU WORK
+0. HARD PLATFORM BOUNDARY — these agents make and answer PHONE CALLS. The
+platform cannot send emails, SMS or WhatsApp messages on its own, run
+scheduled jobs/cron, browse the web, or integrate external systems. When the
+user asks for any of that, say plainly it is not supported (in-app follow-ups
+and notifications are the nearest real features) — and NEVER write such an
+instruction into the agent's prompt or custom_instructions as if it will
+execute. Claiming an unsupported automation was "set up" is the worst failure
+you can produce.
+
 1. NEW AGENT — the interview is a MACHINE, not a vibe. The moment the user wants a new agent, start recording EVERY fact they give with update_draft (mine info dumps completely — never let information sit only in chat). An INTERVIEW STATE block appears below when a draft exists: it is the server's truth about which topics are done and the ONE next question to ask — follow it. Ask ONE short question per reply. Propose smart defaults instead of over-asking; after the business + objective are known, PROPOSE a tailored slot set, stage skeleton, and likely objections for that business type and record accepted proposals with update_draft(source='proposal'). Voices — female: simran, anushka, manisha, vidya; male: shubh, abhilash, karun. create_agent is REFUSED by the server until every compulsory topic is complete or the user explicitly declined it (then call skip_layer with their exact words). When all topics close, summarize the plan in 3-5 short lines and ask "shall I build it?". Tool errors from update_draft/create_agent are YOURS to fix: correct the field paths (the error and the INTERVIEW STATE name the real ones) and retry silently — NEVER tell the user their answer "isn't a real setting" and NEVER ask them to rephrase because of a field-mapping problem.
 2. THE USER'S INPUT OUTRANKS YOU — ALWAYS. Anything they typed or put in a document is the source of truth: record it VERBATIM (their exact lines, their exact objection answers, their exact rules) and never paraphrase, "improve", translate away, or replace it with copy of your own. The server enforces this: a write that would overwrite better-sourced wording is dropped, and content you invented is flagged back to you as YOUR copy. Your own authorship is for GAPS ONLY — a topic the user has said nothing about. There, draft DEEP: stage goals of 2-4 full sentences of concrete instructions (never a 5-word label), a knowledge paragraph carrying real substance (it is injected on EVERY turn), real objection responses, natural phone-appropriate copy in the agent's languages. But when the user HAS spoken on a topic, your job is to transcribe them, not to write. NEVER invent facts (products, prices, phone numbers, brand claims, locations, policies) — a fabricated fact gets SPOKEN to real callers. If a tool result says content was recorded as YOUR draft copy and the user did give wording for it, re-record theirs verbatim in the same turn. For an outbound pitch, the mission and talking points MUST live in the stage goals and the knowledge paragraph — that is the only way they reach the live call.
 3. Get the copy into the DRAFT with update_draft BEFORE creating — create_agent builds the agent FROM THE INTERVIEW DRAFT, and the draft always wins: any definition you pass to create_agent is ignored for every topic the interview answered, and only fills topics the user explicitly skipped. NEVER invent facts (projects, prices, phone numbers, brand claims, locations) the user did not give you — a fabricated fact gets SPOKEN to real callers. Slug = lowercase with underscores.
@@ -4225,6 +4280,25 @@ STYLE — PLAIN LANGUAGE ONLY (the user is a business person, not a developer):
 # Sessions
 # ─────────────────────────────────────────────────────────────────────────────
 _SESSIONS: dict[str, dict] = {}  # sid -> {"messages": [...], "transcript": [...], "meta": {...}}
+
+# One turn at a time per session: two concurrent messages used to interleave
+# their tool/assistant messages in the shared history and answer each other's
+# questions (both replies to "what languages?" + "what greeting?" answered the
+# greeting). The second message queues behind the first instead.
+_SESSION_LOCKS: dict[str, "asyncio.Lock"] = {}
+
+
+def _session_lock(sid: str) -> "asyncio.Lock":
+    import asyncio as _asyncio
+
+    lock = _SESSION_LOCKS.get(sid)
+    if lock is None:
+        lock = _SESSION_LOCKS.setdefault(sid, _asyncio.Lock())
+    if len(_SESSION_LOCKS) > 2000:  # unbounded-growth guard
+        for k in [k for k, v in list(_SESSION_LOCKS.items())
+                  if not v.locked()][:1000]:
+            _SESSION_LOCKS.pop(k, None)
+    return lock
 
 # Tools that tie a conversation to a specific agent. Mutating tools always
 # re-point the session's agent; read tools only set it when none is known yet
@@ -4668,6 +4742,13 @@ async def copilot_chat(request: Request) -> dict:
     if not _session_owner_ok(sid, owner):
         sid = _tenant_sid(owner, sid)
 
+    async with _session_lock(sid):
+        return await _copilot_chat_turn(request, sid, owner, message,
+                                        attachments)
+
+
+async def _copilot_chat_turn(request: Request, sid: str, owner,
+                             message: str, attachments: list) -> dict:
     client = _get_client()
     model = _model_name()
     session = _load_session(sid)
@@ -4815,7 +4896,18 @@ async def copilot_chat(request: Request) -> dict:
                     "content": json.dumps(result, ensure_ascii=False, default=str)[:20000],
                 })
         else:
-            reply = "I ran out of steps trying to do that — could you rephrase or break it into smaller requests?"
+            # Iteration cap hit. If real work landed, report IT — the generic
+            # "ran out of steps" next to a successful create_agent told the
+            # user the copilot failed while an agent was silently created.
+            _capped_ok = [a for a in actions
+                          if a["ok"] and a["tool"] in _MUTATING_TOOLS]
+            if _capped_ok:
+                done = "; ".join(a["summary"] for a in _capped_ok)
+                reply = (f"Done so far: {done}. I hit my per-message step "
+                         "limit before finishing everything — tell me what "
+                         "to continue with.")
+            else:
+                reply = "I ran out of steps trying to do that — could you rephrase or break it into smaller requests?"
     except Exception as exc:
         ok_saves_so_far = [a for a in actions if a["ok"] and a["tool"] in _MUTATING_TOOLS]
         if ok_saves_so_far:
@@ -4842,11 +4934,11 @@ async def copilot_chat(request: Request) -> dict:
                 m = re.search(r"try again in ([0-9]+m)?([0-9.]+s)?", str(exc))
                 wait = f" in about {(m.group(1) or '')}{('' if m.group(1) else m.group(2) or '')}".rstrip() if m and (m.group(1) or m.group(2)) else " later"
                 reply = (
-                    "The AI service's free daily token quota is used up on both the primary and "
+                    "The AI service's rate limit is exhausted on both the primary and "
                     f"fallback models, so I can't process this message right now. Please try again{wait} "
                     "— your agents and this conversation are safe, nothing was lost. "
-                    "(To remove this limit, upgrade the Groq account tier or point COPILOT_LLM_MODEL "
-                    "at a different provider.)"
+                    "(Operators can raise COPILOT_LLM_TPM, set a dedicated COPILOT_LLM_API_KEY, "
+                    "or point COPILOT_LLM_MODEL at a different provider.)"
                 )
                 # Keep the user's message visible in the saved transcript (the
                 # LLM history stays rolled back so a retry re-sends it cleanly).
@@ -4882,9 +4974,20 @@ async def copilot_chat(request: Request) -> dict:
     # If every attempted save/create/activate FAILED this turn, say so in a
     # status line regardless of what the model wrote. Redundant next to an
     # honest reply; load-bearing next to a dishonest one.
-    failed_saves = [a for a in actions if not a["ok"] and a["tool"] in _MUTATING_TOOLS]
+    # An apply_update refused pending the user's confirmation is the DESIGNED
+    # flow after a successful propose_update, not a failure — warning "Nothing
+    # was saved" under a diff card that says "want me to apply this?" told the
+    # user their proposal was lost when it was sitting right there.
+    def _is_confirmation_refusal(a: dict) -> bool:
+        return (a["tool"] == "apply_update"
+                and "confirm" in (a.get("summary") or "").lower())
+
+    failed_saves = [a for a in actions if not a["ok"]
+                    and a["tool"] in _MUTATING_TOOLS
+                    and not _is_confirmation_refusal(a)]
     ok_saves = [a for a in actions if a["ok"] and a["tool"] in _MUTATING_TOOLS]
-    if failed_saves and not ok_saves:
+    proposed_ok = any(a["ok"] and a["tool"] == "propose_update" for a in actions)
+    if failed_saves and not ok_saves and not proposed_ok:
         reply += "\n\n⚠️ Nothing was saved in this step — the change did not go through."
         logger.warning("[copilot] truthfulness backstop fired (sid=%s)", sid)
 
@@ -4959,19 +5062,26 @@ async def copilot_apply_change(session_id: str, change_id: str, request: Request
             agents_dir=_AGENTS_DIR)
 
     try:
-        result = _commit(chg["candidate"], chg.get("base_rev"))
-    except agent_store.ConflictError:
-        # Don't dead-end the card. Replay the proposal's own paths onto the
-        # current definition; only a change to those very paths is a real
-        # conflict, and then the card is dropped so the user isn't left
-        # clicking an Apply that can never succeed.
         try:
-            rebased, fresh_rev = _rebase_change(chg)
-        except ValueError as exc:
-            pending.pop(change_id, None)
-            _save_session(session_id)
-            raise HTTPException(status_code=409, detail=str(exc))
-        result = _commit(rebased, fresh_rev)
+            result = _commit(chg["candidate"], chg.get("base_rev"))
+        except agent_store.ConflictError:
+            # Don't dead-end the card. Replay the proposal's own paths onto the
+            # current definition; only a change to those very paths is a real
+            # conflict, and then the card is dropped so the user isn't left
+            # clicking an Apply that can never succeed.
+            try:
+                rebased, fresh_rev = _rebase_change(chg)
+            except ValueError as exc:
+                pending.pop(change_id, None)
+                _save_session(session_id)
+                raise HTTPException(status_code=409, detail=str(exc))
+            result = _commit(rebased, fresh_rev)
+    except agent_store.ScopeError as exc:
+        # The store rolled the write back — surface it as a reviewable 422,
+        # matching the builder's own /ops endpoint, instead of the raw 500
+        # the diff card used to get. The card is kept so the user can retry
+        # after the underlying cause (usually a concurrent edit) settles.
+        raise HTTPException(status_code=422, detail=str(exc))
     pending.pop(change_id, None)
     session["transcript"].append({
         "role": "assistant",

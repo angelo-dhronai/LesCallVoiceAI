@@ -98,15 +98,18 @@ def _slug_db_owner(slug: str) -> Optional[str]:
 
 
 def _snapshot_revision(slug: str, owner: str, actor: str, reason: str,
-                       sha: str, yaml_text: str) -> None:
+                       sha: str, yaml_text: str) -> int | None:
     """Pre-write snapshot into agent_revisions (best-effort must NOT be
-    best-effort: losing the undo trail silently defeats the feature — raise)."""
+    best-effort: losing the undo trail silently defeats the feature — raise).
+    Returns the row id so a scope-check rollback can retract it."""
     from shared.db.database import get_db
     with get_db() as db:
-        db.execute(
+        row = db.execute(
             "INSERT INTO agent_revisions (slug, owner, actor, reason, sha256, "
-            "yaml_text) VALUES (?,?,?,?,?,?)",
-            (slug, owner or None, actor or None, reason or None, sha, yaml_text))
+            "yaml_text) VALUES (?,?,?,?,?,?) RETURNING id",
+            (slug, owner or None, actor or None, reason or None, sha,
+             yaml_text)).fetchone()
+        snap_id = row["id"] if row else None
         # Retention: keep the newest REVISION_RETENTION per slug.
         rows = db.execute(
             "SELECT id FROM agent_revisions WHERE slug=? ORDER BY id DESC",
@@ -114,6 +117,22 @@ def _snapshot_revision(slug: str, owner: str, actor: str, reason: str,
         stale = [r["id"] for r in rows[REVISION_RETENTION:]]
         for rid in stale:
             db.execute("DELETE FROM agent_revisions WHERE id=?", (rid,))
+    return snap_id
+
+
+def _retract_snapshot(snap_id: int | None) -> None:
+    """Remove a snapshot whose write was rolled back by the scope check —
+    otherwise every rejected apply leaves a phantom revision row describing a
+    change that never happened."""
+    if snap_id is None:
+        return
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            db.execute("DELETE FROM agent_revisions WHERE id=?", (snap_id,))
+    except Exception:
+        logger.warning("[store] could not retract snapshot %s", snap_id,
+                       exc_info=True)
 
 
 def list_revisions(slug: str, limit: int = 50) -> list[dict]:
@@ -174,8 +193,10 @@ def write_agent(
             f"Agent '{slug}' changed since it was loaded (rev mismatch)",
             current=current_dict, current_rev=current_sha)
 
-    # (c) snapshot the PRE-write YAML text
-    _snapshot_revision(slug, owner, actor, reason, current_sha, current_text)
+    # (c) snapshot the PRE-write YAML text (retracted if the scope check
+    # rolls the write back — see below)
+    _snap_id = _snapshot_revision(slug, owner, actor, reason, current_sha,
+                                  current_text)
 
     # (d) stamp server-managed fields
     new_dict = dict(new_dict)
@@ -207,9 +228,11 @@ def write_agent(
         unexpected = [d["path"] for d in diff if not is_within(d["path"], allowed)]
         changed_paths = [d["path"] for d in diff]
         if unexpected:
-            # Auto-restore the snapshot, loudly.
+            # Auto-restore the snapshot, loudly — and retract the revision
+            # row, which described a write that now never happened.
             path.write_text(current_text, encoding="utf-8")
             agent_registry.invalidate(slug)
+            _retract_snapshot(_snap_id)
             raise ScopeError(
                 "Write touched paths outside the requested change and was "
                 f"rolled back: {', '.join(unexpected[:10])}",

@@ -45,7 +45,10 @@ IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 # Guardrails whose verdict can never change for this row, so the executor stops
 # reconsidering it. Everything else is retried on the next sweep.
-PERMANENT = {"retry_cap", "dnd", "too_old", "no_contact"}
+# 'superseded': a call to this contact happened AFTER the follow-up was
+# created — the conversation the follow-up wanted already took place; dialling
+# again reads as "we forgot we just spoke".
+PERMANENT = {"retry_cap", "dnd", "too_old", "no_contact", "superseded"}
 
 
 def now_local() -> dt.datetime:
@@ -116,10 +119,24 @@ def blocked_reason(row: dict[str, Any], *, now: dt.datetime,
     """
     if row.get("dnd"):
         return "dnd"
-    if not row.get("contact_handle"):
+    # A dialable number is the requirement, not a live contacts row: users
+    # delete/recreate contacts routinely, and treating a dangling contact_id
+    # as terminal permanently blocked 38 live follow-ups in the executor's
+    # first 30 minutes — every one of which had a usable phone via the calls
+    # join (dial_phone = COALESCE(ct.phone, c.phone)).
+    if not row.get("dial_phone"):
         return "no_contact"
-    if int(row.get("attempts") or 0) >= config.AUTODIAL_MAX_ATTEMPTS:
+    max_attempts = int(row.get("max_attempts") or 0) or config.AUTODIAL_MAX_ATTEMPTS
+    if int(row.get("attempts") or 0) >= max_attempts:
         return "retry_cap"
+
+    # The conversation already happened: a call to this contact placed AFTER
+    # the follow-up was created supersedes it (the analysis of that call will
+    # have produced its own follow-up decision).
+    last_call = as_dt(row.get("last_contact_call_at"))
+    created = as_dt(row.get("created_at"))
+    if last_call is not None and created is not None and last_call > created:
+        return "superseded"
 
     scheduled = as_dt(row.get("scheduled_at"))
     if scheduled is None:
@@ -132,9 +149,16 @@ def blocked_reason(row: dict[str, Any], *, now: dt.datetime,
     if now - scheduled > dt.timedelta(hours=config.AUTODIAL_MAX_AGE_H):
         return "too_old"
 
-    last = as_dt(row.get("last_attempt_at"))
-    if last is not None and now - last < dt.timedelta(minutes=config.AUTODIAL_RETRY_GAP_MIN):
-        return "retry_gap"
+    # Explicit backoff wins over the implicit gap when set (written by
+    # record_attempt as attempts×gap linear backoff).
+    next_try = as_dt(row.get("next_attempt_at"))
+    if next_try is not None:
+        if now < next_try:
+            return "retry_gap"
+    else:
+        last = as_dt(row.get("last_attempt_at"))
+        if last is not None and now - last < dt.timedelta(minutes=config.AUTODIAL_RETRY_GAP_MIN):
+            return "retry_gap"
 
     if placed_today >= config.AUTODIAL_MAX_PER_DAY:
         return "daily_cap"
@@ -148,7 +172,9 @@ def explain(reason: str, now: dt.datetime | None = None) -> str:
     now = now or now_local()
     return {
         "dnd": "Customer asked not to be contacted — never auto-dialled.",
-        "no_contact": "No linked contact number to call.",
+        "no_contact": "No phone number on the follow-up or its call.",
+        "superseded": ("A newer call to this customer already happened — "
+                       "this follow-up is settled."),
         "retry_cap": f"Reached the {config.AUTODIAL_MAX_ATTEMPTS}-attempt limit — needs a human.",
         "not_due": "Not due yet.",
         "too_old": f"More than {config.AUTODIAL_MAX_AGE_H}h past its time — too cold to auto-call.",
@@ -166,17 +192,24 @@ def explain(reason: str, now: dt.datetime | None = None) -> str:
 
 _DUE_SQL = """
     SELECT f.id, f.owner, f.call_id, f.contact_id, f.scheduled_at, f.priority,
-           f.reason, f.attempts, f.last_attempt_at, f.status,
+           f.reason, f.summary, f.attempts, f.last_attempt_at, f.status,
+           f.mode, f.max_attempts, f.next_attempt_at, f.created_at,
            COALESCE(ct.legacy_id, 'db' || ct.id::text) AS contact_handle,
            COALESCE(ct.phone, c.phone)                 AS dial_phone,
            ct.name                                     AS contact_name,
-           (ct.disposition = 'rejected')               AS dnd
+           (ct.disposition = 'rejected')               AS dnd,
+           cm.description                              AS commitment_text,
+           (SELECT max(c3.started_at) FROM calls c3
+             WHERE c3.contact_id = f.contact_id AND c3.owner = f.owner
+               AND f.contact_id IS NOT NULL)           AS last_contact_call_at
       FROM followups f
       LEFT JOIN calls c    ON c.id  = f.call_id
       LEFT JOIN contacts ct ON ct.id = f.contact_id
+      LEFT JOIN commitments cm ON cm.id = f.commitment_id
      WHERE f.deleted_at IS NULL
        AND f.autodial_blocked_at IS NULL
        AND f.decision = 'yes'
+       AND f.mode = 'auto'
        AND f.status IN ('pending', 'scheduled', 'missed')
        AND f.scheduled_at IS NOT NULL
      ORDER BY f.priority = 'urgent' DESC, f.scheduled_at
@@ -188,6 +221,10 @@ def due_candidates(limit: int = 200) -> list[dict[str, Any]]:
 
     Deliberately only `decision='yes'`: a 'no' or 'unsure' decision must never
     result in an automatic call — 'unsure' is exactly the case a human reviews.
+    Deliberately only `mode='auto'`: auto-dialling is OPT-IN per follow-up
+    (default 'manual'), set by a human toggle or the agent's
+    follow_up.auto_execute flag at decision time. The 0007-era executor
+    dialled every yes-row; that inversion of intent is what 0008 fixed.
     """
     with get_db() as db:
         return [dict(r) for r in db.execute(_DUE_SQL, (limit,)).fetchall()]
@@ -231,13 +268,19 @@ def record_attempt(fid: int, *, ok: bool, detail: str = "",
             "detail": detail[:300],
         })
         if ok:
+            # Linear backoff: attempt N schedules attempt N+1 no sooner than
+            # N × retry-gap from now. Written explicitly (next_attempt_at) so
+            # the UI can answer "why isn't it calling yet" without modelling
+            # the executor's implicit-gap rule.
             db.execute(
                 """UPDATE followups
                       SET attempts = attempts + 1, last_attempt_at = now(),
+                          next_attempt_at = now() + make_interval(
+                              mins => ? * (attempts + 1)),
                           last_attempt_error = NULL, status = 'scheduled',
                           audit = ?, updated_at = now()
                     WHERE id = ?""",
-                (json.dumps(audit[-50:]), fid),
+                (config.AUTODIAL_RETRY_GAP_MIN, json.dumps(audit[-50:]), fid),
             )
         else:
             db.execute(
@@ -248,3 +291,20 @@ def record_attempt(fid: int, *, ok: bool, detail: str = "",
                     WHERE id = ?""",
                 (detail[:300], json.dumps(audit[-50:]), permanent, fid),
             )
+
+
+def record_result(fid: int, outcome: str) -> None:
+    """Stamp the FreeSWITCH originate result on the follow-up.
+
+    answered|no_answer|busy|declined|failed. Non-answered rows stay
+    retry-eligible (record_attempt already set the backoff); 'answered' is
+    provisional — the analysis-time completion hook in stage_followup is what
+    marks the row completed, because an originate +OK also fires for
+    voicemail pickups.
+    """
+    with get_db() as db:
+        db.execute(
+            "UPDATE followups SET execution_outcome=?, updated_at=now() "
+            "WHERE id=?",
+            (outcome[:32], fid),
+        )

@@ -16,6 +16,7 @@ import os
 import queue as _queue
 import re
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -89,6 +90,35 @@ _CHUNK_MAX_CHARS = 180
 # Matches the +0.1s inter-file pacing gap in conversation_call_bridge.py's
 # _playback_loop; used when reporting total utterance duration for echo-mute.
 _INTER_WAV_PACING_S = 0.1
+
+# Early first-flush: the caller used to hear nothing until part 1's ENTIRE
+# Sarvam stream completed — measured median 806ms / max 1882ms of extra dead
+# air per turn (2026-07-23 latency audit), because a 90-char Indic part can
+# synthesize to ~5s of audio. Instead, once ≥ _EARLY_FLUSH_MIN_S of PCM is
+# buffered for the first part, flush it as its own WAV so playback starts
+# while the rest still synthesizes. The bridge paces files with a ~100ms gap,
+# so the cut must land in an inter-word pause, never mid-word: after the
+# minimum is buffered we keep scanning the newest chunk's tail RMS and flush
+# at the first near-silence; _EARLY_FLUSH_MAX_S caps the wait when someone
+# speaks without pausing (a mid-word seam is still better than +1s dead air).
+TTS_EARLY_FLUSH = os.environ.get("TTS_EARLY_FLUSH", "true").lower() == "true"
+_EARLY_FLUSH_MIN_S = float(os.environ.get("TTS_EARLY_FLUSH_MIN_S", "0.9"))
+_EARLY_FLUSH_MAX_S = float(os.environ.get("TTS_EARLY_FLUSH_MAX_S", "1.6"))
+_EARLY_FLUSH_TAIL_MS = 40          # window scanned for the pause
+_EARLY_FLUSH_SILENCE_RMS = 300     # ≲1% full-scale ≈ inter-word gap
+
+
+def _tail_is_pause(pcm: bytes, sample_rate: int) -> bool:
+    """True when the last _EARLY_FLUSH_TAIL_MS of `pcm` is near-silent."""
+    tail_bytes = int(sample_rate * 2 * _EARLY_FLUSH_TAIL_MS / 1000)
+    tail = pcm[-tail_bytes:]
+    if len(tail) < tail_bytes:
+        return False
+    try:
+        import audioop
+        return audioop.rms(tail, 2) < _EARLY_FLUSH_SILENCE_RMS
+    except Exception:
+        return True  # can't judge — don't hold audio hostage
 
 
 def _split_for_streaming(text: str) -> list[str]:
@@ -277,11 +307,20 @@ class SarvamTTS(StreamingTTS):
             )
         total_duration = 0.0
         flushed_parts = 0
+        speak_t0 = time.monotonic()
+
+        # Early-flush state (first part of the utterance only).
+        sink_flushable = hasattr(self._sink, 'flush')
+        early_min_bytes = int(self._sample_rate * 2 * _EARLY_FLUSH_MIN_S)
+        early_max_bytes = int(self._sample_rate * 2 * _EARLY_FLUSH_MAX_S)
 
         try:
             for part in parts:
                 if self._cancelled:
                     break
+                part_bytes = 0
+                part_tail = b""
+                early_flushed = False
                 async for chunk in self._stream_audio(part):
                     if self._cancelled:
                         logger.info("[TTS:Sarvam] Cancelled mid-stream")
@@ -292,7 +331,33 @@ class SarvamTTS(StreamingTTS):
                         self._capture_buf += chunk.audio
                     chunk_count += 1
                     if chunk_count == 1:
-                        logger.info("[TTS:Sarvam] First chunk sent to sink")
+                        logger.info(
+                            "[TTS:Sarvam] First chunk sent to sink (%.0fms)",
+                            (time.monotonic() - speak_t0) * 1000,
+                        )
+
+                    # Early first-flush: get audio to the caller before the
+                    # part's stream completes. First part only, at most once,
+                    # cut at an inter-word pause (or the hard cap).
+                    if (TTS_EARLY_FLUSH and sink_flushable
+                            and flushed_parts == 0 and not early_flushed
+                            and self._capture_buf is None):  # never while caching
+                        part_bytes += len(chunk.audio)
+                        part_tail = (part_tail + chunk.audio)[-4096:]
+                        if part_bytes >= early_min_bytes and (
+                            part_bytes >= early_max_bytes
+                            or _tail_is_pause(part_tail, self._sample_rate)
+                        ):
+                            await self._sink.flush()
+                            total_duration += getattr(
+                                self._sink, 'last_flush_duration', 0.0)
+                            flushed_parts += 1
+                            early_flushed = True
+                            logger.info(
+                                "[TTS:Sarvam] Early flush %.2fs after %.0fms",
+                                part_bytes / (self._sample_rate * 2),
+                                (time.monotonic() - speak_t0) * 1000,
+                            )
                 if self._cancelled:
                     break
                 # Incremental flush: hand this part's audio to the transport

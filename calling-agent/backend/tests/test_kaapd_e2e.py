@@ -124,7 +124,7 @@ def _build_kaapd(cop_mod, agents_dir):
         {"role": "user", "content": "build the Kaapd agent from this brief"}],
         "transcript": [], "meta": {}}
     guard = {"user_turns": 3, "created_this_turn": False,
-             "session": session, "user_message": "here is the brief",
+             "session": session, "user_message": "brief attached — use defaults and build the agent",
              "sid": "kaapd1"}
     _ch, notes, progress, _closed = cop_mod._merge_extracted_into_draft(
         session, dict(_KAAPD_FIELDS))
@@ -133,6 +133,7 @@ def _build_kaapd(cop_mod, agents_dir):
     iv = cop_mod._interview_state(session)
     progress = cop_mod.interview_progress(iv["draft"], iv["skipped"])
     for open_id in list(progress["open_layers"]):
+        guard.pop("skips_this_turn", None)  # each skip on its own turn
         _run(cop_mod._execute_tool("skip_layer", {
             "layer_id": open_id,
             "user_words": "skip that, use defaults"}, guard))
@@ -266,11 +267,12 @@ def test_kaapd_incident_b_shape_is_refused_at_create(cop, monkeypatch):
         session = {"messages": [{"role": "user", "content": "brief"}],
                    "transcript": [], "meta": {}}
         guard = {"user_turns": 3, "created_this_turn": False,
-                 "session": session, "user_message": "go", "sid": "s2"}
+                 "session": session, "user_message": "skip the rest, go ahead, create it", "sid": "s2"}
         cop_mod._merge_extracted_into_draft(session, dict(_KAAPD_FIELDS))
         iv = cop_mod._interview_state(session)
         progress = cop_mod.interview_progress(iv["draft"], iv["skipped"])
         for open_id in list(progress["open_layers"]):
+            guard.pop("skips_this_turn", None)  # each skip on its own turn
             _run(cop_mod._execute_tool("skip_layer", {
                 "layer_id": open_id, "user_words": "skip"}, guard))
         with pytest.raises(ValueError, match="crash on a live call"):

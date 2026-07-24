@@ -102,6 +102,19 @@ class TelephonySink(AudioSink):
                 "[%s] [TelephonySink] flush duration=%.2fs (%d bytes)",
                 self._conn_id, self.last_flush_duration, pcm_size,
             )
+            # The pipeline arms turn_speech_end_ts when a caller turn lands;
+            # the first flush after that IS the turn's first audible audio
+            # (modulo FS injection). One greppable line per turn for the
+            # number every latency fix targets.
+            anchor = getattr(self, "turn_speech_end_ts", 0.0)
+            if anchor > 0.0:
+                logger.info(
+                    "[%s] [LATENCY] speech_end→first_audio %.0fms "
+                    "(flush %.2fs)",
+                    self._conn_id, (now - anchor) * 1000.0,
+                    self.last_flush_duration,
+                )
+                self.turn_speech_end_ts = 0.0
             self._pcm_buffer.clear()
 
             # Phase B & C: Normalization
@@ -118,7 +131,22 @@ class TelephonySink(AudioSink):
                     except Exception:
                         pass
                 else:
-                    logger.warning("[%s] [TelephonySink] Normalization failed, using raw file", self._conn_id)
+                    # DROP, never queue the raw file: FreeSWITCH plays 8kHz;
+                    # handing it a 16k WAV plays at half speed / octave down.
+                    # This drop was the documented 2026-06-02 fix but never
+                    # survived into committed code — the fall-through was
+                    # dormant only because TTS_OUTPUT_SR defaults to 8000,
+                    # and the RUNBOOK's rollback (TTS_OUTPUT_SR=16000)
+                    # re-armed it. A skipped utterance beats demon audio.
+                    logger.error(
+                        "[%s] [TelephonySink] Normalization failed — DROPPING "
+                        "%s (raw %d Hz would play wrong on FS)",
+                        self._conn_id, raw_filepath, self._sample_rate)
+                    try:
+                        os.remove(raw_filepath)
+                    except Exception:
+                        pass
+                    return
 
             # Phase E: Ensure permissions
             try:

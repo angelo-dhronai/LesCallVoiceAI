@@ -98,6 +98,16 @@ except Exception as _exc:  # pragma: no cover - watcher is best-effort
     logger.warning("[BRIDGE] registry watcher not started: %r", _exc)
 
 
+def _reap_played_wav(path: str) -> None:
+    """Delete a played-out TTS WAV; scheduled 30s after its pacing sleep."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # pragma: no cover - reaping is best-effort
+        logger.debug("[BRIDGE] wav reap failed for %s: %r", path, exc)
+
+
 def _resolve_active_agent_slug() -> str:
     """Slug of the agent that should answer inbound calls.
 
@@ -259,7 +269,8 @@ def _lookup_recent_outbound_dial(caller_number: str = "") -> dict | None:
             with get_db() as db:
                 entries = [dict(r) for r in db.execute(
                     "SELECT owner, phone, contact_id, name, agent_slug,"
-                    " dialed_at, context_note FROM call_links WHERE dialed_at >= ?"
+                    " dialed_at, context_note, followup_id, placed_by"
+                    " FROM call_links WHERE dialed_at >= ?"
                     " ORDER BY dialed_at DESC LIMIT 50",
                     (window_start,)).fetchall()]
         except Exception as exc:
@@ -1031,6 +1042,16 @@ class TelephonySession:
         if self.direction == "outbound" and dial and dial.get("phone"):
             phone = dial["phone"]
 
+        # Billing transparency (0009): who initiated the call. Inbound = the
+        # customer dialled us; outbound = whatever the dial record declared
+        # (user | autodial | automation). A matched dial that predates 0009
+        # carries no placed_by — fall back on followup_id (autodialer is the
+        # only path that sets it), else assume a human clicked Call.
+        placed_by = "user"
+        if self.direction == "outbound" and dial:
+            placed_by = (dial.get("placed_by")
+                         or ("autodial" if dial.get("followup_id") else "user"))
+
         def _iso(t: float) -> str:
             return datetime.datetime.fromtimestamp(
                 t, datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -1081,8 +1102,8 @@ class TelephonySession:
                 "transcript, summary, collected_data, recording_path, "
                 "download_token, recording_url, contact_id, outcome, outcome_kind, "
                 "agent_revision, agent_sha, agent_health, "
-                "llm_models_used, llm_fallback_turns) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "llm_models_used, llm_fallback_turns, placed_by) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT (conn_id) DO UPDATE SET "
                 "call_key=COALESCE(excluded.call_key, calls.call_key), "
                 "ended_at=excluded.ended_at, "
@@ -1102,7 +1123,8 @@ class TelephonySession:
                 "agent_sha=COALESCE(calls.agent_sha, excluded.agent_sha), "
                 "agent_health=COALESCE(calls.agent_health, excluded.agent_health), "
                 "llm_models_used=COALESCE(calls.llm_models_used, excluded.llm_models_used), "
-                "llm_fallback_turns=COALESCE(calls.llm_fallback_turns, excluded.llm_fallback_turns)",
+                "llm_fallback_turns=COALESCE(calls.llm_fallback_turns, excluded.llm_fallback_turns), "
+                "placed_by=COALESCE(calls.placed_by, excluded.placed_by)",
                 (self.conn_id, call_key, self.direction, self.agent_slug, self.campaign_id,
                  phone or None, significant_digits(phone) or None,
                  lang or None, _iso(started), _iso(ended), round(ended - started, 1),
@@ -1112,7 +1134,7 @@ class TelephonySession:
                  int(getattr(self, "agent_revision", 0) or 0),
                  str(getattr(self, "agent_sha", "") or "") or None,
                  str(getattr(self, "agent_health", "") or "") or None,
-                 llm_models_used, llm_fallback_turns),
+                 llm_models_used, llm_fallback_turns, placed_by),
             )
 
     async def _event_loop(self):
@@ -1182,6 +1204,15 @@ class TelephonySession:
                 if duration > 0:
                     logger.info(f"[{self.conn_id}] [PLAYBACK_PACE] Sleeping for {duration:.2f}s duration")
                     await asyncio.sleep(duration + 0.1) # slight buffer
+
+                # Reap the WAV once it can no longer be in use: playback ends
+                # ~injection-overhead after the pacing sleep, and FreeSWITCH
+                # holds its own fd anyway (a Linux unlink never cuts audio
+                # mid-play). Nothing else deleted these — 2 calls left 53
+                # files in /tmp/ai_telephony_playback, and this VM has
+                # already had a disk-full incident.
+                asyncio.get_running_loop().call_later(
+                    30.0, _reap_played_wav, wav_path)
                 
             except asyncio.CancelledError:
                 break

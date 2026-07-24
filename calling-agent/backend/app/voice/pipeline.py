@@ -974,16 +974,17 @@ class VoicePipeline:
                 )
                 # F16: best-known conversation language for the STT router's
                 # script-misdetection retry (genuine Hindi transcribed as
-                # Gurmukhi etc.). Only passed once at least one user turn has
-                # established a language (language_history non-empty) — never
-                # on the first utterance of a call, so pre-detection behaviour
-                # is unchanged.
+                # Gurmukhi etc.). Before any caller turn establishes a language
+                # this is the language the agent itself opened in — an
+                # approximate anchor, but the retry only fires on transcripts
+                # in scripts we don't support at all, where the alternative is
+                # dropping the caller's first response outright (2026-07-24
+                # test call: 540ms "hello" → ml-IN conf 1.00 → dropped → dead-
+                # air reprompt → hang-up).
                 _retry_lang = None
                 if self.conversation is not None:
                     _conv_state = getattr(self.conversation, "state", None)
-                    if _conv_state is not None and getattr(
-                        _conv_state, "language_history", None
-                    ):
+                    if _conv_state is not None:
                         _retry_lang = getattr(_conv_state, "language", None) or None
                 stt_result = await self.stt.transcribe(
                     segment.audio, sample_rate=SAMPLE_RATE, language=_stt_lang,

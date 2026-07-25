@@ -17,7 +17,7 @@ Config (deploy/.pg_env — shared by lescall-runtime and lescall-dashboard):
     GCS_RECORDINGS_BUCKET=lescall-recordings     # empty → uploads disabled
     GCS_RECORDINGS_PREFIX=recordings
     GOOGLE_APPLICATION_CREDENTIALS=/path/sa.json # or VM default credentials
-    PUBLIC_BASE_URL=https://agent.lescall.dhronai.com
+    PUBLIC_BASE_URL=https://agent.lescall.com
     RECORDING_LOCAL_RETENTION_DAYS=3
 
 CLI (catch-up sync + retention cleanup, cron/systemd-timer friendly):
@@ -62,7 +62,7 @@ def gcs_enabled() -> bool:
 
 def public_base_url() -> str:
     return os.environ.get(
-        "PUBLIC_BASE_URL", "https://agent.lescall.dhronai.com").rstrip("/")
+        "PUBLIC_BASE_URL", "https://agent.lescall.com").rstrip("/")
 
 
 def retention_days() -> float:

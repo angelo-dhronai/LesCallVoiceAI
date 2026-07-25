@@ -57,7 +57,7 @@ ALERT_EMAIL = os.environ.get("SENTINEL_ALERT_EMAIL", "tech@dhronai.com")
 INBOUND_ALERT_H = float(os.environ.get("SENTINEL_INBOUND_ALERT_H", "26"))
 DISK_ALERT_PCT = int(os.environ.get("SENTINEL_DISK_ALERT_PCT", "90"))
 MEM_MIN_MB = int(os.environ.get("SENTINEL_MEM_MIN_MB", "300"))
-EDGE_URL = os.environ.get("PUBLIC_BASE_URL", "https://agent.lescall.dhronai.com")
+EDGE_URL = os.environ.get("PUBLIC_BASE_URL", "https://agent.lescall.com")
 
 RESTART_COOLDOWN_S = 600
 RESTART_CAP_PER_HOUR = 3

@@ -166,14 +166,14 @@ Single-tenant fallback is active until these are set (they can live in
 ```
 GOOGLE_CLIENT_ID=...apps.googleusercontent.com
 GOOGLE_CLIENT_SECRET=...
-OAUTH_REDIRECT_URL=https://agent.lescall.dhronai.com/auth/callback
+OAUTH_REDIRECT_URL=https://agent.lescall.com/auth/callback
 LESCALL_SESSION_SECRET=<long random string>     # else dashboard/.session_secret is generated
 LESCALL_ALLOWED_EMAILS=tech@dhronai.com         # comma-separated; "*" = open signup
 ```
 
 Google Cloud Console prerequisites (console.cloud.google.com → APIs & Services
 → Credentials → Create OAuth client ID, type "Web application"):
-- Authorized redirect URI: `https://agent.lescall.dhronai.com/auth/callback`
+- Authorized redirect URI: `https://agent.lescall.com/auth/callback`
   (add `http://localhost:8080/auth/callback` for local testing)
 - Configure the OAuth consent screen (app name "LesCall", logo, support email).
 
@@ -181,7 +181,7 @@ What turns on the moment BOTH client id + secret are set (dashboard restart):
 - **Login wall** (`auth.install_login_gate`): every route except `/login`,
   `/auth/*`, `/static/*`, `/api/auth/me` requires a session — HTML navigations
   redirect to the branded login page (`static/login.html`, styled after
-  lescall.dhronai.com), API calls get 401.
+  lescall.com), API calls get 401.
 - `/auth/login` → Google → `/auth/callback` verifies + checks
   `LESCALL_ALLOWED_EMAILS`, upserts the `users` row, sets the signed cookie.
 - `/auth/logout` clears it.
@@ -192,7 +192,15 @@ The cookie `Secure` flag follows OAUTH_REDIRECT_URL's scheme, so use the
 https URL in production (TLS terminates in front of nginx).
 
 **STATUS: DONE 2026-07-12** — creds in `calling-agent/.env`, dashboard
-restarted, live on https://agent.lescall.dhronai.com.
+restarted, live on https://agent.lescall.com.
+
+**DOMAIN MOVE 2026-07-25**: agent.lescall.dhronai.com → **agent.lescall.com**
+(dhronai.com DNS records deleted). New Let's Encrypt cert issued; the old
+vhosts now just 301 to the new domain and can be dropped (plus
+`certbot delete --cert-name {agent,dashboard}.lescall.dhronai.com`) once
+their certs near expiry — their renewals fail without DNS, which is expected.
+Google OAuth client: redirect URI + JS origin updated to agent.lescall.com in
+the console. Stored `calls.recording_url` links were rewritten in the DB.
 
 Host-nginx layer (required because agent.lescall proxies "/" to the SPA
 *container* on :8081, which would bypass FastAPI's gate): the vhosts in
@@ -203,9 +211,9 @@ in `/etc/nginx/lescall-backups/`). They send `/auth/`, `/login`, `/api/`,
 (`/api/auth/me`) in front of the container SPA — a no-op whenever OAuth is
 unconfigured. Rollback: restore the backups + `nginx -t && systemctl reload nginx`.
 
-CAVEAT: DNS for `dashboard.lescall.dhronai.com` points at a DIFFERENT server
-(35.207.192.113, the old box) — the wall on THIS host doesn't govern whatever
-runs there. Point that DNS record here (or retire it) to close the loop.
+(Historical caveat, resolved by the 2026-07-25 domain move: DNS for
+`dashboard.lescall.dhronai.com` pointed at a different old server; that
+record is deleted along with the rest of the dhronai.com zone.)
 
 ## 5b. Number-verification dialplan (outbound caller-ID proof) — DONE 2026-07-12
 
@@ -243,7 +251,7 @@ responses are terminal-success.
 Every finished call writes a full `calls` row (owner, agent_slug, callee
 phone, duration_s, transcript, summary, collected_data slots, follow_up from
 AI analysis, recording_path) plus a **256-bit random `download_token`**. The
-public link is `https://agent.lescall.dhronai.com/api/recordings/dl/<token>`
+public link is `https://agent.lescall.com/api/recordings/dl/<token>`
 — auth-exempt, unguessable, and any miss returns an identical 404, so a
 leaked link cannot be edited into someone else's recording.
 

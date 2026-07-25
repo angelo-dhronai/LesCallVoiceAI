@@ -1167,7 +1167,7 @@ async def root() -> HTMLResponse:
     # The dashboard UI is the React app (frontend/, served by nginx); this
     # process is API-only.
     return HTMLResponse("<h1>LesCall API</h1><p>The dashboard lives at "
-                        "<a href='https://agent.lescall.dhronai.com'>agent.lescall.dhronai.com</a>.</p>")
+                        "<a href='https://agent.lescall.com'>agent.lescall.com</a>.</p>")
 
 
 # ---------------------------------------------------------------------------

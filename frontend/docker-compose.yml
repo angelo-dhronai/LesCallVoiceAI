@@ -1,7 +1,7 @@
 # Reproducible deploy of the LesCall dashboard frontend.
 #   docker compose up -d --build
 # Serves the SPA on 127.0.0.1:8081 and proxies /api -> host backend (:8080).
-# Public access is fronted by the system nginx vhost (dashboard.lescall.dhronai.com).
+# Public access is fronted by the system nginx vhost (agent.lescall.com).
 services:
   frontend:
     build: .

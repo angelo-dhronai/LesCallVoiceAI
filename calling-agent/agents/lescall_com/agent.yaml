@@ -129,7 +129,7 @@ response_bank:
     en:
     - '{''reply'': "Our platform can help you automate your calling process and improve
       efficiency. I''d like to invite you to try out our pilot program. Please visit
-      our website at lescall.dhronai.com to learn more.", ''response'': "We''re interested
+      our website at lescall.com to learn more.", ''response'': "We''re interested
       in learning more."}'
   decline_farewell:
     en: No problem at all — thank you for your time, have a great day!

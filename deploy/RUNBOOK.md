@@ -195,12 +195,13 @@ https URL in production (TLS terminates in front of nginx).
 restarted, live on https://agent.lescall.com.
 
 **DOMAIN MOVE 2026-07-25**: agent.lescall.dhronai.com → **agent.lescall.com**
-(dhronai.com DNS records deleted). New Let's Encrypt cert issued; the old
-vhosts now just 301 to the new domain and can be dropped (plus
-`certbot delete --cert-name {agent,dashboard}.lescall.dhronai.com`) once
-their certs near expiry — their renewals fail without DNS, which is expected.
+(dhronai.com DNS records deleted). New Let's Encrypt cert issued; the legacy
+dhronai vhosts and their certs were fully removed the same day (certbot
+delete + dashboard.lescall vhost dropped — the old names no longer resolve).
 Google OAuth client: redirect URI + JS origin updated to agent.lescall.com in
 the console. Stored `calls.recording_url` links were rewritten in the DB.
+Topology note: apex `lescall.com`/`www` stay on the separate marketing box
+(35.207.233.208); only `agent.lescall.com` points at this VM.
 
 Host-nginx layer (required because agent.lescall proxies "/" to the SPA
 *container* on :8081, which would bypass FastAPI's gate): the vhosts in

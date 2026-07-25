@@ -52,7 +52,7 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
           <img
             src="/logo.png"
             alt="LesCall — Call Intelligence"
-            className={cx('w-auto object-contain', collapsed ? 'h-7' : 'h-8')}
+            className={cx('w-auto object-contain', collapsed ? 'h-6' : 'h-9')}
           />
         </div>
 

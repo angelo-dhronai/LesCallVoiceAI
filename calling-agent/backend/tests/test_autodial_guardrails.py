@@ -36,6 +36,10 @@ def row(**over):
         "scheduled_at": at(0, 9),           # due well before any test `now`
         "contact_handle": "db42", "dial_phone": "+919999999999",
         "contact_name": "Asha", "dnd": False,
+        # AI-picked time (the conservative default these tests assume):
+        # grace + business window apply. auto_scheduled=0 = the CUSTOMER
+        # stated the time — covered by its own tests below.
+        "auto_scheduled": 1,
     }
     base.update(over)
     return base
@@ -123,12 +127,41 @@ def test_daily_cap_is_a_hard_ceiling():
 
 
 def test_grace_period_lets_a_human_intervene():
-    """A row scheduled seconds ago is not dialled instantly."""
+    """An AI-picked time scheduled seconds ago is not dialled instantly."""
     sched = at(0, 12)
     r = row(scheduled_at=sched)
     assert autodial.blocked_reason(r, now=sched, placed_today=0) == "not_due"
     after = sched + dt.timedelta(minutes=config.AUTODIAL_GRACE_MIN + 1)
     assert autodial.blocked_reason(r, now=after, placed_today=0) is None
+
+
+# ── customer-stated times (auto_scheduled=0) ────────────────────────────────
+
+def test_customer_stated_time_skips_grace():
+    """'Call me in 10 minutes' must fire AT its time — grace would make a
+    10-minute promise ~15 minutes late."""
+    sched = at(0, 12)
+    r = row(scheduled_at=sched, auto_scheduled=0)
+    assert autodial.blocked_reason(r, now=sched, placed_today=0) is None
+    # …but a not-yet-due row still waits.
+    early = sched - dt.timedelta(minutes=1)
+    assert autodial.blocked_reason(r, now=early, placed_today=0) == "not_due"
+
+
+def test_customer_stated_time_gets_courtesy_window():
+    """The customer's own ask ('call me at 8 tonight' / Sunday) is honoured
+    beyond the business window — but never at unsociable hours."""
+    r = row(scheduled_at=at(0, 9), auto_scheduled=0)
+    # 20:00 Monday: outside business window, inside courtesy window.
+    assert autodial.blocked_reason(r, now=at(0, 20), placed_today=0) is None
+    # Sunday noon: weekday gate does not apply to a customer-stated time.
+    r_sun = row(scheduled_at=at(6, 11), auto_scheduled=0)
+    assert autodial.blocked_reason(r_sun, now=at(6, 12), placed_today=0) is None
+    # 22:00: beyond the courtesy window — still refused.
+    assert autodial.blocked_reason(r, now=at(0, 22), placed_today=0) == "outside_window"
+    # …and an AI-picked time keeps the conservative business window.
+    r_ai = row(scheduled_at=at(0, 9), auto_scheduled=1)
+    assert autodial.blocked_reason(r_ai, now=at(0, 20), placed_today=0) == "outside_window"
 
 
 def test_stale_followups_are_abandoned_not_called():

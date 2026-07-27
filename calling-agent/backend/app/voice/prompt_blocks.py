@@ -787,3 +787,40 @@ def firm_rules_block(agent_def: AgentDefinition, lang: str = "en") -> list[str]:
         if handoff:
             lines.append(f"▸ Handoff message: '{handoff}'")
     return lines
+
+
+def call_closure_block(agent_def: AgentDefinition, lang: str = "en") -> list[str]:
+    """━━ ENDING THE CALL ━━ — unconditional platform doctrine, every agent.
+
+    Two universal rules the business mandates on ALL agents, existing and
+    future, so they sit outside guardrails.use_builtin_rules:
+    1. permission-to-close: the agent never wraps up a call the caller hasn't
+       agreed to end — it asks "anything else I can help with?" first. The
+       platform hangs up automatically after the goodbye (deterministic
+       close-confirm in ConversationRouter arms hangup_pending; the bridge
+       tears the channel down after the farewell audio drains).
+    2. callback pin-down: "call me later/in 10 minutes/tomorrow" must leave
+       the call with a SPECIFIC agreed time — the platform schedules a real
+       follow-up call from it, so a vague "sure, we'll call you" is a broken
+       promise.
+    """
+    return [
+        "",
+        "━━ ENDING THE CALL ━━",
+        "✗ NEVER end or wrap up the call on your own — before any goodbye, "
+        "ALWAYS ask the caller's permission first, e.g. 'Is there anything "
+        "else I can help you with?', and only close after they confirm "
+        "they're done",
+        "✓ When the caller says goodbye or confirms they're done, reply with "
+        "ONE warm goodbye line and nothing more — the platform ends the call "
+        "after your goodbye, so never mention hanging up, disconnecting, or "
+        "any technical step",
+        "✓ When the caller asks to be called later ('call me in 10 minutes', "
+        "'call me tomorrow'), politely agree and pin down ONE specific time "
+        "before letting them go — confirm it back in one short sentence "
+        "('Perfect — I'll call you tomorrow at 4 PM.'); a real follow-up "
+        "call is scheduled from what you agree, so never promise vaguely",
+        "✗ NEVER keep pushing after the caller has said they want to leave "
+        "or has declined twice — accept gracefully, ask permission to close, "
+        "and say goodbye",
+    ]

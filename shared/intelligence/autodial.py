@@ -89,19 +89,30 @@ def as_dt(value: Any) -> dt.datetime | None:
 # Pure guardrail predicates
 # ---------------------------------------------------------------------------
 
-def within_window(when: dt.datetime) -> bool:
-    """True if `when` (local) is inside the permitted calling window."""
+def within_window(when: dt.datetime, *, customer_requested: bool = False) -> bool:
+    """True if `when` (local) is inside the permitted calling window.
+
+    customer_requested=True is the row whose time the CUSTOMER stated
+    ("call me at 8 tonight", auto_scheduled=0): honouring their own ask
+    outranks the business window, so a wider courtesy window applies
+    (AUTODIAL_CB_HOUR_START..END, any weekday). AI-picked times keep the
+    conservative default window.
+    """
+    if customer_requested:
+        return (config.AUTODIAL_CB_HOUR_START <= when.hour
+                < config.AUTODIAL_CB_HOUR_END)
     if when.weekday() not in config.autodial_weekdays():
         return False
     return config.AUTODIAL_HOUR_START <= when.hour < config.AUTODIAL_HOUR_END
 
 
-def next_window_open(when: dt.datetime) -> dt.datetime:
+def next_window_open(when: dt.datetime,
+                     customer_requested: bool = False) -> dt.datetime:
     """The next moment the window opens at or after `when` — used to explain a
     skip ("will call after 10:00 Mon") rather than just refusing."""
     probe = when
     for _ in range(14 * 24):  # bounded: a fortnight of hourly probes
-        if within_window(probe):
+        if within_window(probe, customer_requested=customer_requested):
             return probe
         nxt = (probe + dt.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         if nxt.hour < probe.hour:  # rolled past midnight
@@ -143,7 +154,13 @@ def blocked_reason(row: dict[str, Any], *, now: dt.datetime,
         # No time on the row means nothing decided WHEN to call. Refuse rather
         # than treat "unscheduled" as "call right now".
         return "not_due"
-    due_at = scheduled + dt.timedelta(minutes=config.AUTODIAL_GRACE_MIN)
+    # auto_scheduled=0 means the CUSTOMER stated this time ("call me in 10
+    # minutes", "tomorrow at 4"). Their explicit ask skips the human-review
+    # grace — a 10-minute callback that waits grace+poll arrives ~15 minutes
+    # late and reads as a broken promise. AI-guessed times keep the grace.
+    customer_requested = not int(row.get("auto_scheduled") or 0)
+    due_at = scheduled if customer_requested else (
+        scheduled + dt.timedelta(minutes=config.AUTODIAL_GRACE_MIN))
     if now < due_at:
         return "not_due"
     if now - scheduled > dt.timedelta(hours=config.AUTODIAL_MAX_AGE_H):
@@ -162,7 +179,7 @@ def blocked_reason(row: dict[str, Any], *, now: dt.datetime,
 
     if placed_today >= config.AUTODIAL_MAX_PER_DAY:
         return "daily_cap"
-    if not within_window(now):
+    if not within_window(now, customer_requested=customer_requested):
         return "outside_window"
     return None
 
@@ -194,11 +211,14 @@ _DUE_SQL = """
     SELECT f.id, f.owner, f.call_id, f.contact_id, f.scheduled_at, f.priority,
            f.reason, f.summary, f.attempts, f.last_attempt_at, f.status,
            f.mode, f.max_attempts, f.next_attempt_at, f.created_at,
+           f.auto_scheduled, f.followup_type,
            COALESCE(ct.legacy_id, 'db' || ct.id::text) AS contact_handle,
            COALESCE(ct.phone, c.phone)                 AS dial_phone,
            ct.name                                     AS contact_name,
            (ct.disposition = 'rejected')               AS dnd,
            cm.description                              AS commitment_text,
+           c.started_at                                AS source_call_at,
+           ci.customer_intent                          AS source_call_intent,
            (SELECT max(c3.started_at) FROM calls c3
              WHERE c3.contact_id = f.contact_id AND c3.owner = f.owner
                AND f.contact_id IS NOT NULL)           AS last_contact_call_at
@@ -206,6 +226,7 @@ _DUE_SQL = """
       LEFT JOIN calls c    ON c.id  = f.call_id
       LEFT JOIN contacts ct ON ct.id = f.contact_id
       LEFT JOIN commitments cm ON cm.id = f.commitment_id
+      LEFT JOIN call_intelligence ci ON ci.call_id = f.call_id
      WHERE f.deleted_at IS NULL
        AND f.autodial_blocked_at IS NULL
        AND f.decision = 'yes'

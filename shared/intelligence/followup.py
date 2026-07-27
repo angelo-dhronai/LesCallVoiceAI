@@ -100,6 +100,9 @@ def ingest_in_call_commitments(call: dict[str, Any]) -> None:
     if not isinstance(raw, list):
         return
     anchor = _parse_anchor(call)
+    # Relative offsets ("call me in 10 minutes") count from when the caller
+    # said it — the end of the call, not its start.
+    call_end = anchor + dt.timedelta(seconds=int(call.get("duration_s") or 0))
     with get_db() as db:
         db.execute(
             "DELETE FROM commitments WHERE call_id=? AND source='in_call'",
@@ -109,7 +112,15 @@ def ingest_in_call_commitments(call: dict[str, Any]) -> None:
             if not isinstance(c, dict):
                 continue
             day, tm = str(c.get("day") or ""), str(c.get("time") or "")
-            deadline = resolve_deadline(day, tm, anchor) if day else None
+            offset_min = 0
+            try:
+                offset_min = max(0, min(int(c.get("offset_min") or 0), 7 * 24 * 60))
+            except (TypeError, ValueError):
+                offset_min = 0
+            if offset_min:
+                deadline = (call_end + dt.timedelta(minutes=offset_min)).isoformat()
+            else:
+                deadline = resolve_deadline(day, tm, anchor) if day else None
             db.execute(
                 """INSERT INTO commitments
                        (call_id, owner, contact_id, made_by, kind, description,
@@ -120,14 +131,26 @@ def ingest_in_call_commitments(call: dict[str, Any]) -> None:
                  c.get("made_by") or "customer", c.get("kind") or "callback",
                  str(c.get("description") or "callback requested")[:500],
                  str(c.get("quote") or "")[:500] or None,
-                 " ".join(x for x in (day, tm) if x) or None,
+                 (f"in {offset_min} minutes" if offset_min
+                  else " ".join(x for x in (day, tm) if x) or None),
                  deadline, 1 if c.get("vague") else 0,
                  1 if c.get("clarified") else 0),
             )
 
 
-def _auto_schedule(fu: dict[str, Any], commitments: list[dict[str, Any]]) -> tuple[str | None, bool]:
+def _auto_schedule(fu: dict[str, Any], commitments: list[dict[str, Any]],
+                   call_end: dt.datetime | None = None) -> tuple[str | None, bool]:
     """Concrete scheduled_at (ISO) + whether it was auto-picked."""
+    # Relative request ("call me in 10 minutes") beats a calendar guess —
+    # the LLM extraction reports it as suggested_offset_minutes.
+    try:
+        offset_min = max(0, min(int(fu.get("suggested_offset_minutes") or 0),
+                                7 * 24 * 60))
+    except (TypeError, ValueError):
+        offset_min = 0
+    if offset_min:
+        base = call_end or _now()
+        return (base + dt.timedelta(minutes=offset_min)).isoformat(), False
     date_s, time_s = fu.get("suggested_date"), fu.get("suggested_time")
     if date_s:
         return f"{date_s} {time_s or f'{_DEFAULT_HOUR:02d}:00'}:00+05:30", not bool(time_s)
@@ -186,8 +209,11 @@ def decide(call: dict[str, Any], judgment: dict[str, Any],
             "commitment_id": best.get("id"),
         }
 
+    call_end = _parse_anchor(call) + dt.timedelta(
+        seconds=int(call.get("duration_s") or 0))
+
     if flags.get("callback_requested"):
-        sched, auto = _auto_schedule(judgment, commitments)
+        sched, auto = _auto_schedule(judgment, commitments, call_end)
         return {
             "decision": "yes", "confidence": 0.95,
             "explanation": "The live engine recorded an explicit callback request.",
@@ -202,7 +228,7 @@ def decide(call: dict[str, Any], judgment: dict[str, Any],
     required = (judgment.get("required") or "unsure").lower()
     confidence = judgment.get("confidence")
     if required == "yes":
-        sched, auto = _auto_schedule(judgment, commitments)
+        sched, auto = _auto_schedule(judgment, commitments, call_end)
         return {
             "decision": "yes", "confidence": confidence,
             "explanation": judgment.get("reason") or "AI analysis found a pending obligation.",
@@ -236,22 +262,27 @@ def decide(call: dict[str, Any], judgment: dict[str, Any],
 
 
 def _agent_auto_execute(agent_slug: str | None) -> bool:
-    """Whether this agent's YAML opts its follow-ups into auto-dialling.
+    """Whether this agent's follow-ups are auto-dialled.
 
-    follow_up.auto_execute.enabled — same per-agent-flag pattern as
-    clarify_commitments. Missing agent/file/key all mean False: auto-calling
-    a customer is opt-in, never inferred.
+    Platform universal rule (2026-07-27): ON by default for every agent —
+    a missing agent dir, missing file, or missing key all mean True, so the
+    rule covers agents created later and calls whose slug has no YAML on
+    disk. An agent opts OUT with follow_up.auto_execute: {enabled: false}.
+    Mirrors the schema-side default in
+    calling-agent/backend/app/agent_definition/schema.py (change both
+    together). Every autodial guardrail (window, caps, DND, kill switch)
+    still applies to each individual call.
     """
     if not agent_slug:
-        return False
+        return True
     try:
         from shared.intelligence.pipeline import _agent_yaml
 
         ay = _agent_yaml(agent_slug) or {}
-        return bool(((ay.get("follow_up") or {}).get("auto_execute") or {})
-                    .get("enabled"))
+        flag = ((ay.get("follow_up") or {}).get("auto_execute") or {}).get("enabled")
+        return True if flag is None else bool(flag)
     except Exception:
-        return False
+        return True
 
 
 def _complete_executed_followup(call: dict[str, Any]) -> None:

@@ -86,12 +86,17 @@ TIMEZONE = os.environ.get("INTEL_TIMEZONE", "Asia/Kolkata")
 # ---------------------------------------------------------------------------
 
 AUTODIAL_ENABLED = _flag("INTEL_AUTODIAL_ENABLED", True)
-# Seconds between sweeps. Deliberately unhurried: a follow-up is not urgent to
-# the minute, and a slow loop bounds the blast radius of any mistake.
-AUTODIAL_POLL_S = _int("INTEL_AUTODIAL_POLL_S", 120)
+# Seconds between sweeps. 60 keeps a "call me in 10 minutes" promise honest
+# (worst case: due + one sweep) while still pacing any backlog drain.
+AUTODIAL_POLL_S = _int("INTEL_AUTODIAL_POLL_S", 60)
 # Local-time calling window (inclusive start, exclusive end), in TIMEZONE.
 AUTODIAL_HOUR_START = _int("INTEL_AUTODIAL_HOUR_START", 10)
 AUTODIAL_HOUR_END = _int("INTEL_AUTODIAL_HOUR_END", 19)
+# Courtesy window for CUSTOMER-STATED callback times (auto_scheduled=0):
+# "call me at 8 tonight" is honoured at 8 tonight, any weekday — but never
+# before 07:00 or after 21:00 local, whatever the caller said.
+AUTODIAL_CB_HOUR_START = _int("INTEL_AUTODIAL_CB_HOUR_START", 7)
+AUTODIAL_CB_HOUR_END = _int("INTEL_AUTODIAL_CB_HOUR_END", 21)
 # Permitted weekdays, Monday=0 … Sunday=6. Default Mon-Sat: Sunday calling is
 # the fastest way to generate complaints.
 AUTODIAL_WEEKDAYS = os.environ.get("INTEL_AUTODIAL_WEEKDAYS", "0,1,2,3,4,5")

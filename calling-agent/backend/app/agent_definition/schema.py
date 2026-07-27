@@ -562,15 +562,16 @@ class FollowUpConfig:
     # In-call vague-commitment clarification (PLAN-intelligence-layer §2.8):
     # when the caller makes a vague promise ("call me next week"), ask exactly
     # ONE polite clarifying question so the follow-up can be scheduled
-    # precisely. {enabled: false} — off by default; existing agents unchanged.
+    # precisely. Platform universal rule (2026-07-27): ON by default for all
+    # agents; from_dict injects enabled=True unless the YAML says
+    # {enabled: false}.
     clarify_commitments: dict = field(default_factory=dict)
-    # Follow-up execution default for THIS agent's calls: {enabled: false}.
-    # When true, yes-decision follow-ups are created with mode='auto' and the
-    # platform's auto-dialer places the call at the scheduled time (subject
-    # to every autodial guardrail + the INTEL_AUTODIAL_ENABLED kill switch).
-    # Off by default — auto-calling a customer is opt-in, per follow-up or
-    # per agent, never platform-imposed. Same shape/precedent as
-    # clarify_commitments.
+    # Follow-up execution default for THIS agent's calls. When enabled,
+    # yes-decision follow-ups are created with mode='auto' and the platform's
+    # auto-dialer places the call at the scheduled time (subject to every
+    # autodial guardrail + the INTEL_AUTODIAL_ENABLED kill switch). Platform
+    # universal rule (2026-07-27): ON by default for all agents; opt out with
+    # {enabled: false}.
     auto_execute: dict = field(default_factory=dict)
 
 
@@ -980,11 +981,21 @@ class AgentDefinition:
         # explicitly.
 
         fu_d = _as_dict(d, "follow_up")
+        # Platform universal rule (2026-07-27): callback capture + follow-up
+        # auto-execution are ON for every agent, existing and future. A YAML
+        # that says nothing gets enabled=True; only an explicit
+        # {enabled: false} opts an agent out. (The post-call side —
+        # shared/intelligence/followup.py:_agent_auto_execute — applies the
+        # same default when reading the raw YAML; change both together.)
+        _clarify = _as_dict(fu_d, "clarify_commitments")
+        _clarify.setdefault("enabled", True)
+        _auto_exec = _as_dict(fu_d, "auto_execute")
+        _auto_exec.setdefault("enabled", True)
         follow_up = FollowUpConfig(
             whatsapp_promise=_as_dict(fu_d, "whatsapp_promise"),
             callback=_as_dict(fu_d, "callback"),
-            clarify_commitments=_as_dict(fu_d, "clarify_commitments"),
-            auto_execute=_as_dict(fu_d, "auto_execute"),
+            clarify_commitments=_clarify,
+            auto_execute=_auto_exec,
         )
 
         pc_d = _as_dict(d, "post_call")

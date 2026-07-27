@@ -147,3 +147,66 @@ def test_resolve_deadline_concrete_timestamps():
     assert resolve_deadline("Monday", "", anchor).startswith("2026-07-27T11:00")  # next Monday
     assert resolve_deadline("Today", "5 baje", anchor).startswith("2026-07-20T17:00")
     assert resolve_deadline("", "evening", anchor) is None
+
+
+# ── relative offsets ("call me in 10 minutes") — platform rule 2026-07-27 ──
+
+def test_relative_offset_is_precise_no_question():
+    """A concrete relative delay needs NO clarification — confirm and record."""
+    r = make_router()
+    resp = drive(r, "I'm in a meeting, call me after 10 minutes")
+    assert not asks_a_question(resp)
+    assert "10 minute" in resp
+    assert r.state_mgr.extra_flags.get("callback_requested") is True
+    assert r.state_mgr.extra_flags.get("callback_offset_min") == 10
+    c = r.state_mgr.extra_flags["commitments"][-1]
+    assert c["offset_min"] == 10
+    assert c["clarified"] is True and c["vague"] is False
+
+
+def test_relative_offset_hinglish_word_numbers():
+    r = make_router()
+    drive(r, "das minute baad call karna")
+    assert r.state_mgr.extra_flags.get("callback_offset_min") == 10
+
+
+def test_half_hour_phrase():
+    r = make_router()
+    drive(r, "call me back after half an hour please")
+    assert r.state_mgr.extra_flags.get("callback_offset_min") == 30
+
+
+def test_vague_relative_ask_gets_minutes_flavoured_question():
+    r = make_router()
+    resp = drive(r, "thodi der baad call karna")
+    assert "?" in resp and "minute" in resp.lower()
+    assert r._pending_clarify is not None
+
+
+def test_clarification_answer_in_minutes_resolves():
+    r = make_router()
+    drive(r, "call me later")                  # vague → question
+    resp = drive(r, "say fifteen minutes")     # answer in minutes
+    assert not asks_a_question(resp)
+    c = r.state_mgr.extra_flags["commitments"][-1]
+    assert c["offset_min"] == 15 and c["clarified"] is True
+
+
+def test_clarify_is_on_by_default_for_all_agents():
+    """Platform universal rule: a YAML that says nothing about
+    clarify_commitments gets it ENABLED (only enabled:false opts out)."""
+    d = {
+        "agent_id": "t_default",
+        "version": "1.0.0",
+        "identity": {"agent_name": "Asha", "company_name": "TestCo"},
+        "languages": {"supported": ["en"], "default": "en", "tts_voices": {}},
+        "call_flow": {"stages": [
+            {"id": "S1", "order": 0, "goal": "one", "turns_until_advance": 8}]},
+        "response_bank": {"opening_greeting": "hi"},
+    }
+    agent = AgentDefinition.from_dict(d)
+    assert agent.follow_up.clarify_commitments.get("enabled") is True
+    assert agent.follow_up.auto_execute.get("enabled") is True
+    r = ConversationRouter(agent_def=agent, default_language="en")
+    drive(r, "call me after 20 minutes")
+    assert r.state_mgr.extra_flags.get("callback_offset_min") == 20

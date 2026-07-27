@@ -563,19 +563,40 @@ engine:
 - Tests: `tests/test_call_repair.py` (14) — replay/cap/window/scripts,
   reprompt composition per language, and the watchdog decision matrix.
 
-## 14. Follow-up execution modes — opt-in auto-dialling (2026-07-23)
+## 14. Follow-up execution modes — auto-dialling ON by default (2026-07-27)
 
 The 0007 auto-dialer dialled EVERY decision='yes' follow-up (it placed its
 first 12 real calls the moment the Thu 10:00 IST window opened). Migration
-0008 makes auto-dialling **opt-in**:
+0008 made auto-dialling opt-in — and the opt-in was never exercised: 225
+follow-ups accumulated with 0 `mode='auto'` rows, so the executor ran ~720
+empty sweeps/day and every "call me tomorrow" silently died. On 2026-07-27
+the business made follow-up calling a **platform universal rule**: ON for
+every agent, existing and future.
 
-- `followups.mode` `manual` (default) | `auto` — only `auto` rows are dial
-  candidates (`autodial._DUE_SQL`). Per-row toggle in FollowUps → Edit
-  (re-arming clears a previous permanent block); also settable at create.
-- Per-agent default: `follow_up.auto_execute: {enabled: true}` in agent.yaml
-  → yes-decision follow-ups from that agent's calls are born `auto`
-  (consumed in `stage_followup`; same pattern as `clarify_commitments`).
-  `INTEL_AUTODIAL_ENABLED` stays the platform kill switch above everything.
+- `followups.mode` `manual` | `auto` — only `auto` rows are dial candidates
+  (`autodial._DUE_SQL`). Per-row toggle in FollowUps → Edit (re-arming
+  clears a previous permanent block); also settable at create.
+- **Default is now auto**: `_agent_auto_execute` (shared/intelligence/
+  followup.py) returns True when the agent YAML says nothing — missing
+  agent dir/file/key all mean True. An agent opts OUT with
+  `follow_up.auto_execute: {enabled: false}`. The schema-side default
+  (agent_definition/schema.py from_dict) mirrors this — change both
+  together. `INTEL_AUTODIAL_ENABLED` stays the platform kill switch above
+  everything.
+- **Relative callbacks** ("call me in 10 minutes"): captured in-call by the
+  clarifier (`_parse_relative_offset`, commitments carry `offset_min`),
+  extracted post-call (`follow_up.suggested_offset_minutes` in the LLM
+  schema), scheduled from CALL END. Customer-stated times
+  (`auto_scheduled=0`) skip the 5-min grace and use the courtesy window
+  (`INTEL_AUTODIAL_CB_HOUR_START/END`, default 07-21 IST, any weekday)
+  instead of the business window; AI-picked times keep grace + 10-19
+  Mon-Sat. Poll is 60s (`INTEL_AUTODIAL_POLL_S`).
+- **Opening line**: the executor stamps `call_links.callback_meta`
+  ({reason, topic=customer_intent, requested_when, source_call_at}); the
+  bridge feeds it to `set_callback_context(meta=...)` and
+  `_callback_opening()` renders "we spoke earlier today about X and you'd
+  asked me to call you back — is now a good time?" in the agent's language
+  (en/hi/gu templates, no LLM on the latency-critical opening).
 - New guardrails: `superseded` (a newer call to the contact after the
   follow-up was created — permanent), per-row `max_attempts` (NULL =
   platform default 3), explicit `next_attempt_at` linear backoff
@@ -596,3 +617,37 @@ first 12 real calls the moment the Thu 10:00 IST window opened). Migration
 - Open product items (deliberately NOT built): in-call "stop calling me" →
   DND disposition; TRAI NDNC scrubbing; billing stamp for platform-placed
   calls.
+
+## 15. Agent-initiated hangup + close-permission rule (2026-07-27)
+
+Before this, no engine-initiated hangup existed — the closing line played
+and the channel stayed up until the caller hung up (dead air, burned
+minutes). Platform universal rule, every agent:
+
+- **Supreme rule — permission to close**: the prompt band
+  `━━ ENDING THE CALL ━━` (prompt_blocks.call_closure_block, rendered
+  unconditionally in every system prompt) makes the agent ask "anything
+  else I can help you with?" before any goodbye. Deterministic backstop:
+  `_is_close_confirmation` (agent's last response asked the permission
+  question + caller replies a short "no / nahi bas / that's all") routes
+  into the farewell close. `_contains_farewell` additionally catches
+  goodbyes the intent classifier scores as affirmation ("okay bye").
+- **hangup_pending** (ConversationRouter) arms ONLY on caller-consented
+  or terminal closes: farewell exchange, close-permission confirm, wrong
+  number, DND / decline threshold, LLM-failure graceful close. It is NOT
+  `state.is_closing` (which also fires on booking-confirmed while the
+  conversation continues). Any new caller utterance clears it — "wait,
+  one more question" after the goodbye is answered, not cut off.
+- **Execution**: `TelephonySession._playback_loop` polls (0.5s get
+  timeout) → `_maybe_agent_hangup` waits for wav_queue empty +
+  `playback_busy_until` + grace, min 3s after arming (covers TTS synth
+  of the farewell) → `hangup_request` over TCP 9004 → socket_server
+  `_dispatch_hangup_request` queues an **event-locked** `hangup
+  NORMAL_CLEARING` app, so FreeSWITCH ends the channel only after queued
+  farewell audio finishes. Normal teardown (recording, metering, intel
+  enqueue) then runs off the WS close as always.
+- Kill switch: `ENABLE_AGENT_HANGUP=false` (bridge env). Tuning:
+  `AGENT_HANGUP_MIN_WAIT_S` (3.0), `AGENT_HANGUP_GRACE_S` (1.0).
+- Tests: `test_agent_hangup.py` (arming/cancel semantics),
+  `test_autodial_guardrails.py` (customer-stated time grace/window),
+  `test_commitment_clarify.py` (relative offsets, default-on).

@@ -512,7 +512,8 @@ def _save_call_link(entries: list[dict]) -> None:
 def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
                  owner: str = "", context_note: str = "",
                  followup_id: int | None = None,
-                 placed_by: str = "user") -> None:
+                 placed_by: str = "user",
+                 callback_meta: dict | None = None) -> None:
     entry = {
         "phone": phone, "contact_id": contact_id, "name": name,
         "dialed_at": _now_iso(),
@@ -530,6 +531,10 @@ def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
         # automation). Stamped onto calls.placed_by by the bridge so tenants
         # can audit platform-placed spend.
         "placed_by": placed_by,
+        # Structured fields for the follow-up call's OPENING line
+        # ({reason, topic, requested_when, source_call_at}) — the bridge
+        # hands them to ConversationRouter.set_callback_context(meta=...).
+        "callback_meta": callback_meta or None,
     }
     link_id = None
     try:
@@ -539,11 +544,12 @@ def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
             row = db.execute(
                 "INSERT INTO call_links (owner, phone, sig_digits, contact_id,"
                 " name, agent_slug, dialed_at, context_note, followup_id,"
-                " placed_by)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING id",
+                " placed_by, callback_meta)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
                 (owner, phone, significant_digits(phone), contact_id, name,
                  agent_slug, entry["dialed_at"], context_note or None,
-                 followup_id, placed_by)).fetchone()
+                 followup_id, placed_by,
+                 json.dumps(callback_meta) if callback_meta else None)).fetchone()
             link_id = row["id"] if row else None
             # Dial records only matter inside the matching windows; prune
             # anything older than a week (replaces the file's last-5000 cap).
@@ -3849,10 +3855,19 @@ async def _autodial_once() -> int:
             ctx += f" Commitment to fulfil: {row['commitment_text']}."
         if row.get("summary"):
             ctx += f" Previous call: {row['summary']}"
+        # Structured meta for the OPENING line itself ("we spoke earlier
+        # today about X and you'd asked me to call you back") — the topic is
+        # the source call's customer_intent, already a short phrase.
+        cb_meta = {
+            "reason": str(row.get("reason") or "")[:300],
+            "topic": str(row.get("source_call_intent") or "")[:120],
+            "requested_when": str(row.get("scheduled_at") or ""),
+            "source_call_at": str(row.get("source_call_at") or ""),
+        }
         _record_dial(phone, str(row.get("contact_handle") or ""),
                      row.get("contact_name") or "", agent_slug=slug, owner=owner,
                      context_note=ctx[:800], followup_id=row["id"],
-                     placed_by="autodial")
+                     placed_by="autodial", callback_meta=cb_meta)
         await asyncio.to_thread(
             autodial.record_attempt, row["id"], ok=True,
             detail=f"auto-dialled {phone} as {slug}")

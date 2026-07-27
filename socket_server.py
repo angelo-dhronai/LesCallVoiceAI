@@ -822,6 +822,21 @@ def build_playback_file_payload(wav_path: str) -> bytes:
     )
 
 
+# Agent-initiated graceful hangup (platform rule): the hangup APPLICATION is
+# queued with event-lock like every playback, so FreeSWITCH executes it only
+# after any in-flight/queued farewell audio has finished playing — never
+# mid-sentence. NORMAL_CLEARING keeps CDRs/billing indistinguishable from a
+# caller-side hangup.
+HANGUP_PAYLOAD = (
+    b"sendmsg\n"
+    b"call-command: execute\n"
+    b"execute-app-name: hangup\n"
+    b"execute-app-arg: NORMAL_CLEARING\n"
+    b"event-lock: true\n"
+    b"\n"
+)
+
+
 # ------------------ Phase 12: call registry + playback listener ------
 
 # Thread-safe registry of in-flight calls keyed by Channel-Call-UUID.
@@ -945,6 +960,37 @@ def _dispatch_playback_request(req: dict) -> dict:
             "bytes_sent": len(payload)}
 
 
+def _dispatch_hangup_request(req: dict) -> dict:
+    """Sibling of _dispatch_playback_request for {"type": "hangup_request"}:
+    queue an event-locked hangup app on the call so FreeSWITCH ends the
+    channel after the farewell audio finishes. Same registry lookup, same
+    send_lock discipline, never raises."""
+    uuid = (req.get("conn_id") or "").strip()
+    if not uuid:
+        return {"ok": False, "reason": "missing conn_id"}
+    with _active_calls_lock:
+        entry = _active_calls.get(uuid)
+        if entry is None or not entry.get("live"):
+            # The caller beat us to it — that is success, not an error.
+            return {"ok": True, "uuid": uuid, "already_down": True}
+        conn = entry["conn"]
+        send_lock = entry["send_lock"]
+    with send_lock:
+        with _active_calls_lock:
+            still_live = (uuid in _active_calls
+                          and _active_calls[uuid].get("live"))
+        if not still_live:
+            return {"ok": True, "uuid": uuid, "already_down": True}
+        try:
+            log.info("[%s] [HANGUP_COMMAND] agent-initiated hangup "
+                     "(event-locked, after queued playback)", uuid)
+            conn.sendall(HANGUP_PAYLOAD)
+        except OSError as exc:
+            return {"ok": False, "reason": f"sendall failed: {exc!r}",
+                    "uuid": uuid}
+    return {"ok": True, "uuid": uuid, "bytes_sent": len(HANGUP_PAYLOAD)}
+
+
 def _playback_client_thread(client: socket.socket, peer) -> None:
     client.settimeout(5.0)
     try:
@@ -966,11 +1012,26 @@ def _playback_client_thread(client: socket.socket, peer) -> None:
             log.warning("playback listener json decode failed "
                         "peer=%s err=%r", peer, exc)
             return
-        if (req.get("type") or "") != "playback_request":
+        _req_type = req.get("type") or ""
+        if _req_type == "hangup_request":
+            result = _dispatch_hangup_request(req)
+            if result.get("ok"):
+                log.info("[%s] [HANGUP_DISPATCHED] already_down=%s",
+                         result.get("uuid"), result.get("already_down", False))
+            else:
+                log.warning("[%s] [HANGUP_INVALID] reason=%r",
+                            req.get("conn_id"), result.get("reason"))
+            try:
+                ack = json.dumps(result, ensure_ascii=False).encode("utf-8")
+                client.sendall(struct.pack(">I", len(ack)) + ack)
+            except OSError:
+                pass
+            return
+        if _req_type != "playback_request":
             log.warning("playback listener unexpected type=%r "
                         "peer=%s", req.get("type"), peer)
             return
-        log.info("[%s] [PLAYBACK_SEND] received request for %s", 
+        log.info("[%s] [PLAYBACK_SEND] received request for %s",
                  req.get("conn_id"), req.get("wav_path"))
         result = _dispatch_playback_request(req)
         if result.get("ok"):

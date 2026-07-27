@@ -21,6 +21,7 @@ import re
 import time
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from openai import AsyncOpenAI
 
@@ -694,6 +695,20 @@ class ConversationRouter:
         # from the original call's notes (call_links.context_note). Rendered
         # as a WHY-YOU-ARE-CALLING-BACK prompt block when non-empty.
         self.callback_context: str = ""
+        # Structured metadata for a platform-scheduled follow-up call
+        # (call_links.callback_meta, stamped by the auto-dial executor):
+        # {reason, topic, requested_when, source_call_at}. When present, the
+        # opening line references the earlier conversation instead of the
+        # cold outbound greeting.
+        self.callback_meta: dict = {}
+        # Agent-initiated hangup (platform rule, all agents): set ONLY on the
+        # truly-final close paths (farewell exchange, wrong number, DND /
+        # decline threshold, LLM-failure graceful close, close-permission
+        # confirm). The telephony bridge polls this after the final utterance
+        # drains and tears the channel down. NOT the same as state.is_closing,
+        # which also fires on booking-confirmed while the conversation is
+        # still live.
+        self.hangup_pending: bool = False
         # Persistent customer memory (returning caller), set by the bridge via
         # set_customer_context(). Empty dict = unknown caller = no band.
         self.customer_context: dict = {}
@@ -818,10 +833,15 @@ class ConversationRouter:
         logger.info("[CONTEXT] direction=%s contact=%r", self.call_direction,
                     self.outbound_contact_name or None)
 
-    def set_callback_context(self, context_note: str) -> None:
+    def set_callback_context(self, context_note: str,
+                             meta: dict | None = None) -> None:
         """Context for a scheduled callback (why we're calling back) —
-        rendered as a WHY-YOU-ARE-CALLING-BACK block in the system prompt."""
+        rendered as a WHY-YOU-ARE-CALLING-BACK block in the system prompt.
+        `meta` (call_links.callback_meta, from the auto-dial executor) makes
+        the OPENING line itself reference the earlier call."""
         self.callback_context = (context_note or "").strip()
+        if isinstance(meta, dict) and meta:
+            self.callback_meta = dict(meta)
 
     def set_customer_context(self, ctx: dict | None) -> None:
         """Persistent customer memory for a RETURNING caller, pre-fetched by
@@ -1026,6 +1046,73 @@ class ConversationRouter:
         self.memory.add_assistant(text, language=self.state.language)
         return text
 
+    def _callback_opening(self) -> str | None:
+        """Opening line for a platform-scheduled follow-up call: warmly
+        reference the earlier conversation and the caller's own callback
+        request, then ask if now is a good time. Deterministic (no LLM on the
+        latency-critical opening); language = the agent's opening language."""
+        meta = self.callback_meta or {}
+        if not meta:
+            return None
+        lang = (self.state.language or "en")[:2]
+        name = (self.outbound_contact_name or "").strip()
+        agent = (getattr(self._def.identity, "agent_name", "") or "").strip()
+        company = (getattr(self._def.identity, "company_name", "") or "").strip()
+        # How long ago the original call was, for a natural time reference.
+        when_key = "recent"
+        src = str(meta.get("source_call_at") or "")
+        try:
+            src_dt = datetime.fromisoformat(src.replace("Z", "+00:00"))
+            if src_dt.tzinfo is None:
+                src_dt = src_dt.replace(tzinfo=timezone(timedelta(hours=5, minutes=30)))
+            now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+            age = now_ist - src_dt
+            if age <= timedelta(hours=3):
+                when_key = "just_now"
+            elif src_dt.astimezone(now_ist.tzinfo).date() == now_ist.date():
+                when_key = "today"
+            elif (now_ist.date() - src_dt.astimezone(now_ist.tzinfo).date()).days == 1:
+                when_key = "yesterday"
+            else:
+                when_key = "recent"
+        except (ValueError, TypeError):
+            pass
+        when = {
+            "en": {"just_now": "a little while ago", "today": "earlier today",
+                   "yesterday": "yesterday", "recent": "a few days ago"},
+            "hi": {"just_now": "abhi thodi der pehle", "today": "aaj",
+                   "yesterday": "kal", "recent": "kuch din pehle"},
+            "gu": {"just_now": "hamna thodi var pehla", "today": "aaje",
+                   "yesterday": "gai kale", "recent": "thoda divas pehla"},
+        }.get(lang, {}).get(when_key) or {"just_now": "a little while ago",
+                                          "today": "earlier today",
+                                          "yesterday": "yesterday",
+                                          "recent": "a few days ago"}[when_key]
+        topic = str(meta.get("topic") or "").strip().rstrip(".")
+        if len(topic) > 90:  # keep the opening breath-sized
+            topic = ""
+        who = f" {name}" if name else ""
+        ident = " and ".join(x for x in (agent,) if x)
+        frm = f" from {company}" if company else ""
+        if lang == "hi":
+            about = f" {topic} ke baare mein" if topic else ""
+            return (f"Namaste{who}! Main {ident or 'aapka agent'}"
+                    f"{' ' + company + ' se' if company else ''}. "
+                    f"Humari {when} baat hui thi{about}, aur aapne mujhe call "
+                    f"karne ko kaha tha — isliye aapko call kiya. "
+                    f"Kya abhi baat karna theek rahega?")
+        if lang == "gu":
+            about = f" {topic} vishe" if topic else ""
+            return (f"Namaste{who}! Hu {ident or 'tamaro agent'}"
+                    f"{' ' + company + ' thi' if company else ''}. "
+                    f"Aapni {when} vaat thai hati{about}, ane tame mane call "
+                    f"karva kahyu hatu — etle call karyo chhe. "
+                    f"Su atyare vaat kari shakiye?")
+        about = f" about {topic}" if topic else ""
+        return (f"Hello{who}! This is {ident or 'your assistant'}{frm}. "
+                f"We spoke {when}{about}, and you'd asked me to give you a "
+                f"call back — so here I am. Is now a good time to talk?")
+
     async def generate_opening(self) -> EngineResult:
         """Inbound warm welcome — agent answers the call.
         Bilingual so caller can respond in their preferred language."""
@@ -1036,6 +1123,14 @@ class ConversationRouter:
             _ob_greeting = self._lang_response(self._def.outbound.opening_greeting)
             if _ob_greeting:
                 greeting = _ob_greeting
+            # Platform rule (all agents): a scheduled follow-up call must OPEN
+            # by referencing the earlier conversation and the caller's own
+            # request — never with the cold outbound pitch. Built from the
+            # structured callback_meta the auto-dial executor stamped on the
+            # dial record; falls back to the normal greeting when absent.
+            _cb_greeting = self._callback_opening()
+            if _cb_greeting:
+                greeting = _cb_greeting
         # Outbound personalization: greet the dialed contact by name. Canonical
         # form is {contact_name}; also tolerate the template syntaxes LLM
         # editors keep inventing (${contact_name}, {{contact_name}}, [name],
@@ -1097,6 +1192,13 @@ class ConversationRouter:
         # Turn transaction: snapshot BEFORE any mutation so a continuation of
         # the caller's previous utterance can supersede this whole turn.
         self.begin_turn_transaction(text)
+
+        # A new caller utterance cancels a pending agent hangup: "wait, one
+        # more question" after the goodbye must be answered, not cut off.
+        # Every close path below re-arms it if this turn also ends the call.
+        if self.hangup_pending:
+            logger.info("[HANGUP] caller spoke again — hangup cancelled")
+            self.hangup_pending = False
 
         # v3 commitment clarification: the suppression window (armed when we
         # ask "what day works?") decays one notch per user turn.
@@ -1412,7 +1514,17 @@ class ConversationRouter:
                 return
 
         # --- Farewell at any stage ---
-        if intent == "farewell":
+        # Platform rule (all agents): the close-permission confirm counts as a
+        # farewell — our previous turn asked "anything else I can help with?"
+        # and the caller confirmed they're done. The caller's own goodbye and
+        # this confirmed wrap-up are the ONLY paths that arm hangup_pending
+        # from normal conversation: the agent never cuts a call the caller
+        # hasn't agreed to end.
+        # The word check backs up the classifier: "okay bye" classifies as
+        # affirmation (the leading okay wins), which used to skip this branch
+        # entirely and hand the goodbye to the LLM.
+        if (intent == "farewell" or self._contains_farewell(text)
+                or self._is_close_confirmation(text)):
             _cancel_llm()
             # v3 last-chance commitment checkpoint: if the caller is leaving
             # with a vague promise on the table ("ok bye, call me next week"),
@@ -1438,6 +1550,7 @@ class ConversationRouter:
             self.memory.add_assistant(resp, language=self.state.language)
             self._store_last_response(resp)
             self.state.stage = STAGE_CLOSING
+            self.hangup_pending = True
             yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
             return
 
@@ -1454,6 +1567,7 @@ class ConversationRouter:
                 self.state.stage = STAGE_CLOSING
                 self.call_outcome = self.call_outcome or "wrong_number"
                 self.state_mgr.extra_flags["wrong_number"] = True
+                self.hangup_pending = True
                 resp = self._lang_response(self._def.outbound.wrong_number_close,
                                            lang=self._closing_language()) \
                     or "I'm so sorry — it seems I have the wrong number. Have a great day!"
@@ -1530,6 +1644,7 @@ class ConversationRouter:
                     self.state_mgr.extra_flags["dnd_requested"] = True
                     self.call_outcome = self.call_outcome or "dnd"
                     logger.info("[DND] caller requested do-not-disturb — ending call")
+                self.hangup_pending = True
                 self.memory.add_assistant(resp, language=self.state.language)
                 self._store_last_response(resp)
                 yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
@@ -2820,6 +2935,7 @@ class ConversationRouter:
                     self._llm_failure_streak)
                 self.call_outcome = self.call_outcome or "system_error"
                 self.state.is_closing = True
+                self.hangup_pending = True
                 fallback = (self._lang_response(
                     self._def.response_bank.graceful_close)
                     or self._lang_response(
@@ -3141,6 +3257,7 @@ class ConversationRouter:
             *pb.anti_repetition_block(self._def),
             *pb.objection_block(self._def, lang),
             *pb.firm_rules_block(self._def, lang),
+            *pb.call_closure_block(self._def, lang),
         ]
 
         # QA tracker block — second layer of anti-repetition enforcement
@@ -3452,9 +3569,10 @@ class ConversationRouter:
     _CALLBACK_TIME_RE = re.compile(
         r"\b(kal|tomorrow|parso|evening|morning|afternoon|shaam|subah|dopahar|"
         r"baje|pm|am|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
-        r"next week|baad|later)\b", re.IGNORECASE)
+        r"next week|baad|later|minutes?|mins?|minit|hours?|ghante|ghanta)\b"
+        r"|मिनट|घंटे|घंटा|મિનિટ|કલાક", re.IGNORECASE)
     _CALLBACK_ASK_RE = re.compile(
-        r"\b(call (?:me )?(?:back|later|tomorrow|after)|callback|call karna|"
+        r"\b(call (?:me )?(?:back|later|tomorrow|after|in)|callback|call karna|"
         r"phone karna|baad mein (?:call|baat)|baad me (?:call|baat)|"
         r"phir (?:call|baat)|dobara call)\b", re.IGNORECASE)
 
@@ -3463,6 +3581,49 @@ class ConversationRouter:
         return bool(self._CALLBACK_ASK_RE.search(text)) or (
             bool(self._CALLBACK_TIME_RE.search(text))
             and bool(re.search(r"\b(call|baat|phone)\b", text, re.IGNORECASE)))
+
+    # ── Close-permission confirm (platform rule, all agents) ────────────
+    # The prompt doctrine makes every agent ask permission before wrapping
+    # up ("Is there anything else I can help you with?"). This pair detects
+    # that exchange deterministically: our last response asked the question,
+    # the caller's short reply says they're done → close like a farewell.
+    _CLOSE_PERMISSION_RE = re.compile(
+        r"anything else|any other (?:question|help)|anything more|"
+        r"aur (?:kuch|koi)|kuch aur|koi aur|और कुछ|कुछ और|और कोई|"
+        r"biju kai|bija koi|kai biju|બીજું કંઈ|કંઈ બીજું|બીજો કોઈ",
+        re.IGNORECASE)
+    _DONE_REPLY_RE = re.compile(
+        r"^(?:no+|nope|nahi+n?|nhi|na|bas|bs|नहीं|ना|बस|ના|બસ|"
+        r"that'?s all|nothing(?: else| more)?|no,? than(?:ks|k you)|"
+        r"i'?m (?:good|okay|fine)|all good|done|it'?s (?:okay|fine))\b",
+        re.IGNORECASE)
+
+    @staticmethod
+    def _contains_farewell(text: str) -> bool:
+        """Same farewell vocabulary as detect_intent — applied directly so a
+        goodbye inside a longer utterance ('okay thank you, bye') closes the
+        call even when the classifier scored the turn as something else."""
+        lower = (text or "").lower()
+        if re.search(r"\b(bye|goodbye|alvida|aavjo)\b", lower):
+            return True
+        return any(w in lower for w in ("अलविदा", "फिर मिलते", "આવજો", "ફરી મળીશું"))
+
+    def _is_close_confirmation(self, text: str) -> bool:
+        """True when the caller just confirmed they're done, in reply to our
+        permission-to-close question. Kept deliberately strict: the reply
+        must be short, open with a done-word, and ask nothing new — 'no, but
+        actually...' keeps the conversation alive."""
+        last = (self.last_agent_response or "")
+        if not last or not self._CLOSE_PERMISSION_RE.search(last):
+            return False
+        t = (text or "").strip()
+        if not t or len(t) > 45 or "?" in t:
+            return False
+        if re.search(r"\b(what|how|when|where|why|which|kya|kaise|kab|kaha|"
+                     r"kaun|kitna|kitne|su|kem|ketla|but|lekin|par)\b",
+                     t, re.IGNORECASE):
+            return False
+        return bool(self._DONE_REPLY_RE.search(t))
 
     @staticmethod
     def _parse_day_time(text: str) -> tuple[str, str]:
@@ -3492,16 +3653,84 @@ class ConversationRouter:
             tm = "evening"
         return day, tm
 
+    # ── Relative callback offsets ("call me in/after 10 minutes") ──────
+    # Word-numbers cover the spoken forms STT actually produces in en/hi/gu
+    # code-mix; Devanagari/Gujarati numerals arrive as digits from Sarvam.
+    _REL_NUM_WORDS = {
+        "one": 1, "two": 2, "five": 5, "ten": 10, "fifteen": 15,
+        "twenty": 20, "thirty": 30, "forty five": 45, "sixty": 60,
+        "ek": 1, "do": 2, "paanch": 5, "panch": 5, "das": 10, "dus": 10,
+        "pandrah": 15, "bees": 20, "tees": 30,
+        "दस": 10, "पांच": 5, "पाँच": 5, "पंद्रह": 15, "बीस": 20, "तीस": 30,
+        "દસ": 10, "પાંચ": 5, "પંદર": 15, "વીસ": 20, "ત્રીસ": 30,
+    }
+    _REL_MIN_RE = re.compile(
+        r"\b(\d{1,3}|" + "|".join(_REL_NUM_WORDS) + r")\s*"
+        r"(?:-|se)?\s*(?:\d{1,3}\s*)?"          # "10-15 minute" ranges → lower bound
+        r"(minutes?|mins?|minit|min\b|मिनट|મિનિટ)", re.IGNORECASE)
+    _REL_HOUR_RE = re.compile(
+        r"\b(\d{1,2}|" + "|".join(_REL_NUM_WORDS) + r")\s*"
+        r"(hours?|hrs?|ghante|ghanta|घंटे|घंटा|કલાક)", re.IGNORECASE)
+    _REL_HALF_HOUR_RE = re.compile(
+        r"\b(half\s+(?:an\s+)?hour|aa?dha\s+ghant|आधा\s*घंट|आधे\s*घंट|"
+        r"અડધો\s*કલાક)", re.IGNORECASE)
+    _REL_ONE_HOUR_RE = re.compile(
+        r"\b(an\s+hour|one\s+hour|ek\s+ghanta|एक\s*घंट)", re.IGNORECASE)
+    _REL_VAGUE_RE = re.compile(
+        r"\b(baad|later|thodi\s+der|thoda\s+der|abhi\s+nahi|"
+        r"in\s+a\s+(?:bit|while)|after\s+some\s?time|kuch\s+der)\b|"
+        r"बाद|थोड़ी\s*देर|પછી|થોડી\s*વાર", re.IGNORECASE)
+
+    @classmethod
+    def _parse_relative_offset(cls, text: str) -> int | None:
+        """Minutes until the requested callback, or None when the phrase has
+        no usable relative offset ('call me in 10 minutes' → 10)."""
+        def _num(tok: str) -> int:
+            tok = tok.strip().lower()
+            return int(tok) if tok.isdigit() else cls._REL_NUM_WORDS.get(tok, 0)
+        if cls._REL_HALF_HOUR_RE.search(text):
+            return 30
+        m = cls._REL_MIN_RE.search(text)
+        if m and _num(m.group(1)):
+            return max(1, min(_num(m.group(1)), 24 * 60))
+        m = cls._REL_HOUR_RE.search(text)
+        if m and _num(m.group(1)):
+            return max(1, min(_num(m.group(1)), 24)) * 60
+        if cls._REL_ONE_HOUR_RE.search(text):
+            return 60
+        return None
+
+    @staticmethod
+    def _offset_phrase(offset_min: int, lang: str = "en") -> str:
+        """'in 10 minutes' / '10 minute mein' — spoken confirmation form."""
+        if offset_min % 60 == 0:
+            n = offset_min // 60
+            unit = {"en": ("hour", "hours"), "hi": ("ghante", "ghante"),
+                    "gu": ("kalak", "kalak")}.get(lang, ("hour", "hours"))
+            amount = f"{n} {unit[0] if n == 1 else unit[1]}"
+        else:
+            amount = f"{offset_min} minute" + ("s" if lang == "en" and offset_min != 1 else "")
+        return {"en": f"in about {amount}",
+                "hi": f"{amount} mein",
+                "gu": f"{amount} ma"}.get(lang, f"in about {amount}")
+
     def _handle_callback_request(self, text: str, policy: dict) -> str | None:
         """Capture a callback time preference WITHOUT booking a calendar slot
         (never _record_calendar_booking) and reply from the policy bank."""
         day, tm = self._parse_day_time(text)
-        preference = " ".join(x for x in (day, tm) if x) or "later"
+        offset_min = self._parse_relative_offset(text)
+        if offset_min:
+            preference = self._offset_phrase(offset_min,
+                                             (self.state.language or "en")[:2])
+        else:
+            preference = " ".join(x for x in (day, tm) if x) or "later"
         slot_name = str(policy.get("capture_slot") or "callback_time")
         if slot_name in self.state_mgr.slots:
             self.state_mgr.set_externally(slot_name, preference, source="system")
         self.state_mgr.extra_flags["callback_requested"] = True
         self.state_mgr.extra_flags["callback_time"] = preference
+        if offset_min:
+            self.state_mgr.extra_flags["callback_offset_min"] = offset_min
         self.call_outcome = self.call_outcome or "callback_requested"
         logger.info("[CALLBACK] captured preference %r (no calendar booking)", preference)
         resp = self._lang_response(policy.get("responses") or {})
@@ -3521,34 +3750,53 @@ class ConversationRouter:
         self.state_mgr.extra_flags["commitments"] = list(self._commitments)
 
     def _record_commitment(self, quote: str, day: str, tm: str,
-                           clarified: bool) -> dict:
+                           clarified: bool, offset_min: int | None = None) -> dict:
+        if offset_min:
+            described = self._offset_phrase(offset_min, "en")
+        else:
+            described = " ".join(x for x in (day, tm) if x) or "later"
         c = {
             "kind": "callback", "made_by": "customer",
-            "description": ("Customer asked to be called "
-                            + (" ".join(x for x in (day, tm) if x) or "later")),
+            "description": f"Customer asked to be called {described}",
             "quote": quote[:300], "day": day, "time": tm,
-            "vague": not (day and tm), "clarified": clarified,
+            "offset_min": offset_min or 0,
+            "vague": not (offset_min or (day and tm)), "clarified": clarified,
             "turn": self.state.turn_count,
         }
         self._commitments.append(c)
         self._sync_commitments()
         return c
 
-    def _capture_callback_flags(self, day: str, tm: str) -> None:
+    def _capture_callback_flags(self, day: str, tm: str,
+                                offset_min: int | None = None) -> None:
         """The same side effects _handle_callback_request produces, so the
         outcome taxonomy and dashboard snapshots keep working unchanged."""
-        preference = " ".join(x for x in (day, tm) if x) or "later"
+        if offset_min:
+            preference = self._offset_phrase(offset_min,
+                                             (self.state.language or "en")[:2])
+        else:
+            preference = " ".join(x for x in (day, tm) if x) or "later"
         cb_policy = self._def.call_flow.callback_policy or {}
         slot_name = str(cb_policy.get("capture_slot") or "callback_time")
         if slot_name in self.state_mgr.slots:
             self.state_mgr.set_externally(slot_name, preference, source="system")
         self.state_mgr.extra_flags["callback_requested"] = True
         self.state_mgr.extra_flags["callback_time"] = preference
+        if offset_min:
+            self.state_mgr.extra_flags["callback_offset_min"] = offset_min
         self.call_outcome = self.call_outcome or "callback_requested"
 
-    def _clarify_question(self, day: str, tm: str) -> str:
+    def _clarify_question(self, day: str, tm: str, relative: bool = False) -> str:
         lang = (self.state.language or "en")[:2]
-        if day and not tm:
+        if relative:
+            # "call me in a bit / thodi der baad" — pin down the delay, not a day.
+            bank = {"en": "Of course — about how many minutes should I wait "
+                          "before calling you back, or is there a time that suits you?",
+                    "hi": "Zaroor — main kitne minute baad call karun, ya koi "
+                          "time batayein jo aapko theek lage?",
+                    "gu": "Chokkas — ketli minute pachhi call karu, ke koi "
+                          "time kaho je tamne thik lage?"}
+        elif day and not tm:
             bank = {"en": f"Sure — what time on {day.lower()} works best for you?",
                     "hi": f"Zaroor — {day.lower()} ko kitne baje call karna theek rahega?",
                     "gu": f"Chokkas — {day.lower()} na roj ketla vage call karvo thik rahese?"}
@@ -3562,10 +3810,14 @@ class ConversationRouter:
                     "gu": "Chokkas — kya divse ane ketla vage call karvo thik rahese?"}
         return bank.get(lang, bank["en"])
 
-    def _clarify_confirmation(self, day: str, tm: str) -> str:
-        preference = " ".join(x for x in (day, tm) if x) or "soon"
+    def _clarify_confirmation(self, day: str, tm: str,
+                              offset_min: int | None = None) -> str:
         lang = (self.state.language or "en")[:2]
-        bank = {"en": f"Perfect — we'll call you {preference}. Thank you!",
+        if offset_min:
+            preference = self._offset_phrase(offset_min, lang)
+        else:
+            preference = " ".join(x for x in (day, tm) if x) or "soon"
+        bank = {"en": f"Perfect — I'll call you back {preference}. Thank you!",
                 "hi": f"Bilkul — hum aapko {preference} call karenge. Dhanyavaad!",
                 "gu": f"Saras — ame tamne {preference} call karishu. Aabhar!"}
         return bank.get(lang, bank["en"])
@@ -3574,7 +3826,14 @@ class ConversationRouter:
         """Fresh commitment detected. Vague + not yet asked → ask the ONE
         clarification; otherwise record it and acknowledge politely."""
         day, tm = self._parse_day_time(text)
-        self._capture_callback_flags(day, tm)
+        offset_min = self._parse_relative_offset(text)
+        self._capture_callback_flags(day, tm, offset_min)
+        if offset_min:
+            self._record_commitment(text, day, tm, clarified=True,
+                                    offset_min=offset_min)
+            logger.info("[COMMITMENT] relative commitment captured: +%d min",
+                        offset_min)
+            return self._clarify_confirmation(day, tm, offset_min)
         if day and tm:
             self._record_commitment(text, day, tm, clarified=True)
             logger.info("[COMMITMENT] precise commitment captured: %s %s", day, tm)
@@ -3586,9 +3845,10 @@ class ConversationRouter:
         self._clarify_asked = True
         self._pending_clarify = commitment
         self._suppress_time_match_turns = 2  # this turn + the answer turn
+        _relative = not day and bool(self._REL_VAGUE_RE.search(text))
         logger.info("[COMMITMENT] vague commitment (%r) — asking clarification",
                     " ".join(x for x in (day, tm) if x) or "later")
-        return self._clarify_question(day, tm)
+        return self._clarify_question(day, tm, relative=_relative)
 
     def _resolve_clarification(self, text: str) -> str | None:
         """The turn after our clarification question: fold the answer into the
@@ -3598,6 +3858,18 @@ class ConversationRouter:
         self._pending_clarify = None
         if pending is None:
             return None
+        offset_min = self._parse_relative_offset(text)
+        if offset_min:
+            pending["offset_min"] = offset_min
+            pending["vague"] = False
+            pending["clarified"] = True
+            pending["description"] = ("Customer asked to be called "
+                                      + self._offset_phrase(offset_min, "en"))
+            self._sync_commitments()
+            self._capture_callback_flags("", "", offset_min)
+            self._suppress_time_match_turns = 1
+            logger.info("[COMMITMENT] clarified: +%d min", offset_min)
+            return self._clarify_confirmation("", "", offset_min)
         day, tm = self._parse_day_time(text)
         day = day or pending.get("day", "")
         tm = tm or pending.get("time", "")

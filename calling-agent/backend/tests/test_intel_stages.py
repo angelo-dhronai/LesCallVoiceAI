@@ -132,6 +132,23 @@ def test_decide_yes_uses_suggested_datetime():
     assert row["auto_scheduled"] == 0
 
 
+def test_decide_relative_offset_schedules_from_call_end():
+    """'Call me in 10 minutes' → scheduled 10 minutes after the call ENDED,
+    never coerced to a next-day calendar guess."""
+    from shared.intelligence import followup
+
+    call = _call_row(
+        collected_data=json.dumps({"flags": {"callback_requested": True}}),
+        started_at="2026-07-18T10:00:00Z", duration_s=120.0)
+    row = followup.decide(call, _judgment(required="unsure", suggested_date=None,
+                                          suggested_time=None,
+                                          suggested_offset_minutes=10), [])
+    assert row["decision"] == "yes"
+    # anchor 10:00 IST + 2 min call + 10 min offset = 10:12 IST
+    assert row["scheduled_at"].startswith("2026-07-18T10:12")
+    assert row["auto_scheduled"] == 0  # customer-stated → no grace, courtesy window
+
+
 def test_decide_no_is_archived_with_explanation():
     from shared.intelligence import followup
 

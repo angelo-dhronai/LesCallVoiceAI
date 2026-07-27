@@ -44,6 +44,20 @@ logger = logging.getLogger("call_bridge")
 PLAYBACK_HOST = "127.0.0.1"
 PLAYBACK_PORT = 9004
 
+# Agent-initiated graceful hangup (platform rule, all agents). The engine
+# arms ConversationRouter.hangup_pending only on caller-consented closes
+# (farewell exchange, close-permission confirm, wrong number, DND); the
+# bridge then asks socket_server to end the channel once the farewell audio
+# has drained. Kill switch for rollback.
+AGENT_HANGUP_ENABLED = os.environ.get(
+    "ENABLE_AGENT_HANGUP", "true").lower() == "true"
+# Seconds after hangup_pending is first seen before the channel may drop —
+# covers TTS synth + flush latency of the farewell line, so a slow flush is
+# never mistaken for "audio already drained".
+AGENT_HANGUP_MIN_WAIT_S = float(os.environ.get("AGENT_HANGUP_MIN_WAIT_S", "3.0"))
+# Seconds of post-playback grace after the estimated wire-playback end.
+AGENT_HANGUP_GRACE_S = float(os.environ.get("AGENT_HANGUP_GRACE_S", "1.0"))
+
 # TTS synthesis/output sample rate. 8000 = Sarvam synthesizes at telephony
 # rate directly and TelephonySink skips the ffmpeg downsample entirely
 # (~100-300ms blocking subprocess per flush). Set 16000 to restore the old
@@ -269,7 +283,8 @@ def _lookup_recent_outbound_dial(caller_number: str = "") -> dict | None:
             with get_db() as db:
                 entries = [dict(r) for r in db.execute(
                     "SELECT owner, phone, contact_id, name, agent_slug,"
-                    " dialed_at, context_note, followup_id, placed_by"
+                    " dialed_at, context_note, followup_id, placed_by,"
+                    " callback_meta"
                     " FROM call_links WHERE dialed_at >= ?"
                     " ORDER BY dialed_at DESC LIMIT 50",
                     (window_start,)).fetchall()]
@@ -586,8 +601,18 @@ class TelephonySession:
                             conn_id, dial.get("name"), dial.get("phone"))
                 # Callback context (call_links.context_note): why this call
                 # is being made — WHY-YOU-ARE-CALLING-BACK prompt block.
+                # callback_meta (scheduled follow-ups only) additionally makes
+                # the OPENING line reference the earlier call.
                 if dial.get("context_note") and hasattr(conversation, "set_callback_context"):
-                    conversation.set_callback_context(str(dial["context_note"]))
+                    _cb_meta = dial.get("callback_meta")
+                    if isinstance(_cb_meta, str) and _cb_meta.strip():
+                        try:
+                            _cb_meta = json.loads(_cb_meta)
+                        except ValueError:
+                            _cb_meta = None
+                    conversation.set_callback_context(
+                        str(dial["context_note"]),
+                        meta=_cb_meta if isinstance(_cb_meta, dict) else None)
             else:
                 conversation.set_call_context(conn_id=conn_id)
         except Exception as exc:
@@ -619,6 +644,9 @@ class TelephonySession:
         self.event_task = None
         self._metering_task = None
         self._running = False
+        # Agent-initiated hangup bookkeeping (see _maybe_agent_hangup).
+        self._hangup_sent = False
+        self._hangup_armed_ts: float | None = None
 
         # Rolling tail of recent transcript turns, for the dashboard's live
         # snapshot writer (see ws_audio_receiver.py). Purely additive — fed
@@ -1167,11 +1195,23 @@ class TelephonySession:
         self.source.push_frame(pcm)
 
     async def _playback_loop(self):
-        """Polls the TelephonySink for finalized WAV files and injects them."""
+        """Polls the TelephonySink for finalized WAV files and injects them.
+
+        Also owns the agent-initiated hangup (platform rule, all agents):
+        once the conversation armed hangup_pending (farewell exchange /
+        wrong number / DND / close-permission confirm) and the farewell
+        audio has drained, ask socket_server to end the channel. The
+        timeout-poll below exists for exactly this — a blocking get() would
+        never re-check hangup_pending after the final WAV."""
         while self._running:
             try:
-                wav_path = await self.sink.wav_queue.get()
-                
+                try:
+                    wav_path = await asyncio.wait_for(
+                        self.sink.wav_queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    await self._maybe_agent_hangup()
+                    continue
+
                 # Task 3: Playback Enqueue Observability
                 duration = 0.0
                 size = 0
@@ -1257,6 +1297,74 @@ class TelephonySession:
             return True
         except Exception as e:
             logger.error(f"[{self.conn_id}] [PLAYBACK_ERROR] Failed to inject playback: {e}")
+            return False
+
+    async def _maybe_agent_hangup(self) -> None:
+        """End the channel once the conversation's farewell has fully drained.
+
+        Fires at most once, and only when ALL of:
+        - the engine armed hangup_pending (caller-consented close),
+        - no WAV is queued for injection,
+        - the estimated wire playback has finished (sink.playback_busy_until
+          + grace) — the farewell line is never cut mid-sentence,
+        - hangup_pending has been armed for AGENT_HANGUP_MIN_WAIT_S, so a
+          farewell still inside TTS synthesis (queue momentarily empty, no
+          flush yet) can't be mistaken for drained audio.
+        """
+        if not AGENT_HANGUP_ENABLED or self._hangup_sent:
+            return
+        conv = getattr(self.pipeline, "conversation", None)
+        if conv is None or not getattr(conv, "hangup_pending", False):
+            self._hangup_armed_ts = None  # engine cancelled (caller spoke again)
+            return
+        now = time.monotonic()
+        if self._hangup_armed_ts is None:
+            self._hangup_armed_ts = now
+            logger.info("[%s] [HANGUP_ARMED] farewell delivered — waiting for "
+                        "audio to drain", self.conn_id)
+            return
+        if now - self._hangup_armed_ts < AGENT_HANGUP_MIN_WAIT_S:
+            return
+        if not self.sink.wav_queue.empty():
+            return
+        busy_until = float(getattr(self.sink, "playback_busy_until", 0.0) or 0.0)
+        if now < busy_until + AGENT_HANGUP_GRACE_S:
+            return
+        self._hangup_sent = True
+        logger.info("[%s] [HANGUP_REQUEST] farewell drained — ending call",
+                    self.conn_id)
+        await self._send_hangup_request()
+
+    async def _send_hangup_request(self) -> bool:
+        """Ask socket_server (TCP 9004) to queue an event-locked hangup on
+        this call. Same one-shot length-prefixed JSON protocol as playback."""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(PLAYBACK_HOST, PLAYBACK_PORT),
+                timeout=2.0
+            )
+            req = {"type": "hangup_request", "conn_id": self.conn_id}
+            payload = json.dumps(req).encode("utf-8")
+            writer.write(struct.pack(">I", len(payload)) + payload)
+            await writer.drain()
+            try:
+                ack_hdr = await asyncio.wait_for(reader.readexactly(4), timeout=2.0)
+                (length,) = struct.unpack(">I", ack_hdr)
+                ack_payload = await asyncio.wait_for(
+                    reader.readexactly(length), timeout=2.0)
+                ack = json.loads(ack_payload.decode("utf-8"))
+                if not ack.get("ok"):
+                    logger.warning("[%s] [HANGUP_RESULT] refused: %r",
+                                   self.conn_id, ack.get("reason"))
+            except Exception as e:
+                logger.warning("[%s] [HANGUP_RESULT] ack failed: %r",
+                               self.conn_id, e)
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception as e:
+            logger.error("[%s] [HANGUP_ERROR] failed to send hangup request: %r",
+                         self.conn_id, e)
             return False
 
     def _print_summary(self):

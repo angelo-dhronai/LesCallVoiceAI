@@ -84,7 +84,8 @@ Return ONE JSON object with EXACTLY these fields:
                "reason": "why (or why not)", "who_promised": "customer_requested|agent_promised|internal|external_dependency or null",
                "expected_outcome": "...", "type": "callback|send_info|meeting|visit|payment|other or null",
                "priority": "low|medium|high|urgent",
-               "suggested_date": "YYYY-MM-DD or null", "suggested_time": "HH:MM or null"}
+               "suggested_date": "YYYY-MM-DD or null", "suggested_time": "HH:MM or null",
+               "suggested_offset_minutes": integer or null}
 }
 
 Rules:
@@ -95,6 +96,10 @@ Rules:
 - follow_up.required="no" needs a reason too (e.g. "resolved, customer declined, wrong number").
   Use "unsure" with a reason when signals conflict or the call is too short/garbled to judge.
 - All dates are in the future relative to the call date given below; never output past dates.
+- When the customer asked to be called back after a RELATIVE delay ("call me in 10 minutes",
+  "after half an hour", "das minute baad"), set follow_up.suggested_offset_minutes to that
+  delay in minutes (counted from the end of the call) and leave suggested_date/time null.
+  Never convert a relative delay into a next-day date.
 - compliance_score starts at 100 and drops for issues (misleading claims, pressure tactics,
   data-handling problems, abusive handling). risk_score is the risk of LOSING this customer/deal.
 - Score honestly: a wrong number is lead_score 0; a hot buyer asking for pricing is 80+."""
@@ -364,6 +369,10 @@ def parse_and_validate(raw: str, call: dict[str, Any]) -> dict[str, Any]:
 
     fu = data.get("follow_up") if isinstance(data.get("follow_up"), dict) else {}
     date_s, time_s = _future_date(fu.get("suggested_date"), fu.get("suggested_time"), call_date)
+    try:
+        offset_min = int(fu.get("suggested_offset_minutes") or 0)
+    except (TypeError, ValueError):
+        offset_min = 0
     rec["follow_up"] = {
         "required": _enum(fu.get("required"), _ENUMS["followup_required"], "unsure"),
         "confidence": _clamp(fu.get("confidence"), 0.0, 1.0),
@@ -375,6 +384,9 @@ def parse_and_validate(raw: str, call: dict[str, Any]) -> dict[str, Any]:
         "priority": _enum(fu.get("priority"), _ENUMS["priority"], "medium"),
         "suggested_date": date_s,
         "suggested_time": time_s,
+        # Relative requests ("call me in 10 minutes"): minutes after call end,
+        # clamped to a week; 0/absent = not a relative request.
+        "suggested_offset_minutes": max(0, min(offset_min, 7 * 24 * 60)),
     }
     return rec
 

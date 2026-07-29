@@ -17,6 +17,7 @@ Key behaviours
 
 from __future__ import annotations
 
+import os
 import re
 import time
 import logging
@@ -33,7 +34,13 @@ logger = logging.getLogger(__name__)
 
 MIN_TRANSCRIPT_LENGTH = 2
 MAX_RETRIES = 1
-MIN_CONFIDENCE = 0.4
+# Threshold for the DERIVED confidence score (see _derive_confidence).
+# Sarvam's REST response has no confidence field, so for months every
+# transcript carried a fabricated 1.0 and this gate never fired once in
+# production. Below the threshold the segment is returned empty WITHOUT
+# Whisper fallback — the pipeline's existing empty-transcript path then
+# plays the "sorry, could you repeat that?" re-ask.
+MIN_CONFIDENCE = float(os.environ.get("STT_MIN_CONFIDENCE", "0.4"))
 
 # Initial backoff 60 s, doubles each strike, caps at 5 min
 _RL_INITIAL_BACKOFF_S = 60.0
@@ -417,29 +424,30 @@ class STTRouter:
                 "[STT] Sarvam rate-limited (%.0fs remaining) — routing to fallback",
                 remaining,
             )
-            text, _, _, _ = await self._try_provider(
+            text, _, _, _, conf = await self._try_provider(
                 self._fallback, "fallback", audio_bytes, sample_rate, language
             )
-            return STTResult(text=text)
+            return STTResult(text=text, confidence=conf)
 
         # ── Try primary (Sarvam) ─────────────────────────────────────────
         try:
-            text, had_error, detected_lang, reject = await self._try_provider(
+            text, had_error, detected_lang, reject, conf = await self._try_provider(
                 self._primary, "primary", audio_bytes, sample_rate, language
             )
         except SarvamRateLimitError as exc:
             # Apply exponential backoff; reset on the next successful call
             self._apply_sarvam_backoff(exc)
-            text, _, _, _ = await self._try_provider(
+            text, _, _, _, conf = await self._try_provider(
                 self._fallback, "fallback", audio_bytes, sample_rate, language
             )
-            return STTResult(text=text)
+            return STTResult(text=text, confidence=conf)
 
         if text:
             # Successful Sarvam call → reset rate-limit strike counter
             self._sarvam_rl_count = 0
             logger.info("[STT] Primary succeeded: %r", text)
-            return STTResult(text=text, detected_language=detected_lang)
+            return STTResult(text=text, detected_language=detected_lang,
+                             confidence=conf)
 
         if not had_error:
             # F16: Sarvam produced REAL text but in an unsupported script
@@ -462,14 +470,14 @@ class STTRouter:
 
         # ── Primary had a genuine API/network error → try fallback ───────
         logger.info("[STT] Primary errored — routing to fallback provider")
-        text, _, _, _ = await self._try_provider(
+        text, _, _, _, conf = await self._try_provider(
             self._fallback, "fallback", audio_bytes, sample_rate, language
         )
         if text:
             logger.info("[STT] Fallback succeeded: %r", text)
         else:
             logger.warning("[STT] Both providers failed — returning empty transcript")
-        return STTResult(text=text)
+        return STTResult(text=text, confidence=conf)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -545,7 +553,7 @@ class STTRouter:
 
         retry_reject: _RejectedTranscript | None = None
         try:
-            text, had_error, detected_lang, retry_reject = await self._try_provider(
+            text, had_error, detected_lang, retry_reject, conf = await self._try_provider(
                 self._primary, "primary-script-retry",
                 audio_bytes, sample_rate, retry_lang,
             )
@@ -553,7 +561,7 @@ class STTRouter:
             # Same backoff bookkeeping as the main path; the segment stays
             # fallback-eligible since the audio contained speech.
             self._apply_sarvam_backoff(exc)
-            text, had_error, detected_lang = "", True, None
+            text, had_error, detected_lang, conf = "", True, None, None
 
         if text:
             self.script_recovered_count += 1
@@ -562,7 +570,8 @@ class STTRouter:
                 "[STT] Script-retry recovered transcript %r (lang=%s, forced=%s)",
                 text, detected_lang, retry_lang,
             )
-            return STTResult(text=text, detected_language=detected_lang)
+            return STTResult(text=text, detected_language=detected_lang,
+                             confidence=conf)
 
         # Retry rejected/empty/errored → audio contained speech, so this is
         # fallback-eligible (unlike a clean-empty no-speech segment).
@@ -571,7 +580,7 @@ class STTRouter:
             "audio contained speech, routing to fallback",
             retry_reject.reason if retry_reject else None, had_error,
         )
-        fb_text, _, fb_lang, _ = await self._try_provider(
+        fb_text, _, fb_lang, _, fb_conf = await self._try_provider(
             self._fallback, "fallback", audio_bytes, sample_rate, retry_lang
         )
         if fb_text:
@@ -580,7 +589,9 @@ class STTRouter:
             logger.warning(
                 "[STT] Fallback also failed after script reject — dropping segment"
             )
-        return STTResult(text=fb_text, detected_language=fb_lang if fb_text else None)
+        return STTResult(text=fb_text,
+                         detected_language=fb_lang if fb_text else None,
+                         confidence=fb_conf if fb_text else None)
 
     def _post_process(self, text: str, language: str) -> str:
         if not text:
@@ -594,13 +605,13 @@ class STTRouter:
         audio_bytes: bytes,
         sample_rate: int,
         language: str,
-    ) -> tuple[str, bool, str | None, _RejectedTranscript | None]:
+    ) -> tuple[str, bool, str | None, _RejectedTranscript | None, float | None]:
         """
         Attempt transcription with up to (max_retries + 1) attempts.
 
         Returns
         -------
-        (transcript, had_error, detected_language, reject)
+        (transcript, had_error, detected_language, reject, confidence)
             transcript : str
                 Clean, post-processed text; empty string if nothing usable.
             had_error : bool
@@ -615,41 +626,66 @@ class STTRouter:
                 validate_transcript rejected — carries the rejection reason,
                 raw text, and detected language so the caller can decide
                 whether the rejection is retry-worthy (unsupported script).
+            confidence : float | None
+                Derived confidence (see _derive_confidence) for an accepted
+                transcript; None on every empty/rejected path.
         """
         had_error = False
 
         for attempt in range(1, self._max_retries + 2):
             try:
+                t0 = time.monotonic()
                 result: STTResult = await provider.transcribe(
                     audio_bytes, sample_rate, language
                 )
+                latency_ms = (time.monotonic() - t0) * 1000.0
                 text = result.text
-                confidence = result.confidence
+                provider_conf = result.confidence
                 detected_lang = result.detected_language
 
-                if confidence < self._min_confidence:
+                # Provider-reported confidence (rare — Sarvam REST has none)
+                # can still gate early, before validation.
+                if (provider_conf is not None
+                        and provider_conf < self._min_confidence):
                     logger.info(
-                        "[STT-FILTER] reason=low_confidence score=%.2f text=%r "
-                        "provider=%s attempt=%d",
-                        confidence, text, label, attempt,
+                        "[STT-FILTER] reason=low_confidence source=provider "
+                        "score=%.2f text=%r provider=%s attempt=%d",
+                        provider_conf, text, label, attempt,
                     )
-                    return "", False, None, None
+                    return "", False, None, None, None
 
                 if len(text) < self._min_length:
                     logger.info(
                         "[STT] %s short/empty transcript %r (attempt %d) — no speech",
                         label, text, attempt,
                     )
-                    return "", False, None, None
+                    return "", False, None, None, None
 
                 validated, reject_reason = validate_transcript_ex(text)
                 if validated:
                     processed = self._post_process(validated, language)
-                    logger.info(
-                        "[STT] %s attempt %d: %r -> validated %r -> processed %r",
-                        label, attempt, text, validated, processed,
+                    confidence = self._derive_confidence(
+                        processed, audio_bytes, sample_rate,
+                        latency_ms, provider_conf,
                     )
-                    return processed, False, detected_lang, None
+                    if confidence < self._min_confidence:
+                        # Low-score turns are routed to a re-ask, not
+                        # silently accepted: empty + no reject = the caller
+                        # treats it as clean-empty (no Whisper burn) and the
+                        # pipeline plays its STT-fallback phrase.
+                        logger.info(
+                            "[STT-FILTER] reason=low_confidence "
+                            "source=derived score=%.2f text=%r "
+                            "provider=%s attempt=%d",
+                            confidence, processed, label, attempt,
+                        )
+                        return "", False, None, None, None
+                    logger.info(
+                        "[STT] %s attempt %d: %r -> validated %r -> processed "
+                        "%r (confidence=%.2f)",
+                        label, attempt, text, validated, processed, confidence,
+                    )
+                    return processed, False, detected_lang, None, confidence
 
                 logger.info(
                     "[STT] %s transcript %r rejected by validation (attempt %d)",
@@ -659,7 +695,7 @@ class STTRouter:
                     reason=reject_reason or "unknown",
                     raw_text=text,
                     detected_language=detected_lang,
-                )
+                ), None
 
             except SarvamRateLimitError:
                 raise
@@ -677,4 +713,47 @@ class STTRouter:
                     label, attempt + 1, self._max_retries + 1,
                 )
 
-        return "", had_error, None, None
+        return "", had_error, None, None, None
+
+    @staticmethod
+    def _derive_confidence(
+        text: str,
+        audio_bytes: bytes,
+        sample_rate: int,
+        latency_ms: float,
+        provider_confidence: float | None,
+    ) -> float:
+        """Derived 0–1 confidence for a validated transcript.
+
+        Sarvam/Whisper report no usable confidence, so instead of faking one
+        the router scores the transcript against signals it actually has:
+
+        - words-per-second vs the audio duration: beyond ~6 wps the
+          transcript carries more words than the audio plausibly did —
+          the over-generation signature of hallucination;
+        - a single word surviving from a long stretch of speech — most of
+          the audio transcribed to nothing;
+        - the function-word quality score the validator already computes
+          (its hard floor is 0.3; 0.3–0.45 passes validation but is weak);
+        - a mild penalty for extreme provider latency.
+
+        A provider-reported confidence, when one ever exists, is the
+        starting point instead of 1.0.
+        """
+        score = (provider_confidence
+                 if provider_confidence is not None else 1.0)
+        words = len(text.split())
+        duration_s = (len(audio_bytes) / (2.0 * sample_rate)
+                      if sample_rate else 0.0)
+        wps = words / duration_s if duration_s > 0.15 else 0.0
+        if wps > 8.0:
+            score *= 0.3
+        elif wps > 6.0:
+            score *= 0.6
+        if duration_s >= 1.5 and words == 1:
+            score *= 0.6
+        if _score_transcript_quality(text) < 0.45:
+            score *= 0.75
+        if latency_ms > 10_000:
+            score *= 0.85
+        return max(0.05, min(1.0, score))

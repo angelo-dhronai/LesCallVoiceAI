@@ -73,4 +73,5 @@ class OpenAIWhisperSTT(STTProvider):
 
         transcript = result.text.strip()
         logger.info("[STT:Whisper] Transcript: %r", transcript)
-        return STTResult(text=transcript, confidence=1.0)
+        # Whisper's API reports no confidence — None, never a fabricated 1.0.
+        return STTResult(text=transcript)

@@ -201,9 +201,17 @@ class SarvamSTT(STTProvider):
 
         data = response.json()
         transcript = data.get("transcript", "").strip()
-        confidence = float(data.get("confidence", 1.0))
+        # saarika's REST response carries no confidence field — report None
+        # rather than a fabricated 1.0 (which kept the router's
+        # MIN_CONFIDENCE gate from ever firing). If Sarvam ever ships one,
+        # it flows through automatically.
+        _conf_raw = data.get("confidence")
+        confidence = float(_conf_raw) if _conf_raw is not None else None
         detected_lang = data.get("language_code") or None
-        logger.info("[STT:Sarvam] Transcript: %r (confidence=%.2f, lang=%s)", transcript, confidence, detected_lang)
+        logger.info("[STT:Sarvam] Transcript: %r (confidence=%s, lang=%s)",
+                    transcript,
+                    "n/a" if confidence is None else f"{confidence:.2f}",
+                    detected_lang)
         return STTResult(text=transcript, confidence=confidence, detected_language=detected_lang)
 
     async def warmup(self) -> None:

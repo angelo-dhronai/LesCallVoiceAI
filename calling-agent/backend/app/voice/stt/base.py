@@ -22,9 +22,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class STTResult:
-    """STT transcription result with confidence score."""
+    """STT transcription result with confidence score.
+
+    confidence is None when nothing real is known. Providers must NOT
+    fabricate a value (Sarvam's REST response has no confidence field, and
+    the old default of 1.0 meant the router's MIN_CONFIDENCE gate never
+    fired once in production). The router computes a derived score for
+    validated transcripts and returns it here.
+    """
     text: str
-    confidence: float = 1.0
+    confidence: float | None = None
     detected_language: str | None = None
 
 

@@ -76,3 +76,5 @@ dashboard/sarvam_key_master.json
 data/sentinel_state.json
 data/sentinel_status.json
 core
+agent.yaml
+calling-agent/agents/**/agent.yaml

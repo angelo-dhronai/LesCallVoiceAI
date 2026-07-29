@@ -1,6 +1,15 @@
-# PLAN — Native LLM tool calling for live calls (proposal, not implemented)
+# PLAN — Native LLM tool calling for live calls
 
-Status: **awaiting approval** · Author: audit follow-up 2026-07-29
+Status: **IMPLEMENTED 2026-07-29** (same day). P0 probe passed: TTFT flat
+(median 1142ms with 5 tools vs 1165ms without), streamed tool_calls work
+through the compat shim BUT arrive with `index=None` (handled) and the
+model returns tool calls INSTEAD of text (so shadow mode moved to the
+background extractor, and "on" mode speaks deterministic confirmations
+on tool-only turns). Machinery: `app/voice/llm_tools.py` +
+`ConversationRouter._execute_tool_proposals` / `_shadow_tool_extract`.
+Modes: `llm_config.enable_tools` = off | **shadow (default)** | on;
+env `LLM_TOOLS_MODE` is the global kill switch. Flip agents to "on"
+after the P1 agreement metric looks clean (grep `[TOOLS] shadow`).
 
 ## Current state (verified in code, not docs)
 

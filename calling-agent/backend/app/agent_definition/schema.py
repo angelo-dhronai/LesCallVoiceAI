@@ -323,6 +323,21 @@ class CallFlowConfig:
     # {enabled: false, capture_slot: callback_time, responses: {lang: str},
     #  counts_as_decline: true}
     callback_policy: dict = field(default_factory=dict)
+    # Call-termination policy (all keys optional; {} = platform defaults):
+    #   llm_end_call: bool (default True) — the LLM may end the call by
+    #     appending [END_CALL] after its goodbye line; the engine strips the
+    #     token and arms the platform hangup.
+    #   end_conditions: [str] — plain-English business rules rendered into
+    #     the system prompt as ━━ END-CALL RULES ━━ ("once the visit is
+    #     booked and confirmed, wrap up", "if the caller is abusive, end").
+    #   farewell_patterns: [str] — extra caller phrases (any language /
+    #     script) that count as a goodbye and close deterministically.
+    #   silence_hangup: {enabled: bool, grace_s: float} — after the dead-air
+    #     reprompt cap is spent, say goodbye and end instead of holding the
+    #     line open forever.
+    #   max_call_minutes: number — hard duration cap (0 = no cap); the agent
+    #     delivers one wrap-up line and the platform ends the call.
+    termination: dict = field(default_factory=dict)
 
     # Convenience accessors -------------------------------------------------
 
@@ -623,6 +638,14 @@ class LLMConfig:
     filler_min_gap_turns: int = 0
     filler_max_per_call: int = 0
     filler_ack_extended: bool = False
+    # Native LLM tool calling (deploy/PLAN-llm-tool-calling.md):
+    #   "off"    — no tools anywhere.
+    #   "shadow" — spoken path unchanged; the background extractor uses the
+    #              tool roster and action proposals are logged only (P1).
+    #   "on"     — tools on the main streaming call, executed through the
+    #              deterministic gates (P2/P3).
+    # Env LLM_TOOLS_MODE overrides this for every agent (kill switch).
+    enable_tools: str = "shadow"
     # Additional domain-specific NEVER/ALWAYS rules appended to the
     # platform's built-in rules in the system prompt. (D4: from_dict aliases
     # these into guardrails when guardrails carries no rules of its own —
@@ -806,6 +829,7 @@ class AgentDefinition:
             completed_when=_as_dict(cf_d, "completed_when"),
             scheduling=_as_dict(cf_d, "scheduling"),
             callback_policy=_as_dict(cf_d, "callback_policy"),
+            termination=_as_dict(cf_d, "termination"),
         )
 
         kb_d = _as_dict(d, "knowledge_base")
@@ -882,6 +906,8 @@ class AgentDefinition:
             filler_ack_extended=_as_bool(llm_d, "filler_ack_extended", False),
             extra_never_rules=[str(x) for x in _as_list(llm_d, "extra_never_rules")],
             extra_always_rules=[str(x) for x in _as_list(llm_d, "extra_always_rules")],
+            enable_tools=(lambda m: m if m in ("off", "shadow", "on") else "shadow")(
+                (_as_str(llm_d, "enable_tools", "shadow") or "shadow").lower()),
         )
 
         _MERGE_POLICIES = ("free", "correction_gated", "confirm")

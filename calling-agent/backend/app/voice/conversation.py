@@ -78,6 +78,12 @@ LANG_LLM_CLASSIFY_FIRST_TURN = os.environ.get(
 logger = logging.getLogger(__name__)
 
 _MARKDOWN_RE = re.compile(r"[*#`~_\[\]()>|]")
+# LLM end-of-call signal (call_flow.termination.llm_end_call): the model
+# appends [END_CALL] after its goodbye line. Must be stripped BEFORE
+# _validate_response — the markdown filter would mangle it into spoken
+# "ENDCALL". Bracketed form is case-insensitive; the bare form must be
+# upper-case so natural "end call" prose is never eaten.
+_END_CALL_RE = re.compile(r"(?i:\[\s*end[\s_-]*call\s*\])|\bEND[_-]?CALL\b")
 _EMOJI_RE = re.compile(
     "[\U0001f600-\U0001f64f\U0001f300-\U0001f5ff\U0001f680-\U0001f6ff"
     "\U0001f1e0-\U0001f1ff\U00002702-\U000027b0\U0001fa00-\U0001fa6f"
@@ -759,6 +765,24 @@ class ConversationRouter:
         # which also fires on booking-confirmed while the conversation is
         # still live.
         self.hangup_pending: bool = False
+        # Hard close (max-duration cap / business-mandated cut): caller speech
+        # does NOT cancel a hard-armed hangup — the platform is ending the
+        # call regardless. Every consented-close path leaves this False.
+        self._hangup_hard: bool = False
+        # Set while streaming when the LLM appended the [END_CALL] token to
+        # its goodbye (call_flow.termination.llm_end_call, default on). The
+        # token itself is stripped before TTS ever sees it.
+        self._llm_end_call_seen: bool = False
+        # Native tool calling (deploy/PLAN-llm-tool-calling.md). Mode is
+        # per-agent llm_config.enable_tools with the LLM_TOOLS_MODE env kill
+        # switch; proposals are accumulated by _call_llm_stream and executed
+        # (or shadow-logged) at end-of-stream in _consume_llm_with_filler.
+        from .llm_tools import resolve_tools_mode
+        self._tools_mode: str = resolve_tools_mode(self._def)
+        self._pending_tool_proposals: list = []
+        if self._tools_mode != "off":
+            logger.info("[TOOLS] mode=%s agent=%s", self._tools_mode,
+                        self._def.agent_id)
         # Persistent customer memory (returning caller), set by the bridge via
         # set_customer_context(). Empty dict = unknown caller = no band.
         self.customer_context: dict = {}
@@ -1100,6 +1124,63 @@ class ConversationRouter:
         self.memory.add_assistant(text, language=self.state.language)
         return text
 
+    _SILENCE_GOODBYE = {
+        "en": "It seems I'm not able to reach you right now, so I'll let you "
+              "go. Thank you for your time — have a great day!",
+        "hi": "लगता है अभी आपकी आवाज़ नहीं आ रही है, तो अभी कॉल यहीं रखते हैं। "
+              "आपके समय के लिए धन्यवाद, आपका दिन शुभ हो!",
+        "gu": "લાગે છે કે અત્યારે તમારો અવાજ નથી આવી રહ્યો, તો હું કૉલ અહીં મૂકું છું. "
+              "તમારા સમય માટે આભાર, તમારો દિવસ શુભ રહે!",
+    }
+
+    def generate_silence_goodbye(self) -> str:
+        """Silence hangup (termination.silence_hangup): every dead-air repair
+        attempt is spent and the caller still isn't there — say one polite
+        goodbye and arm the platform hangup instead of holding the channel
+        open forever. The caller speaking again still cancels the hangup at
+        the top of process_stream. Called by the pipeline watchdog."""
+        lang = (self.state.language or "en")[:2]
+        text = (self._lang_response(self._def.response_bank.closing_responses,
+                                    lang=lang)
+                or self._SILENCE_GOODBYE.get(lang, self._SILENCE_GOODBYE["en"]))
+        self.state.is_closing = True
+        self.commit_pending_turn()
+        self.state.stage = STAGE_CLOSING
+        self.state_mgr.extra_flags["silence_hangup"] = True
+        self.call_outcome = self.call_outcome or "no_response"
+        self.hangup_pending = True
+        self.memory.add_assistant(text, language=self.state.language)
+        logger.info("[HANGUP] silence hangup — caller unreachable, closing")
+        return text
+
+    _MAXDUR_GOODBYE = {
+        "en": "I've taken a lot of your time already, so let me not hold you "
+              "any longer. Thank you so much for speaking with me — have a "
+              "great day!",
+        "hi": "मैंने आपका काफ़ी समय ले लिया है, इसलिए अब आपको और नहीं रोकेंगे। "
+              "बात करने के लिए बहुत धन्यवाद — आपका दिन शुभ हो!",
+        "gu": "મેં તમારો ઘણો સમય લઈ લીધો છે, એટલે હવે તમને વધુ નહીં રોકું. "
+              "વાત કરવા બદલ ખૂબ આભાર — તમારો દિવસ શુભ રહે!",
+    }
+
+    def generate_timeout_goodbye(self) -> str:
+        """Hard duration cap (termination.max_call_minutes): deliver one
+        wrap-up line and arm a HARD hangup — this is the single close the
+        caller's next utterance does not cancel, because the business set an
+        absolute ceiling on call length. Called by the pipeline watchdog."""
+        lang = (self.state.language or "en")[:2]
+        text = self._MAXDUR_GOODBYE.get(lang, self._MAXDUR_GOODBYE["en"])
+        self.state.is_closing = True
+        self.commit_pending_turn()
+        self.state.stage = STAGE_CLOSING
+        self.state_mgr.extra_flags["max_duration_close"] = True
+        self.call_outcome = self.call_outcome or "max_duration"
+        self.hangup_pending = True
+        self._hangup_hard = True
+        self.memory.add_assistant(text, language=self.state.language)
+        logger.info("[HANGUP] max-call-duration reached — hard close")
+        return text
+
     def _callback_opening(self) -> str | None:
         """Opening line for a platform-scheduled follow-up call: warmly
         reference the earlier conversation and the caller's own callback
@@ -1250,9 +1331,17 @@ class ConversationRouter:
         # A new caller utterance cancels a pending agent hangup: "wait, one
         # more question" after the goodbye must be answered, not cut off.
         # Every close path below re-arms it if this turn also ends the call.
+        # A HARD close (max-duration cap) is the one exception — the platform
+        # is ending the call, so further speech is left unanswered.
         if self.hangup_pending:
+            if self._hangup_hard:
+                logger.info("[HANGUP] hard close pending — caller speech ignored")
+                return
             logger.info("[HANGUP] caller spoke again — hangup cancelled")
             self.hangup_pending = False
+        # Stale end-call signal from a cancelled/superseded LLM stream must
+        # never arm a hangup on a later turn.
+        self._llm_end_call_seen = False
 
         # v3 commitment clarification: the suppression window (armed when we
         # ask "what day works?") decays one notch per user turn.
@@ -2304,6 +2393,95 @@ class ConversationRouter:
 
     # ── Async LLM slot extraction (gap-filler; never on the hot path) ───
 
+    def _execute_tool_proposals(self, had_text: bool) -> list[str]:
+        """Execute ("on" mode) the tool proposals accumulated by
+        _call_llm_stream, through the deterministic gates the plan requires:
+        fill-only slot merges, stage-legality checks, the turn-transaction
+        deferral already inside _record_calendar_booking, and the existing
+        llm_end_call gate. Returns spoken confirmation lines for TOOL-ONLY
+        turns; when the model also produced text, its own words are the
+        confirmation and nothing extra is spoken.
+        """
+        proposals, self._pending_tool_proposals = (
+            self._pending_tool_proposals, [])
+        if not proposals:
+            return []
+        if self._tools_mode != "on":
+            for p in proposals:
+                logger.info("[TOOLS] dropped proposal outside 'on' mode: "
+                            "%s %r", p.name, p.args)
+            return []
+        from .llm_tools import clean_slot_args, confirm_line
+        lang = (self.state.language or "en")[:2]
+        lines: list[str] = []
+        for p in proposals:
+            if not p.valid:
+                continue  # malformed args — already logged loudly
+            try:
+                if p.name == "record_customer_details":
+                    data = clean_slot_args(p.args)
+                    changes = (self.state_mgr.merge_state(
+                        data, source="tool", fill_only=True) if data else [])
+                    logger.info("[TOOLS] record_customer_details %r → "
+                                "%d filled", data, len(changes))
+                    if changes and not had_text:
+                        lines.append(confirm_line(p.name, lang, {}))
+
+                elif p.name == "book_appointment":
+                    date = str(p.args.get("date") or "").strip()
+                    tm = str(p.args.get("time") or "").strip()
+                    cs = self.memory.call_state
+                    if not date or not tm:
+                        logger.info("[TOOLS] book_appointment rejected — "
+                                    "missing args %r", p.args)
+                    elif self.state.is_closing or self.state.turn_count <= 1:
+                        # Stage-legality gate (phantom-booking protection).
+                        logger.info("[TOOLS] book_appointment rejected — not "
+                                    "legal now (closing=%s turn=%d)",
+                                    self.state.is_closing,
+                                    self.state.turn_count)
+                    elif cs.appointment_date and cs.appointment_time:
+                        logger.info("[TOOLS] book_appointment rejected — "
+                                    "appointment already fixed (fill-only)")
+                    else:
+                        cs.appointment_date = cs.appointment_date or date
+                        cs.appointment_time = cs.appointment_time or tm
+                        self._record_calendar_booking(f"{date} at {tm}")
+                        logger.info("[TOOLS] book_appointment executed "
+                                    "%s at %s", date, tm)
+                        if not had_text:
+                            lines.append(confirm_line(
+                                p.name, lang, {"date": date, "time": tm}))
+
+                elif p.name == "request_callback":
+                    when = str(p.args.get("when") or "").strip() or "later"
+                    self._capture_callback_flags(when, "")
+                    logger.info("[TOOLS] request_callback executed when=%r",
+                                when)
+                    if not had_text:
+                        lines.append(confirm_line(p.name, lang,
+                                                  {"when": when}))
+
+                elif p.name == "flag_do_not_call":
+                    self.state_mgr.extra_flags["dnd_requested"] = True
+                    logger.info("[TOOLS] flag_do_not_call executed")
+                    if not had_text:
+                        lines.append(confirm_line(p.name, lang, {}))
+
+                elif p.name == "end_call":
+                    if bool(self._termination_cfg().get("llm_end_call", True)):
+                        self._llm_end_call_seen = True
+                        logger.info("[TOOLS] end_call → llm_end_call signal "
+                                    "(reason=%r)", p.args.get("reason"))
+                    else:
+                        logger.info("[TOOLS] end_call ignored — "
+                                    "llm_end_call disabled")
+                else:
+                    logger.warning("[TOOLS] unknown tool proposed: %s", p.name)
+            except Exception:
+                logger.exception("[TOOLS] executing %s failed", p.name)
+        return lines
+
     def _spawn_slot_extractor(self, text: str) -> None:
         """Fire a background LLM extraction for slots the regexes missed.
 
@@ -2327,6 +2505,13 @@ class ConversationRouter:
 
     async def _llm_extract_slots(self, text: str, missing: list[str]) -> None:
         try:
+            if self._tools_mode == "shadow":
+                # P1 shadow: same trigger, same fill-only trust level, but
+                # the extraction runs through the live tool roster so real
+                # calls generate proposal data without touching the spoken
+                # path. Action proposals are logged, never executed.
+                await self._shadow_tool_extract(text, missing)
+                return
             client = self._get_client()
             keys = ", ".join(f'"{m}"' for m in missing)
             resp = await asyncio.wait_for(
@@ -2368,6 +2553,64 @@ class ConversationRouter:
             pass
         except Exception as exc:
             logger.debug("[STATE:LLM] extractor skipped: %s", exc)
+
+    async def _shadow_tool_extract(self, text: str, missing: list[str]) -> None:
+        """Shadow-mode background extraction via the tool roster.
+
+        record_customer_details fills the still-missing slots exactly like
+        the legacy json extractor (fill_only merge); every other proposal is
+        `[TOOLS] shadow`-logged for the P1 agreement metric. Grep
+        `[TOOLS] shadow proposal` vs the deterministic paths to decide when
+        "on" is safe per agent.
+        """
+        from .llm_tools import (ToolCallAccumulator, build_tool_declarations,
+                                clean_slot_args)
+        client = self._get_client()
+        context = (f"Agent said: {self.last_agent_response or '(call start)'}\n"
+                   f"Caller replied: {text}")
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=self._model,
+                messages=[{
+                    "role": "system",
+                    "content": (
+                        "You observe one exchange from a phone call (may be "
+                        "Hinglish/Hindi/Gujarati/English, noisy ASR). Call "
+                        "tools to record any details or actions the CALLER "
+                        "clearly stated. Call nothing otherwise."),
+                }, {"role": "user", "content": context}],
+                max_tokens=200,
+                temperature=0,
+                tools=build_tool_declarations(
+                    list(self.state_mgr.slots.keys())),
+                **self._llm_extra,
+            ),
+            timeout=2.5,
+        )
+        msg = resp.choices[0].message
+        acc = ToolCallAccumulator()
+        acc.add_delta(getattr(msg, "tool_calls", None))
+        for p in acc.finish():
+            if not p.valid:
+                continue
+            if p.name == "record_customer_details":
+                data = clean_slot_args(p.args)
+                wanted = {k: v for k, v in data.items() if k in missing}
+                if wanted:
+                    changes = self.state_mgr.merge_state(
+                        wanted, source="llm", utterance=text, fill_only=True)
+                    if changes:
+                        logger.info(
+                            "[STATE:TOOLS] Gap-filled %s",
+                            ", ".join(f"{c.field}={c.new!r}"
+                                      for c in changes))
+                extra = {k: v for k, v in data.items() if k not in missing}
+                if extra:
+                    logger.info("[TOOLS] shadow record extras (not merged): "
+                                "%r", extra)
+            else:
+                logger.info("[TOOLS] shadow proposal: %s %r (caller=%r)",
+                            p.name, p.args, text[:80])
 
     def _extract_project_from_text(self, text: str) -> tuple[str, str] | None:
         """Return (canonical_name, location) if a known project is mentioned.
@@ -2948,6 +3191,39 @@ class ConversationRouter:
                 full_parts.append(chunk)
                 yield EngineResult(text=chunk, is_shortcut=False, intent=intent)
 
+        # Native tool proposals ("on" mode): execute through the
+        # deterministic gates. Runs BEFORE the end-call check because the
+        # end_call tool arms the same _llm_end_call_seen flag the [END_CALL]
+        # marker uses. Confirmation lines are yielded only on TOOL-ONLY
+        # turns (the compat shim returns tool calls INSTEAD of text) so an
+        # executed action is never followed by dead air.
+        for _line in self._execute_tool_proposals(had_text=bool(full_parts)):
+            full_parts.append(_line)
+            yield EngineResult(text=_line, is_shortcut=True, intent=intent)
+
+        # LLM end-call signal (termination.llm_end_call): the stream carried
+        # an [END_CALL] token — the goodbye chunks above are the farewell, so
+        # close exactly like the deterministic farewell paths. Caller speech
+        # after this still cancels at the top of process_stream.
+        if self._llm_end_call_seen:
+            self._llm_end_call_seen = False
+            self.state.is_closing = True
+            self.commit_pending_turn()  # closing turn — never rolled back
+            self.state.stage = STAGE_CLOSING
+            self.hangup_pending = True
+            logger.info("[HANGUP] LLM end-call signal — closing after goodbye")
+            if not full_parts:
+                # Marker arrived with no speakable goodbye — never end on
+                # dead silence; play the configured closing line.
+                resp = self._lang_response(
+                    self._def.response_bank.closing_responses,
+                    lang=self._closing_language()) or self._localized(
+                    "closing",
+                    "Thank you for your time! Have a great day!",
+                    lang=self._closing_language())
+                full_parts.append(resp)
+                yield EngineResult(text=resp, is_shortcut=False, intent="farewell")
+
         if full_parts:
             full_text = " ".join(full_parts)
             self.memory.add_assistant(full_text, language=self.state.language)
@@ -3088,6 +3364,19 @@ class ConversationRouter:
             {"role": "system", "content": system + "\n\n" + _final}]
         messages.extend(self.memory.get_history_for_llm())
 
+        # Native tool calling — "on" mode only. Shadow mode deliberately does
+        # NOT declare tools here: the P0 probe showed the Gemini compat shim
+        # returns tool calls INSTEAD of text, so declaring them changes what
+        # the caller hears; shadow runs on the background extractor instead.
+        self._pending_tool_proposals = []
+        _tool_kwargs: dict = {}
+        _tool_acc = None
+        if self._tools_mode == "on":
+            from .llm_tools import ToolCallAccumulator, build_tool_declarations
+            _tool_kwargs["tools"] = build_tool_declarations(
+                list(self.state_mgr.slots.keys()))
+            _tool_acc = ToolCallAccumulator()
+
         _SENTENCE_END = re.compile(r'[.!?।]\s')
         # Clause boundary (comma/colon/semicolon too) — used ONLY for the first
         # emission so audio starts at the model's first natural pause instead of
@@ -3108,6 +3397,7 @@ class ConversationRouter:
                     max_tokens=self._def.llm_config.max_tokens,
                     temperature=0.7,
                     stream=True,
+                    **_tool_kwargs,
                     **self._llm_extra,
                 )
             except asyncio.CancelledError:
@@ -3130,6 +3420,7 @@ class ConversationRouter:
                     max_tokens=self._def.llm_config.max_tokens,
                     temperature=0.7,
                     stream=True,
+                    **_tool_kwargs,
                 )
 
             buffer = ""
@@ -3148,6 +3439,8 @@ class ConversationRouter:
                     timed_out = True
                     break
                 delta = chunk.choices[0].delta
+                if _tool_acc is not None and getattr(delta, "tool_calls", None):
+                    _tool_acc.add_delta(delta.tool_calls)
                 if delta.content:
                     if not _ttft_logged:
                         _ttft_logged = True
@@ -3166,20 +3459,28 @@ class ConversationRouter:
                         if not _first_emitted and len(sentence.split()) < 4:
                             break  # too short to ship alone — wait for more
                         buffer = buffer[match.end():]
+                        sentence = self._strip_end_call_marker(sentence)
                         if sentence:
                             yield _validate_response(sentence, self.state.language,
                                                       self._def.llm_config.max_response_length)
                             _first_emitted = True
 
+            if _tool_acc is not None and _tool_acc.has_calls:
+                self._pending_tool_proposals = _tool_acc.finish()
+
+            tail = self._strip_end_call_marker(buffer.strip())
             if timed_out:
-                if buffer.strip():
-                    yield _validate_response(buffer.strip(), self.state.language,
+                if tail:
+                    yield _validate_response(tail, self.state.language,
                                              self._def.llm_config.max_response_length)
                 else:
+                    # Never hang up on the heels of a timeout fallback — the
+                    # line promises a follow-up, not a goodbye.
+                    self._llm_end_call_seen = False
                     yield (self._lang_response(self._def.response_bank.timeout_fallbacks)
                            or "Let me get back to you on that.")
-            elif buffer.strip():
-                yield _validate_response(buffer.strip(), self.state.language,
+            elif tail:
+                yield _validate_response(tail, self.state.language,
                                              self._def.llm_config.max_response_length)
 
         except asyncio.CancelledError:
@@ -3696,18 +3997,62 @@ class ConversationRouter:
     _DONE_REPLY_RE = re.compile(
         r"^(?:no+|nope|nahi+n?|nhi|na|bas|bs|नहीं|ना|बस|ના|બસ|"
         r"that'?s all|nothing(?: else| more)?|no,? than(?:ks|k you)|"
+        r"than(?:ks|k you|k u|ku)|dhanyavaa?d|shukriya|aabhar|"
+        r"धन्यवाद|शुक्रिया|आभार|આભાર|"
         r"i'?m (?:good|okay|fine)|all good|done|it'?s (?:okay|fine))\b",
         re.IGNORECASE)
 
-    @staticmethod
-    def _contains_farewell(text: str) -> bool:
+    # Unambiguous "I'm hanging up now" phrasings beyond the classic goodbye
+    # words. Kept deliberately narrow — a phrase that can appear mid-pitch
+    # ("take care of maintenance", "I have to go to Surat next week") must
+    # NEVER be here; per-agent additions go in termination.farewell_patterns.
+    _FAREWELL_EXTRA = (
+        "gotta go", "got to go", "good night", "रखता हूँ", "रखता हूं",
+        "रखती हूँ", "रखती हूं", "फोन रखो", "फोन रखिए", "rakhta hu",
+        "rakhta hoon", "rakhti hu", "rakhti hoon", "phone rakh",
+        "call rakh", "rakh raha hu", "rakh rahi hu", "muku chu",
+        "phone muku", "મૂકું છું", "ફોન મૂક",
+    )
+
+    def _contains_farewell(self, text: str) -> bool:
         """Same farewell vocabulary as detect_intent — applied directly so a
         goodbye inside a longer utterance ('okay thank you, bye') closes the
-        call even when the classifier scored the turn as something else."""
+        call even when the classifier scored the turn as something else.
+        call_flow.termination.farewell_patterns adds per-agent phrases (any
+        language/script, matched as lowercase substrings)."""
         lower = (text or "").lower()
         if re.search(r"\b(bye|goodbye|alvida|aavjo)\b", lower):
             return True
-        return any(w in lower for w in ("अलविदा", "फिर मिलते", "આવજો", "ફરી મળીશું"))
+        if any(w in lower for w in ("अलविदा", "फिर मिलते", "આવજો", "ફરી મળીશું")):
+            return True
+        if any(w in lower for w in self._FAREWELL_EXTRA):
+            return True
+        extra = [str(p).lower().strip() for p in
+                 (self._termination_cfg().get("farewell_patterns") or [])]
+        return any(p and p in lower for p in extra)
+
+    def _termination_cfg(self) -> dict:
+        """call_flow.termination with a safe empty default."""
+        cfg = getattr(self._def.call_flow, "termination", None)
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _strip_end_call_marker(self, text: str) -> str:
+        """Remove the [END_CALL] token before validation — _validate_response
+        strips brackets/underscores and would leave spoken 'ENDCALL' litter.
+        Seeing the token arms the end-call signal when the agent allows it
+        (termination.llm_end_call, default True); when disallowed the token
+        is still stripped so it can never be spoken."""
+        if not text or ("[" not in text and "END" not in text):
+            return text
+        new = _END_CALL_RE.sub("", text)
+        if new != text:
+            if bool(self._termination_cfg().get("llm_end_call", True)):
+                self._llm_end_call_seen = True
+                logger.info("[HANGUP] LLM emitted [END_CALL] with its goodbye")
+            else:
+                logger.info("[HANGUP] [END_CALL] stripped — llm_end_call disabled")
+            new = new.strip()
+        return new
 
     def _is_close_confirmation(self, text: str) -> bool:
         """True when the caller just confirmed they're done, in reply to our

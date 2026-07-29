@@ -75,3 +75,4 @@ dashboard/sarvam_key_master.json
 # Sentinel runtime state (watchdog cooldowns + status snapshot)
 data/sentinel_state.json
 data/sentinel_status.json
+core

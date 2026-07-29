@@ -631,6 +631,284 @@ def followup_delete(fid: int, owner: str = Depends(current_owner)):
 
 
 # ---------------------------------------------------------------------------
+# Follow-up call approval — the human-in-the-loop gate
+#
+# The auto-dialer may only ring a number a named person signed off on. See
+# migration 0011 and shared/intelligence/autodial.py for the incident this
+# came from; the short version is that the AI's own "yes, follow up" verdict
+# turned out to be worth very little. Of the 20 rows armed for auto-dialling
+# on 2026-07-29, fifteen had no commitment on the source call at all, and nine
+# of those were nevertheless labelled promised_by='agent_promised' — including
+# calls that failed on OUR side ("call failed due to technical audio issues",
+# confidence 1.0). So the review UI must not merely restate the AI's reason:
+# it has to show the human what was actually SAID, and admit when nothing was.
+# ---------------------------------------------------------------------------
+
+# How long an approval stays good. Matches AUTODIAL_MAX_AGE_H so an approval
+# never outlives the row's own staleness guard: consent to call someone today
+# is not consent to call them next week.
+_APPROVAL_TTL_H = 72
+
+# Rows a human can be asked to authorise. 'no' is excluded — the AI saw no
+# reason to call, and surfacing those invites rubber-stamping.
+_APPROVABLE_DECISIONS = ("yes", "unsure")
+
+
+def _autodial_max_attempts() -> int:
+    """How many times one approval may ring the same person before the row
+    needs a human again. Surfaced to the UI so the approve dialog can state it
+    rather than let the operator assume "approve" means exactly one call."""
+    try:
+        from shared.intelligence import config as intel_config
+
+        return int(intel_config.AUTODIAL_MAX_ATTEMPTS)
+    except Exception:
+        return 3
+
+
+def _evidence_for(db, rows: list[dict]) -> dict[int, dict]:
+    """Per-follow-up proof of why a call is being proposed.
+
+    Two tiers, and the difference between them is the entire point:
+
+      quoted    a commitment was extracted from the call with the verbatim
+                words that created the obligation, and who said them.
+      inferred  no commitment exists. The follow-up is the model's own idea.
+
+    Deliberately joined on call_id, NOT on followups.commitment_id: that FK is
+    NULL on every row in production (all 89 commitments carry a quote, yet not
+    one follow-up points at one), so trusting it would have shown "no evidence"
+    for calls that genuinely do have a recorded promise.
+    """
+    call_ids = sorted({int(r["call_id"]) for r in rows if r.get("call_id")})
+    if not call_ids:
+        return {}
+    marks = ",".join("?" for _ in call_ids)
+    commits: dict[int, list[dict]] = {}
+    for c in db.execute(
+        f"""SELECT call_id, made_by, kind, description, quote, deadline_text,
+                   confidence
+              FROM commitments
+             WHERE call_id IN ({marks})
+             ORDER BY made_by, id""",
+        tuple(call_ids),
+    ).fetchall():
+        commits.setdefault(int(c["call_id"]), []).append({
+            "made_by": c["made_by"], "kind": c["kind"],
+            "description": c["description"], "quote": c["quote"],
+            "deadline_text": c["deadline_text"],
+            "confidence": c["confidence"],
+        })
+
+    # Tail of the transcript as context. A promise, if there is one, is made
+    # near the end; `right(...)` keeps a long call from bloating the response.
+    tails: dict[int, list[dict]] = {}
+    for t in db.execute(
+        f"""SELECT id, right(transcript, 4000) AS tail FROM calls
+             WHERE id IN ({marks})""",
+        tuple(call_ids),
+    ).fetchall():
+        turns = parse_turns(t["tail"] or "")[-8:]
+        tails[int(t["id"])] = [
+            {"at": at, "speaker": who, "text": text[:400]}
+            for at, who, text in turns
+        ]
+
+    out: dict[int, dict] = {}
+    for r in rows:
+        cid = int(r["call_id"]) if r.get("call_id") else 0
+        found = commits.get(cid, [])
+        out[int(r["id"])] = {
+            "strength": "quoted" if found else "inferred",
+            "commitments": found,
+            "transcript_tail": tails.get(cid, []),
+        }
+    return out
+
+
+@router.get("/followups/review-queue")
+def followup_review_queue(owner: str = Depends(current_owner),
+                          limit: int = Query(100, le=200),
+                          include_declined: int = 0):
+    """Everyone with a follow-up call awaiting a human decision, with proof.
+
+    This is what backs the "Review & approve calls" dialog. Nothing here has
+    been called and nothing here can be called until it comes back through
+    /approve.
+
+    include_declined=1 also returns rows someone already refused. Without it a
+    decline is a one-way door: the row leaves this queue, and the queue is the
+    only screen that can approve. Changing your mind has to be possible.
+    """
+    states = ("pending", "declined") if include_declined else ("pending",)
+    state_marks = ",".join("?" for _ in states)
+    marks = ",".join("?" for _ in _APPROVABLE_DECISIONS)
+    with get_db() as db:
+        rows = [dict(r) for r in db.execute(
+            f"""SELECT f.id, f.call_id, f.contact_id, f.decision, f.confidence,
+                       f.reason, f.explanation, f.summary, f.followup_type,
+                       f.promised_by, f.scheduled_at, f.auto_scheduled,
+                       f.priority, f.status, f.mode, f.attempts,
+                       f.approval_state, f.created_at, f.declined_at, f.declined_by,
+                       c.call_key, c.started_at AS source_call_at,
+                       ct.name AS contact_name,
+                       COALESCE(ct.legacy_id, 'db' || ct.id::text) AS contact_handle,
+                       COALESCE(ct.phone, c.phone) AS dial_phone,
+                       (ct.disposition = 'rejected') AS dnd,
+                       ci.customer_intent
+                  FROM followups f
+                  LEFT JOIN calls c ON c.id = f.call_id
+                  LEFT JOIN contacts ct ON ct.id = f.contact_id
+                  LEFT JOIN call_intelligence ci ON ci.call_id = f.call_id
+                 WHERE f.owner = ?
+                   AND f.deleted_at IS NULL
+                   AND f.approval_state IN ({state_marks})
+                   AND f.decision IN ({marks})
+                   AND f.status IN ('pending', 'scheduled', 'missed')
+                 ORDER BY f.approval_state = 'pending' DESC,
+                          f.priority = 'urgent' DESC,
+                          COALESCE(f.scheduled_at, f.created_at) ASC
+                 LIMIT ?""",
+            (owner, *states, *_APPROVABLE_DECISIONS, limit),
+        ).fetchall()]
+        evidence = _evidence_for(db, rows)
+    for r in rows:
+        r["evidence"] = evidence.get(int(r["id"]),
+                                     {"strength": "inferred", "commitments": [],
+                                      "transcript_tail": []})
+    # `total` counts only what still needs a decision, so the header badge
+    # means the same thing whether or not declined rows are being shown.
+    return {"items": rows,
+            "total": sum(1 for r in rows if r["approval_state"] == "pending"),
+            "shown": len(rows),
+            "max_attempts_per_approval": _autodial_max_attempts(),
+            "approval_ttl_hours": _APPROVAL_TTL_H}
+
+
+def _approve_rows(db, owner: str, ids: list[int], *, mode: str,
+                  ttl_h: int) -> list[int]:
+    """Stamp approval on rows this owner actually owns. Returns the ids hit.
+
+    A DND contact is never approvable, whatever the UI sent — the customer's
+    own "stop calling me" outranks an operator's click.
+    """
+    done: list[int] = []
+    for fid in ids:
+        row = db.execute(
+            """SELECT f.id, f.audit, (ct.disposition = 'rejected') AS dnd
+                 FROM followups f
+                 LEFT JOIN contacts ct ON ct.id = f.contact_id
+                WHERE f.id=? AND f.owner=? AND f.deleted_at IS NULL""",
+            (fid, owner),
+        ).fetchone()
+        if not row or row["dnd"]:
+            continue
+        audit = _j(row["audit"])
+        audit.append(_now_audit(
+            owner, "approved",
+            f"approved for {'automatic' if mode == 'auto' else 'manual'} "
+            f"calling, valid {ttl_h}h"))
+        # autodial_blocked_at is deliberately NOT cleared here. If the dialer
+        # permanently stopped this row (retry cap, no number), approving the
+        # CONTENT of the call should not silently restart the attempts; that
+        # stays an explicit re-arm through PATCH mode=auto.
+        db.execute(
+            """UPDATE followups
+                  SET approval_state='approved',
+                      approved_at=now(),
+                      approved_by=?,
+                      approval_expires_at=now() + (? || ' hours')::interval,
+                      declined_at=NULL, declined_by=NULL,
+                      mode=?,
+                      audit=?,
+                      updated_at=now()
+                WHERE id=? AND owner=?""",
+            (owner, str(int(ttl_h)), mode, json.dumps(audit[-50:]), fid, owner),
+        )
+        done.append(int(fid))
+    return done
+
+
+@router.post("/followups/{fid}/approve")
+def followup_approve(fid: int, body: dict | None = None,
+                     owner: str = Depends(current_owner)):
+    """Authorise this one call. mode='auto' lets the dialer place it."""
+    body = body or {}
+    mode = body.get("mode") or "auto"
+    if mode not in ("manual", "auto"):
+        raise HTTPException(status_code=422, detail="bad mode")
+    try:
+        ttl_h = max(1, min(720, int(body.get("expires_in_h") or _APPROVAL_TTL_H)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="bad expires_in_h")
+    with get_db() as db:
+        done = _approve_rows(db, owner, [fid], mode=mode, ttl_h=ttl_h)
+    if not done:
+        raise HTTPException(
+            status_code=404,
+            detail="follow-up not found, or the contact asked not to be called")
+    return {"ok": True, "approved": done, "mode": mode, "expires_in_h": ttl_h}
+
+
+@router.post("/followups/approve")
+def followups_approve_bulk(body: dict, owner: str = Depends(current_owner)):
+    """Approve a reviewed batch. The UI sends only ids the human ticked."""
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=422, detail="ids required")
+    try:
+        ids = [int(i) for i in ids][:200]
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="ids must be integers")
+    mode = body.get("mode") or "auto"
+    if mode not in ("manual", "auto"):
+        raise HTTPException(status_code=422, detail="bad mode")
+    try:
+        ttl_h = max(1, min(720, int(body.get("expires_in_h") or _APPROVAL_TTL_H)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="bad expires_in_h")
+    with get_db() as db:
+        done = _approve_rows(db, owner, ids, mode=mode, ttl_h=ttl_h)
+    # skipped = not owned, deleted, or DND. Reported so a bulk approve that
+    # quietly dropped rows doesn't read as a full success.
+    return {"ok": True, "approved": done, "count": len(done),
+            "skipped": len(ids) - len(done), "mode": mode}
+
+
+@router.post("/followups/{fid}/decline")
+def followup_decline(fid: int, body: dict | None = None,
+                     owner: str = Depends(current_owner)):
+    """Refuse this call. The row stays on the list and stays callable by hand;
+    it simply loses the right to dial itself."""
+    body = body or {}
+    note = (body.get("note") or "").strip()
+    with get_db() as db:
+        row = db.execute(
+            "SELECT audit, notes FROM followups"
+            " WHERE id=? AND owner=? AND deleted_at IS NULL", (fid, owner),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="follow-up not found")
+        audit = _j(row["audit"])
+        audit.append(_now_audit(owner, "declined", note[:200] or "not approved"))
+        sets = ["approval_state='declined'", "declined_at=now()",
+                "declined_by=?", "approved_at=NULL", "approved_by=NULL",
+                "approval_expires_at=NULL", "mode='manual'", "audit=?",
+                "updated_at=now()"]
+        params: list[Any] = [owner, json.dumps(audit[-50:])]
+        if note:
+            notes = _j(row["notes"])
+            notes.append({**_now_audit(owner, "note"), "text": note[:1000]})
+            sets.append("notes=?")
+            params.append(json.dumps(notes[-100:]))
+        db.execute(
+            f"UPDATE followups SET {', '.join(sets)} WHERE id=? AND owner=?",
+            (*params, fid, owner),
+        )
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Action items
 # ---------------------------------------------------------------------------
 

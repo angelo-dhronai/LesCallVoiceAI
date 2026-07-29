@@ -76,7 +76,59 @@ _LANG_CODE_MAP = {
     "en": "en-IN",
     "hi": "hi-IN",
     "gu": "gu-IN",
+    # Full platform roster (voice_catalog.PLATFORM_LANGUAGES). A language
+    # missing here silently falls back to en-IN, which pushes Indic text
+    # through the English frontend — mispronounced, halting delivery.
+    "mr": "mr-IN",
+    "ta": "ta-IN",
+    "te": "te-IN",
+    "kn": "kn-IN",
+    "ml": "ml-IN",
+    "bn": "bn-IN",
+    "pa": "pa-IN",
+    "od": "od-IN",
 }
+
+# Adaptive speech rate. Two documented Bulbul behaviours skew perceived speed
+# away from the configured pace (docs.sarvam.ai TTS best-practices):
+#   • long, lightly-punctuated sentences are delivered rushed — on top of the
+#     fleet-wide 1.15 base pace they read as "too fast";
+#   • Hindi delivery runs audibly slower than English at the same pace value,
+#     so a base pace tuned on English sounds sluggish in hi.
+# Corrections are per-request multipliers on the agent's configured pace
+# (agent.yaml tts_voices.<lang>.pace stays the base knob), clamped to
+# bulbul:v3's supported range. TTS_ADAPTIVE_PACE=false restores raw base pace.
+_PACE_MIN, _PACE_MAX = 0.5, 2.0
+TTS_ADAPTIVE_PACE = os.environ.get("TTS_ADAPTIVE_PACE", "true").lower() == "true"
+_LANG_PACE_FACTORS = {
+    lang: float(os.environ.get(f"TTS_PACE_FACTOR_{lang.upper()}", default))
+    for lang, default in (("hi", "1.08"), ("gu", "1.0"), ("en", "1.0"))
+}
+# A sentence (text between .!?। boundaries) at/above this length gets damped —
+# the threshold is on sentence length, not chunk length, because a chunk
+# packing several short well-punctuated sentences paces fine.
+_LONG_SENT_CHARS = int(os.environ.get("TTS_PACE_LONG_SENT_CHARS", "140"))
+_LONG_SENT_FACTOR = float(os.environ.get("TTS_PACE_LONG_SENT_FACTOR", "0.93"))
+# Folded into the canned-audio cache key: retuning any knob above must miss
+# the cache, or old-pace PCM would replay for greetings/fillers forever.
+_PACE_CFG_TAG = "|".join(
+    [str(int(TTS_ADAPTIVE_PACE))]
+    + [f"{k}:{v}" for k, v in sorted(_LANG_PACE_FACTORS.items())]
+    + [str(_LONG_SENT_CHARS), str(_LONG_SENT_FACTOR)]
+)
+
+
+def _effective_pace(base: float, language: str, text: str) -> float:
+    """Per-request pace: base × language factor × long-sentence damping."""
+    pace = base if base else 1.0
+    if TTS_ADAPTIVE_PACE:
+        pace *= _LANG_PACE_FACTORS.get(language, 1.0)
+        longest = max(
+            (len(s) for s in _SENTENCE_BOUNDARY_RE.split(text)), default=0
+        )
+        if longest >= _LONG_SENT_CHARS:
+            pace *= _LONG_SENT_FACTOR
+    return round(min(max(pace, _PACE_MIN), _PACE_MAX), 3)
 
 # Incremental-playback chunking. Long utterances are synthesized in parts and
 # flushed to the sink part-by-part, so telephony playback of part 1 starts
@@ -403,7 +455,7 @@ class SarvamTTS(StreamingTTS):
         lang_code = _LANG_CODE_MAP.get(self._language, "en-IN")
         key = (
             f"{self._model}|{self._speaker}|{self._pace}|{lang_code}|"
-            f"{self._sample_rate}|{text}"
+            f"{self._sample_rate}|{_PACE_CFG_TAG}|{text}"
         )
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return TTS_CACHE_DIR / f"{digest}.pcm"
@@ -494,15 +546,37 @@ class SarvamTTS(StreamingTTS):
             if path is not None and buf and self._last_speak_clean:
                 self._write_cache(path, bytes(buf))
 
+    def _check_stream_rate(self, first_chunk: bytes) -> None:
+        """Detect a sample-rate the sink will mislabel.
+
+        Every sink downstream stamps WAV headers with the *requested* rate
+        without verifying what Sarvam actually sent — if Sarvam ever falls
+        back to its 24 kHz default while we label the PCM 8 kHz, FreeSWITCH
+        plays it at 1/3 speed, octaves down, with zero errors anywhere. The
+        stream is normally headerless linear16, but if a RIFF header shows
+        up we can read the real rate; detection only, audio is untouched.
+        """
+        if len(first_chunk) < 28 or first_chunk[:4] != b"RIFF" \
+                or first_chunk[8:12] != b"WAVE":
+            return
+        actual = int.from_bytes(first_chunk[24:28], "little")
+        if actual and actual != self._sample_rate:
+            logger.warning(
+                "[TTS:Sarvam] Stream declares %d Hz but sink assumes %d Hz — "
+                "playback will run at %.2fx speed",
+                actual, self._sample_rate, self._sample_rate / actual,
+            )
+
     async def _stream_audio(self, text: str):
         lang_code = _LANG_CODE_MAP.get(self._language, "en-IN")
+        pace = _effective_pace(self._pace, self._language, text)
 
         payload = {
             "text": text,
             "target_language_code": lang_code,
             "speaker": self._speaker,
             "model": self._model,
-            "pace": self._pace,
+            "pace": pace,
             "speech_sample_rate": self._sample_rate,
             "output_audio_codec": "linear16",
         }
@@ -555,12 +629,16 @@ class SarvamTTS(StreamingTTS):
                         )
                         return
 
-                    logger.info("[TTS:Sarvam] Streaming started for %r (%s, %s)",
-                                text[:50], lang_code, self._speaker)
+                    logger.info("[TTS:Sarvam] Streaming started for %r (%s, %s, pace=%.2f)",
+                                text[:50], lang_code, self._speaker, pace)
 
+                    first_chunk = True
                     async for raw_chunk in response.aiter_bytes(CHUNK_READ_SIZE):
                         if self._cancelled:
                             return
+                        if first_chunk:
+                            first_chunk = False
+                            self._check_stream_rate(raw_chunk)
                         yield TTSChunk(
                             audio=raw_chunk,
                             text_segment=text,

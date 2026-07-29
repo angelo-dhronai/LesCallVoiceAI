@@ -884,7 +884,8 @@ async def apply_yaml_from_document(name: str, doc_id: str, request: Request) -> 
 
 # ── TTS voice preview ───────────────────────────────────────────────────────
 @router.get("/api/tts/preview")
-async def tts_voice_preview(speaker: str, model: str = "bulbul:v3", language: str = "en-IN"):
+async def tts_voice_preview(speaker: str, model: str = "bulbul:v3", language: str = "en-IN",
+                            pace: float = 1.0):
     """Stream a short TTS sample as audio/wav for in-browser playback."""
     import httpx
     api_key = os.environ.get("SARVAM_API_KEY", "")
@@ -901,6 +902,7 @@ async def tts_voice_preview(speaker: str, model: str = "bulbul:v3", language: st
         "target_language_code": language,
         "speaker": speaker,
         "model": model,
+        "pace": min(max(pace, 0.5), 2.0),
         "speech_sample_rate": 16000,
         "output_audio_codec": "linear16",
     }

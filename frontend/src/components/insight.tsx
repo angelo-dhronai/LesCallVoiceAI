@@ -8,6 +8,7 @@
 import type { ReactNode } from 'react'
 import { Badge, cx } from './ui'
 import { StatusBadge } from './kit'
+import { CountingNumber } from './motion'
 import { RadialRing } from './charts'
 import { scoreColor } from '../lib/chartColors'
 import type { Commitment } from '../api/intel'
@@ -155,7 +156,9 @@ export function StatTile({ label, value, hint }: {
 }) {
   return (
     <div>
-      <div className="metric text-2xl font-bold">{value}</div>
+      <div className="metric text-2xl font-bold">
+        {typeof value === 'number' ? <CountingNumber value={value} /> : value}
+      </div>
       <div className="text-xs text-dim">{label}</div>
       {hint && <div className="text-2xs text-dim">{hint}</div>}
     </div>

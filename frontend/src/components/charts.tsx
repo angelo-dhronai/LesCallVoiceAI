@@ -1,10 +1,22 @@
-import { useId } from 'react'
+import { useEffect, useId, useState } from 'react'
 
-/** Inline area sparkline rendered as crisp SVG. */
+/** First-paint trigger for the draw-in transitions below. Data refetches
+ *  don't re-fire it — charts only perform on arrival, then stay quiet. */
+function useDrawn() {
+  const [drawn, setDrawn] = useState(false)
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setDrawn(true))
+    return () => cancelAnimationFrame(id)
+  }, [])
+  return drawn
+}
+
+/** Inline area sparkline rendered as crisp SVG; the line draws itself in. */
 export function Sparkline({
   data, color = 'var(--accent)', height = 44, fill = true, strokeWidth = 2,
 }: { data: number[]; color?: string; height?: number; fill?: boolean; strokeWidth?: number }) {
   const id = useId().replace(/:/g, '')
+  const drawn = useDrawn()
   const w = 100
   const pts = data.length ? data : [0, 0]
   const max = Math.max(...pts), min = Math.min(...pts)
@@ -21,19 +33,26 @@ export function Sparkline({
           <stop offset="100%" stopColor={color} stopOpacity="0" />
         </linearGradient>
       </defs>
-      {fill && <path d={area} fill={`url(#sg${id})`} />}
-      <path d={line} fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+      {fill && (
+        <path d={area} fill={`url(#sg${id})`}
+          style={{ opacity: drawn ? 1 : 0, transition: 'opacity .7s ease .35s' }} />
+      )}
+      <path d={line} fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke"
+        pathLength={1} strokeDasharray="1"
+        strokeDashoffset={drawn ? 0 : 1}
+        style={{ transition: 'stroke-dashoffset 1s cubic-bezier(.22,1,.36,1)' }} />
     </svg>
   )
 }
 
-/** Radial progress ring with centered label. */
+/** Radial progress ring with centered label; sweeps to its value on mount. */
 export function RadialRing({
   value, max = 100, size = 64, stroke = 7, color = 'var(--accent)', label,
 }: { value: number; max?: number; size?: number; stroke?: number; color?: string; label?: string }) {
+  const drawn = useDrawn()
   const r = (size - stroke) / 2
   const c = 2 * Math.PI * r
-  const frac = Math.max(0, Math.min(1, value / (max || 1)))
+  const frac = drawn ? Math.max(0, Math.min(1, value / (max || 1))) : 0
   return (
     <div className="relative inline-grid place-items-center" style={{ width: size, height: size }}>
       <svg width={size} height={size} className="-rotate-90">

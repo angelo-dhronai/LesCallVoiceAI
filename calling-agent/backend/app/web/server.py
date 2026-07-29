@@ -353,7 +353,8 @@ def make_app(hub: EventHub, pipeline=None, standalone: bool = False) -> FastAPI:
 
     # ── TTS voice preview ─────────────────────────────────────────────
     @app.get("/api/tts/preview")
-    async def tts_voice_preview(speaker: str, model: str = "bulbul:v3", language: str = "en-IN"):
+    async def tts_voice_preview(speaker: str, model: str = "bulbul:v3", language: str = "en-IN",
+                                pace: float = 1.0):
         """Stream a short TTS sample and return it as audio/wav for in-browser playback."""
         import struct, os
         import httpx as _httpx
@@ -371,6 +372,7 @@ def make_app(hub: EventHub, pipeline=None, standalone: bool = False) -> FastAPI:
             "target_language_code": language,
             "speaker": speaker,
             "model": model,
+            "pace": min(max(pace, 0.5), 2.0),
             "speech_sample_rate": 16000,
             "output_audio_codec": "linear16",
         }

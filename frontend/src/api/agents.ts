@@ -190,10 +190,10 @@ export const deleteBooking = (name: string, index: number) =>
 export const previewIntent = (text: string, agent?: string, language = 'auto') =>
   post<IntentResult>('/preview/intent', { text, agent, language })
 
-export const ttsPreviewUrl = (speaker: string, model: string, language: string) =>
+export const ttsPreviewUrl = (speaker: string, model: string, language: string, pace?: number) =>
   `/api/tts/preview?speaker=${encodeURIComponent(speaker)}&model=${encodeURIComponent(
     model,
-  )}&language=${encodeURIComponent(language)}`
+  )}&language=${encodeURIComponent(language)}${pace ? `&pace=${pace}` : ''}`
 
 /* ─────────────────────── wizard payload ───────────────────────
  * Ports buildAgentFromWizard() from the standalone builder so a from-scratch

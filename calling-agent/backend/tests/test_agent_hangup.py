@@ -112,3 +112,48 @@ def test_wrong_number_close_arms_hangup():
     drive(r, "you have the wrong number")
     assert r.state.is_closing is True
     assert r.hangup_pending is True
+
+
+# ── Confirmed callback = consented close (platform rule, 2026-07-27) ──
+# "Call me after 10 minutes" is the caller asking for the call to end NOW
+# and resume later — after confirming the time the agent says goodbye and
+# the platform hangs up. This is what the Copilot could never deliver via
+# prompt guardrails: no script text can cut a call, only this engine path.
+
+def test_confirmed_relative_callback_closes_the_call():
+    r = make_router()
+    resp = drive(r, "can you call me after 10 minutes")
+    assert "10 minute" in resp
+    assert r.state.is_closing is True
+    assert r.hangup_pending is True
+
+
+def test_confirmed_day_time_callback_closes_the_call():
+    r = make_router()
+    drive(r, "call me tomorrow at 5 pm")
+    assert r.hangup_pending is True
+
+
+def test_clarify_question_turn_does_not_close():
+    """The pin-down QUESTION keeps the call open — only the confirmed
+    answer closes it."""
+    r = make_router()
+    q = drive(r, "call me later")
+    assert "?" in q
+    assert r.hangup_pending is False
+    a = drive(r, "ten minutes")
+    assert "?" not in a
+    assert r.hangup_pending is True
+
+
+def test_busy_brushoff_pins_down_then_closes():
+    """'Sorry not free right now' must not burn decline strikes or keep
+    pitching — it asks when to call back, then closes on the answer."""
+    r = make_router()
+    q = drive(r, "sorry not free right now")
+    assert "?" in q and "no problem" in q.lower()
+    assert r.state.decline_count == 0
+    assert r.hangup_pending is False
+    drive(r, "call me after 15 minutes")
+    assert r.state_mgr.extra_flags.get("callback_offset_min") == 15
+    assert r.hangup_pending is True

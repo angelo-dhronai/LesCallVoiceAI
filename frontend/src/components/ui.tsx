@@ -1,13 +1,29 @@
-import type { ReactNode } from 'react'
+import { useRef, type CSSProperties, type ReactNode } from 'react'
 
 export function cx(...c: (string | false | null | undefined)[]) {
   return c.filter(Boolean).join(' ')
 }
 
-export function Card({ className, children, hover, glow }: { className?: string; children: ReactNode; hover?: boolean; glow?: 'mint' | 'indigo' }) {
+export function Card({ className, children, hover, glow, style }: {
+  className?: string; children: ReactNode; hover?: boolean; glow?: 'mint' | 'indigo'
+  /** Escape hatch for entrance choreography (animation-delay) — not layout. */
+  style?: CSSProperties
+}) {
+  const ref = useRef<HTMLDivElement>(null)
+  // Hoverable cards get a pointer-tracking spotlight (CSS vars, no re-render).
+  const onPointerMove = hover
+    ? (e: React.PointerEvent<HTMLDivElement>) => {
+        if (e.pointerType !== 'mouse' || !ref.current) return
+        const r = ref.current.getBoundingClientRect()
+        ref.current.style.setProperty('--spot-x', `${e.clientX - r.left}px`)
+        ref.current.style.setProperty('--spot-y', `${e.clientY - r.top}px`)
+      }
+    : undefined
   return (
-    <div className={cx('card', hover && 'card-hover', glow === 'mint' && 'shadow-glow-mint', glow === 'indigo' && 'shadow-glow-indigo', className)}>
+    <div ref={ref} onPointerMove={onPointerMove} style={style}
+      className={cx('card', hover && 'card-hover', glow === 'mint' && 'shadow-glow-mint', glow === 'indigo' && 'shadow-glow-indigo', className)}>
       {children}
+      {hover && <span aria-hidden className="card-spotlight" />}
     </div>
   )
 }

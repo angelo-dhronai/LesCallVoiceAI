@@ -1,4 +1,5 @@
 import { useEffect, useRef, type ReactNode } from 'react'
+import { AnimatePresence, motion } from 'motion/react'
 import { X } from 'lucide-react'
 import { cx } from './ui'
 
@@ -54,6 +55,13 @@ function useFocusTrap(open: boolean) {
   return panelRef
 }
 
+const backdropAnim = {
+  initial: { opacity: 0 },
+  animate: { opacity: 1 },
+  exit: { opacity: 0 },
+  transition: { duration: 0.2 },
+} as const
+
 /** Centered modal dialog. */
 export function Modal({
   open, onClose, title, children, footer, wide,
@@ -61,21 +69,35 @@ export function Modal({
   useEsc(onClose)
   useScrollLock(open)
   const panelRef = useFocusTrap(open)
-  if (!open) return null
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby={title ? 'modal-title' : undefined}>
-      <div className="fixed inset-0 z-[80] bg-zinc-950/30" onClick={onClose} aria-hidden="true" />
-      <div ref={panelRef} className={cx('card relative z-[90] w-full p-5 shadow-glass-lg animate-fade-up', wide ? 'max-w-2xl' : 'max-w-md')}>
-        {title && (
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <h3 id="modal-title" className="font-display text-lg font-semibold tracking-tight">{title}</h3>
-            <button onClick={onClose} aria-label="Close dialog" className="grid h-8 w-8 place-items-center rounded-lg text-dim transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]"><X size={16} /></button>
+    <AnimatePresence>
+      {open && (
+        <div role="dialog" aria-modal="true" aria-labelledby={title ? 'modal-title' : undefined}>
+          <motion.div {...backdropAnim} className="fixed inset-0 z-[80] bg-zinc-950/30" aria-hidden="true" />
+          {/* Centering wrapper — clicks on it (i.e. outside the panel) close,
+              same as the backdrop it covers. */}
+          <div className="fixed inset-0 z-[90] grid place-items-center p-4" onClick={onClose}>
+            <motion.div
+              ref={panelRef}
+              onClick={(e) => e.stopPropagation()}
+              initial={{ opacity: 0, y: 14, scale: 0.97 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 8, scale: 0.98 }}
+              transition={{ type: 'spring', stiffness: 380, damping: 32 }}
+              className={cx('card w-full p-5 shadow-glass-lg', wide ? 'max-w-2xl' : 'max-w-md')}>
+              {title && (
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <h3 id="modal-title" className="font-display text-lg font-semibold tracking-tight">{title}</h3>
+                  <button onClick={onClose} aria-label="Close dialog" className="grid h-8 w-8 place-items-center rounded-lg text-dim transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]"><X size={16} /></button>
+                </div>
+              )}
+              <div data-lenis-prevent className="max-h-[70vh] overflow-y-auto">{children}</div>
+              {footer && <div className="mt-4 flex justify-end gap-2">{footer}</div>}
+            </motion.div>
           </div>
-        )}
-        <div className="max-h-[70vh] overflow-y-auto">{children}</div>
-        {footer && <div className="mt-4 flex justify-end gap-2">{footer}</div>}
-      </div>
-    </div>
+        </div>
+      )}
+    </AnimatePresence>
   )
 }
 
@@ -93,30 +115,37 @@ export function FullscreenModal({
   useEsc(onClose)
   useScrollLock(open)
   const panelRef = useFocusTrap(open)
-  if (!open) return null
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby={title ? 'fullscreen-modal-title' : undefined}>
-      <div className="fixed inset-0 z-[80] bg-zinc-950/40" onClick={onClose} aria-hidden="true" />
-      <div
-        ref={panelRef}
-        className="fixed inset-0 z-[90] flex flex-col overflow-hidden bg-[var(--surface-solid)] shadow-glass-lg animate-fade-up"
-      >
-        <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-[var(--border)] px-4 py-3 sm:px-6">
-          <h3 id="fullscreen-modal-title" className="min-w-0 flex-1 truncate font-display text-lg font-bold tracking-tight sm:text-xl">
-            {title}
-          </h3>
-          {headerExtra}
-          <button onClick={onClose} aria-label="Close dialog"
-            className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-dim transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]">
-            <X size={18} />
-          </button>
+    <AnimatePresence>
+      {open && (
+        <div role="dialog" aria-modal="true" aria-labelledby={title ? 'fullscreen-modal-title' : undefined}>
+          <motion.div {...backdropAnim} className="fixed inset-0 z-[80] bg-zinc-950/40" aria-hidden="true" />
+          <motion.div
+            ref={panelRef}
+            initial={{ opacity: 0, scale: 0.985 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.99 }}
+            transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
+            className="fixed inset-0 z-[90] flex flex-col overflow-hidden bg-[var(--surface-solid)] shadow-glass-lg"
+          >
+            <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-[var(--border)] px-4 py-3 sm:px-6">
+              <h3 id="fullscreen-modal-title" className="min-w-0 flex-1 truncate font-display text-lg font-bold tracking-tight sm:text-xl">
+                {title}
+              </h3>
+              {headerExtra}
+              <button onClick={onClose} aria-label="Close dialog"
+                className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-dim transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]">
+                <X size={18} />
+              </button>
+            </div>
+            {children}
+            {footer && (
+              <div className="shrink-0 border-t border-[var(--border)] px-4 py-3 sm:px-6">{footer}</div>
+            )}
+          </motion.div>
         </div>
-        {children}
-        {footer && (
-          <div className="shrink-0 border-t border-[var(--border)] px-4 py-3 sm:px-6">{footer}</div>
-        )}
-      </div>
-    </div>
+      )}
+    </AnimatePresence>
   )
 }
 
@@ -127,20 +156,29 @@ export function SlideOver({
   useEsc(onClose)
   useScrollLock(open)
   const panelRef = useFocusTrap(open)
-  if (!open) return null
   return (
-    <div className="fixed inset-0 z-[80]" role="dialog" aria-modal="true" aria-labelledby={title ? 'slideover-title' : undefined}>
-      <div className="absolute inset-0 bg-zinc-950/30" onClick={onClose} aria-hidden="true" />
-      <div ref={panelRef} className="absolute right-0 top-0 flex h-full w-[min(94vw,560px)] flex-col bg-[var(--surface-solid)] shadow-glass-lg animate-slide-in-right">
-        <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-5 py-4">
-          <div className="min-w-0 flex-1">
-            <h3 id="slideover-title" className="truncate font-display text-lg font-bold tracking-tight">{title}</h3>
-          </div>
-          {headerExtra}
-          <button onClick={onClose} aria-label="Close panel" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-dim hover:bg-[var(--surface-2)]"><X size={16} /></button>
+    <AnimatePresence>
+      {open && (
+        <div className="fixed inset-0 z-[80]" role="dialog" aria-modal="true" aria-labelledby={title ? 'slideover-title' : undefined}>
+          <motion.div {...backdropAnim} className="absolute inset-0 bg-zinc-950/30" onClick={onClose} aria-hidden="true" />
+          <motion.div
+            ref={panelRef}
+            initial={{ x: '100%' }}
+            animate={{ x: 0 }}
+            exit={{ x: '100%' }}
+            transition={{ type: 'spring', stiffness: 360, damping: 40 }}
+            className="absolute right-0 top-0 flex h-full w-[min(94vw,560px)] flex-col bg-[var(--surface-solid)] shadow-glass-lg">
+            <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-5 py-4">
+              <div className="min-w-0 flex-1">
+                <h3 id="slideover-title" className="truncate font-display text-lg font-bold tracking-tight">{title}</h3>
+              </div>
+              {headerExtra}
+              <button onClick={onClose} aria-label="Close panel" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-dim hover:bg-[var(--surface-2)]"><X size={16} /></button>
+            </div>
+            <div data-lenis-prevent className="flex-1 overflow-y-auto p-5">{children}</div>
+          </motion.div>
         </div>
-        <div className="flex-1 overflow-y-auto p-5">{children}</div>
-      </div>
-    </div>
+      )}
+    </AnimatePresence>
   )
 }

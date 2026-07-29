@@ -560,11 +560,61 @@ _RESPONSE_FALLBACK = "Sorry, could you repeat that?"
 
 _REPEAT_DETECT_PATTERNS = [
     "repeat", "say again", "say that again", "once more", "pardon",
-    "dobara bolo", "dobara", "phir se bolo", "phir se", "phir kaho",
+    "dobara bolo", "dobara", "dubara", "phir se bolo", "phir se", "phir kaho",
     "fari bol", "fari bolsho", "fari janavo",
-    "फिर बोलो", "दोबारा", "दोबारा बोलो", "एक बार फिर",
+    "फिर बोलो", "फिर से", "दोबारा", "दोबारा बोलो", "दुबारा", "एक बार फिर",
     "ફરી બોલ", "ફરી",
+    # "the same thing (in Hindi)" — live call 2026-07-28 looped the canned
+    # language ack three turns because none of these matched. "सेम ची" is a
+    # prefix of "सेम चीज़" in both the combining-nukta and precomposed forms.
+    "same thing", "same cheez", "sem cheez", "सेम ची", "वही बात", "वही बता",
+    "એ જ વાત",
 ]
+
+# Tokens that make up a *bare* language-switch request — language names,
+# switch directives, postpositions, and politeness/filler across the three
+# focus languages (en/hi/gu) and their scripts. _lang_switch_has_content()
+# strips these; whatever survives is a real ask the caller wants answered,
+# not just a request to change language.
+_LANG_SWITCH_STOP_TOKENS = frozenset([
+    # language names (incl. common suffixed/agglutinated forms)
+    "english", "hindi", "gujarati", "angrezi", "angreji", "inglish",
+    "इंग्लिश", "अंग्रेज़ी", "अंग्रेजी", "हिंदी", "हिन्दी", "गुजराती",
+    "हिंदीमें", "गुजरातीमें",
+    "ગુજરાતી", "અંગ્રેજી", "હિન્દી", "ઇંગ્લિશ",
+    "ગુજરાતીમાં", "હિન્દીમાં", "અંગ્રેજીમાં", "ઇંગ્લિશમાં",
+    # switch directives / verbs
+    "speak", "talk", "say", "tell", "switch", "continue", "reply", "use",
+    "change", "know", "understand",
+    "bolo", "boliye", "bol", "bola", "bolna", "baat", "vaat", "vat",
+    "karo", "kariye", "kare", "karna", "kar",
+    "batao", "bataiye", "bata", "batana", "samajh", "aata", "aati",
+    "बोलो", "बोलिए", "बोल", "बोलें", "बोलना", "बात",
+    "बताओ", "बताइए", "बताना", "बता",
+    "करो", "करिए", "कीजिए", "करें", "कर", "समझ", "आता", "आती",
+    "વાત", "બોલો", "બોલ", "બોલવું", "કરો", "કહો", "જણાવો", "આવડે", "આવડતું",
+    # postpositions / auxiliaries
+    "in", "to", "me", "mai", "mein", "ma", "maa", "mei", "se", "par", "pe",
+    "ki", "ka", "ke", "ko", "hai", "hain", "ho", "hu", "hun", "che", "chhe",
+    "में", "मैं", "मा", "माँ", "से", "को", "का", "की", "के",
+    "है", "हैं", "हूँ", "हूं", "हो",
+    "માં", "મા", "ને", "નું", "ની", "નો", "થી", "છે", "છું",
+    # politeness / fillers / pronouns / negation / restriction
+    "please", "pls", "plz", "kya", "kyaa", "aap", "ap", "tum", "tu",
+    "i", "you", "we", "can", "could", "would", "will", "do", "does",
+    "don't", "dont", "can't", "cant", "cannot", "not", "no", "yes",
+    "ok", "okay", "na", "ji", "sir", "madam", "bhai", "hello", "hi",
+    "haan", "ha", "arre", "are", "ek", "ye", "yeh", "wo", "woh",
+    "the", "a", "an", "this", "that", "it", "only", "just", "now", "abhi",
+    "zara", "thoda", "mujhe", "muje", "mujhko", "hume", "humein",
+    "mera", "meri", "apna", "nahi", "nahin", "nai",
+    "sirf", "fakt", "kewal", "khali", "bas",
+    "जी", "ना", "नहीं", "नही", "हाँ", "हां", "एक", "ये", "यह", "वो", "वह",
+    "अभी", "जरा", "थोड़ा", "मुझे", "मुझको", "हमें", "मेरा", "मेरी", "अरे",
+    "क्या", "आप", "तुम", "कृपया", "सिर्फ", "केवल", "खाली", "बस",
+    "હા", "ના", "નથી", "નહીં", "નહિ", "મને", "હું", "તમે", "જરા", "એક",
+    "ફક્ત", "માત્ર", "બસ", "ખાલી", "પ્લીઝ", "જી",
+])
 
 
 
@@ -751,6 +801,10 @@ class ConversationRouter:
         # Consecutive-LLM-failure streak (env LLM_FAILURE_STREAK_LIMIT,
         # 0/unset = off = today's endless canned-fallback behaviour).
         self._llm_failure_streak: int = 0
+        # One-turn LLM directive armed by the language-switch handler when the
+        # caller's switch request carries a real ask (or names the language
+        # already active) — consumed by _call_llm_stream, cleared every turn.
+        self._turn_lang_directive: str | None = None
         # Async LLM slot-extractor bookkeeping (strong ref; latest turn only).
         self._slot_extract_task: asyncio.Task | None = None
         self._slot_extract_enabled = (
@@ -1398,6 +1452,7 @@ class ConversationRouter:
         self.state.llm_cancelled = False
         self.state.parallel_execution = True
         self.state.objection_handled = False
+        self._turn_lang_directive = None
 
         # --- Intent detection ---
         _kb = self._def.knowledge_base
@@ -1502,7 +1557,10 @@ class ConversationRouter:
                     self.state.language_lock_turns = -7
                     self.state.language_history = [new_lang] * 5
                 logger.info("[REPEAT+LANG] Re-rendering last response in %s", self.state.language)
-                # LLM will see the updated language in the system prompt and re-render
+                # LLM sees the updated language in the system prompt; the
+                # directive makes the re-render explicit so it never answers
+                # with a bare "sure, let's speak X" acknowledgment.
+                self._arm_lang_redeliver_directive(self.state.language)
             else:
                 _cancel_llm()
                 resp = self.last_agent_response
@@ -1709,11 +1767,11 @@ class ConversationRouter:
 
         # --- Language switch at any stage ---
         if intent == "language_switch":
-            _cancel_llm()
+            old_lang = self.state.language
             new_lang = self._extract_requested_language(text)
             logger.info(
                 "[LANG] Explicit switch request -> %s (was %s, locked=%s)",
-                new_lang, self.state.language, self.state.language_locked,
+                new_lang, old_lang, self.state.language_locked,
             )
             self.state.language = new_lang
             self.state.language_locked = True
@@ -1721,15 +1779,35 @@ class ConversationRouter:
             # Explicit caller requests should persist but allow natural switching.
             self.state.language_lock_turns = -7
             self.state.language_history = [new_lang] * 5
-            _ls_bank = self._def.response_bank.lang_switch_responses
-            resp = (_ls_bank.get(new_lang) or _ls_bank.get("hi") or _ls_bank.get("en")
-                    or next(iter(_ls_bank.values()), "") or "Sure!")
-            self.memory.add_assistant(resp, language=new_lang)
-            self._store_last_response(resp)
             logger.info("[LANG-LOCK] explicit_switch lang=%s lock_turns=%d (persists ~17 turns)",
                         new_lang, self.state.language_lock_turns)
-            yield EngineResult(text=resp, is_shortcut=True, intent="language_switch")
-            return
+            # The canned ack is ONLY for a bare "change language" ask that
+            # actually changes the language. When the caller names the language
+            # they're already speaking ("हिंदी में बताओ" mid-Hindi-call = "say
+            # THAT in Hindi"), or the request carries a real ask ("हिंदी में
+            # बताओ लेस कॉल के बारे में"), the ack drops their actual question —
+            # a live call answered "जी बिल्कुल, हम हिंदी में बात करते हैं।"
+            # three turns straight. Those turns go to the LLM with a one-turn
+            # re-deliver directive; the language state above is already set, and
+            # the parallel LLM task builds its prompt only after this handler
+            # returns, so the new language is what it sees.
+            if new_lang == old_lang or self._lang_switch_has_content(text):
+                self._arm_lang_redeliver_directive(new_lang)
+                logger.info(
+                    "[LANG] switch is content-bearing or already-%s — routing "
+                    "to LLM for re-delivery instead of canned ack", new_lang)
+            else:
+                _cancel_llm()
+                _ls_bank = self._def.response_bank.lang_switch_responses
+                resp = (_ls_bank.get(new_lang) or _ls_bank.get("hi") or _ls_bank.get("en")
+                        or next(iter(_ls_bank.values()), "") or "Sure!")
+                self.memory.add_assistant(resp, language=new_lang)
+                # Deliberately NOT _store_last_response: the ack must never
+                # become the repeat/replay target — "repeat that" after a
+                # switch should replay the last substantive utterance.
+                self.memory.qa_tracker.observe_agent_turn(resp, self.memory.turn_index)
+                yield EngineResult(text=resp, is_shortcut=True, intent="language_switch")
+                return
 
         # =============================================================
         # NON-SHORTCUT ROUTING — extract data, advance stage, let LLM respond
@@ -2994,6 +3072,11 @@ class ConversationRouter:
                 f"{_lang_script_note.get(self.state.language, '')} "
                 f"Do NOT mix languages. Do NOT switch mid-sentence."
             )
+        # One-turn language-switch re-delivery directive (armed by the
+        # language_switch / repeat+lang handlers; also cleared at turn start).
+        if self._turn_lang_directive:
+            _final = self._turn_lang_directive + "\n" + _final
+            self._turn_lang_directive = None
         # ONE system message, always. Gemini's OpenAI-compat endpoint keeps
         # only a single systemInstruction — with the language trailer sent as
         # a SECOND system message it silently REPLACED the entire agent
@@ -3576,11 +3659,29 @@ class ConversationRouter:
         r"phone karna|baad mein (?:call|baat)|baad me (?:call|baat)|"
         r"phir (?:call|baat)|dobara call)\b", re.IGNORECASE)
 
+    # "I can't talk NOW" without any callback wording — a brush-off, not an
+    # objection. Routed into the callback pin-down flow (ask when to call
+    # back, confirm, close) instead of the decline strike counter, which
+    # would keep pitching a caller who already said they're busy.
+    # Devanagari/Gujarati alternatives sit outside \b groups (matras break
+    # word boundaries — the Indic regex gotcha).
+    _BUSY_NOW_RE = re.compile(
+        r"\b(not free|not right now|busy right now|bit busy|i'?m busy|"
+        r"can'?t talk|cannot talk|in a meeting|driving right now|"
+        r"abhi busy|abhi free nahi|abhi time nahi|abhi fursat nahi|"
+        r"fursat nahi|abhi baat nahi|abhi nahi kar|hamna nahi|"
+        r"atyare nahi|atyare busy|atyare time nathi)\b"
+        r"|अभी\s*(?:busy|व्यस्त|समय\s*नहीं|बात\s*नहीं)|फ़?ुरसत\s*नहीं"
+        r"|અત્યારે\s*(?:નહીં|વ્યસ્ત|સમય\s*નથી)|હમણાં\s*નહીં",
+        re.IGNORECASE)
+
     def _detect_callback_request(self, text: str) -> bool:
-        """Deferral WITH a callback flavour (time preference or 'call me back')."""
+        """Deferral WITH a callback flavour (time preference or 'call me
+        back'), or a busy-now brush-off — both mean 'reach me later'."""
         return bool(self._CALLBACK_ASK_RE.search(text)) or (
             bool(self._CALLBACK_TIME_RE.search(text))
-            and bool(re.search(r"\b(call|baat|phone)\b", text, re.IGNORECASE)))
+            and bool(re.search(r"\b(call|baat|phone)\b", text, re.IGNORECASE))
+        ) or bool(self._BUSY_NOW_RE.search(text))
 
     # ── Close-permission confirm (platform rule, all agents) ────────────
     # The prompt doctrine makes every agent ask permission before wrapping
@@ -3733,9 +3834,11 @@ class ConversationRouter:
             self.state_mgr.extra_flags["callback_offset_min"] = offset_min
         self.call_outcome = self.call_outcome or "callback_requested"
         logger.info("[CALLBACK] captured preference %r (no calendar booking)", preference)
+        self._arm_callback_close()
         resp = self._lang_response(policy.get("responses") or {})
         return resp or (
-            f"No problem at all — we'll call you back {preference}. Thank you!")
+            f"No problem at all — we'll call you back {preference}. "
+            "Thank you, and have a great day!")
 
     # ── v3 in-call commitment clarification (PLAN-intelligence-layer §2.8) ──
 
@@ -3786,9 +3889,30 @@ class ConversationRouter:
             self.state_mgr.extra_flags["callback_offset_min"] = offset_min
         self.call_outcome = self.call_outcome or "callback_requested"
 
-    def _clarify_question(self, day: str, tm: str, relative: bool = False) -> str:
+    def _arm_callback_close(self) -> None:
+        """A confirmed callback IS the caller's request to end the call now —
+        honouring it (confirm + goodbye, then platform hangup) is the
+        consented close the supreme rule requires. The caller speaking again
+        still cancels the hangup at the top of process_stream."""
+        self.state.is_closing = True
+        self.commit_pending_turn()  # closing turn — never rolled back
+        self.state.stage = STAGE_CLOSING
+        self.hangup_pending = True
+        logger.info("[HANGUP] callback confirmed — closing with caller consent")
+
+    def _clarify_question(self, day: str, tm: str, relative: bool = False,
+                          busy: bool = False) -> str:
         lang = (self.state.language or "en")[:2]
-        if relative:
+        if busy:
+            # "sorry, not free right now" — apologise for the timing and pin
+            # down when to call back; never keep pitching a busy caller.
+            bank = {"en": "No problem at all — about how many minutes later "
+                          "should I call you back, or is there a time that suits you?",
+                    "hi": "Koi baat nahi — main kitne minute baad call karun, "
+                          "ya koi time batayein jo aapko theek lage?",
+                    "gu": "Kai vandho nahi — ketli minute pachhi call karu, "
+                          "ke koi time kaho je tamne thik lage?"}
+        elif relative:
             # "call me in a bit / thodi der baad" — pin down the delay, not a day.
             bank = {"en": "Of course — about how many minutes should I wait "
                           "before calling you back, or is there a time that suits you?",
@@ -3817,9 +3941,14 @@ class ConversationRouter:
             preference = self._offset_phrase(offset_min, lang)
         else:
             preference = " ".join(x for x in (day, tm) if x) or "soon"
-        bank = {"en": f"Perfect — I'll call you back {preference}. Thank you!",
-                "hi": f"Bilkul — hum aapko {preference} call karenge. Dhanyavaad!",
-                "gu": f"Saras — ame tamne {preference} call karishu. Aabhar!"}
+        # Goodbye tail included: this confirmation is a closing line — the
+        # platform hangs up after it plays (_arm_callback_close).
+        bank = {"en": f"Perfect — I'll call you back {preference}. "
+                      "Thank you, and have a great day!",
+                "hi": f"Bilkul — hum aapko {preference} call karenge. "
+                      "Dhanyavaad, aapka din shubh rahe!",
+                "gu": f"Saras — ame tamne {preference} call karishu. "
+                      "Aabhar, tamaro divas saras rahe!"}
         return bank.get(lang, bank["en"])
 
     def _maybe_ask_clarification(self, text: str) -> str | None:
@@ -3833,22 +3962,30 @@ class ConversationRouter:
                                     offset_min=offset_min)
             logger.info("[COMMITMENT] relative commitment captured: +%d min",
                         offset_min)
+            self._arm_callback_close()
             return self._clarify_confirmation(day, tm, offset_min)
         if day and tm:
             self._record_commitment(text, day, tm, clarified=True)
             logger.info("[COMMITMENT] precise commitment captured: %s %s", day, tm)
+            self._arm_callback_close()
             return self._clarify_confirmation(day, tm)
         commitment = self._record_commitment(text, day, tm, clarified=False)
         if self._clarify_asked:
             # One question per call, ever — never interrogate the caller.
+            self._arm_callback_close()
             return self._clarify_confirmation(day, tm)
         self._clarify_asked = True
         self._pending_clarify = commitment
         self._suppress_time_match_turns = 2  # this turn + the answer turn
+        # Busy flavour only when the brush-off carries NO time hint at all —
+        # "busy right now, call me next week" still gets the day question.
+        _busy = (not day and not tm
+                 and bool(self._BUSY_NOW_RE.search(text))
+                 and not self._CALLBACK_TIME_RE.search(text))
         _relative = not day and bool(self._REL_VAGUE_RE.search(text))
         logger.info("[COMMITMENT] vague commitment (%r) — asking clarification",
                     " ".join(x for x in (day, tm) if x) or "later")
-        return self._clarify_question(day, tm, relative=_relative)
+        return self._clarify_question(day, tm, relative=_relative, busy=_busy)
 
     def _resolve_clarification(self, text: str) -> str | None:
         """The turn after our clarification question: fold the answer into the
@@ -3869,6 +4006,7 @@ class ConversationRouter:
             self._capture_callback_flags("", "", offset_min)
             self._suppress_time_match_turns = 1
             logger.info("[COMMITMENT] clarified: +%d min", offset_min)
+            self._arm_callback_close()
             return self._clarify_confirmation("", "", offset_min)
         day, tm = self._parse_day_time(text)
         day = day or pending.get("day", "")
@@ -3885,6 +4023,7 @@ class ConversationRouter:
         self._capture_callback_flags(day, tm)
         self._suppress_time_match_turns = 1  # cover this turn's extraction too
         logger.info("[COMMITMENT] clarified: %s %s", day, tm)
+        self._arm_callback_close()
         return self._clarify_confirmation(day, tm)
 
     def _commitment_checkpoint(self, farewell_text: str) -> str | None:
@@ -4030,6 +4169,34 @@ class ConversationRouter:
         """Return True if the caller is asking to repeat the last agent response."""
         lower = text.lower().strip()
         return any(p in lower for p in _REPEAT_DETECT_PATTERNS)
+
+    def _lang_switch_has_content(self, text: str) -> bool:
+        """True when a language-switch utterance carries a substantive ask
+        beyond the switch itself ("हिंदी में बताओ लेस कॉल के बारे में").
+
+        Errs toward True: the cost of a wrong True is one LLM turn instead of
+        the instant canned ack; the cost of a wrong False is the ack swallowing
+        the caller's actual question.
+        """
+        # \w alone shatters Indic tokens: Python's \w excludes matras and
+        # anusvara (Mn/Mc), so "हिंदी" tokenizes as ['ह','द']. Include the
+        # full Devanagari + Gujarati blocks explicitly.
+        tokens = re.findall(r"[\w'’ऀ-ॿ઀-૿]+", text.lower())
+        residue = [t for t in tokens if t not in _LANG_SWITCH_STOP_TOKENS]
+        return sum(len(t) for t in residue) >= 4
+
+    def _arm_lang_redeliver_directive(self, lang: str) -> None:
+        """One-turn system-prompt trailer: answer the caller's actual request
+        in the requested language — never a bare language acknowledgment."""
+        name = {"hi": "Hindi", "gu": "Gujarati", "en": "English"}.get(
+            lang, "the requested language")
+        self._turn_lang_directive = (
+            f"LANGUAGE SWITCH THIS TURN: the caller just asked for {name}. Do NOT "
+            f"answer with a bare acknowledgment like 'sure, let's speak {name}'. "
+            f"Answer their actual request fully in {name}; if they asked you to "
+            f"repeat or re-explain something you already said, restate that "
+            f"content in {name}."
+        )
 
     # ------------------------------------------------------------------
     # LLM warmup (feature 6)

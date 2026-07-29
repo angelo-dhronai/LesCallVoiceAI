@@ -1,4 +1,5 @@
-import type { ReactNode } from 'react'
+import { useId, type ReactNode } from 'react'
+import { motion } from 'motion/react'
 import { ChevronRight, Search, X } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { Badge, cx } from './ui'
@@ -199,13 +200,21 @@ export function Field({ label, children }: { label: string; children: ReactNode 
 export function Segmented<T extends string>({
   options, value, onChange,
 }: { options: { value: T; label: string }[]; value: T; onChange: (v: T) => void }) {
+  // Per-instance layoutId — two Segmented controls on one page must not
+  // trade thumbs with each other.
+  const id = useId()
   return (
     <div className="inline-flex max-w-full overflow-x-auto rounded-xl bg-[var(--surface-2)] p-1 ring-1 ring-[var(--border)]">
       {options.map((o) => (
         <button key={o.value} onClick={() => onChange(o.value)} aria-pressed={value === o.value}
-          className={cx('min-h-[36px] shrink-0 whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-semibold transition sm:min-h-0',
-            value === o.value ? 'bg-[var(--surface-solid)] text-[var(--text)] shadow-sm' : 'text-dim hover:text-soft')}>
-          {o.label}
+          className={cx('relative min-h-[36px] shrink-0 whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-semibold transition-colors sm:min-h-0',
+            value === o.value ? 'text-[var(--text)]' : 'text-dim hover:text-soft')}>
+          {value === o.value && (
+            <motion.span layoutId={`seg-thumb-${id}`} aria-hidden
+              className="absolute inset-0 rounded-md bg-[var(--surface-solid)] shadow-sm"
+              transition={{ type: 'spring', stiffness: 500, damping: 40 }} />
+          )}
+          <span className="relative">{o.label}</span>
         </button>
       ))}
     </div>
@@ -232,7 +241,13 @@ export function BarList({
             <span className="shrink-0 font-semibold tabular-nums text-dim">{it.value.toLocaleString('en-IN')}</span>
           </div>
           <div className="h-2 overflow-hidden rounded-full bg-[var(--surface-2)]">
-            <div className="h-full rounded-full transition-all" style={{ width: `${(it.value / max) * 100}%`, background: color }} />
+            {/* Grows on first paint, then springs between values on refetch.
+                Delay is capped so long lists don't tail off forever. */}
+            <motion.div className="h-full rounded-full"
+              initial={{ width: 0 }}
+              animate={{ width: `${(it.value / max) * 100}%` }}
+              transition={{ duration: 0.7, delay: Math.min(i * 0.05, 0.4), ease: [0.22, 1, 0.36, 1] }}
+              style={{ background: color }} />
           </div>
         </div>
       ))}

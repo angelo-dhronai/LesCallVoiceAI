@@ -3717,37 +3717,26 @@ async def automation_call_now(automation_id: str) -> JSONResponse:
     return JSONResponse({"ok": True, "msg": "Calling now…"})
 
 
-async def _automation_scheduler_loop() -> None:
-    """Background loop: every AUTOMATION_POLL_SECONDS, dial any entry whose
-    scheduled_time has passed. Entries with no scheduled_time set are left
-    alone — Call Now is the only way to trigger them."""
-    while True:
-        try:
-            now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
-            for entry in _load_automation_store():
-                if entry["status"] != "scheduled" or not entry.get("scheduled_time"):
-                    continue
-                try:
-                    due = datetime.datetime.fromisoformat(entry["scheduled_time"].replace("Z", "+00:00"))
-                except Exception:
-                    continue
-                if due <= now:
-                    await _dial_automation_entry(entry["id"])
-        except Exception as exc:
-            logger.error("automation scheduler tick failed: %r", exc)
-        await asyncio.sleep(AUTOMATION_POLL_SECONDS)
-
-
 @app.on_event("startup")
 async def _start_automation_scheduler() -> None:
-    # RETIRED (intelligence layer): the legacy followup_automations auto-dial
-    # scheduler served the deleted Follow-Up Automation page; its endpoints
-    # are 403-gated and its only remaining DB rows are stale. It dialed REAL
-    # phones for any 'scheduled' row with a past time, so it stays off. The
-    # replacement is the followups engine + automation rules
-    # (deploy/PLAN-intelligence-layer.md). Re-enable deliberately if ever
-    # needed: asyncio.create_task(_automation_scheduler_loop())
-    logger.info("legacy followup-automation scheduler DISABLED (intelligence layer)")
+    # DELETED, not merely disabled (2026-07-29). The legacy
+    # followup_automations scheduler dialled a REAL phone for any 'scheduled'
+    # row whose time had passed — no approval, no DND, no calling window, no
+    # cap. It had been left in the file as a commented-out
+    # `asyncio.create_task(_automation_scheduler_loop())`, which meant the
+    # platform was one uncommented line away from automatic dialling that the
+    # follow-up approval gate cannot see: it reads followup_automations, a
+    # table shared/intelligence/autodial.py never queries.
+    #
+    # After the 2026-07-29 incident that is not an acceptable thing to leave
+    # lying around, so the loop is gone from the source. `git show` it if you
+    # ever need it back — but the replacement is the followups engine, where
+    # a named human approves each call first.
+    #
+    # _dial_automation_entry survives: it still backs the operator-triggered
+    # POST /api/followup-automation/{id}/call-now, which is a person clicking.
+    logger.info("legacy followup-automation auto-dial scheduler REMOVED "
+                "(follow-ups require human approval — see migration 0011)")
 
 
 # ---------------------------------------------------------------------------
@@ -3840,6 +3829,23 @@ async def _autodial_once() -> int:
         # Same guard the manual button gets: a still-ringing leg must not be
         # dialled a second time.
         if _recent_dial_for(phone, owner, within_s=_DUPLICATE_DIAL_WINDOW_S) is not None:
+            continue
+
+        # Last line of defence, sitting directly above the code that rings a
+        # real phone. due_candidates already filters on approval and
+        # blocked_reason re-checks it — this third check is deliberate
+        # redundancy, because the cost of being wrong here is a stranger's
+        # handset lighting up with an AI on the other end. If it ever fires,
+        # something upstream regressed; say so loudly rather than dialling.
+        if str(row.get("approval_state") or "") != "approved":
+            logger.error(
+                "autodial REFUSED follow-up %s (%s): reached the dial path "
+                "without human approval (approval_state=%r). The SQL gate "
+                "should have excluded this row — treat as a bug.",
+                row["id"], phone, row.get("approval_state"))
+            await asyncio.to_thread(
+                autodial.record_attempt, row["id"], ok=False,
+                detail="Refused: no human approval on file", permanent=False)
             continue
 
         slug = ident["agent_slug"]

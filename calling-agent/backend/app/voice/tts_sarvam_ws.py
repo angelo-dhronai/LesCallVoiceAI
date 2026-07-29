@@ -39,6 +39,14 @@ _LANG_CODE_MAP = {
     "en": "en-IN",
     "hi": "hi-IN",
     "gu": "gu-IN",
+    "mr": "mr-IN",
+    "ta": "ta-IN",
+    "te": "te-IN",
+    "kn": "kn-IN",
+    "ml": "ml-IN",
+    "bn": "bn-IN",
+    "pa": "pa-IN",
+    "od": "od-IN",
 }
 
 

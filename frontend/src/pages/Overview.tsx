@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import { PageHeader, AsyncState, StatusBadge } from '../components/kit'
 import { Card, Badge, Button, EmptyState, LiveDot, cx } from '../components/ui'
+import { BorderBeam } from '../components/motion'
 import { Sparkline } from '../components/charts'
 import { CHART } from '../lib/chartColors'
 import { StatCard } from '../components/StatCard'
@@ -90,6 +91,9 @@ export default function Overview() {
       {/* First-run setup path — disappears once the tenant is fully live. */}
       {!steps.allDone && !agents.isLoading && !numbers.isLoading && (
         <Card glow="mint" className="mb-6 p-4">
+          {/* The one beam on this screen: setup is the single thing a
+              not-yet-live tenant should look at. */}
+          <BorderBeam />
           <div className="mb-1 flex items-center justify-between gap-3 px-3 pt-1">
             <h2 className="font-display text-base font-bold tracking-tight">Get set up</h2>
             <span className="text-xs text-dim">
@@ -110,12 +114,14 @@ export default function Overview() {
       )}
 
       <AsyncState loading={ov.isLoading} error={ov.error}>
+        {/* Raw numbers (not num()-formatted strings) so the tiles count up;
+            the delays cascade the row left to right on arrival. */}
         <div className="mb-6 grid grid-cols-2 gap-4 xl:grid-cols-4">
-          <StatCard label="Calls today" value={num(k?.total_calls ?? 0)} icon={<PhoneCall size={16} />} />
-          <StatCard label="Answered" value={num(k?.answered_calls ?? 0)} icon={<CheckCircle2 size={16} />} />
-          <StatCard label="Minutes used" value={`${num(Math.round(k?.minutes_used ?? 0))}`} icon={<Timer size={16} />}
+          <StatCard label="Calls today" value={k?.total_calls ?? 0} icon={<PhoneCall size={16} />} />
+          <StatCard label="Answered" value={k?.answered_calls ?? 0} icon={<CheckCircle2 size={16} />} delay={60} />
+          <StatCard label="Minutes used" value={Math.round(k?.minutes_used ?? 0)} icon={<Timer size={16} />} delay={120}
             sub={ov.data?.minutes_quota?.remaining_minutes != null ? `${num(Math.round(ov.data.minutes_quota.remaining_minutes))} left` : undefined} />
-          <StatCard label="Live now" value={num(ov.data?.active_calls ?? 0)} icon={<Radio size={16} />}
+          <StatCard label="Live now" value={ov.data?.active_calls ?? 0} icon={<Radio size={16} />} delay={180}
             sub={ov.data?.runtime_status !== 'healthy' ? ov.data?.runtime_status : undefined} />
         </div>
 

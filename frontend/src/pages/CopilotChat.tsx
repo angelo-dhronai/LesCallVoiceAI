@@ -8,6 +8,7 @@ import {
   type InterviewProgress, type PendingChange, type VoiceSample,
 } from '../api/copilot'
 import { cx, Badge, Button, EmptyState, Spinner } from '../components/ui'
+import { TextShimmer } from '../components/motion'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { TryAgentDialog } from '../components/TryAgent'
 import { ActivateAgentModal, type ActivateTarget } from '../components/ActivateAgent'
@@ -414,7 +415,7 @@ function TypingBubble() {
             />
           ))}
         </div>
-        <div className="mt-1 text-2xs text-dim">{caption}</div>
+        <div className="mt-1 text-2xs"><TextShimmer>{caption}</TextShimmer></div>
       </div>
     </div>
   )
@@ -949,7 +950,7 @@ export default function CopilotChat() {
 
       {/* messages */}
       <div className="relative flex min-h-0 flex-1 flex-col">
-        <div ref={scrollRef} onScroll={onMessagesScroll} className="flex flex-1 flex-col overflow-y-auto pr-1">
+        <div ref={scrollRef} onScroll={onMessagesScroll} data-lenis-prevent className="flex flex-1 flex-col overflow-y-auto pr-1">
           {loadingTranscript ? (
             <div className="flex flex-col gap-4 py-2">
               <div className="skeleton h-16 w-2/3 rounded-2xl rounded-tl-md" />

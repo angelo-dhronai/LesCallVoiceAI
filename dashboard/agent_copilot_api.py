@@ -1745,7 +1745,7 @@ def _resolve_agent_slug(name: str) -> str:
 # execution so the LLM can pass whatever the user said).
 _TOOLS_WITH_AGENT_NAME = {
     "get_agent", "update_agent", "activate_agent",
-    "get_routing", "set_routing", "replace_mentions",
+    "get_routing", "set_routing", "replace_mentions", "find_text",
     "propose_update", "update_stage", "add_stage", "remove_stage",
     "reorder_stages", "update_slot", "add_slot", "remove_slot",
     "list_revisions", "rollback_agent",
@@ -1766,6 +1766,7 @@ _TOOL_VERBS = {
     "create_agent": "create the agent",
     "update_agent": "update the agent",
     "replace_mentions": "apply the replacement",
+    "find_text": "search the agent",
     "activate_agent": "activate the agent",
     "get_routing": "check call routing",
     "set_routing": "update call routing",
@@ -1849,6 +1850,30 @@ def _replace_in_tree(node: Any, pattern: "re.Pattern", replacement: str) -> tupl
             total += n
         return out, total
     return node, 0
+
+
+def _find_in_tree(node: Any, pattern: "re.Pattern",
+                  path: str = "") -> list[tuple[str, str]]:
+    """(dotted-path, ±40-char snippet) for every string VALUE matching
+    pattern. List items are keyed by their id/name when present (stages,
+    slots, catalog entries) so paths read like call_flow.stages[GREETING].goal.
+    Same traversal shape as _replace_in_tree; read-only."""
+    hits: list[tuple[str, str]] = []
+    if isinstance(node, str):
+        m = pattern.search(node)
+        if m:
+            s, e = max(0, m.start() - 40), min(len(node), m.end() + 40)
+            hits.append((path, ("…" if s else "") + node[s:e]
+                         + ("…" if e < len(node) else "")))
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            hits += _find_in_tree(v, pattern, f"{path}.{k}" if path else str(k))
+    elif isinstance(node, (list, tuple)):
+        for i, item in enumerate(node):
+            key = (item.get("id") or item.get("name")) \
+                if isinstance(item, dict) else None
+            hits += _find_in_tree(item, pattern, f"{path}[{key or i}]")
+    return hits
 
 
 # Bulbul v3 roster (verified against the live API 2026-07-24) plus the legacy
@@ -2400,6 +2425,94 @@ def _quality_warnings(merged: dict,
             f"{_default_lang} versions so the scripted answers can be "
             "spoken on real calls."
         )
+
+    # ── Cross-surface contradiction lints (2026-07-28) ──────────────────
+    # A live call spoke a banned "twenty-minute demo … Tuesday at 10 AM"
+    # AFTER the stage goals were edited: call_goal (rendered every turn as
+    # CALL MISSION) and the scheduling FIRM RULES kept ordering the old
+    # behaviour. These catch the three definition shapes that let that
+    # happen. Deliberately not gated by include_wiring_lints — they flag
+    # real contradictions, not enrichment gaps.
+    _sched = (cf.get("scheduling") if isinstance(cf, dict) else None) or {}
+    _exact_n = (str(_sched.get("style") or "exact_n") != "flexible"
+                and _sched.get("enabled") is not False)
+    _cal = merged.get("calendar") or {}
+    _has_slots = (bool(_cal.get("mock_slots"))
+                  and str(_cal.get("type") or "mock") != "none")
+    _goal_surfaces = [("call_flow.call_goal",
+                       str(cf.get("call_goal") or "")
+                       if isinstance(cf, dict) else "")]
+    _goal_surfaces += [
+        (f"stage {s.get('id') or f'#{i}'}", str(s.get("goal") or ""))
+        for i, s in enumerate(stages) if isinstance(s, dict)]
+
+    # (i) goals say the CALLER picks the time, but scheduling still resolves
+    # to exact_n — the always-injected platform rules contradict the goals.
+    _caller_picks_re = re.compile(
+        r"do(?:n'?t| not)?\s+(?:suggest|offer|propose|give)[^.]{0,60}"
+        r"(?:time|date|slot)"
+        r"|let them (?:tell|say|pick|choose)"
+        r"|ask (?:them )?when they(?:'d| would)?\s*(?:be )?free"
+        r"|when they (?:are|'re|would be) free",
+        re.IGNORECASE)
+    _conflicting = [n for n, g in _goal_surfaces
+                    if g and _caller_picks_re.search(g)]
+    if _exact_n and _conflicting:
+        w.append(
+            "These goals tell the agent to let the CALLER propose the time "
+            f"({', '.join(_conflicting)}), but call_flow.scheduling still "
+            "resolves to 'exact_n' (agent offers N specific times). Set "
+            "call_flow.scheduling to {\"style\": \"flexible\"} so the "
+            "always-injected platform rules match the goals."
+        )
+
+    # (ii) unreachable beats: the turn that satisfies advance_when is
+    # answered under the NEXT stage's goal, so a multi-beat goal on an
+    # intent-advanced stage with min_turns<=1 only ever speaks its first beat.
+    _unreachable = []
+    for i, s in enumerate(stages):
+        if not isinstance(s, dict):
+            continue
+        aw = s.get("advance_when") or {}
+        if not aw.get("intent"):
+            continue
+        try:
+            _min = int(aw.get("min_turns") or 0)
+        except (TypeError, ValueError):
+            _min = 0
+        if _min > 1:
+            continue
+        _beats = [x for x in re.split(r"[.!?]", str(s.get("goal") or ""))
+                  if len(x.strip()) > 15]
+        if len(_beats) >= 2:
+            _unreachable.append(str(s.get("id") or f"#{i}"))
+    if _unreachable:
+        w.append(
+            "These stages advance the moment the caller's trigger intent "
+            f"lands, so only the FIRST beat of their goal is ever spoken: "
+            f"{', '.join(_unreachable)}. The reply to the triggering turn is "
+            "generated under the NEXT stage's goal. Keep only the trigger "
+            "beat here (e.g. the identity question) and move everything "
+            "meant for AFTER the caller's answer to the TOP of the next "
+            "stage's goal — or set advance_when.min_turns: 2."
+        )
+
+    # (iii) meeting-booking language with no calendar while exact_n: the
+    # agent has no times to offer — 'flexible' (caller proposes) is the
+    # correct declaration, or add real slots.
+    if _exact_n and not _has_slots:
+        _booking_re = re.compile(
+            r"\b(demo(?:nstration)?s?|meeting|appointment|schedul\w*|"
+            r"book(?:ing)?|visit|call ?back)\b", re.IGNORECASE)
+        _bookish = [n for n, g in _goal_surfaces if g and _booking_re.search(g)]
+        if _bookish:
+            w.append(
+                f"This agent books meetings ({', '.join(_bookish)}) but "
+                "calendar.mock_slots is EMPTY while call_flow.scheduling "
+                "resolves to 'exact_n' — it has no times to offer. Set "
+                "call_flow.scheduling to {\"style\": \"flexible\"} (the "
+                "caller proposes the time) or add real calendar.mock_slots."
+            )
     return w
 
 
@@ -2511,7 +2624,10 @@ TOOLS: list[dict] = [
                 "knowledge, canned responses, rules, everything at once (case-insensitive). "
                 "ALWAYS use this instead of update_agent when the user renames or swaps something that "
                 "appears in multiple places: a person (boss/owner), company name, product, city, phone "
-                "number, price, or the agent's own name. This guarantees no stale mention survives."
+                "number, price, or the agent's own name. This guarantees no stale mention survives. "
+                "Also the right tool for removing BANNED phrasing the user wants the agent to stop "
+                "saying: replace the banned phrase with the corrected wording everywhere at once, "
+                "then verify with find_text."
             ),
             "parameters": {
                 "type": "object",
@@ -2522,6 +2638,27 @@ TOOLS: list[dict] = [
                     "dry_run": {"type": "boolean", "description": "true = only count/preview matches, write nothing"},
                 },
                 "required": ["name", "find", "replace"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_text",
+            "description": (
+                "Read-only search: report every place a text appears in an agent (case-insensitive) "
+                "with the exact field path and a snippet. Use it (a) BEFORE a removal/ban edit to map "
+                "every surface that speaks the phrase — stage goals, call_flow.call_goal, objection "
+                "answers, knowledge, rules — and (b) AFTER the edits to VERIFY zero mentions remain. "
+                "Never claim a phrase is gone without a 0-hit find_text result."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "agent slug or spoken name"},
+                    "find": {"type": "string", "description": "exact text to search for, e.g. 'twenty-minute'"},
+                },
+                "required": ["name", "find"],
             },
         },
     },
@@ -3265,6 +3402,31 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
     if tool == "get_agent":
         name = str(args["name"]).strip()
         res = await builder.get_agent(name)
+        # Compact spoken-surfaces digest FIRST in the payload: historical
+        # tool results are truncated to 900 chars in _context_window, and a
+        # full definition dump buries call_goal ~6KB deep — which is how a
+        # stale "twenty-minute demo" mission survived a ban edit unseen.
+        cf = res.get("call_flow") or {}
+        res = {"spoken_surfaces": {
+            "call_goal": str(cf.get("call_goal") or "")[:200],
+            "opening_greeting": str((res.get("response_bank") or {})
+                                    .get("opening_greeting") or "")[:120],
+            # Per-language speaking speed (0.5–2.0, 1.0 natural) — surfaced so
+            # a "talks too fast/slow" turn can quote the current value without
+            # digging through the truncated full dump.
+            "pace": {lg: (v or {}).get("pace")
+                     for lg, v in ((res.get("languages") or {})
+                                   .get("tts_voices") or {}).items()},
+            "stages": [{"id": s.get("id"),
+                        "goal_head": str(s.get("goal") or "")[:60]}
+                       for s in (cf.get("stages") or [])
+                       if isinstance(s, dict)],
+            "scheduling": cf.get("scheduling") or {"style": "exact_n (default)"},
+            "mock_slots_count": len(((res.get("calendar") or {})
+                                     .get("mock_slots")) or []),
+            "never_rules_count": len(((res.get("guardrails") or {})
+                                      .get("never_rules")) or []),
+        }, **res}
         return res, f"Looked at {_agent_display_name(name)}", True, False
 
     if tool == "validate_agent":
@@ -3675,6 +3837,22 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                "replace": replacement, "replaced": count,
                "revision": result["revision"], "effective": "next_call"}
         return res, f"Replaced '{find}' with '{replacement}' in {count} places in {_agent_display_name(name)}", True, True
+
+    if tool == "find_text":
+        name = str(args["name"]).strip()
+        find = str(args.get("find") or "")
+        if not find.strip():
+            raise ValueError("'find' text is required")
+        current, _base = _read_full_definition(name)
+        for k in ("agent_id", "version", "revision", "updated_at", "updated_by"):
+            current.pop(k, None)
+        hits = _find_in_tree(current, re.compile(re.escape(find), re.IGNORECASE))
+        res = {"status": "ok", "name": name, "find": find,
+               "matches": len(hits),
+               "hits": [{"path": p, "snippet": s} for p, s in hits[:40]]}
+        return res, (f"'{find}' appears in {len(hits)} place(s) in {_agent_display_name(name)}"
+                     if hits else
+                     f"'{find}' does not appear anywhere in {_agent_display_name(name)}"), True, False
 
     if tool == "activate_agent":
         if guard.get("created_this_turn"):
@@ -4149,7 +4327,21 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                                {"call_flow.stages"})
         res = {"status": "updated", "name": name, "diff": _render_diff(diff),
                "stages": [str(s.get("id")) for s in stages],
-               "revision": result["revision"], "effective": "next_call"}
+               "revision": result["revision"], "effective": "next_call",
+               # Stage edits only touch call_flow.stages — re-surface the
+               # mission (rendered EVERY turn as ━━ CALL MISSION ━━) so a
+               # ban/removal edit can't silently leave it stale, and run the
+               # quality lints so cross-surface contradictions show up in
+               # the same turn (update_stage historically returned neither).
+               "quality": _quality_warnings(candidate,
+                                            include_wiring_lints=False),
+               "call_goal": str((candidate.get("call_flow") or {})
+                               .get("call_goal") or "")[:300],
+               "call_goal_note": (
+                   "call_goal renders EVERY turn as the CALL MISSION — if "
+                   "this edit removed or banned phrasing, verify call_goal "
+                   "no longer carries it (fix via update_agent)."),
+               }
         return res, f"{reason} in {_agent_display_name(name)}", True, True
 
     if tool in ("update_slot", "add_slot", "remove_slot"):
@@ -4196,7 +4388,9 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         result = _write_scoped(name, candidate, base_rev, reason, {"slots"})
         res = {"status": "updated", "name": name, "diff": _render_diff(diff),
                "slots": [str(s.get("name")) for s in slots], "notes": notes,
-               "revision": result["revision"], "effective": "next_call"}
+               "revision": result["revision"], "effective": "next_call",
+               "quality": _quality_warnings(candidate,
+                                            include_wiring_lints=False)}
         return res, f"{reason} in {_agent_display_name(name)}", True, True
 
     if tool == "list_revisions":
@@ -4258,7 +4452,7 @@ you can produce.
    a. Users name agents by their spoken name ("Ananya") — pass that name as-is to tools; resolution to the right agent is automatic. If a tool says no such agent exists, tell the user plainly which agents DO exist and ask which they meant — never guess a different agent and never silently switch to the active one.
    a2. ONE agent, TWO directions: when a name matches the same agent in both inbound and outbound, do NOT spend a turn asking if the answer is already obvious. Re-call the tool with the direction appended — get_agent("Prakhar (outbound)"). The user talking about dialling out, contacts, or leads means outbound; talking about callers reaching them means inbound. Ask only when the request genuinely fits both, and ask ONCE — never repeat the same failing call.
    b. Call get_agent first if you haven't read that agent THIS conversation, and re-read it before any edit you're not 100% sure about.
-   c. RENAMES/SWAPS: when the user changes something that can appear in more than one place — a person (boss, owner, CEO), the company, a product, a city, a price, a phone number, or the agent's own name — you MUST use replace_mentions (find/replace across the whole agent), NOT update_agent. Example: "assistant for Mr. Ben → Mr. Umang" = replace_mentions(find="Mr. Ben", replace="Mr. Umang"). A partial edit that leaves old mentions in the greeting or responses is a FAILURE.
+   c. RENAMES/SWAPS: when the user changes something that can appear in more than one place — a person (boss, owner, CEO), the company, a product, a city, a price, a phone number, the agent's own name, or a phrase the user wants the agent to STOP SAYING — you MUST use replace_mentions (find/replace across the whole agent), NOT update_agent. Example: "assistant for Mr. Ben → Mr. Umang" = replace_mentions(find="Mr. Ben", replace="Mr. Umang"). Map the mentions first and verify afterwards with find_text. A partial edit that leaves old mentions in the greeting, responses, or call_flow.call_goal is a FAILURE.
    d. After replace_mentions, if the replaced count seems low for how prominent the thing is, get_agent and check for other spellings/variants of the old text (e.g. "Ben", "Mr Ben", "बेन") and replace those too.
    e. Other edits: update_agent with the MINIMAL partial change (server-side merge keeps everything else). NEVER resend a whole list to edit one item: for one call stage use update_stage/add_stage/remove_stage/reorder_stages; for one collected-info question use update_slot/add_slot/remove_slot — these edit exactly that item on the server.
    e2. For bigger or riskier edits, prefer the two-step flow: propose_update (returns a diff — show it to the user in plain words) → apply_update after they confirm, or discard_update if they decline. Every change is versioned: list_revisions shows history and rollback_agent undoes a change when the user asks.
@@ -4266,14 +4460,15 @@ you can produce.
    e4. If an apply comes back saying the agent changed since the proposal, do NOT retry the same apply — it will fail identically every time. get_agent to see the current state, then either propose_update again from that fresh state, or tell the user plainly what changed underneath. Repeating a failing apply is never progress.
    f. After every successful edit, tell the user in one plain sentence WHAT is different now and that it applies from the next call (quote the revision number when the tool returns one). If nothing was changed in a turn, never claim it was.
    g. If the user says a change didn't take effect on a real call: do NOT speculate about caching or internal mechanisms. First list_agents to confirm the agent you've been editing IS the live one — if a different agent is live, say so plainly and ask whether to activate the right one. Then get_agent, hunt for the old wording, and fix every remaining mention. Special case: if the OLD OPENING LINE still played at connect, the greeting lives ONLY in response_bank.opening_greeting — check and fix THAT field; editing stage goals never changes what plays at connect.
+   h. If the user says the agent SAID something it was told not to: find_text the offending phrase — the surface that still carries it (most often call_flow.call_goal, an objection answer, or the knowledge paragraph) is the bug, NOT the stage goal you already edited. If the offence is the agent proposing meeting times, also check call_flow.scheduling: the exact_n default FORCES time offers regardless of goals — set {{"style": "flexible"}}.
 6. QUESTIONS ("which agent is live?"): use list_agents / get_agent / get_routing. Do NOT call get_agent unless the user asks about that agent or you are about to edit it — during a new-agent interview no tool calls are needed until you create.
 
 DEFINITION FIELDS you may set (all optional — deep-merged onto defaults). SHAPES ARE STRICT — get them right the first time:
 - identity: agent_name, company_name, company_tagline, role_description, contact, role_line (full replacement identity sentence)
 - personality: pronouns (she|he), energy (low|medium|high), tone, style, custom_instructions, traits [str], energy_mirroring (bool), ai_disclosure ("deflect"|"admit"|"admit_if_pressed"), verbosity_max_sentences (int)
-- languages MUST be an OBJECT, never a list: {{"supported": ["hi","en"], "default": "hi", "allow_code_mixing": true, "stt_forced_language": "", "tts_voices": {{"hi": {{"model":"bulbul:v3","speaker":"simran","pace":1.15}}, "en": {{...}}}}}}. tts_voices lives INSIDE languages — never at the top level.
+- languages MUST be an OBJECT, never a list: {{"supported": ["hi","en"], "default": "hi", "allow_code_mixing": true, "stt_forced_language": "", "tts_voices": {{"hi": {{"model":"bulbul:v3","speaker":"simran","pace":1.15}}, "en": {{...}}}}}}. tts_voices lives INSIDE languages — never at the top level. pace = speaking speed 0.5–2.0 (1.0 natural, 1.15 platform default) and is PER LANGUAGE. SPEED COMPLAINTS ('talks too fast', 'too slow' — overall or in one language): do NOT silently change anything. FIRST tell the user the current setting and the scale, read from the agent (get_agent's spoken_surfaces.pace has it), e.g. 'LesCall currently speaks at pace 1.15 on a 0.5–2.0 scale, where 1.0 is natural' — THEN ask what they'd prefer (slower or faster, or an exact number) and apply their choice to that language's pace in ±0.1 steps via update_agent. Never change the voice to fix speed.
 - call_direction: the STRING "inbound" or "outbound" — never a list. If the user wants BOTH, use "inbound" — the platform automatically applies the outbound approach whenever it places the call.
-- call_flow: {{"call_goal": "one-sentence mission", "stages": [{{id, order, goal, turns_until_advance, role, collect: [slot names], advance_when: {{all_collect_filled|slots|min_turns|intent|appointment_captured, max_turns: N (time escape — the stage also advances at turn N even if the condition never fires)}}, branches: [{{when_intent: affirmation|negation|question, goto: STAGE_ID, max_takes, actions: [capture_phone|promise_whatsapp_media|book_visit|schedule_callback]}}]}}], "scheduling": {{offer_count, style: exact_n|flexible, enabled: false when the business doesn't book}}, "callback_policy": {{enabled, capture_slot, responses: {{lang: str}}, counts_as_decline}}, "completed_when": {{required_slots, require_appointment}}}}. Stage roles: greeting|confirm_person|discovery|pitch|recommend|scheduling|confirmation|closing. Write goals in ENGLISH as instructions (the agent replies in the caller's language). STAGE WIRING IS WHAT MAKES THE FLOW ACTUALLY RUN: every stage SHOULD carry role; a stage whose goal asks for slots lists them in collect and uses advance_when {{all_collect_filled: true, max_turns: 6}}; a yes/no confirmation stage gets turns_until_advance 2-3 or advance_when {{intent: affirmation, max_turns: 3}}; NEVER leave a mid-flow stage needing 8+ caller turns — one such stage consumes an entire call and the rest of your flow never plays (this is exactly how a live agent ignored its whole script). If you omit the wiring at create time the platform derives it from the goals and slots — but wiring you write explicitly always wins.
+- call_flow: {{"call_goal": "one-sentence mission", "stages": [{{id, order, goal, turns_until_advance, role, collect: [slot names], advance_when: {{all_collect_filled|slots|min_turns|intent|appointment_captured, max_turns: N (time escape — the stage also advances at turn N even if the condition never fires)}}, branches: [{{when_intent: affirmation|negation|question, goto: STAGE_ID, max_takes, actions: [capture_phone|promise_whatsapp_media|book_visit|schedule_callback]}}]}}], "scheduling": {{style: exact_n|flexible — flexible means the CALLER proposes the time; SET flexible whenever the user says not to suggest times or to ask when the caller is free; exact_n (the default) makes the platform force N specific time offers every turn, offer_count, enabled: false when the business doesn't book}}, "callback_policy": {{enabled, capture_slot, responses: {{lang: str}}, counts_as_decline}}, "completed_when": {{required_slots, require_appointment}}}}. Stage roles: greeting|confirm_person|discovery|pitch|recommend|scheduling|confirmation|closing. Write goals in ENGLISH as instructions (the agent replies in the caller's language). STAGE WIRING IS WHAT MAKES THE FLOW ACTUALLY RUN: every stage SHOULD carry role; a stage whose goal asks for slots lists them in collect and uses advance_when {{all_collect_filled: true, max_turns: 6}}; a yes/no confirmation stage gets turns_until_advance 2-3 or advance_when {{intent: affirmation, max_turns: 3}}; NEVER leave a mid-flow stage needing 8+ caller turns — one such stage consumes an entire call and the rest of your flow never plays (this is exactly how a live agent ignored its whole script). If you omit the wiring at create time the platform derives it from the goals and slots — but wiring you write explicitly always wins.
 - slots (TOP-LEVEL list — the qualification schema, the heart of data capture): [{{name, priority (lower asked first), required, label, question: {{hi/en/gu: exact wording}}, type: text|number|money|enum|boolean|phone|date|time|location, enum_values, enum_synonyms, depends_on: [slot names never asked before], merge_policy: free|correction_gated|confirm, confirm_readback: ""|verbatim|digit_groups_2 (phone in 2-digit groups), max_asks (2 recommended), reask_question: {{lang}}}}]. EVERY new agent gets slots for what it must collect, with questions in EVERY supported language.
 - knowledge_base: portfolio_prompt_text (plain-English paragraph — injected every turn), portfolio_section_label, locations, objection_patterns, known_projects {{"lowercase key": ["Canonical Name", "location or price"]}}, catalog [{{id, name, location, configurations, price_range, availability, positioning_tag, pitch_points, aliases, facts}}], match_rules [{{when: {{slot: value or "<=40L"}}, recommend: [ids], reason}}], pricing_policy {{mode: on_request|state_freely|defer, defer_line: {{lang}}}}, stt_corrections {{use_builtin_tables: false for non-real-estate agents}}
 - brand: spoken_company_name, positioning_tagline, credibility_markers [str], trust_proofs [top 2-3 — objection ammo], regions_served, contact_phone, whatsapp_number
@@ -4285,6 +4480,13 @@ DEFINITION FIELDS you may set (all optional — deep-merged onto defaults). SHAP
 - post_call: outcomes [{{id, label, kind: success|progress|failure}}], scoring {{enabled, criteria_prompt, score_labels}}
 - guardrails.builtin_rules_pack: "generic" (default for new agents — industry-neutral conversation rules) or "real_estate" (set this for real-estate businesses — site-visit/property-focused rules). guardrails.honesty.knowledge_grounding: "strict" (default for new agents) makes the agent deflect instead of inventing when asked about products/prices not in its knowledge — keep it unless the user explicitly wants free improvisation.
 
+WHAT THE LIVE CALL ACTUALLY READS (the injection model — edits that ignore this LOOK successful but change nothing on the phone; a real user's ban was spoken verbatim on the very next call because of it):
+- call_flow.call_goal renders on EVERY turn as "━━ CALL MISSION ━━ … Every turn must move the call toward this mission." A stale mission overrides stage-goal edits — any change to the agent's objective, offer, or wording (e.g. dropping "twenty-minute demo") MUST update call_goal too (update_agent; update_stage cannot touch it).
+- Only the CURRENT stage's goal is injected per turn. A rule written into one stage's goal is INVISIBLE for the rest of the call. Durable behaviour rules ("never say X", "never suggest times") belong in guardrails.never_rules / always_rules — those are injected on every turn.
+- call_flow.scheduling defaults to {{"style": "exact_n", "offer_count": 2}}, which makes the platform FIRM RULES order the agent to "always give exactly TWO specific time options". When the user wants the CALLER to propose the time ("ask them when they're free", "don't suggest times"), you MUST set call_flow.scheduling to {{"style": "flexible"}} — otherwise the platform rules fight the goals. An agent with empty calendar.mock_slots has no times to offer at all; exact_n there is always wrong.
+- STAGE-BEAT PLACEMENT: the caller turn that satisfies a stage's advance_when is answered under the NEXT stage's goal. Script meant for "right after the caller confirms" goes at the TOP of the NEXT stage's goal — or raise advance_when.min_turns to 2 so the confirming stage keeps the turn. A confirm_person stage's goal should contain ONLY the confirm beat; anything written after it in that goal is never spoken.
+- BANNED-PHRASE SWEEP (any "stop saying X" / "remove X" / "never do Y"): get_agent FRESH, then find_text the phrase (and obvious variants) to map every surface — call_goal, every stage goal, objection_playbook answers, portfolio_prompt_text, catalog pitch_points, outbound.* lines, brand.trust_proofs, existing rules. Fix EVERY hit, add a guardrails.never_rules entry for the ban, then find_text AGAIN and only claim success on a 0-hit result — report remaining hits honestly.
+
 THE OPENING LINE & PLACEHOLDERS (get this right — it burned a real user):
 - The first thing spoken on EVERY call is response_bank.opening_greeting, word-for-word. Stage goals are INSTRUCTIONS to the AI (always written in English), never a script. When the user talks about the greeting / the first line / "as soon as the call connects", edit opening_greeting — editing a stage goal will NOT change what plays at connect.
 - Exactly TWO placeholders exist, both single curly braces and ONLY inside opening_greeting:
@@ -4295,11 +4497,12 @@ CALL-REPAIR BEHAVIOUR THE PLATFORM APPLIES TO EVERY AGENT (know this before you 
 - Bare "hello?" from the caller within ~25s of the opening line: the agent replays its last utterance (up to twice), on the assumption the caller didn't hear it. This deliberately does NOT fire when the opening line is itself just "Hello?" — a hello answering a hello means contact is established, so the agent moves straight on to its script.
 - ~6s of caller silence: the agent says it couldn't hear and re-asks.
 - ENDING CALLS (platform-wide): before wrapping up, every agent asks the caller's permission ("anything else I can help you with?") and only says goodbye after the caller confirms they're done — then the PLATFORM hangs the call up automatically after the goodbye. The agent never cuts a call the caller hasn't agreed to end.
-- CALLBACK REQUESTS (platform-wide): when a caller says "call me later / in 10 minutes / tomorrow", every agent pins down ONE specific time, confirms it back, and the platform automatically places a real follow-up call at that time — opening with a polite reference to the earlier conversation. This is on for all agents by default; a business can opt an agent out of the automatic calling (follow_up.auto_execute enabled false) but the time pin-down stays.
+- CALLBACK REQUESTS & BUSY CALLERS (platform-wide): when a caller says "call me later / in 10 minutes / tomorrow" or brushes off with "sorry, not free right now", every agent stops pitching, pins down ONE specific time, confirms it with a goodbye, and the platform HANGS UP the call by itself right after that confirmation — then automatically places a real follow-up call at the agreed time, opening with a polite reference to the earlier conversation. This is on for all agents by default; a business can opt an agent out of the automatic calling (follow_up.auto_execute enabled false) but the time pin-down stays.
+- HANGING UP IS PLATFORM CODE, NOT A PROMPT: no guardrail, stage goal, or script text can make (or stop) the agent physically cutting a call — the platform's own engine decides that, on the consented paths above. If a user asks you to make the agent "cut the call" on goodbyes, busy callers, or callback requests, tell them it already happens automatically — do NOT write a rule claiming the agent will "end the call" (it would be a false promise) and do NOT add rules like "never reschedule / never ask for a better time", which fight the platform's callback pin-down.
 So if a user reports "it keeps repeating hello" or "it won't start its script", explain what actually happens rather than guessing — and do NOT rewrite their opening line to dodge a platform rule unless they want different words. Changing a greeting they liked, to work around behaviour you misdiagnosed, is a failure.
 If a tool result includes "notes", the platform auto-corrected or DROPPED some of your input — read them; if content was dropped, put it where the note says (usually a stage goal) with update_agent in the SAME turn.
 If a tool result includes non-empty "quality" warnings, the agent is too shallow — you MUST resolve every one with update_agent in the SAME turn before telling the user it's ready. Do not report a hollow agent as done.
-WHEN THE USER SAYS A CHANGE "isn't in the agent" or "wasn't implemented": do not just re-word the same field. get_agent, and translate their intent into the fields the CALL actually reads — the mission/talking points belong in call_flow.stages goals AND knowledge_base.portfolio_prompt_text (both are spoken), the pitch is not "implemented" if it only sits in one thin stage goal. Enrich those, then confirm what specifically changed.
+WHEN THE USER SAYS A CHANGE "isn't in the agent" or "wasn't implemented": do not just re-word the same field. get_agent, and translate their intent into the fields the CALL actually reads — call_flow.call_goal (the every-turn CALL MISSION), call_flow.scheduling (time-offer behaviour), call_flow.stages goals AND knowledge_base.portfolio_prompt_text (both are spoken), guardrails rules. The pitch is not "implemented" if it only sits in one thin stage goal, and a ban is not implemented while call_goal or a platform scheduling default still orders the old behaviour. Enrich those, then confirm what specifically changed.
 
 TRUTHFULNESS (ABSOLUTE — violations are the worst possible failure):
 - SUMMARIES ARE READ, NEVER INVENTED: when you describe the agent's plan/objective/direction to the user ("here is a summary", "shall I build it?"), every claim must come from the CURRENT draft or tool results — its call_direction, call_flow.call_goal, stages and languages — never from generic boilerplate. Telling a user their OUTBOUND sample-kit sales agent will "handle customer inquiries" and "answer inbound calls" (a real incident) makes them doubt everything that was actually captured correctly.

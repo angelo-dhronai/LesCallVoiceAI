@@ -130,6 +130,16 @@ def blocked_reason(row: dict[str, Any], *, now: dt.datetime,
     """
     if row.get("dnd"):
         return "dnd"
+    # Human approval, re-checked outside the SQL. _DUE_SQL already filters
+    # unapproved rows, so this is deliberately redundant: it means an edit to
+    # that one query cannot, on its own, put the platform back to cold-calling
+    # people. Both would have to be wrong at once. Absent/unknown value reads
+    # as NOT approved — the fail-safe direction is always "don't call".
+    if str(row.get("approval_state") or "pending") != "approved":
+        return "not_approved"
+    approval_expiry = as_dt(row.get("approval_expires_at"))
+    if approval_expiry is not None and now >= approval_expiry:
+        return "approval_expired"
     # A dialable number is the requirement, not a live contacts row: users
     # delete/recreate contacts routinely, and treating a dangling contact_id
     # as terminal permanently blocked 38 live follow-ups in the executor's
@@ -189,6 +199,10 @@ def explain(reason: str, now: dt.datetime | None = None) -> str:
     now = now or now_local()
     return {
         "dnd": "Customer asked not to be contacted — never auto-dialled.",
+        "not_approved": ("Waiting for your approval — review it under "
+                         "“Review & approve calls” before it can be dialled."),
+        "approval_expired": ("The approval for this call has expired — "
+                             "approve it again to let the platform dial."),
         "no_contact": "No phone number on the follow-up or its call.",
         "superseded": ("A newer call to this customer already happened — "
                        "this follow-up is settled."),
@@ -212,6 +226,7 @@ _DUE_SQL = """
            f.reason, f.summary, f.attempts, f.last_attempt_at, f.status,
            f.mode, f.max_attempts, f.next_attempt_at, f.created_at,
            f.auto_scheduled, f.followup_type,
+           f.approval_state, f.approved_at, f.approved_by, f.approval_expires_at,
            COALESCE(ct.legacy_id, 'db' || ct.id::text) AS contact_handle,
            COALESCE(ct.phone, c.phone)                 AS dial_phone,
            ct.name                                     AS contact_name,
@@ -231,6 +246,10 @@ _DUE_SQL = """
        AND f.autodial_blocked_at IS NULL
        AND f.decision = 'yes'
        AND f.mode = 'auto'
+       -- THE gate. A human approved THIS row, by name, before we may ring
+       -- anyone. Never widen this predicate; see 0011 for why it exists.
+       AND f.approval_state = 'approved'
+       AND (f.approval_expires_at IS NULL OR f.approval_expires_at > now())
        AND f.status IN ('pending', 'scheduled', 'missed')
        AND f.scheduled_at IS NOT NULL
      ORDER BY f.priority = 'urgent' DESC, f.scheduled_at
@@ -240,12 +259,22 @@ _DUE_SQL = """
 def due_candidates(limit: int = 200) -> list[dict[str, Any]]:
     """Rows the executor should consider this sweep, most urgent first.
 
-    Deliberately only `decision='yes'`: a 'no' or 'unsure' decision must never
-    result in an automatic call — 'unsure' is exactly the case a human reviews.
-    Deliberately only `mode='auto'`: auto-dialling is OPT-IN per follow-up
-    (default 'manual'), set by a human toggle or the agent's
-    follow_up.auto_execute flag at decision time. The 0007-era executor
-    dialled every yes-row; that inversion of intent is what 0008 fixed.
+    Three independent conditions must ALL hold, and they mean different things:
+
+    `decision='yes'`   the AI judged a follow-up worthwhile. Advisory only.
+    `mode='auto'`      someone is willing for the platform to dial this KIND
+                       of row. A preference; a config default can set it.
+    `approval_state`   a named human authorised THIS row. A fact about a
+                       person's action. Nothing but the approve endpoint can
+                       write it, so no default, flag, or prompt regression can
+                       manufacture consent.
+
+    The third one is the only real safeguard, because the first two have both
+    failed in production: 0007's executor dialled every yes-row (12 unwanted
+    calls, 2026-07-23), and after 0008 made mode opt-in, commit b693a8c
+    flipped the per-agent default back on and the dialer called a customer who
+    had promised nothing (2026-07-29, follow-up 216). Consent is not a
+    default. Do not reduce these three to fewer.
     """
     with get_db() as db:
         return [dict(r) for r in db.execute(_DUE_SQL, (limit,)).fetchall()]

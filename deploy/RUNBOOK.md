@@ -633,11 +633,24 @@ minutes). Platform universal rule, every agent:
   into the farewell close. `_contains_farewell` additionally catches
   goodbyes the intent classifier scores as affirmation ("okay bye").
 - **hangup_pending** (ConversationRouter) arms ONLY on caller-consented
-  or terminal closes: farewell exchange, close-permission confirm, wrong
-  number, DND / decline threshold, LLM-failure graceful close. It is NOT
-  `state.is_closing` (which also fires on booking-confirmed while the
-  conversation continues). Any new caller utterance clears it — "wait,
-  one more question" after the goodbye is answered, not cut off.
+  or terminal closes: farewell exchange, close-permission confirm,
+  **confirmed callback commitment** ("call me in 10 minutes" → confirm +
+  goodbye tail → close; the request to be called later IS consent to end
+  now — `_arm_callback_close`), wrong number, DND / decline threshold,
+  LLM-failure graceful close. It is NOT `state.is_closing` (which also
+  fires on booking-confirmed while the conversation continues). Any new
+  caller utterance clears it — "wait, one more question" after the
+  goodbye is answered, not cut off.
+- **Busy brush-offs** ("sorry not free right now / abhi busy / atyare
+  nahi" — `_BUSY_NOW_RE`) route into the callback pin-down flow instead
+  of the objection strike counter: one polite "about how many minutes
+  later should I call you back?" question, then confirm + close on the
+  answer. No decline strike is burned.
+- **Prompt text can NEVER hang up a call** — only the engine paths above
+  do. The Copilot doctrine (agent_copilot_api.py) forbids the builder
+  from writing guardrails that claim the agent will "end the call"; a
+  real user incident (2026-07-27) had the Copilot ship exactly that
+  rule, which also fought the pin-down ("do NOT ask for a better time").
 - **Execution**: `TelephonySession._playback_loop` polls (0.5s get
   timeout) → `_maybe_agent_hangup` waits for wav_queue empty +
   `playback_busy_until` + grace, min 3s after arming (covers TTS synth
@@ -651,3 +664,128 @@ minutes). Platform universal rule, every agent:
 - Tests: `test_agent_hangup.py` (arming/cancel semantics),
   `test_autodial_guardrails.py` (customer-stated time grace/window),
   `test_commitment_clarify.py` (relative offsets, default-on).
+
+## 16. Follow-up calls require human approval (2026-07-29) — INCIDENT FIX
+
+**What happened.** At 05:36 UTC the auto-dialer called a real customer
+(+91 87678 65050, contact 88) on follow-up 216 → call 304, `placed_by=autodial`.
+The source was a 44-second call two days earlier on which **nobody promised
+anything** — the pipeline recorded it as `promised_by='agent_promised'`,
+`confidence 0.9`, and the dialer trusted that. Of the 20 rows armed that
+morning, 15 had no commitment on the source call at all, and several were calls
+that had failed on *our* side ("call failed due to technical audio issues")
+logged as agent promises with confidence 1.0.
+
+**This was the second occurrence.** Migration 0008 made auto-dialling opt-in on
+2026-07-23 after the 0007 executor placed 12 unwanted calls; commit `b693a8c`
+(§14) then flipped the per-agent `auto_execute` default back ON and reopened it.
+The lesson: `mode='auto'` is a *preference* and a code default can synthesise
+it. Approval is a *fact about a person's action* and nothing but the approve
+endpoint can write it.
+
+### The gate — three independent layers, all must pass
+
+1. **SQL** — `shared/intelligence/autodial.py` `_DUE_SQL`:
+   `AND f.approval_state = 'approved'` +
+   `AND (f.approval_expires_at IS NULL OR f.approval_expires_at > now())`.
+2. **Pure guardrail** — `blocked_reason()` returns `not_approved` /
+   `approval_expired`, evaluated second (only DND outranks it). Absence reads
+   as unapproved: a missing key never means "go ahead". Neither code is in
+   `PERMANENT` — an unapproved row must stay rescuable by the human it waits on.
+3. **Dial site** — `dashboard/server.py` `_autodial_once()`, immediately above
+   `_record_dial`: refuses and `logger.error`s if it ever sees an unapproved
+   row. If that line fires, layers 1–2 have regressed; treat it as a bug.
+
+Approval cannot be manufactured elsewhere: `approval_state` is **not** in
+`_FU_PATCHABLE` (so `PATCH /followups/{id}` cannot grant it), and neither the
+pipeline, manual create, nor automation rules set it — everything defaults to
+`pending` via migration 0011.
+
+### Schema (0011)
+
+`followups.approval_state` (`pending|approved|declined`, NOT NULL DEFAULT
+`pending`), `approved_at`, `approved_by`, `approval_expires_at`, `declined_at`,
+`declined_by`. `idx_followups_autodial` rebuilt with the approval predicate;
+new `idx_followups_review` for the queue. **No backfill** — the DEFAULT put all
+264 existing rows in `pending`, which is exactly the intended blast radius.
+
+### API (`dashboard/intel_api.py`, all owner-scoped, all audited)
+
+- `GET  /api/intel/followups/review-queue?include_declined=0|1&limit=`
+  → `{items[], total (pending only), shown, approval_ttl_hours, max_attempts_per_approval}`
+- `POST /api/intel/followups/{id}/approve` `{mode?, expires_in_h?}`
+- `POST /api/intel/followups/approve` `{ids[], mode?, expires_in_h?}` (bulk)
+- `POST /api/intel/followups/{id}/decline` `{note?}`
+
+Approval TTL is **72 h** (`_APPROVAL_TTL_H`, matched to `AUTODIAL_MAX_AGE_H`).
+`_approve_rows` refuses DND contacts regardless of what the UI sent, and
+deliberately does **not** clear `autodial_blocked_at` — approving the *content*
+of a call is not re-arming a permanently blocked row.
+
+### Evidence — why the reviewer is shown words, not conclusions
+
+`_evidence_for()` joins `commitments` **on `call_id`, not
+`followups.commitment_id`** (that FK is NULL on essentially every row, while
+all 89 commitments carry a machine-verified verbatim `quote`). Two tiers:
+`strength='quoted'` (≥1 commitment → shows the quote and who said it) and
+`strength='inferred'` (none → amber block stating *"No promise was recorded on
+this call"*, and when `promised_by=='agent_promised'`, *"— despite labelling it
+an agent promise"*). Plus `right(transcript, 4000)` → last 8 turns as context.
+**The UI contradicts the AI's claim rather than restating it.** That is the
+point of the screen; do not "simplify" it back into a summary.
+
+### UI
+
+`frontend/src/components/FollowupReview.tsx` — `FullscreenModal` opened from
+"Review & approve calls" in the Follow-ups header (plus an amber banner while
+anything is pending). Per-row Approve / Don't call, bulk select-all (skips
+declined and DND), "Show declined" toggle so a decline is never a one-way door.
+Row badges: `auto-call approved` only when `mode==='auto' && approval_state==='approved'`;
+`needs approval` otherwise. Manual "Call now" stamps a `mode='manual'` approval
+before dialling, so every call — hand-placed or automatic — has a named
+authoriser in `followups.audit`.
+
+### Tests
+
+- `test_autodial_guardrails.py` (75) — pure-function gate, incl. fail-safe on a
+  missing key and a source assertion that the predicate is still in `_DUE_SQL`.
+- `test_followup_approval.py` (12) — **PG-backed**, calls `due_candidates()` for
+  real. This is the layer a pure-function test cannot reach and the one that
+  would have caught the incident.
+
+### Operating it
+
+- Kill switch: `INTEL_AUTODIAL_ENABLED` in `deploy/.pg_env`. **Set to `false`
+  on 2026-07-29 as the incident stop.** Turning it back on does *not* by itself
+  dial anyone — every row is `pending` — but do it deliberately:
+  `docker compose -f deploy/docker-compose.services.yml up -d api`
+  (**a bare `restart` does not re-read the env file**; that bit the cont-merge
+  canary on 07-24). Verify with `docker exec lescall-api env | grep AUTODIAL`.
+- Resting-state check — this should return only rows you intend to be called:
+  `SELECT id, approved_by, approval_expires_at FROM followups
+    WHERE approval_state='approved' AND approval_expires_at > now();`
+- One approval permits up to `INTEL_AUTODIAL_MAX_ATTEMPTS` (3) attempts over
+  the TTL; the approve dialog states this. Set the env to 1 if the policy is
+  literally one call per approval.
+
+### Also removed
+
+The dormant legacy `_automation_scheduler_loop` (`followup_automations`) is
+**deleted**, not commented out. It dialled real phones for any past-due
+'scheduled' row with no approval/DND/window/cap, read a table the approval gate
+never queries, and sat one uncommented line from live. `_dial_automation_entry`
+survives for the operator-triggered `call-now` endpoint.
+
+### Known, NOT fixed by this change (needs a decision)
+
+- **Campaign engine** (`POST /api/outbound/campaign/start`): one authenticated
+  request with `max_calls:0, delay_seconds:0` dials the whole contact book as
+  fast as FreeSWITCH accepts, **ignores `disposition='rejected'` (DND)**, and
+  has no calling-window check. Starting it is a human act, so it is outside the
+  follow-up gate — but the DND blindness is a real compliance gap.
+- **`POST /api/outbound/dial/{handle}`** does not check DND either; `?force=1`
+  removes the duplicate-dial guard.
+- **Sentinel loopback probe** (`shared/sentinel.py`, 03:00 UTC daily) self-calls
+  our own DIDs from `phone_numbers` — it does **not** ring customers today. If a
+  BYON tenant ever registers a number that terminates on a human handset it
+  would, so make it per-number opt-in before that happens.

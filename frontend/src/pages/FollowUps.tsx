@@ -6,7 +6,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  Check, ExternalLink, Info, Pencil, PhoneCall, Plus, RefreshCw, X, Zap,
+  Check, ExternalLink, Info, Pencil, PhoneCall, Plus, RefreshCw, ShieldAlert,
+  X, Zap,
 } from 'lucide-react'
 import { useGet, useRefresh } from '../api/hooks/useApi'
 import { patch, post } from '../api/mutate'
@@ -17,6 +18,7 @@ import {
   StatusBadge, Table, TD, TH, THead, TR, Textarea,
 } from '../components/kit'
 import { Modal } from '../components/Modal'
+import { FollowupReview, ReviewCallsButton } from '../components/FollowupReview'
 import { useToast } from '../components/Toast'
 import { useConfirm } from '../components/confirm'
 import { useUrlNumber, useUrlParam } from '../lib/hooks'
@@ -63,6 +65,15 @@ export default function FollowUps() {
     ['followups', bucket, page],
     `/intel/followups?bucket=${bucket}&page=${page}&limit=${LIMIT}`,
     { refetchInterval: 60_000 })
+
+  // Count for the header badge. `total` counts only rows still awaiting a
+  // decision, so it stays truthful even when the dialog is showing declined
+  // rows too (which it fetches under its own key).
+  const [reviewing, setReviewing] = useState(false)
+  const reviewQ = useGet<{ items: unknown[]; total: number }>(
+    ['followups', 'review-queue'], '/intel/followups/review-queue',
+    { refetchInterval: 60_000 })
+  const awaiting = reviewQ.data?.total ?? 0
 
   // Land on a bucket that actually has work. "Today" is empty on most days —
   // opening there showed an empty table with no rows and therefore no action
@@ -134,6 +145,15 @@ export default function FollowUps() {
     if (!ok) return
     setCallingId(f.id)
     try {
+      // Record the authorisation before dialling, not after. Clicking this
+      // button IS the human-in-the-loop step, so it should leave the same
+      // "approved_by <person>, at <time>" trace on the row that the review
+      // dialog does — otherwise the audit trail can answer "who allowed this
+      // call?" for auto-dialled rows but not for hand-dialled ones. Non-fatal:
+      // a stamping failure must not block a call the user just confirmed.
+      try {
+        await post(`/intel/followups/${f.id}/approve`, { mode: 'manual' })
+      } catch { /* audit stamp is best-effort; the confirm above is the gate */ }
       await post(`/outbound/dial/${encodeURIComponent(f.contact_handle)}`)
       toast(`Calling ${who(f)} — it rings in 15-30s`, 'success')
       // Record the attempt on the follow-up. Not marked completed: the call may
@@ -223,15 +243,32 @@ export default function FollowUps() {
   return (
     <div className="space-y-6">
       <PageHeader title="Follow-ups"
-        sub="AI-decided after every call, with the reasoning attached. Deciding and scheduling are automatic — placing the call is not: use Call now on a row."
+        sub="AI-decided after every call, with the reasoning attached. Deciding and scheduling are automatic — calling is not: every follow-up call needs your approval first, whether you place it or the platform does."
         actions={
           <>
-            <Button onClick={() => setCreating(true)}><Plus size={14} /> New follow-up</Button>
+            <ReviewCallsButton count={awaiting} onClick={() => setReviewing(true)} />
+            <Button variant="ghost" onClick={() => setCreating(true)}>
+              <Plus size={14} /> New follow-up
+            </Button>
             <Button variant="ghost" onClick={() => refresh(['followups'])}>
               <RefreshCw size={14} /> Refresh
             </Button>
           </>
         } />
+
+      {awaiting > 0 && (
+        <Card className="flex flex-wrap items-center gap-3 border-amber-300/60 p-4
+                         dark:border-amber-400/30">
+          <ShieldAlert size={16} className="shrink-0 text-amber-600 dark:text-amber-300"
+            aria-hidden />
+          <p className="min-w-0 flex-1 text-sm text-[var(--text)]">
+            {awaiting} follow-up {awaiting === 1 ? 'call is' : 'calls are'} waiting
+            for your approval. Nothing is dialled until you review
+            {awaiting === 1 ? ' it' : ' them'}.
+          </p>
+          <Button size="sm" onClick={() => setReviewing(true)}>Review now</Button>
+        </Card>
+      )}
 
       <Card className="p-5">
         <Segmented<Bucket>
@@ -280,12 +317,25 @@ export default function FollowUps() {
                     <TD>
                       <div className="flex flex-wrap items-center gap-1">
                         <StatusBadge value={f.status} />
-                        {/* Auto = the platform itself places this call at the
-                            scheduled time. Manual rows never auto-dial. */}
-                        {f.mode === 'auto' && (
+                        {/* `auto` on its own stopped meaning "the platform
+                            will call this" in 0011: a named human must also
+                            have approved the row. A badge that said "auto" on
+                            an unapproved row is precisely the false
+                            reassurance that let an unapproved call go out, so
+                            this reports the gate, not the preference. */}
+                        {f.mode === 'auto' && f.approval_state === 'approved' && (
                           <Badge tone="indigo" soft>
-                            <Zap size={10} /> auto
+                            <Zap size={10} /> auto-call approved
                           </Badge>
+                        )}
+                        {f.approval_state === 'pending'
+                          && !['completed', 'cancelled', 'archived'].includes(f.status) && (
+                          <Badge tone="amber" soft>
+                            <ShieldAlert size={10} /> needs approval
+                          </Badge>
+                        )}
+                        {f.approval_state === 'declined' && (
+                          <Badge tone="neutral" soft>do not auto-call</Badge>
                         )}
                       </div>
                     </TD>
@@ -403,9 +453,15 @@ export default function FollowUps() {
               ]} />
             <p className="mt-1.5 text-2xs text-dim">
               {editMode === 'auto'
-                ? 'The platform places this call itself at the scheduled time (10:00–19:00 IST, Mon–Sat, retry with backoff). The agent opens the call remembering the previous conversation and this follow-up’s reason.'
+                ? 'Lets the platform place this call at the scheduled time (10:00–19:00 IST, Mon–Sat, retry with backoff), but only once you have approved it — this switch on its own never dials anyone. The agent opens the call remembering the previous conversation and this follow-up’s reason.'
                 : 'Stays on your list — use the call button when you’re ready.'}
             </p>
+            {editMode === 'auto' && editing?.approval_state !== 'approved' && (
+              <p className="mt-1 text-2xs text-amber-600 dark:text-amber-300">
+                Still needs approval — open “Review &amp; approve calls” to
+                authorise it after saving.
+              </p>
+            )}
             {editing?.autodial_blocked_at && editMode === 'auto' && (
               <p className="mt-1 text-2xs text-amber-600 dark:text-amber-300">
                 Auto-calling was previously stopped ({editing.last_attempt_error ?? 'blocked'}).
@@ -452,6 +508,8 @@ export default function FollowUps() {
           </Field>
         </div>
       </Modal>
+
+      <FollowupReview open={reviewing} onClose={() => setReviewing(false)} />
     </div>
   )
 }

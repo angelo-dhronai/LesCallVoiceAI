@@ -42,6 +42,35 @@ def _sched_style(agent_def: AgentDefinition) -> str:
     return style if style in ("exact_n", "flexible") else "exact_n"
 
 
+def _has_offerable_slots(agent_def: AgentDefinition) -> bool:
+    """True when the calendar actually holds slots the agent could offer."""
+    cal = getattr(agent_def, "calendar", None)
+    if cal is None or str(getattr(cal, "type", "mock") or "mock") == "none":
+        return False
+    return bool(getattr(cal, "mock_slots", None))
+
+
+def _sched_rules(agent_def: AgentDefinition, exact_n_lines: list[str],
+                 no_slots_line: str) -> list[str]:
+    """Scheduling rules for a FIRM RULES pack.
+
+    Both styles presume a slot list. With an empty calendar, exact_n ORDERS
+    the model to invent times (live call 2026-07-28 produced a fabricated
+    "Tuesday at 10 AM or Wednesday at 2 PM") and flexible references free
+    slots that don't exist. Slotless agents get a no-invention rule instead —
+    ask the caller, confirm their proposal — regardless of style.
+    """
+    if (agent_def.call_flow.scheduling or {}).get("enabled") is False:
+        return []
+    if not _has_offerable_slots(agent_def):
+        return [no_slots_line]
+    if _sched_style(agent_def) == "flexible":
+        return [
+            "✓ Offer available time slots flexibly and accept a caller-proposed time when it matches a free slot",
+        ]
+    return exact_n_lines
+
+
 def _count_word(n: int) -> str:
     return _COUNT_WORDS.get(n, str(n))
 
@@ -655,7 +684,6 @@ def firm_rules_block(agent_def: AgentDefinition, lang: str = "en") -> list[str]:
     pack = (str(getattr(gr, "builtin_rules_pack", "real_estate")
                 or "real_estate") if gr else "real_estate")
     n = _offer_count(agent_def)
-    flexible = _sched_style(agent_def) == "flexible"
     lines: list[str] = ["", "━━ FIRM RULES ━━"]
     if use_builtin and pack == "generic":
         # Industry-neutral band: every domain-neutral hygiene rule from the
@@ -668,15 +696,11 @@ def firm_rules_block(agent_def: AgentDefinition, lang: str = "en") -> list[str]:
             if _has_phone_readback_slot(agent_def) else
             "✗ NEVER repeat the caller's phone number back to them unless they explicitly ask you to confirm it"
         )
-        if flexible:
-            sched_rules = [
-                "✓ Offer available time slots flexibly and accept a caller-proposed time when it matches a free slot",
-            ]
-        else:
-            sched_rules = [
-                f"✗ NEVER give more than {n} time options when offering an appointment or callback",
-                f"✗ NEVER ask an open 'when suits you?' — always give exactly {_count_word(n)} specific time options",
-            ]
+        sched_rules = _sched_rules(agent_def, [
+            f"✗ NEVER give more than {n} time options when offering an appointment or callback",
+            f"✗ NEVER ask an open 'when suits you?' — always give exactly {_count_word(n)} specific time options",
+        ], "✗ NEVER invent or state specific times, dates or slots — no calendar is "
+           "configured; ask what day and time suits the caller, then confirm their proposal back")
         lines += [
             "✗ NEVER use hollow filler phrases: 'खुशी हुई', 'आपका जवाब सुनकर खुशी हुई', 'Happy to help', "
             "'It was a pleasure', 'आपकी बात सुनकर', 'ખુશી થઈ', 'Glad to hear'. "
@@ -684,11 +708,11 @@ def firm_rules_block(agent_def: AgentDefinition, lang: str = "en") -> list[str]:
             _pricing_rule(agent_def, lang),
             phone_rule,
             "✗ NEVER ask for information that is already marked ✓ in CONVERSATION STATE",
-            sched_rules[0],
+            *sched_rules[:1],
             "✗ NEVER dump the whole catalogue on one caller",
             _fabrication_rule(agent_def, default_rule="✗ NEVER make up "
                               "products, prices or dates not listed above"),
-            *(sched_rules[1:] if not flexible else []),
+            *sched_rules[1:],
             "✗ NEVER ask 'Do you have any questions?' — only answer questions when the caller asks one",
             "✗ NEVER push the conversation to a new topic if the caller is still on the current one",
             "✗ NEVER launch into a detailed pitch before confirming it is a good moment to talk",
@@ -706,15 +730,11 @@ def firm_rules_block(agent_def: AgentDefinition, lang: str = "en") -> list[str]:
             if _has_phone_readback_slot(agent_def) else
             "✗ NEVER repeat the caller's phone number back to them unless they explicitly ask you to confirm it"
         )
-        if flexible:
-            sched_rules = [
-                "✓ Offer available time slots flexibly and accept a caller-proposed time when it matches a free slot",
-            ]
-        else:
-            sched_rules = [
-                f"✗ NEVER give more than {n} time options for site visit",
-                f"✗ NEVER say 'When can you come?' — always give exactly {_count_word(n)} specific time options",
-            ]
+        sched_rules = _sched_rules(agent_def, [
+            f"✗ NEVER give more than {n} time options for site visit",
+            f"✗ NEVER say 'When can you come?' — always give exactly {_count_word(n)} specific time options",
+        ], "✗ NEVER invent or state specific times, dates or slots for the site visit — no "
+           "calendar is configured; ask what day and time suits the caller, then confirm their proposal back")
         lines += [
             "✗ NEVER use hollow filler phrases: 'खुशी हुई', 'आपका जवाब सुनकर खुशी हुई', 'Happy to help', "
             "'It was a pleasure', 'आपकी बात सुनकर', 'ખુશી થઈ', 'Glad to hear'. "
@@ -722,10 +742,10 @@ def firm_rules_block(agent_def: AgentDefinition, lang: str = "en") -> list[str]:
             _pricing_rule(agent_def, lang),
             phone_rule,
             "✗ NEVER ask for information that is already marked ✓ in CONVERSATION STATE",
-            sched_rules[0] if not flexible else sched_rules[0],
+            *sched_rules[:1],
             "✗ NEVER dump the whole portfolio on one caller",
             _fabrication_rule(agent_def),
-            *(sched_rules[1:] if not flexible else []),
+            *sched_rules[1:],
             "✗ NEVER ask 'Do you have any questions?' or 'Any questions about the property?' — only answer questions when the caller asks one",
             "✗ NEVER push the conversation to a new topic if the caller is still on the current one",
             "✗ NEVER give property pitches until the caller has expressed genuine interest",
@@ -746,6 +766,23 @@ def firm_rules_block(agent_def: AgentDefinition, lang: str = "en") -> list[str]:
         if r:
             lines.append(f"✗ NEVER {r}")
     for r in always_rules:
+        r = str(r).strip()
+        if r.lower().startswith("always "):
+            r = r[7:]
+        if r:
+            lines.append(f"✓ {r}")
+    # llm_config.extra_never_rules / extra_always_rules — same rendering as the
+    # guardrail rules above. Parsed since D-era but injected NOWHERE until
+    # 2026-07-28: agents carrying them (e.g. "keep replies to 1-2 sentences")
+    # silently lost those rules.
+    llm_cfg = getattr(agent_def, "llm_config", None)
+    for r in (getattr(llm_cfg, "extra_never_rules", None) or []):
+        r = str(r).strip()
+        if r.lower().startswith("never "):
+            r = r[6:]
+        if r:
+            lines.append(f"✗ NEVER {r}")
+    for r in (getattr(llm_cfg, "extra_always_rules", None) or []):
         r = str(r).strip()
         if r.lower().startswith("always "):
             r = r[7:]
@@ -820,6 +857,11 @@ def call_closure_block(agent_def: AgentDefinition, lang: str = "en") -> list[str
         "before letting them go — confirm it back in one short sentence "
         "('Perfect — I'll call you tomorrow at 4 PM.'); a real follow-up "
         "call is scheduled from what you agree, so never promise vaguely",
+        "✓ When the caller says they're busy or can't talk right now, do NOT "
+        "pitch or ask anything else — apologise for the timing, ask when to "
+        "call back, confirm the time, and say goodbye in the same breath "
+        "(a caller who asked you to call later has already agreed the call "
+        "is over — skip the 'anything else?' question)",
         "✗ NEVER keep pushing after the caller has said they want to leave "
         "or has declined twice — accept gracefully, ask permission to close, "
         "and say goodbye",

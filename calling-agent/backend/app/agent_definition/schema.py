@@ -182,6 +182,11 @@ class TTSVoiceConfig:
         except (TypeError, ValueError):
             self.pace = 1.0
         if not (0.5 <= self.pace <= 2.0):
+            # Reset silently and a user typing pace: 2.5 gets SLOWER speech
+            # than the 1.15 fleet default with no explanation.
+            logging.getLogger(__name__).warning(
+                "[TTSVoiceConfig] pace %s outside 0.5–2.0 — using 1.0",
+                self.pace)
             self.pace = 1.0
         if not isinstance(self.gender, str):
             self.gender = ""

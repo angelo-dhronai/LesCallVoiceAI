@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useLocation } from 'react-router-dom'
+import { useLenis } from 'lenis/react'
 import { Sidebar } from './Sidebar'
 import { Topbar } from './Topbar'
 import { NAV } from '../lib/nav'
@@ -25,9 +26,18 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [mobileOpen, setMobileOpen] = useState(false)
   const { pathname } = useLocation()
   const { services, overall, liveCount } = useHealth()
+  const lenis = useLenis()
 
   // Navigating closes the mobile drawer.
   useEffect(() => { setMobileOpen(false) }, [pathname])
+
+  // Each panel opens at its top — an inherited scroll offset on a fresh page
+  // reads as a broken load. Immediate (not smoothed): the content under the
+  // scrollbar is already new, so easing would animate the wrong page.
+  useEffect(() => {
+    if (lenis) lenis.scrollTo(0, { immediate: true, force: true })
+    else window.scrollTo(0, 0)
+  }, [pathname, lenis])
 
   // Tab title tracks the active panel (helps users with several tabs open).
   useEffect(() => { document.title = `${titleFor(pathname)} · LesCall` }, [pathname])

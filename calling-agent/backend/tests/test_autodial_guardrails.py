@@ -40,6 +40,12 @@ def row(**over):
         # grace + business window apply. auto_scheduled=0 = the CUSTOMER
         # stated the time — covered by its own tests below.
         "auto_scheduled": 1,
+        # Every test below this line is about some OTHER brake, so the base row
+        # is one a human already approved. The approval gate itself is pinned
+        # in its own section at the bottom — and note that omitting this key
+        # entirely still refuses the call, which is the behaviour that matters.
+        "approval_state": "approved",
+        "approval_expires_at": None,
     }
     base.update(over)
     return base
@@ -351,3 +357,90 @@ def test_no_phone_anywhere_is_still_permanent():
 def test_explain_covers_superseded():
     text = autodial.explain("superseded")
     assert "newer call" in text
+
+
+# ── human approval — the gate that outranks every other brake ───────────────
+#
+# 2026-07-29: the dialer called a customer two days after a 44-second call on
+# which nobody promised anything. The AI had scored that call
+# promised_by='agent_promised', confidence 0.9. Fifteen of the twenty rows
+# armed that morning had no recorded commitment at all. The lesson these tests
+# encode is that the model's verdict is not consent, and neither is a config
+# default: only a stamped human approval is.
+
+def test_a_perfect_row_is_still_refused_without_approval():
+    """Due, in-window, in-budget, dialable, not DND — and still not called.
+
+    This is the whole feature in one assertion: everything the old code looked
+    at says "dial", and the answer is no.
+    """
+    r = row(approval_state="pending")
+    assert autodial.blocked_reason(r, now=at(0, 14), placed_today=0) == "not_approved"
+
+
+@pytest.mark.parametrize("state", ["pending", "declined", "", None, "APPROVED",
+                                   "yes", "true", "auto"])
+def test_only_the_exact_string_approved_unlocks_a_call(state):
+    """Anything that is not exactly 'approved' means do not call.
+
+    Includes the near-misses a future refactor might introduce ('APPROVED',
+    'true'), because a fuzzy match here would be indistinguishable from having
+    no gate at all.
+    """
+    r = row(approval_state=state)
+    assert autodial.blocked_reason(r, now=at(0, 14), placed_today=0) == "not_approved"
+
+
+def test_a_row_missing_the_approval_field_entirely_is_refused():
+    """Fail-safe on absence. If a query forgets to SELECT approval_state, or a
+    caller hands over a dict built before 0011, the row must read as
+    unapproved rather than sail through on a missing key."""
+    r = row()
+    del r["approval_state"]
+    assert autodial.blocked_reason(r, now=at(0, 14), placed_today=0) == "not_approved"
+
+
+def test_approved_row_dials():
+    r = row(approval_state="approved")
+    assert autodial.blocked_reason(r, now=at(0, 14), placed_today=0) is None
+
+
+def test_approval_expires():
+    """Consent to call someone today is not consent to call them next week."""
+    r = row(approval_state="approved", approval_expires_at=at(0, 13))
+    assert autodial.blocked_reason(r, now=at(0, 12), placed_today=0) is None
+    assert autodial.blocked_reason(
+        r, now=at(0, 13), placed_today=0) == "approval_expired"
+    assert autodial.blocked_reason(
+        r, now=at(0, 14), placed_today=0) == "approval_expired"
+
+
+def test_expired_approval_is_recoverable_not_permanent():
+    """Re-approving must work: neither approval code may be PERMANENT, or the
+    executor would stamp autodial_blocked_at and the row could never be
+    rescued by the human it is waiting for."""
+    assert "not_approved" not in autodial.PERMANENT
+    assert "approval_expired" not in autodial.PERMANENT
+
+
+def test_dnd_still_outranks_approval():
+    """A customer's "stop calling me" beats an operator's click."""
+    r = row(approval_state="approved", dnd=True)
+    assert autodial.blocked_reason(r, now=at(0, 14), placed_today=0) == "dnd"
+
+
+def test_approval_predicates_are_in_the_candidate_sql():
+    """Defence in depth, asserted on the source.
+
+    blocked_reason is the second line of defence; _DUE_SQL is the first. If a
+    refactor drops the predicate from the query, the pure-function tests above
+    would all still pass while production quietly went back to cold-calling.
+    """
+    sql = autodial._DUE_SQL
+    assert "approval_state = 'approved'" in sql
+    assert "approval_expires_at IS NULL OR f.approval_expires_at > now()" in sql
+
+
+def test_explain_tells_the_user_what_to_do_about_it():
+    assert "approval" in autodial.explain("not_approved").lower()
+    assert "expired" in autodial.explain("approval_expired").lower()

@@ -20,6 +20,7 @@
   --accent: #00d98c;
   --accent-2: #4f46e5;
   --shadow: 0 4px 30px rgba(15, 23, 42, 0.05), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --spotlight: rgba(16, 185, 129, 0.07);
 }
 
 .dark {
@@ -37,6 +38,7 @@
   --accent: #00f5a0;
   --accent-2: #8b85ff;
   --shadow: 0 18px 60px -20px rgba(0, 0, 0, 0.7), 0 2px 10px rgba(0, 0, 0, 0.4);
+  --spotlight: rgba(0, 245, 160, 0.055);
 }
 
 * { border-color: var(--border); }
@@ -88,7 +90,11 @@ body {
     overflow: hidden;
   }
   .card-hover { transition: transform .25s cubic-bezier(.22,1,.36,1), box-shadow .25s; }
-  .card-hover:hover { transform: translateY(-2px); box-shadow: var(--shadow), 0 24px 60px -28px rgba(15,23,42,.25); }
+  /* Hover motion is pointer-only: on touch screens a tap would leave the
+     card stuck mid-lift until the next tap elsewhere. */
+  @media (hover: hover) and (pointer: fine) {
+    .card-hover:hover { transform: translateY(-2px); box-shadow: var(--shadow), 0 24px 60px -28px rgba(15,23,42,.25); }
+  }
   /* Section label: quiet, sentence-case, a touch of tracking. */
   .eyebrow { @apply text-[11px] font-medium tracking-[0.05em]; color: var(--text-dim); }
   .metric { font-family: 'Plus Jakarta Sans Variable','Plus Jakarta Sans',Inter,sans-serif; @apply font-bold tracking-tight; color: var(--text); }
@@ -108,6 +114,63 @@ body {
   animation: shimmer 1.4s infinite;
 }
 @keyframes shimmer { 100% { transform: translateX(100%) } }
+
+/* ── Motion layer ─────────────────────────────────────────────────────────
+   Lenis smooth scroll + the Inspira-ported effects (components/motion.tsx).
+   Everything here dies under the global prefers-reduced-motion rule; the
+   border beam is hidden outright because a frozen beam reads as a glitch. */
+
+/* Lenis base styles (window scroller). */
+html.lenis, html.lenis body { height: auto; }
+.lenis.lenis-smooth { scroll-behavior: auto !important; }
+.lenis.lenis-smooth [data-lenis-prevent] { overscroll-behavior: contain; }
+.lenis.lenis-stopped { overflow: hidden; }
+
+/* Pointer-tracking highlight on hoverable cards (Card writes --spot-x/y). */
+.card-spotlight {
+  position: absolute; inset: 0; pointer-events: none; opacity: 0;
+  transition: opacity .35s ease;
+  background: radial-gradient(320px circle at var(--spot-x, 50%) var(--spot-y, 40%),
+    var(--spotlight), transparent 70%);
+}
+/* Pointer-only for the same reason as .card-hover: a tap on touch screens
+   would pin a centered glow (the --spot vars only update on mouse moves). */
+@media (hover: hover) and (pointer: fine) {
+  .card:hover > .card-spotlight { opacity: 1; }
+}
+
+/* Border beam — a light tracing the card edge. One per screen, max. */
+@property --beam-angle { syntax: '<angle>'; inherits: false; initial-value: 0deg; }
+.border-beam {
+  position: absolute; inset: 0; border-radius: inherit; padding: 1.5px;
+  pointer-events: none; opacity: .9;
+  background: conic-gradient(from var(--beam-angle),
+    transparent 60%, var(--beam-from, var(--accent)) 82%,
+    var(--beam-to, var(--accent-2)) 93%, transparent 98%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          mask-composite: exclude;
+  animation: beam-spin var(--beam-duration, 7s) linear infinite;
+}
+@keyframes beam-spin { to { --beam-angle: 360deg; } }
+@media (prefers-reduced-motion: reduce) { .border-beam { display: none; } }
+
+/* Touch devices at desktop widths (iPads): row actions that hide behind
+   group-hover at md:/lg: have no hover to reveal them — keep them visible.
+   md:opacity-0 / lg:opacity-0 are only ever used for this reveal idiom. */
+@media (hover: none) {
+  .md\:opacity-0, .lg\:opacity-0 { opacity: 1 !important; }
+}
+
+/* Shimmering text for in-progress states ("Thinking…"). */
+.text-shimmer {
+  background: linear-gradient(90deg, var(--text-dim) 40%, var(--text) 50%, var(--text-dim) 60%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: text-shimmer 2.2s linear infinite;
+}
+@keyframes text-shimmer { to { background-position: -200% 0; } }
 
 /* Rendered report documents (Reports page, minimal markdown renderer). */
 .report-doc { color: var(--text-soft); font-size: 13.5px; line-height: 1.65; }

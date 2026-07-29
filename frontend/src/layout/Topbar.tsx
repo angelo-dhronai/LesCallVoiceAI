@@ -176,7 +176,7 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
             {IS_MAC ? '⌘K' : 'Ctrl K'}
           </kbd>
           {searchOpen && (
-            <div className="card absolute left-0 top-10 z-40 max-h-72 w-full overflow-y-auto p-1.5 shadow-glass-lg animate-fade-up">
+            <div data-lenis-prevent className="card absolute left-0 top-10 z-40 max-h-72 w-full overflow-y-auto p-1.5 shadow-glass-lg animate-fade-up">
               {q.trim() ? (
                 <>
                   {matches.length === 0 && (
@@ -249,7 +249,7 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
                 </div>
               )}
               {items.length > 0 && (
-                <div className="max-h-80 overflow-y-auto">
+                <div data-lenis-prevent className="max-h-80 overflow-y-auto">
                   {items.map((n) => (
                     <button key={n.id} type="button" onClick={() => openNotification(n)}
                       className={cx('flex w-full items-start gap-2.5 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--surface-2)]',

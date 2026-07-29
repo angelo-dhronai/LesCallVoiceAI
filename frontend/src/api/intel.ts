@@ -57,6 +57,35 @@ export type Followup = {
   next_attempt_at?: string | null
   executed_call_id?: number | null
   execution_outcome?: string | null
+  /** Human-in-the-loop gate (0011). No follow-up is ever auto-dialled while
+   *  this is anything other than 'approved' — `mode: 'auto'` on its own is
+   *  only a preference and grants nothing. */
+  approval_state?: 'pending' | 'approved' | 'declined'
+  approved_at?: string | null
+  approved_by?: string | null
+  approval_expires_at?: string | null
+  declined_at?: string | null
+  declined_by?: string | null
+}
+
+/** One recorded promise, with the words that made it. */
+export type FollowupEvidence = {
+  /** 'quoted' — a commitment was extracted from the call with the verbatim
+   *  words. 'inferred' — nothing was promised; the AI proposed this itself. */
+  strength: 'quoted' | 'inferred'
+  commitments: {
+    made_by: string; kind: string; description: string
+    quote: string | null; deadline_text: string | null; confidence: number | null
+  }[]
+  transcript_tail: { at: string; speaker: string; text: string }[]
+}
+
+/** A follow-up awaiting a human's call decision, with its proof attached. */
+export type FollowupReviewItem = Followup & {
+  customer_intent?: string | null
+  source_call_at?: string | null
+  dnd?: boolean | null
+  evidence: FollowupEvidence
 }
 
 export type IntelDetail = {

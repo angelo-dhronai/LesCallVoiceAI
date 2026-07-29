@@ -759,15 +759,15 @@ function ExtractReview({ fields, missing, busy, onCancel, onApply }: {
 /* ───────────────────────── Voice tab ───────────────────────── */
 function VoiceTab({ agent }: { agent: any }) {
   const toast = useToast()
-  const voices: Record<string, { model: string; speaker: string }> = agent?.languages?.tts_voices ?? {}
+  const voices: Record<string, { model: string; speaker: string; pace?: number }> = agent?.languages?.tts_voices ?? {}
   const entries = Object.entries(voices)
   const [playingLang, setPlayingLang] = useState<string | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
 
-  const play = (lang: string, v: { model: string; speaker: string }) => {
+  const play = (lang: string, v: { model: string; speaker: string; pace?: number }) => {
     try {
       audioRef.current?.pause()
-      const audio = new Audio(ttsPreviewUrl(v.speaker, v.model, BCP47[lang] || 'en-IN'))
+      const audio = new Audio(ttsPreviewUrl(v.speaker, v.model, BCP47[lang] || 'en-IN', v.pace))
       audioRef.current = audio
       setPlayingLang(lang)
       audio.onended = () => setPlayingLang(null)
@@ -785,7 +785,7 @@ function VoiceTab({ agent }: { agent: any }) {
             playingLang === lang ? 'animate-pulse text-mint-500' : 'text-indigo-400')}><Volume2 size={18} /></span>
           <div className="min-w-0">
             <div className="text-sm font-semibold text-[var(--text)]">{lang.toUpperCase()}</div>
-            <div className="truncate text-2xs text-dim">{v.model} · {v.speaker}</div>
+            <div className="truncate text-2xs text-dim">{v.model} · {v.speaker}{v.pace ? ` · ${v.pace}× pace` : ''}</div>
           </div>
           <Button variant="ghost" className="ml-auto" onClick={() => play(lang, v)}>
             {playingLang === lang ? <><Spinner className="h-3.5 w-3.5" /> Playing…</> : <><Volume2 size={14} /> Preview</>}

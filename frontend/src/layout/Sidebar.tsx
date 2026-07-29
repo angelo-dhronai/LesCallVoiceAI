@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { NavLink } from 'react-router-dom'
+import { motion } from 'motion/react'
 import { LogOut, Search } from 'lucide-react'
 import { NAV } from '../lib/nav'
 import { cx } from '../components/ui'
@@ -68,7 +69,7 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
           />
         </div>
 
-        <nav className="mt-3 flex-1 space-y-4 overflow-y-auto px-3 pb-2">
+        <nav data-lenis-prevent className="mt-3 flex-1 space-y-4 overflow-y-auto px-3 pb-2">
           {groups.map((group, gi) => (
             <div key={group.title}>
               <div className={cx('eyebrow px-2 pb-1.5', collapsed && 'lg:hidden')}>{group.title}</div>
@@ -81,12 +82,22 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
                       'group relative flex items-center gap-2.5 rounded-md px-2 py-[7px] text-sm font-medium transition-colors',
                       collapsed && 'lg:justify-center lg:px-0',
                       isActive
-                        ? 'bg-[var(--surface-2)] text-[var(--text)]'
+                        ? 'text-[var(--text)]'
                         : 'text-soft hover:bg-[var(--surface-2)] hover:text-[var(--text)]',
                     )}>
                     {({ isActive }) => (
                       <>
-                        {isActive && <span className="absolute left-0 h-4 w-0.5 rounded-full bg-mint-500" />}
+                        {/* One shared layoutId: the active pill glides between
+                            items instead of blinking off/on. */}
+                        {isActive && (
+                          <motion.span
+                            layoutId="sidebar-active-pill"
+                            aria-hidden
+                            className="absolute inset-0 rounded-md bg-[var(--surface-2)]"
+                            transition={{ type: 'spring', stiffness: 420, damping: 34 }}>
+                            <span className="absolute left-0 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-mint-500" />
+                          </motion.span>
+                        )}
                         <span className="relative shrink-0">
                           <item.icon size={16} strokeWidth={2} className={cx('shrink-0', isActive ? 'text-mint-600 dark:text-mint-400' : 'text-dim group-hover:text-soft')} />
                           {/* Collapsed rail still shows the live-call count as a dot badge */}
@@ -95,7 +106,7 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
                               className="absolute -right-2 -top-1.5 hidden h-[15px] min-w-[15px] items-center justify-center rounded-full bg-rose-500 px-1 text-2xs font-bold leading-none text-white ring-2 ring-[var(--bg)] lg:inline-flex">{liveCount}</span>
                           )}
                         </span>
-                        <span className={cx('truncate', collapsed && 'lg:hidden')}>{item.label}</span>
+                        <span className={cx('relative truncate', collapsed && 'lg:hidden')}>{item.label}</span>
                         {item.badge && liveCount > 0 && (
                           <span className={cx('relative ml-auto inline-flex', collapsed && 'lg:hidden')}>
                             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-400 opacity-40" />

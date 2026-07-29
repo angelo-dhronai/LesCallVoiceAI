@@ -283,7 +283,14 @@ Pieces:
 
 CAVEAT: the ADC rides on alwynantonyben@'s Google session. If org session
 control expires it, uploads pause (timer retries; local serving unaffected)
-until the login command above is re-run. Durable fix: attach the
+until the login command above is re-run.
+**This fired 2026-07-14** (`RefreshError: Reauthentication is needed` on
+every sync since; ~220 calls local-only, log shipping stuck on the same
+credential, Sentinel alerting hourly). Verified 2026-07-29: no working
+write-capable Google credential exists on the VM at all — the attached
+default compute SA has `devstorage.read_only` scope, and scope/SA changes
+both require the VM to be STOPPED. So the re-login below is the only
+unblock short of the durable fix. Durable fix: attach the
 `lescall-recsync` SA to the VM (`gcloud compute instances set-service-account
 lescall-agent --zone asia-south1-c --service-account lescall-recsync@lescall.
 iam.gserviceaccount.com --scopes cloud-platform`, VM must be STOPPED —
@@ -755,9 +762,12 @@ authoriser in `followups.audit`.
 
 ### Operating it
 
-- Kill switch: `INTEL_AUTODIAL_ENABLED` in `deploy/.pg_env`. **Set to `false`
-  on 2026-07-29 as the incident stop.** Turning it back on does *not* by itself
-  dial anyone — every row is `pending` — but do it deliberately:
+- Kill switch: `INTEL_AUTODIAL_ENABLED` in `deploy/.pg_env`. Set to `false` on
+  2026-07-29 as the incident stop, and **back to `true` the same day once the
+  gate below was live** (log line: `follow-up auto-dialer ON`; all 266 rows sat
+  at `pending`, `due_candidates()` returned 0 with the dialer running). It is a
+  kill switch, not the consent mechanism — off stops everything, on grants
+  nothing. Change it with
   `docker compose -f deploy/docker-compose.services.yml up -d api`
   (**a bare `restart` does not re-read the env file**; that bit the cont-merge
   canary on 07-24). Verify with `docker exec lescall-api env | grep AUTODIAL`.
@@ -776,15 +786,39 @@ The dormant legacy `_automation_scheduler_loop` (`followup_automations`) is
 never queries, and sat one uncommented line from live. `_dial_automation_entry`
 survives for the operator-triggered `call-now` endpoint.
 
+### Campaign engine — same limits, applied 2026-07-29
+
+The bulk dialler was the other path that could ring a list of people, and it
+had none of the above. All in `dashboard/server.py`, pinned by
+`test_campaign_guardrails.py` (21):
+
+- **DND.** `disposition='rejected'` — how an in-call "stop calling me" is
+  recorded (`test_dnd.py`) — is dropped from the audience *before* the cap, so
+  a list of opted-out contacts can't eat the budget. Re-read from the DB before
+  each dial too (`_contact_is_dnd`, **fails closed**): someone who opts out on
+  call 3 is not dialled on call 40 of the same run.
+- **Caps.** `CAMPAIGN_MAX_CALLS` (200) and `CAMPAIGN_MIN_DELAY_SECONDS` (3),
+  both env-overridable. `max_calls:0` now means "up to the ceiling", not
+  "unlimited"; a larger request is clamped. Ceilings ride along on
+  `/campaign/status` so the form states the real number.
+- **Calling hours.** Refuses to start outside `autodial.within_window()` and
+  **halts mid-run** when the window closes, stamping `camp["error"]` with how
+  many were left undialled.
+- **Honest refusals.** An empty or all-rejected audience now returns **400**;
+  it used to return `ok:false` with HTTP 200, which the SPA toasted as
+  "Campaign started" while nothing had been queued.
+- **Audience fix.** `to_contact_later` is a *disposition*; the runner matched
+  only `call_status`, so that audience silently resolved to zero.
+  `_campaign_audience` handles both columns.
+- **UI.** Start is behind a confirm naming the exact number of people; tallies
+  gained a "Do not call N" badge.
+
 ### Known, NOT fixed by this change (needs a decision)
 
-- **Campaign engine** (`POST /api/outbound/campaign/start`): one authenticated
-  request with `max_calls:0, delay_seconds:0` dials the whole contact book as
-  fast as FreeSWITCH accepts, **ignores `disposition='rejected'` (DND)**, and
-  has no calling-window check. Starting it is a human act, so it is outside the
-  follow-up gate — but the DND blindness is a real compliance gap.
-- **`POST /api/outbound/dial/{handle}`** does not check DND either; `?force=1`
-  removes the duplicate-dial guard.
+- **`POST /api/outbound/dial/{handle}`** does not check DND; `?force=1` removes
+  the duplicate-dial guard. It is one phone per click by a logged-in human, so
+  it was left alone deliberately — but a mis-click on a rejected contact still
+  connects.
 - **Sentinel loopback probe** (`shared/sentinel.py`, 03:00 UTC daily) self-calls
   our own DIDs from `phone_numbers` — it does **not** ring customers today. If a
   BYON tenant ever registers a number that terminates on a human handset it

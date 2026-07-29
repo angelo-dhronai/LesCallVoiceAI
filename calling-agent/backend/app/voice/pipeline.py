@@ -40,6 +40,16 @@ logger = logging.getLogger(__name__)
 
 # ENV-based control for barge-in and telephony defaults
 ENABLE_BARGE_IN = os.environ.get("ENABLE_BARGE_IN", "true").lower() == "true"
+
+# Streaming STT canary (default OFF): when the STT router's primary is a
+# SarvamStreamingSTT (installed by the bridge under the same flag), speech
+# frames are ALSO fed to Sarvam's WebSocket while the caller talks, so the
+# transcript is near-ready when the endpoint fires instead of paying the
+# full batch round-trip afterwards. The local buffer and every batch-path
+# safety net stay in place — the stream self-downgrades to batch on any
+# failure.
+ENABLE_STREAMING_STT = (
+    os.environ.get("ENABLE_STREAMING_STT", "false").lower() == "true")
 TELEPHONY_MODE = os.environ.get("TELEPHONY_MODE", "false").lower() == "true"
 
 
@@ -287,6 +297,9 @@ class VoicePipeline:
         # table by the bridge at teardown. Capped so a marathon call can't
         # grow memory unbounded.
         self.turn_traces: list[dict] = []
+        # Set in start() when ENABLE_STREAMING_STT and the router's primary
+        # supports live feeding (SarvamStreamingSTT).
+        self._streaming_stt = None
         # Turn accumulator: tracks full caller text across segments within one
         # turn. Preserved when barge-in fires so the next STT fragment is merged
         # with prior context. Cleared when TTS completes a clean (non-barge-in)
@@ -396,6 +409,15 @@ class VoicePipeline:
         # (guarded by class-level _warmup_done_flag inside each provider).
         warmup_coros = []
         primary_stt = getattr(self.stt, "_primary", None)
+        # Streaming STT: the bridge installs SarvamStreamingSTT as the
+        # router's primary under ENABLE_STREAMING_STT; the VAD layer feeds
+        # it live speech frames whenever this handle is non-None.
+        self._streaming_stt = (
+            primary_stt
+            if ENABLE_STREAMING_STT and hasattr(primary_stt, "feed_nowait")
+            else None)
+        if self._streaming_stt is not None:
+            logger.info("[PIPELINE] Streaming STT ACTIVE (ENABLE_STREAMING_STT)")
         if primary_stt is not None and hasattr(primary_stt, "warmup"):
             if not getattr(primary_stt.__class__, "_warmup_done_flag", False):
                 logger.info("[WARMUP] STT primary warmup queued")
@@ -492,6 +514,12 @@ class VoicePipeline:
             except Exception:
                 logger.exception("[PIPELINE] commit_pending_turn at stop failed")
         await self.audio.stop()
+        if self._streaming_stt is not None:
+            try:
+                await self._streaming_stt.close()
+            except Exception:
+                pass
+            self._streaming_stt = None
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -794,16 +822,29 @@ class VoicePipeline:
                     for pre_frame in self._pre_speech_buffer:
                         self._audio_buffer.extend(pre_frame)
                         self._speech_duration_ms += 20.0
+                        if self._streaming_stt is not None:
+                            self._streaming_stt.feed_nowait(pre_frame)
                     self._pre_speech_buffer.clear()
             self._turn.mark_speech()
             self._audio_buffer.extend(frame)
             self._speech_duration_ms += 20.0
+            if self._streaming_stt is not None:
+                self._streaming_stt.feed_nowait(frame)
 
             if len(self._audio_buffer) > MAX_BUFFER_BYTES:
                 del self._audio_buffer[:len(self._audio_buffer) - MAX_BUFFER_BYTES]
 
-            proxy_words = max(1, int(self._speech_duration_ms / 300))
-            self._turn.update_text(" ".join(["x"] * proxy_words))
+            # Streaming STT emits finalized SEGMENT transcripts mid-turn
+            # (no word partials exist on saaras) — when real words are
+            # available the TurnManager sees them instead of proxy tokens,
+            # so its sentence-end heuristic can actually match.
+            stream_text = (self._streaming_stt.turn_text
+                           if self._streaming_stt is not None else "")
+            if stream_text:
+                self._turn.update_text(stream_text)
+            else:
+                proxy_words = max(1, int(self._speech_duration_ms / 300))
+                self._turn.update_text(" ".join(["x"] * proxy_words))
         else:
             if self._prev_speech:
                 logger.info("[VAD] Speech end (%.0fms)", self._speech_duration_ms)
@@ -844,6 +885,10 @@ class VoicePipeline:
                 self._audio_buffer.clear()
                 self._speech_duration_ms = 0.0
                 self._turn.flush()
+                if self._streaming_stt is not None:
+                    # The fed audio was dropped locally — invalidate any
+                    # segment the server may still emit for it.
+                    self._streaming_stt.reset_turn()
                 return
 
             _now_flush = time.monotonic()
@@ -933,6 +978,10 @@ class VoicePipeline:
                     break
         if drained:
             logger.info("[BARGE-IN] Drained %d items from pipeline queues", drained)
+        if self._streaming_stt is not None:
+            # Audio fed for the dropped segments must not resurface as
+            # stale text in the next turn.
+            self._streaming_stt.reset_turn()
 
     # -----------------------------------------------------------------------
     # Layer 2: STT Worker

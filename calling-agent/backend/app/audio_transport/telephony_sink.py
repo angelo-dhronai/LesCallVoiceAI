@@ -37,7 +37,15 @@ class TelephonySink(AudioSink):
         # echo returns via mod_audio_stream and must not be mistaken for the
         # caller interrupting.
         self.playback_busy_until: float = 0.0
-        
+        # Barge-in support.  on_interrupt is injected by the bridge and asks
+        # socket_server to uuid_break the FreeSWITCH channel — audio already
+        # handed to FS keeps playing no matter what we drop locally, so the
+        # media-layer break must come first.  abort_event releases the
+        # bridge's pacing sleep so the next turn's audio isn't stuck behind
+        # the remaining duration of an utterance nobody is hearing anymore.
+        self.on_interrupt = None
+        self.abort_event: asyncio.Event = asyncio.Event()
+
         if not os.path.exists(self._tmp_dir):
             os.makedirs(self._tmp_dir, exist_ok=True)
             # Ensure it's readable by others (FreeSWITCH)
@@ -55,6 +63,40 @@ class TelephonySink(AudioSink):
         # self._pcm_buffer.clear()
         # PHASE17_DEBUG_DISABLE_BARGE_IN_END
         logger.info("[%s] [TelephonySink] Stopped", self._conn_id)
+
+    async def interrupt_playback(self) -> None:
+        """Barge-in: stop the audio the caller is actually hearing.
+
+        Order matters — uuid_break at FreeSWITCH first (via on_interrupt),
+        because draining local queues cannot touch WAVs already injected
+        into the channel.  Then drop everything queued locally: those parts
+        belong to the response the caller just talked over.
+        """
+        cb = self.on_interrupt
+        if cb is not None:
+            try:
+                await cb()
+            except Exception as exc:
+                logger.warning(
+                    "[%s] [BARGE-IN] uuid_break request failed: %r",
+                    self._conn_id, exc)
+        dropped = 0
+        while True:
+            try:
+                stale = self.wav_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            dropped += 1
+            try:
+                os.remove(stale)
+            except Exception:
+                pass
+        self._pcm_buffer.clear()
+        self.playback_busy_until = 0.0
+        self.abort_event.set()
+        logger.info(
+            "[%s] [BARGE-IN] media playback interrupted "
+            "(dropped %d queued wavs)", self._conn_id, dropped)
 
     async def write_frame(self, pcm: bytes):
         """

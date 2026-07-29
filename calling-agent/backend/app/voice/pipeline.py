@@ -645,6 +645,15 @@ class VoicePipeline:
                     in_cont_window,
                 )
 
+                # Media-layer abort FIRST: WAVs already injected into
+                # FreeSWITCH keep playing no matter what we cancel locally.
+                # interrupt_playback() sends uuid_break to the channel, then
+                # drains the sink's queued WAVs (LocalSpeakerSink has no such
+                # method — CLI mode is unaffected).
+                interrupt = getattr(self.sink, "interrupt_playback", None)
+                if interrupt is not None:
+                    await interrupt()
+
                 await self.tts.stop()
 
                 self._tts_playing = False

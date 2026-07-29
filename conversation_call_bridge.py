@@ -549,6 +549,10 @@ class TelephonySession:
         # Sink runs at the TTS output rate (8k skips ffmpeg), independent of
         # the 16k STT-side source rate.
         self.sink = TelephonySink(sample_rate=TTS_OUTPUT_SR, conn_id=conn_id)
+        # Barge-in: the sink's interrupt path asks socket_server to
+        # uuid_break the FS channel so audio already injected stops at the
+        # media layer, not just in our queues.
+        self.sink.on_interrupt = self._send_break_request
         self.hub = EventHub()
 
         # Routing (dial linkage, direction, agent slug, owner) is normally
@@ -1226,6 +1230,13 @@ class TelephonySession:
 
                 logger.info("[%s] [PLAYBACK_ENQUEUE] path=%s duration=%.2fs bytes=%d ts=%.3f",
                             self.conn_id, wav_path, duration, size, time.time())
+
+                # Re-arm the barge-in abort signal for THIS injection.  Cleared
+                # here (not after the send) so an interrupt landing while the
+                # request is in flight is still caught by the pacing wait.
+                abort_event = getattr(self.sink, "abort_event", None)
+                if abort_event is not None:
+                    abort_event.clear()
                 
                 if self.stats["first_response_t"] is None:
                     self.stats["first_response_t"] = time.time()
@@ -1240,10 +1251,23 @@ class TelephonySession:
                     logger.info("[%s] [PLAYBACK_COMPLETE] path=%s duration=%.2fs bytes=%d ts=%.3f",
                                 self.conn_id, wav_path, duration, size, time.time())
                 
-                # Pace the injection to prevent overlapping AI speech
+                # Pace the injection to prevent overlapping AI speech.  The
+                # wait is barge-in interruptible: uuid_break already silenced
+                # the channel, so finishing the sleep would only delay the
+                # response to whatever the caller barged in with.
                 if duration > 0:
                     logger.info(f"[{self.conn_id}] [PLAYBACK_PACE] Sleeping for {duration:.2f}s duration")
-                    await asyncio.sleep(duration + 0.1) # slight buffer
+                    if abort_event is not None:
+                        try:
+                            await asyncio.wait_for(
+                                abort_event.wait(), timeout=duration + 0.1)
+                            logger.info(
+                                "[%s] [PLAYBACK_PACE] cut short by barge-in",
+                                self.conn_id)
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(duration + 0.1) # slight buffer
 
                 # Reap the WAV once it can no longer be in use: playback ends
                 # ~injection-overhead after the pacing sleep, and FreeSWITCH
@@ -1334,6 +1358,39 @@ class TelephonySession:
         logger.info("[%s] [HANGUP_REQUEST] farewell drained — ending call",
                     self.conn_id)
         await self._send_hangup_request()
+
+    async def _send_break_request(self) -> bool:
+        """Barge-in: ask socket_server (TCP 9004) to uuid_break the channel
+        so audio FreeSWITCH is already playing stops immediately.  Same
+        one-shot length-prefixed JSON protocol as playback/hangup."""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(PLAYBACK_HOST, PLAYBACK_PORT),
+                timeout=2.0
+            )
+            req = {"type": "break_request", "conn_id": self.conn_id}
+            payload = json.dumps(req).encode("utf-8")
+            writer.write(struct.pack(">I", len(payload)) + payload)
+            await writer.drain()
+            try:
+                ack_hdr = await asyncio.wait_for(reader.readexactly(4), timeout=2.0)
+                (length,) = struct.unpack(">I", ack_hdr)
+                ack_payload = await asyncio.wait_for(
+                    reader.readexactly(length), timeout=2.0)
+                ack = json.loads(ack_payload.decode("utf-8"))
+                if not ack.get("ok"):
+                    logger.warning("[%s] [BREAK_RESULT] refused: %r",
+                                   self.conn_id, ack.get("reason"))
+            except Exception as e:
+                logger.warning("[%s] [BREAK_RESULT] ack failed: %r",
+                               self.conn_id, e)
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception as e:
+            logger.error("[%s] [BREAK_ERROR] failed to send break request: %r",
+                         self.conn_id, e)
+            return False
 
     async def _send_hangup_request(self) -> bool:
         """Ask socket_server (TCP 9004) to queue an event-locked hangup on

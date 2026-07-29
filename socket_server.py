@@ -800,6 +800,19 @@ def build_audio_stream_stop_payload(channel_uuid: str) -> bytes:
     return line.encode("utf-8") + b"\n\n"
 
 
+def build_uuid_break_payload(channel_uuid: str) -> bytes:
+    """Barge-in: bgapi uuid_break <uuid> all.
+
+    Stops the file currently playing on the channel AND flushes FS's queue
+    of pending playbacks — audio already handed to FreeSWITCH is beyond the
+    reach of the orchestrator's local queue drains, so this is the only way
+    the caller actually stops hearing the superseded response.  uuid_break
+    is channel-scoped: breaking one call can never touch another tenant's.
+    Same bgapi envelope as uuid_audio_stream start/stop above."""
+    line = "bgapi uuid_break " + channel_uuid.strip() + " all"
+    return line.encode("utf-8") + b"\n\n"
+
+
 def build_playback_file_payload(wav_path: str) -> bytes:
     """Phase 12 (P12-PL): sendmsg execute playback <wav_path>.
 
@@ -991,6 +1004,38 @@ def _dispatch_hangup_request(req: dict) -> dict:
     return {"ok": True, "uuid": uuid, "bytes_sent": len(HANGUP_PAYLOAD)}
 
 
+def _dispatch_break_request(req: dict) -> dict:
+    """Sibling of _dispatch_hangup_request for {"type": "break_request"}:
+    barge-in — issue bgapi uuid_break <uuid> all so the audio the caller is
+    currently hearing stops at the media layer.  Same registry lookup, same
+    send_lock discipline, never raises.  A torn-down call is success (there
+    is nothing left to silence), not an error."""
+    uuid = (req.get("conn_id") or "").strip()
+    if not uuid:
+        return {"ok": False, "reason": "missing conn_id"}
+    with _active_calls_lock:
+        entry = _active_calls.get(uuid)
+        if entry is None or not entry.get("live"):
+            return {"ok": True, "uuid": uuid, "already_down": True}
+        conn = entry["conn"]
+        send_lock = entry["send_lock"]
+    payload = build_uuid_break_payload(uuid)
+    with send_lock:
+        with _active_calls_lock:
+            still_live = (uuid in _active_calls
+                          and _active_calls[uuid].get("live"))
+        if not still_live:
+            return {"ok": True, "uuid": uuid, "already_down": True}
+        try:
+            log.info("[%s] [BREAK_COMMAND] barge-in — uuid_break all "
+                     "(flush current + queued playback)", uuid)
+            conn.sendall(payload)
+        except OSError as exc:
+            return {"ok": False, "reason": f"sendall failed: {exc!r}",
+                    "uuid": uuid}
+    return {"ok": True, "uuid": uuid, "bytes_sent": len(payload)}
+
+
 def _playback_client_thread(client: socket.socket, peer) -> None:
     client.settimeout(5.0)
     try:
@@ -1020,6 +1065,21 @@ def _playback_client_thread(client: socket.socket, peer) -> None:
                          result.get("uuid"), result.get("already_down", False))
             else:
                 log.warning("[%s] [HANGUP_INVALID] reason=%r",
+                            req.get("conn_id"), result.get("reason"))
+            try:
+                ack = json.dumps(result, ensure_ascii=False).encode("utf-8")
+                client.sendall(struct.pack(">I", len(ack)) + ack)
+            except OSError:
+                pass
+            return
+        if _req_type == "break_request":
+            result = _dispatch_break_request(req)
+            if result.get("ok"):
+                log.info("[%s] [BREAK_DISPATCHED] already_down=%s",
+                         result.get("uuid"),
+                         result.get("already_down", False))
+            else:
+                log.warning("[%s] [BREAK_INVALID] reason=%r",
                             req.get("conn_id"), result.get("reason"))
             try:
                 ack = json.dumps(result, ensure_ascii=False).encode("utf-8")

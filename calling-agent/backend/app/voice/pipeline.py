@@ -65,6 +65,8 @@ class Transcript:
     # Carried through from AudioSegment (continuation-merge timing anchors).
     speech_start_ts: float = 0.0
     speech_end_ts: float = 0.0
+    # Derived STT confidence (0..1) from the router; None = unknown.
+    confidence: "float | None" = None
 
 
 @dataclass
@@ -280,6 +282,11 @@ class VoicePipeline:
         self._vad_mute_until = 0.0
         self._barge_in_occurred = False
         self._mic_enabled = mic_enabled
+        # Turn-level trace records (one dict per caller turn), enriched as
+        # the turn's stages complete and batch-persisted to the call_turns
+        # table by the bridge at teardown. Capped so a marathon call can't
+        # grow memory unbounded.
+        self.turn_traces: list[dict] = []
         # Turn accumulator: tracks full caller text across segments within one
         # turn. Preserved when barge-in fires so the next STT fragment is merged
         # with prior context. Cleared when TTS completes a clean (non-barge-in)
@@ -658,6 +665,8 @@ class VoicePipeline:
 
                 self._tts_playing = False
                 self._barge_in_occurred = True
+                if self.turn_traces:
+                    self.turn_traces[-1]["barged_in"] = True
                 self._vad_mute_until = 0.0
                 self._speech_frame_streak = 0
                 # The extended post-filler barge-in guard must not outlive the
@@ -1181,6 +1190,7 @@ class VoicePipeline:
                     stt_latency_ms=stt_latency,
                     speech_start_ts=segment.speech_start_ts,
                     speech_end_ts=segment.speech_end_ts,
+                    confidence=getattr(stt_result, "confidence", None),
                 )
 
                 try:
@@ -1505,6 +1515,31 @@ class VoicePipeline:
                 if sink is not None and hasattr(sink, "flush"):
                     sink.turn_speech_end_ts = transcript.speech_end_ts
 
+            # Turn-level trace record. The numbers were always computed —
+            # they just died as log lines. Enriched below as the LLM stages
+            # complete, by the sink when the first audio flushes, and by the
+            # barge-in handler; the bridge batch-persists to call_turns.
+            sink = getattr(self.tts, "_sink", None)
+            state = getattr(self.conversation, "state", None)
+            trace = {
+                "turn_index": len(self.turn_traces),
+                "ts": time.time(),
+                "stage": (str(getattr(state, "conversation_stage", ""))
+                          or None),
+                "language": getattr(state, "language", None) or None,
+                "user_chars": len(effective_text),
+                "stt_latency_ms": round(transcript.stt_latency_ms, 1),
+                "stt_confidence": getattr(transcript, "confidence", None),
+                "speech_end_to_engine_ms": (
+                    round((time.monotonic() - transcript.speech_end_ts)
+                          * 1000.0, 1)
+                    if transcript.speech_end_ts > 0.0 else None),
+            }
+            if len(self.turn_traces) < 500:
+                self.turn_traces.append(trace)
+            if sink is not None and hasattr(sink, "flush"):
+                sink.turn_trace_ref = trace
+
             try:
                 async def _run_generation():
 
@@ -1632,6 +1667,14 @@ class VoicePipeline:
                     if first_result:
 
                         full_text = " ".join(full_text_parts)
+
+                        trace["llm_first_chunk_ms"] = round(first_chunk_ms, 1)
+                        trace["llm_total_ms"] = round(engine_latency, 1)
+                        trace["agent_chars"] = len(full_text)
+                        trace["intent"] = getattr(first_result, "intent",
+                                                  None) or None
+                        trace["is_filler"] = (
+                            getattr(first_result, "intent", "") == "filler")
 
                         logger.info(
                             "[ENGINE] %r -> %r (%.0fms, first_chunk=%.0fms)",

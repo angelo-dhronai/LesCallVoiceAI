@@ -1169,6 +1169,51 @@ class TelephonySession:
                  llm_models_used, llm_fallback_turns, placed_by),
             )
 
+        # Turn-level traces (0012) — deliberately a SEPARATE transaction:
+        # a missing call_turns table (sqlite dev fallback, un-migrated PG)
+        # must never roll back the calls row above.
+        try:
+            self._persist_call_turns(_iso)
+        except Exception as exc:
+            logger.warning("[%s] call_turns persist failed: %r",
+                           self.conn_id, exc)
+
+    def _persist_call_turns(self, _iso):
+        """Batch-insert the pipeline's in-memory turn traces. Idempotent on
+        reconnect upserts via the (call_id, turn_index) unique key."""
+        from shared.db.database import get_db
+
+        traces = list(getattr(self.pipeline, "turn_traces", []) or [])
+        if not traces:
+            return
+        with get_db() as db:
+            row = db.execute("SELECT id FROM calls WHERE conn_id=?",
+                             (self.conn_id,)).fetchone()
+            if not row:
+                return
+            call_id = row["id"]
+            for t in traces:
+                db.execute(
+                    "INSERT INTO call_turns (call_id, turn_index, ts, stage, "
+                    "intent, language, user_chars, agent_chars, "
+                    "stt_latency_ms, stt_confidence, speech_end_to_engine_ms, "
+                    "llm_first_chunk_ms, llm_total_ms, "
+                    "speech_end_to_first_audio_ms, is_filler, barged_in) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT (call_id, turn_index) DO NOTHING",
+                    (call_id, t.get("turn_index"),
+                     _iso(t["ts"]) if t.get("ts") else None,
+                     t.get("stage"), t.get("intent"), t.get("language"),
+                     t.get("user_chars"), t.get("agent_chars"),
+                     t.get("stt_latency_ms"), t.get("stt_confidence"),
+                     t.get("speech_end_to_engine_ms"),
+                     t.get("llm_first_chunk_ms"), t.get("llm_total_ms"),
+                     t.get("speech_end_to_first_audio_ms"),
+                     bool(t.get("is_filler")), bool(t.get("barged_in"))),
+                )
+        logger.info("[%s] call_turns: persisted %d turn traces",
+                    self.conn_id, len(traces))
+
     async def _event_loop(self):
         """Listens for AI pipeline events to capture first_transcript_t."""
         queue = self.hub.subscribe()

@@ -150,13 +150,22 @@ class TelephonySink(AudioSink):
             # number every latency fix targets.
             anchor = getattr(self, "turn_speech_end_ts", 0.0)
             if anchor > 0.0:
+                first_audio_ms = (now - anchor) * 1000.0
                 logger.info(
                     "[%s] [LATENCY] speech_end→first_audio %.0fms "
                     "(flush %.2fs)",
-                    self._conn_id, (now - anchor) * 1000.0,
+                    self._conn_id, first_audio_ms,
                     self.last_flush_duration,
                 )
                 self.turn_speech_end_ts = 0.0
+                # Write the measurement back into the pipeline's turn-trace
+                # record (armed alongside the anchor) so it survives log
+                # rotation via the call_turns table.
+                ref = getattr(self, "turn_trace_ref", None)
+                if ref is not None:
+                    ref["speech_end_to_first_audio_ms"] = round(
+                        first_audio_ms, 1)
+                    self.turn_trace_ref = None
             self._pcm_buffer.clear()
 
             # Phase B & C: Normalization

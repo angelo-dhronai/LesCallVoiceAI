@@ -58,9 +58,8 @@ MARK_FIRST_BEAT = "only the FIRST beat"
 MARK_NO_TIMES = "no times to offer"
 MARK_DEAD_END_RULES = "no way to act"
 MARK_TINY_CAP = "barely covers a greeting"
-MARK_BARE_OPENING = "looping the call at connect"
 ALL_MARKS = (MARK_CALLER_PICKS, MARK_FIRST_BEAT, MARK_NO_TIMES,
-             MARK_DEAD_END_RULES, MARK_TINY_CAP, MARK_BARE_OPENING)
+             MARK_DEAD_END_RULES, MARK_TINY_CAP)
 
 
 def maya_shape(**over) -> dict:
@@ -194,23 +193,25 @@ def test_normalize_termination_bad_root_shape(cop):
     assert any("termination" in n for n in notes)
 
 
-def test_lint_bare_opening(cop):
-    """maya_shape ships the live incident's bare 'Hello' opening."""
-    assert _warned(cop, maya_shape(), MARK_BARE_OPENING)
-    fixed = maya_shape(response_bank={
-        "opening_greeting": "Hello! This is Maya from LesCall. "
-                            "Am I speaking with {contact_name}?"})
-    assert not _warned(cop, fixed, MARK_BARE_OPENING)
+def test_no_lint_for_short_opening(cop):
+    """'Hello' then wait is the intended style — it must never be nagged.
+    (A bare-opening lint shipped and was reverted 2026-07-30: it pushed
+    users into monologue openings.)"""
+    assert not any(
+        "opening" in w.lower()
+        for w in cop._quality_warnings(maya_shape(),
+                                       include_wiring_lints=False))
 
 
-def test_enrich_new_agent_composes_opening(cop):
+def test_enrich_never_touches_short_opening(cop):
+    """Regression pin for the 2026-07-30 incident: a provided short opening
+    ('Hello') must survive enrichment verbatim — the engine, not the script,
+    delivers the identity intro when the caller responds."""
     notes: list[str] = []
     d = maya_shape(identity={"agent_name": "Maya", "company_name": "Acme"})
     cop._enrich_new_agent(d, notes)
-    opening = d["response_bank"]["opening_greeting"]
-    assert opening.startswith("Hello! This is Maya from Acme")
-    assert "{contact_name}" in opening          # outbound shape
-    assert any("identity opening_greeting" in n for n in notes)
+    assert d["response_bank"]["opening_greeting"] == "Hello"
+    assert not any("opening" in n for n in notes)
 
 
 def test_enrich_new_agent_keeps_full_opening(cop):
@@ -224,14 +225,12 @@ def test_enrich_new_agent_keeps_full_opening(cop):
         "Namaste! Acme se Maya bol rahi hoon."
 
 
-def test_enrich_new_agent_inbound_opening_shape(cop):
+def test_enrich_fills_missing_opening_with_short_hello(cop):
     notes: list[str] = []
-    d = maya_shape(identity={"agent_name": "Maya", "company_name": "Acme"},
-                   call_direction="inbound")
+    d = maya_shape(response_bank={})
     cop._enrich_new_agent(d, notes)
-    opening = d["response_bank"]["opening_greeting"]
-    assert "{contact_name}" not in opening
-    assert "How can I help you today?" in opening
+    assert d["response_bank"]["opening_greeting"] == "Hello!"
+    assert any("opening_greeting was empty" in n for n in notes)
 
 
 def test_normalize_connect_shapes(cop):
@@ -253,9 +252,13 @@ def test_normalize_connect_shapes(cop):
 
 def test_system_prompt_teaches_openings(cop):
     p = cop._system_prompt()
-    for pin in ("OPENING LINES MUST IDENTIFY THE AGENT",
+    for pin in ("OPENING STYLE — SHORT GREETING, THEN WAIT",
+                "NEVER rewrite a user's opening",
                 "call_flow.connect", "hello_fastpath", "delivery_guard"):
         assert pin in p, pin
+    # The reverted doctrine must stay gone: it ordered the Copilot to
+    # rewrite short openings into monologues.
+    assert "OPENING LINES MUST IDENTIFY THE AGENT" not in p
 
 
 def test_system_prompt_teaches_termination(cop):

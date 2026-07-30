@@ -910,8 +910,7 @@ burned stage max_turns. Full diagnosis: `deploy/PLAN-connect-hello-loop.md`.
 | Pipeline | Bare hellos excluded from merge-window/drain merges, CONT-MERGE rollbacks, and accumulator prepends (no more `hello hello hello…`). | `_conversation_layer` |
 | STT | Connect window: short segments (<800ms) force the agent's default language instead of `unknown` (kills the Odia/Kannada retry tax); STT floor lowered to 200ms. | `_stt_worker`, `_min_speech_ms` |
 | STT | Empty-streak damper: only the SECOND consecutive empty speaks "couldn't hear you" (was: every one of 4 — fed an echo→empty→sorry loop). | `_empty_fallback_speaks` |
-| Copilot | Bare openings impossible to author: create-time identity opening in `_enrich_new_agent` (CREATE-ONLY), bare-opening quality lint, OPENING doctrine in the system prompt, `call_flow.connect` schema + normalization. | `agent_copilot_api.py` |
-| Config | 3 bare openings rewritten: `maya_lescall_sdr-in/outbound`, `outbound_lead_qualifier-inbound`. | agent YAMLs |
+| Copilot | OPENING doctrine (see correction below) + `call_flow.connect` schema + normalization; `_enrich_new_agent` fills only a MISSING opening, with a short `Hello!`. | `agent_copilot_api.py` |
 
 **Env knobs (all default ON; delivery guard telephony-only by default).**
 `CONNECT_HELLO_FASTPATH` (true) · `CONNECT_DELIVERY_GUARD` (true if
@@ -931,6 +930,19 @@ correctness fixes with no knob.
 tests in `test_copilot_quality_lints.py`. Watchdog/guard decisions are pure
 functions tested via SimpleNamespace with bound methods (same pattern as
 §17). Golden prompts untouched (no prompt-band changes).
+
+**Doctrine correction (2026-07-30, same day).** The first cut of this fix
+also rewrote the 3 bare `Hello` openings into full identity monologues and
+made the Copilot lint/repair bare openings. That was WRONG and is reverted:
+the owner's intended pattern is **short "Hello" → WAIT → the engine speaks
+the identity intro when the caller responds** (the fast-path row above; the
+intro is a shortcut so it rides the TTS disk cache — no LLM, ~0ms synth
+after first play). Openings are back to `Hello`; the bare-opening lint and
+create-time identity-opening composition are deleted; the system-prompt
+doctrine now says both styles are valid and the Copilot must NEVER rewrite
+a user's opening unless asked (`test_enrich_never_touches_short_opening`
+pins this). For short-opening agents, keep `identity.agent_name` /
+`company_name` filled — the connect intro is composed from them.
 
 **Open item (5.2 audit).** In call b217ca93 (2026-07-29 11:04) echo
 segments born INSIDE the 3.2s ECHO-MUTE window still reached STT — the

@@ -1,8 +1,12 @@
 # PLAN — Repeated "hello"s at call connect / agent long pause
 
-**Date:** 2026-07-30 · **Status:** IMPLEMENTED 2026-07-30 (all phases;
-see RUNBOOK §18 for the operational reference; NOT yet deployed —
-bind-mounted containers serve stale code until restarted)
+**Date:** 2026-07-30 · **Status:** LIVE 2026-07-30 (all phases; RUNBOOK §18
+is the operational reference). **P0 + the Copilot opening guards were
+corrected the same day**: the owner wants openings to STAY a short "Hello"
+(greet → wait → engine speaks the identity intro on the caller's response),
+so the opening rewrites were reverted and the bare-opening lint/enricher
+composition removed — loop prevention is engine-side only (P1.2/P2/P3).
+See RUNBOOK §18 "Doctrine correction".
 **Symptom (user report):** right after connect, the caller says "hello" repeatedly;
 the agent takes a long pause and "keeps waiting" through the hellos. Most calls
 show this at connect.

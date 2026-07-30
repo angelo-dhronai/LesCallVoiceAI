@@ -2116,56 +2116,26 @@ def _slot_identity_tokens(slot: dict) -> set[str]:
     return toks
 
 
-_BARE_OPENING_CORE = {
-    "hello", "hallo", "helo", "hullo", "hi", "hey", "namaste", "namaskar",
-    "ji", "हेलो", "हैलो", "हलो", "नमस्ते", "नमस्कार", "जी",
-    "હેલો", "હલો", "નમસ્તે", "નમસ્કાર", "જી",
-}
-
-
-def _is_bare_opening(text: str) -> bool:
-    """A greeting-word-only opening ("Hello", "Hi ji", "नमस्ते"). After it
-    plays the caller hears silence and answers "hello?", which starts the
-    measured connect hello loop — every agent must open with identity."""
-    toks = re.findall(r"[0-9a-zऀ-ॿ઀-૿]+",
-                      (text or "").lower())
-    return bool(toks) and len(toks) <= 4 and all(
-        t in _BARE_OPENING_CORE for t in toks)
-
-
 def _enrich_new_agent(d: dict, notes: list[str]) -> None:
     """CREATE-ONLY: derive stage wiring (collect / advance_when / role /
     pacing), qa signals, defer_line and slot types from the user's own
     content. Fills-empty-only; a second application is a no-op."""
-    # 0. OPENING — a missing or bare-greeting opening_greeting gets a full
-    # identity line so no new agent can ship the connect hello loop. Runs
-    # before the stages guard: it needs identity, not stages.
+    # 0. OPENING — only a MISSING opening is filled, and only with a short
+    # "Hello!": the platform default is greet-then-WAIT — the engine speaks
+    # the full identity intro (composed from identity fields) the moment the
+    # caller responds. A provided opening is NEVER touched, whatever its
+    # length: rewriting a user's greeting is the incident this comment
+    # commemorates (2026-07-30).
     rb = d.get("response_bank")
     if not isinstance(rb, dict):
         rb = {}
         d["response_bank"] = rb
-    _opening = str(rb.get("opening_greeting") or "").strip()
-    if not _opening or _is_bare_opening(_opening):
-        ident = d.get("identity") if isinstance(d.get("identity"), dict) else {}
-        agent = str(ident.get("agent_name") or "").strip()
-        company = str(ident.get("company_name") or "").strip()
-        who = ""
-        if agent and company and agent.lower() not in company.lower():
-            who = f"{agent} from {company}"
-        else:
-            who = company or agent
-        if who:
-            if str(d.get("call_direction") or "") == "outbound":
-                rb["opening_greeting"] = (
-                    f"Hello! This is {who}. "
-                    "Am I speaking with {contact_name}?")
-            else:
-                rb["opening_greeting"] = (
-                    f"Hello! This is {who}. How can I help you today?")
-            notes.append(
-                "composed a full identity opening_greeting — a bare 'Hello' "
-                "opening leaves the caller in silence and loops the call at "
-                "connect")
+    if not str(rb.get("opening_greeting") or "").strip():
+        rb["opening_greeting"] = "Hello!"
+        notes.append(
+            "opening_greeting was empty — set to a short 'Hello!' (the "
+            "agent greets, waits, and introduces itself the moment the "
+            "caller responds)")
 
     cf = d.get("call_flow") or {}
     stages = cf.get("stages") if isinstance(cf, dict) else None
@@ -2616,19 +2586,11 @@ def _quality_warnings(merged: dict,
                 "caller proposes the time) or add real calendar.mock_slots."
             )
 
-    # Opening sanity: a bare greeting opening re-creates the measured
-    # connect hello loop (caller answers "hello?", agent has nothing worth
-    # replaying, both sides reset each other).
-    _opening = str(((merged.get("response_bank") or {})
-                    .get("opening_greeting")) or "").strip()
-    if _is_bare_opening(_opening):
-        w.append(
-            "response_bank.opening_greeting is a bare greeting "
-            f"({_opening!r}) — after it plays the caller hears silence and "
-            "answers 'hello?', looping the call at connect. Make it a full "
-            "identity line: who is speaking, from which company, and the "
-            "opening question."
-        )
+    # NOTE deliberately NO lint on short/bare openings: "Hello" then wait is
+    # the intended platform style — the engine's connect fast path speaks the
+    # identity intro when the caller responds. (A bare-opening lint shipped
+    # 2026-07-30 and was reverted the same day: it nagged users into
+    # monologue openings.)
 
     # Termination sanity: rules that can never fire, or caps that would cut
     # every call short, must be flagged before they reach a live agent.
@@ -4639,7 +4601,7 @@ CALL-REPAIR BEHAVIOUR THE PLATFORM APPLIES TO EVERY AGENT (know this before you 
 - ENDING CALLS (platform-wide): before wrapping up, every agent asks the caller's permission ("anything else I can help you with?") and only says goodbye after the caller confirms they're done — then the PLATFORM hangs the call up automatically after the goodbye. The platform also ends the call on the caller's own goodbye, after the couldn't-hear reprompts go unanswered (silence hangup), and — by default — whenever the agent itself judges the conversation is over per its END-CALL RULES (see call_flow.termination).
 - CALLBACK REQUESTS & BUSY CALLERS (platform-wide): when a caller says "call me later / in 10 minutes / tomorrow" or brushes off with "sorry, not free right now", every agent stops pitching, pins down ONE specific time, confirms it with a goodbye, and the platform HANGS UP the call by itself right after that confirmation — then automatically places a real follow-up call at the agreed time, opening with a polite reference to the earlier conversation. This is on for all agents by default; a business can opt an agent out of the automatic calling (follow_up.auto_execute enabled false) but the time pin-down stays.
 - CALL-ENDING REQUIREMENTS GO IN call_flow.termination, NOT IN PROMPT TEXT: when a user asks for anything about cutting/ending/hanging up calls — "end the call once the booking is done", "hang up if they abuse the agent", "don't let calls run past 10 minutes", "cut the call when they say chalo rakhta hu" — map it into call_flow.termination (end_conditions for judgment-based rules, farewell_patterns for exact caller phrases, max_call_minutes for duration caps, silence_hangup for no-response behaviour). That section is real engine wiring: the platform physically ends the call from it. A guardrails rule or stage-goal sentence saying "end the call" does NOTHING by itself — never implement a termination request as prompt text alone, and never claim call-cutting behaviour you did not write into termination. Do NOT add rules like "never reschedule / never ask for a better time", which fight the platform's callback pin-down. After setting it, tell the user plainly which of their conditions now end the call.
-- OPENING LINES MUST IDENTIFY THE AGENT: response_bank.opening_greeting is the first thing the caller hears — it must say who is speaking and from which company, then ask the opening question ("Hello! This is Maya from LesCall. Am I speaking with {{contact_name}}?"). NEVER write or preserve a bare greeting ("Hello", "Hi", "नमस्ते") as the opening: after 0.4s of "Hello" the caller hears silence, answers "hello?", and the call loops at connect (measured live — most affected calls ended in a hang-up). When editing any agent whose opening is a bare greeting, repair it to a full identity line and tell the user. Connect-window protections (call_flow.connect: hello_fastpath, delivery_guard) default ON for every agent — configure them only when the business explicitly asks.
+- OPENING STYLE — SHORT GREETING, THEN WAIT (platform-wide): a short opening like "Hello" is the intended default. The agent greets, WAITS for the caller, and the moment the caller responds the PLATFORM itself speaks a full identity intro composed from identity.agent_name and identity.company_name — instantly, with no LLM turn and cached audio. This is engine wiring, so a short opening does NOT stall or loop the call. NEVER rewrite a user's opening — not short-to-long, not long-to-short — unless they ask for different words. A business that wants the full intro spoken up front simply writes the full line into response_bank.opening_greeting; both styles are fully supported. For agents with a short opening, make sure identity.agent_name and identity.company_name are filled in — the connect intro is composed from them. Connect-window protections (call_flow.connect: hello_fastpath, delivery_guard) default ON for every agent — configure them only when the business explicitly asks.
 So if a user reports "it keeps repeating hello" or "it won't start its script", explain what actually happens rather than guessing — and do NOT rewrite their opening line to dodge a platform rule unless they want different words. Changing a greeting they liked, to work around behaviour you misdiagnosed, is a failure.
 If a tool result includes "notes", the platform auto-corrected or DROPPED some of your input — read them; if content was dropped, put it where the note says (usually a stage goal) with update_agent in the SAME turn.
 If a tool result includes non-empty "quality" warnings, the agent is too shallow — you MUST resolve every one with update_agent in the SAME turn before telling the user it's ready. Do not report a hollow agent as done.

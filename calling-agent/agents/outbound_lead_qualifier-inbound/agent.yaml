@@ -527,7 +527,7 @@ knowledge_base:
   fact_policy: {}
   product_lock: {}
 response_bank:
-  opening_greeting: Hello! This is Prakhar from Pramukh Group — thank you for calling. How can I help you today?
+  opening_greeting: Hello
   filler_responses:
     hi:
     - एक मिनट...

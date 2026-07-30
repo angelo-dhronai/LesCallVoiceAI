@@ -1153,7 +1153,7 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
             # otherwise succeed.
             if "type" in s and str(s.get("type")).strip().lower() not in (
                     "", "text", "number", "money", "enum", "boolean",
-                    "phone", "date", "time", "location"):
+                    "phone", "email", "date", "time", "location"):
                 notes.append(f"slot '{s['name']}' type {s['type']!r} invalid — cleared")
                 s["type"] = ""
             elif isinstance(s.get("type"), str):
@@ -1165,7 +1165,7 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
             elif isinstance(s.get("merge_policy"), str):
                 s["merge_policy"] = s["merge_policy"].strip().lower()
             if "confirm_readback" in s and str(s.get("confirm_readback")).strip().lower() not in (
-                    "", "verbatim", "digit_groups_2"):
+                    "", "verbatim", "digit_groups_2", "spelled"):
                 notes.append(f"slot '{s['name']}' confirm_readback {s['confirm_readback']!r} invalid — cleared")
                 s["confirm_readback"] = ""
             elif isinstance(s.get("confirm_readback"), str):
@@ -2311,13 +2311,36 @@ def _enrich_new_agent(d: dict, notes: list[str]) -> None:
     # regex capture. Legacy-named slots stay untyped (typing them kills
     # their name-keyed extractor).
     _qty = re.compile(r"quantity|qty|count|volume|number_of|how_many", re.I)
+    _emailish = re.compile(r"e[-_]?mail", re.I)
+    _phoneish = re.compile(r"phone|mobile|contact[-_]?number|whatsapp", re.I)
     for slot in slots:
         sname = str(slot.get("name") or "")
         if not sname or sname.lower() in _LEGACY_SLOT_NAMES:
             continue
-        if str(slot.get("type") or ""):
-            continue
-        slot["type"] = "number" if _qty.search(sname) else "text"
+        if not str(slot.get("type") or ""):
+            if _emailish.search(sname):
+                slot["type"] = "email"
+            elif _phoneish.search(sname):
+                slot["type"] = "phone"
+            else:
+                slot["type"] = "number" if _qty.search(sname) else "text"
+        # B5 (2026-07-30): contact slots ship fully provisioned — the engine
+        # captures/validates/reads back emails deterministically (spelled
+        # read-back, pending-until-confirmed, capped asks → unresolved flag).
+        # The engine also defaults these at runtime; writing them into the
+        # YAML makes the contract visible to the user.
+        if str(slot.get("type")) == "email":
+            if str(slot.get("merge_policy") or "free") == "free":
+                slot["merge_policy"] = "confirm"
+            if not str(slot.get("confirm_readback") or ""):
+                slot["confirm_readback"] = "spelled"
+            if int(slot.get("max_asks") or 0) <= 0:
+                slot["max_asks"] = 2
+            notes.append(f"slot '{sname}': deterministic email capture "
+                         "provisioned (confirm + spelled read-back + 2-ask cap)")
+        elif (str(slot.get("type")) == "phone"
+                and not str(slot.get("confirm_readback") or "")):
+            slot["confirm_readback"] = "digit_groups_2"
 
 
 def _quality_warnings(merged: dict,
@@ -4586,7 +4609,7 @@ DEFINITION FIELDS you may set (all optional — deep-merged onto defaults). SHAP
 - languages MUST be an OBJECT, never a list: {{"supported": ["hi","en"], "default": "hi", "allow_code_mixing": true, "stt_forced_language": "", "tts_voices": {{"hi": {{"model":"bulbul:v3","speaker":"simran","pace":1.15}}, "en": {{...}}}}}}. tts_voices lives INSIDE languages — never at the top level. pace = speaking speed 0.5–2.0 (1.0 natural, 1.15 platform default) and is PER LANGUAGE. SPEED COMPLAINTS ('talks too fast', 'too slow' — overall or in one language): do NOT silently change anything. FIRST tell the user the current setting and the scale, read from the agent (get_agent's spoken_surfaces.pace has it), e.g. 'LesCall currently speaks at pace 1.15 on a 0.5–2.0 scale, where 1.0 is natural' — THEN ask what they'd prefer (slower or faster, or an exact number) and apply their choice to that language's pace in ±0.1 steps via update_agent. Never change the voice to fix speed.
 - call_direction: the STRING "inbound" or "outbound" — never a list. If the user wants BOTH, use "inbound" — the platform automatically applies the outbound approach whenever it places the call.
 - call_flow: {{"call_goal": "one-sentence mission", "stages": [{{id, order, goal, turns_until_advance, role, collect: [slot names], advance_when: {{all_collect_filled|slots|min_turns|intent|appointment_captured, max_turns: N (time escape — the stage also advances at turn N even if the condition never fires)}}, branches: [{{when_intent: affirmation|negation|question, goto: STAGE_ID, max_takes, actions: [capture_phone|promise_whatsapp_media|book_visit|schedule_callback]}}]}}], "scheduling": {{style: exact_n|flexible — flexible means the CALLER proposes the time; SET flexible whenever the user says not to suggest times or to ask when the caller is free; exact_n (the default) makes the platform force N specific time offers every turn, offer_count, enabled: false when the business doesn't book}}, "callback_policy": {{enabled, capture_slot, responses: {{lang: str}}, counts_as_decline}}, "completed_when": {{required_slots, require_appointment}}, "termination": {{"end_conditions": ["plain-English rules for when the agent should wrap up and END the call — e.g. 'once the site visit is booked and confirmed, thank them and end', 'if the caller becomes abusive, apologise briefly and end immediately' — injected into every turn as END-CALL RULES the agent acts on"], "farewell_patterns": ["extra caller phrases in ANY language/script that mean goodbye and hang up deterministically, e.g. 'chalo rakhta hu' — NEVER single common words like 'ok'/'no'/'haan', they would cut live calls"], "llm_end_call": true (default — lets the agent itself end the call after its goodbye; set false ONLY if the business wants hangups on caller-goodbye alone), "silence_hangup": {{"enabled": true, "grace_s": 10}} (after both couldn't-hear reprompts go unanswered, say goodbye and end instead of holding the line open), "max_call_minutes": N (hard call-length ceiling — one polite wrap-up line, then the platform ends the call even mid-conversation; 0/omitted = no cap)}}, "connect": {{"hello_fastpath": true (default — an early bare "hello?" from the caller gets an instant identity intro instead of a slow LLM turn), "delivery_guard": true (default — during the first seconds a short "hello?" cannot cancel an agent reply the caller has not heard yet); set either false ONLY if the business explicitly wants the protection off}}}}. Stage roles: greeting|confirm_person|discovery|pitch|recommend|scheduling|confirmation|closing. Write goals in ENGLISH as instructions (the agent replies in the caller's language). STAGE WIRING IS WHAT MAKES THE FLOW ACTUALLY RUN: every stage SHOULD carry role; a stage whose goal asks for slots lists them in collect and uses advance_when {{all_collect_filled: true, max_turns: 6}}; a yes/no confirmation stage gets turns_until_advance 2-3 or advance_when {{intent: affirmation, max_turns: 3}}; NEVER leave a mid-flow stage needing 8+ caller turns — one such stage consumes an entire call and the rest of your flow never plays (this is exactly how a live agent ignored its whole script). If you omit the wiring at create time the platform derives it from the goals and slots — but wiring you write explicitly always wins.
-- slots (TOP-LEVEL list — the qualification schema, the heart of data capture): [{{name, priority (lower asked first), required, label, question: {{hi/en/gu: exact wording}}, type: text|number|money|enum|boolean|phone|date|time|location, enum_values, enum_synonyms, depends_on: [slot names never asked before], merge_policy: free|correction_gated|confirm, confirm_readback: ""|verbatim|digit_groups_2 (phone in 2-digit groups), max_asks (2 recommended), reask_question: {{lang}}}}]. EVERY new agent gets slots for what it must collect, with questions in EVERY supported language.
+- slots (TOP-LEVEL list — the qualification schema, the heart of data capture): [{{name, priority (lower asked first), required, label, question: {{hi/en/gu: exact wording}}, type: text|number|money|enum|boolean|phone|email|date|time|location, enum_values, enum_synonyms, depends_on: [slot names never asked before], merge_policy: free|correction_gated|confirm, confirm_readback: ""|verbatim|digit_groups_2 (phone in 2-digit groups)|spelled (email letter-by-letter), max_asks (2 recommended), reask_question: {{lang}}}}]. EVERY new agent gets slots for what it must collect, with questions in EVERY supported language. EMAIL/PHONE CAPTURE IS ENGINE-OWNED (platform-wide): type an email slot "email" — the ENGINE then buffers spelled letters, assembles + validates the address, reads it back letter-by-letter, and confirms or flags it unresolved for follow-up. Write stage goals so the agent asks for the email ONCE and moves on; NEVER script the agent to ask callers to "speak slowly" (slow spelling fragments worse) and never promise letter-by-letter read-back in the goal — the engine does it.
 - knowledge_base: portfolio_prompt_text (plain-English paragraph — injected every turn), portfolio_section_label, locations, objection_patterns, known_projects {{"lowercase key": ["Canonical Name", "location or price"]}}, catalog [{{id, name, location, configurations, price_range, availability, positioning_tag, pitch_points, aliases, facts}}], match_rules [{{when: {{slot: value or "<=40L"}}, recommend: [ids], reason}}], pricing_policy {{mode: on_request|state_freely|defer, defer_line: {{lang}}}}, stt_corrections {{use_builtin_tables: false for non-real-estate agents}}
 - brand: spoken_company_name, positioning_tagline, credibility_markers [str], trust_proofs [top 2-3 — objection ammo], regions_served, contact_phone, whatsapp_number
 - response_bank: opening_greeting (ONE plain string in the default language), identity_responses {{lang: str}}, objection_responses {{lang: [str]}}, objection_playbook [{{id, patterns: [caller phrasings], answer: {{lang: str — may use {{trust_proofs}}}}, prompt_guidance}}], closing_responses {{lang: str}}, canned_phrases [{{patterns, responses: {{lang}}}}], graceful_close {{lang: str}}

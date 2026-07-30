@@ -217,6 +217,12 @@ class LanguageConfig:
     # (accent follows conversation state — English replies could go out
     # hi-IN). Per-agent opt-out for TTS_LANG_FROM_TEXT.
     tts_lang_from_text: bool = True
+    # When True (platform default), mid-call language switches require word
+    # EVIDENCE inside the utterance (density-scored votes; see conversation
+    # _evidence_switch_decision) instead of a single word/label. False
+    # restores the legacy single-signal switching. Per-agent opt-out for
+    # LANG_EVIDENCE_SWITCH.
+    evidence_switch: bool = True
     # Language of the opening greeting ('' = languages.default — today).
     greeting_language: str = ""
     # Hint that the greeting should be bilingual (informational for now).
@@ -799,6 +805,7 @@ class AgentDefinition:
             stt_forced_language=_as_str(lang_d, "stt_forced_language"),
             allow_code_mixing=_as_bool(lang_d, "allow_code_mixing", False),
             tts_lang_from_text=_as_bool(lang_d, "tts_lang_from_text", True),
+            evidence_switch=_as_bool(lang_d, "evidence_switch", True),
             greeting_language=_as_str(lang_d, "greeting_language"),
             bilingual_greeting=_as_bool(lang_d, "bilingual_greeting", False),
             closing_language_policy=_as_str(lang_d, "closing_language_policy"),
@@ -928,9 +935,9 @@ class AgentDefinition:
         )
 
         _MERGE_POLICIES = ("free", "correction_gated", "confirm")
-        _READBACKS = ("", "verbatim", "digit_groups_2")
+        _READBACKS = ("", "verbatim", "digit_groups_2", "spelled")
         _SLOT_TYPES = ("", "text", "number", "money", "enum", "boolean",
-                       "phone", "date", "time", "location")
+                       "phone", "email", "date", "time", "location")
         slots = []
         for s in (d.get("slots") or []):
             if not isinstance(s, dict) or not s.get("name"):

@@ -391,6 +391,13 @@ class STTRouter:
     # Public API
     # ------------------------------------------------------------------
 
+    def set_stream_language(self, code: str) -> None:
+        """A4a: forward a language pin to the streaming primary (no-op for
+        the plain HTTP provider — its language comes per request)."""
+        fn = getattr(self._primary, "set_language", None)
+        if callable(fn):
+            fn(code)
+
     async def transcribe(
         self,
         audio_bytes: bytes,
@@ -417,6 +424,11 @@ class STTRouter:
 
         now = time.monotonic()
 
+        # A4c: the Whisper fallback accepts an ISO-639 hint — the stabilized
+        # conversation language stops "हाँजी?" coming back as ", angie?".
+        _fb_lang = self._resolve_script_retry_language(
+            language, default_language) or language
+
         # ── Sarvam rate-limited: route directly to fallback ──────────────
         if now < self._sarvam_rl_until:
             remaining = self._sarvam_rl_until - now
@@ -425,9 +437,9 @@ class STTRouter:
                 remaining,
             )
             text, _, _, _, conf = await self._try_provider(
-                self._fallback, "fallback", audio_bytes, sample_rate, language
+                self._fallback, "fallback", audio_bytes, sample_rate, _fb_lang
             )
-            return STTResult(text=text, confidence=conf)
+            return STTResult(text=text, confidence=conf, source="fallback")
 
         # ── Try primary (Sarvam) ─────────────────────────────────────────
         try:
@@ -438,9 +450,9 @@ class STTRouter:
             # Apply exponential backoff; reset on the next successful call
             self._apply_sarvam_backoff(exc)
             text, _, _, _, conf = await self._try_provider(
-                self._fallback, "fallback", audio_bytes, sample_rate, language
+                self._fallback, "fallback", audio_bytes, sample_rate, _fb_lang
             )
-            return STTResult(text=text, confidence=conf)
+            return STTResult(text=text, confidence=conf, source="fallback")
 
         if text:
             # Successful Sarvam call → reset rate-limit strike counter
@@ -471,13 +483,13 @@ class STTRouter:
         # ── Primary had a genuine API/network error → try fallback ───────
         logger.info("[STT] Primary errored — routing to fallback provider")
         text, _, _, _, conf = await self._try_provider(
-            self._fallback, "fallback", audio_bytes, sample_rate, language
+            self._fallback, "fallback", audio_bytes, sample_rate, _fb_lang
         )
         if text:
             logger.info("[STT] Fallback succeeded: %r", text)
         else:
             logger.warning("[STT] Both providers failed — returning empty transcript")
-        return STTResult(text=text, confidence=conf)
+        return STTResult(text=text, confidence=conf, source="fallback")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -535,6 +547,32 @@ class STTRouter:
         Without a language hint, today's drop behaviour is preserved.
         """
         self.script_reject_count += 1
+
+        # A4b (2026-07-30): mixed-script salvage BEFORE any retry round-trip.
+        # Sarvam's per-segment detection can wrap ONE junk-script token around
+        # a perfectly good transcript ('ਇਹ। K L W Y N' — the letters were
+        # right); wholesale rejection then costs a 2s retry + a Whisper call
+        # and usually a worse transcript. Drop only the unsupported-script
+        # tokens and re-validate what remains.
+        salvage_tokens = [
+            tok for tok in reject.raw_text.split()
+            if not _UNSUPPORTED_SCRIPT_RE.search(tok)
+        ]
+        if salvage_tokens and len(salvage_tokens) < len(reject.raw_text.split()):
+            salvaged_raw = " ".join(salvage_tokens)
+            salvaged, _salv_reason = validate_transcript_ex(salvaged_raw)
+            if salvaged:
+                salvaged = self._post_process(salvaged, language)
+                self.script_recovered_count += 1
+                logger.warning(
+                    "[STT] Script salvage: kept %r from rejected %r "
+                    "(dropped %d junk-script token(s))",
+                    salvaged, reject.raw_text,
+                    len(reject.raw_text.split()) - len(salvage_tokens),
+                )
+                return STTResult(text=salvaged, detected_language=None,
+                                 confidence=None, source="primary")
+
         retry_lang = self._resolve_script_retry_language(language, default_language)
 
         if not retry_lang:
@@ -551,10 +589,18 @@ class STTRouter:
             reject.raw_text, reject.detected_language, retry_lang,
         )
 
+        # A4 fix (2026-07-30): with the streaming provider as primary, the
+        # retry used to call the stream's transcribe() — which only FLUSHES
+        # (the turn's audio was already consumed server-side), so every
+        # "forced-language retry" silently retried nothing and came back
+        # empty. Retry through the provider's HTTP rescue client (same key,
+        # same semantics) which actually re-uploads audio_bytes.
+        _retry_provider = getattr(self._primary, "_rescue", None) or self._primary
+
         retry_reject: _RejectedTranscript | None = None
         try:
             text, had_error, detected_lang, retry_reject, conf = await self._try_provider(
-                self._primary, "primary-script-retry",
+                _retry_provider, "primary-script-retry",
                 audio_bytes, sample_rate, retry_lang,
             )
         except SarvamRateLimitError as exc:
@@ -571,7 +617,7 @@ class STTRouter:
                 text, detected_lang, retry_lang,
             )
             return STTResult(text=text, detected_language=detected_lang,
-                             confidence=conf)
+                             confidence=conf, source="primary-script-retry")
 
         # Retry rejected/empty/errored → audio contained speech, so this is
         # fallback-eligible (unlike a clean-empty no-speech segment).
@@ -591,7 +637,8 @@ class STTRouter:
             )
         return STTResult(text=fb_text,
                          detected_language=fb_lang if fb_text else None,
-                         confidence=fb_conf if fb_text else None)
+                         confidence=fb_conf if fb_text else None,
+                         source="fallback")
 
     def _post_process(self, text: str, language: str) -> str:
         if not text:

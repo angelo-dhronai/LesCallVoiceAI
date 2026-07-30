@@ -93,10 +93,33 @@ _EMOJI_RE = re.compile(
 
 # Gujarati copula markers in Devanagari (STT sometimes writes Gujarati in
 # Devanagari when language_code=hi-IN). These copulas are exclusively Gujarati
-# and NEVER appear as word-stems in Hindi. One hit is sufficient for detection.
-# Word-boundary anchors prevent false matches inside Hindi words like "छोटा".
+# and NEVER appear as word-stems in Hindi.
+#
+# Boundary rule (2026-07-30 incident): Python's \w EXCLUDES combining marks
+# (matras, virama), so `(?<!\w)` fired MID-WORD after a matra — everyday
+# Hindi "अच्छे" matched marker "छे" (the virama ् before छ read as a word
+# edge) and one such hit flipped a live Hindi call to Gujarati. A marker is
+# a word only when not touching ANY Devanagari codepoint, marks included.
+_DEVA_BLOCK = "ऀ-ॿ"
 _STRONG_GU_DEVA_RE = re.compile(
-    r"(?<!\w)(?:छे|छो|छु|छुं|छीए|केम|तमे|नथी|हसे|जोइए)(?!\w)"
+    rf"(?<![{_DEVA_BLOCK}])(?:छे|छो|छु|छुं|छीए|केम|तमे|नथी|हसे|जोइए)"
+    rf"(?![{_DEVA_BLOCK}])"
+)
+
+# Weak (ambiguous) Gujarati-in-Devanagari markers — 2+ boundary-clean hits
+# required. Same Devanagari-block boundaries as the strong tier: the old
+# substring scan matched "हती" inside Hindi "चाहती" etc. Longer alternatives
+# listed before their prefixes ("जोईए" before "जोई") for clarity — the regex
+# engine's backtracking would resolve them anyway.
+_WEAK_GU_DEVA_RE = re.compile(
+    rf"(?<![{_DEVA_BLOCK}])(?:"
+    r"जोईए|जोइये|जोवुं|जोवा|जोई|"
+    r"माने|तमने|अमने|अमारा|तमारा|"
+    r"बरोबर|सारुं|सारु|माजामा|"
+    r"केमछो|केम छो|"
+    r"शुं|क्यां|आवजो|हतु|हती|अत्यारे|"
+    r"बतावो|जणावो"
+    rf")(?![{_DEVA_BLOCK}])"
 )
 
 
@@ -461,6 +484,39 @@ _GUJARATI_PATTERNS = [
     "nathi", "nahi", "haji",
 ]
 
+# ── A2 (2026-07-30): evidence-density language switching ────────────────────
+# The response language switches on per-word EVIDENCE inside the utterance,
+# not on a single word or a single Sarvam label. Every word casts one vote
+# (en/hi/gu) or none; names, digits, spelled letters, emails, unknown Latin
+# tokens and bare acknowledgements are NEUTRAL. See _evidence_switch_decision.
+LANG_EVIDENCE_SWITCH = os.environ.get(
+    "LANG_EVIDENCE_SWITCH", "true").lower() == "true"
+
+# English *function* words are the only Latin tokens that vote en — a name
+# ("alvin anthony") or brand string must never read as an English switch.
+# Deliberately absent: to/me/in/us/do/he/may (all common romanized-Hindi
+# homographs: तो/में/उस/दो/है/मैं), and every bare ack (see the neutral set).
+_EN_FUNCTION_WORDS = frozenset({
+    "i", "you", "we", "they", "she", "it", "my", "your", "our", "their",
+    "him", "her", "am", "is", "are", "was", "were", "does", "did",
+    "have", "has", "had", "will", "would", "can", "could", "should",
+    "shall", "must", "the", "this", "that", "these", "those", "there",
+    "what", "when", "where", "which", "who", "how", "why", "not",
+    "want", "need", "tell", "know", "speak", "talk", "send", "give",
+    "help", "please", "about", "with", "from", "for", "and", "but",
+    "or", "if", "because", "of", "on", "at", "im", "i'm", "don't",
+    "dont", "can't", "cant",
+})
+
+# Bare acknowledgements/greetings carry no language: hi/gu speakers say
+# "yes yes" freely and en speakers say "haan" back — none of these may vote.
+_SCORER_ACK_NEUTRAL = frozenset({
+    "yes", "no", "ok", "okay", "yeah", "yep", "hmm", "hn", "huh",
+    "hello", "hallo", "hi", "hey", "bye", "thanks", "thank",
+    "haan", "haanji", "hanji", "ha", "ji", "jee", "na", "nahi", "nahin",
+    "theek", "thik", "accha", "acha", "achha", "arre", "are", "oh",
+})
+
 _LANG_CLASSIFY_PROMPT = (
     "Classify the dominant language of this text.\n"
     "Options: English, Hindi, Gujarati\n"
@@ -471,10 +527,55 @@ _LANG_CLASSIFY_PROMPT = (
 
 _LANG_NAME_TO_CODE = {"english": "en", "hindi": "hi", "gujarati": "gu"}
 
+# ── B2/B3 (2026-07-30): deterministic contact capture ───────────────────────
+# When the engine has asked for an email, the caller's spelled/spoken reply
+# is buffered, assembled and read back deterministically — the LLM never
+# invents, confirms, or stores these values.
+CAPTURE_MODE_ENV = os.environ.get("CAPTURE_MODE", "true").lower() == "true"
+
+_CAPTURE_READBACK = {
+    "en": "Let me confirm your email: {spelled}. Is that correct?",
+    "hi": "मैं आपका ईमेल कन्फर्म कर लेता हूँ: {spelled} — क्या यह सही है?",
+    "gu": "હું તમારું ઈમેલ કન્ફર્મ કરી લઉં: {spelled} — બરાબર છે?",
+}
+_CAPTURE_REASK = {
+    "en": ("Sorry, I couldn't catch the full email. Please say it once "
+           "more in one go — for example: name, at, gmail, dot com."),
+    "hi": ("माफ़ कीजिए, पूरा ईमेल समझ नहीं आया। कृपया एक बार में पूरा "
+           "बोलिए — जैसे: name, at, gmail, dot com."),
+    "gu": ("માફ કરશો, પૂરું ઈમેલ સમજાયું નહીં. કૃપા કરીને એક જ વારમાં "
+           "આખું બોલો — જેમ કે: name, at, gmail, dot com."),
+}
+_CAPTURE_CONFIRMED = {
+    "en": "Perfect, I've noted it.",
+    "hi": "बहुत बढ़िया, मैंने नोट कर लिया।",
+    "gu": "સરસ, મેં નોંધી લીધું.",
+}
+_CAPTURE_UNRESOLVED = {
+    "en": ("No problem — let's not worry about the email right now; "
+           "our team will sort it out with you later."),
+    "hi": ("कोई बात नहीं — ईमेल अभी रहने देते हैं; हमारी टीम बाद में "
+           "आपसे ले लेगी।"),
+    "gu": ("કંઈ વાંધો નહીં — ઈમેલ અત્યારે રહેવા દઈએ; અમારી ટીમ પછીથી "
+           "તમારી પાસેથી લઈ લેશે."),
+}
+
 
 def _pattern_score(text: str, patterns: list[str]) -> int:
     words = set(text.split())
     return sum(1 for p in patterns if p in words)
+
+
+# A2 scorer vote sets: romanized words that appear in BOTH pattern lists
+# ("nahi", "bolo", …) are ambiguous → neutral; ack-tier words are neutral
+# regardless of which list carries them.
+_HI_ROMAN_VOTE_WORDS = (
+    frozenset(_HINDI_PATTERNS) - frozenset(_GUJARATI_PATTERNS)
+    - _SCORER_ACK_NEUTRAL)
+_GU_ROMAN_VOTE_WORDS = (
+    frozenset(_GUJARATI_PATTERNS) - frozenset(_HINDI_PATTERNS)
+    - _SCORER_ACK_NEUTRAL)
+_SCORER_STRIP_CHARS = ".,!?;:।॥()[]{}'\"`-–—…"
 
 
 _SLOT_HOUR_RE = re.compile(r"(\d{1,2}):(\d{2})\s*(AM|PM)", re.IGNORECASE)
@@ -755,6 +856,18 @@ class ConversationRouter:
         self._name_confirmed: bool = False
         self._name_pending_turn: int = 0   # turn index when _name_pending was set
         self._rag_context: str = ""        # populated from documents before each LLM call
+        # A2 evidence-density switching state (2026-07-30): Tier-2 pending
+        # target + oscillation-guard anchor. Tier-0 inputs: the STT source of
+        # the current turn (set by the pipeline before process_stream —
+        # Whisper/script-retry recoveries are mishear-prone and never vote)
+        # and the contact-capture slot (B2 — spelled emails/names never vote).
+        self._pending_lang_switch: str | None = None
+        self._last_evidence_switch_turn: int = -10
+        self._turn_stt_source: str = "primary"
+        self._capture_slot: str | None = None   # B2 capture mode (contact slots)
+        self._capture_buf: list[str] = []
+        self._capture_buf_ts: float = 0.0
+        self._capture_fallback_said: set[str] = set()
 
         # Call context — direction defaults to the agent's configured type;
         # the telephony bridge overrides per call via set_call_context()
@@ -1350,6 +1463,10 @@ class ConversationRouter:
         # the caller's previous utterance can supersede this whole turn.
         self.begin_turn_transaction(text)
 
+        # B2: refresh capture-mode state FIRST — the language tiering (A3)
+        # and the pipeline's endpointing/STT forcing read it this turn.
+        self._refresh_capture_slot()
+
         # A new caller utterance cancels a pending agent hangup: "wait, one
         # more question" after the goodbye must be answered, not cut off.
         # Every close path below re-arms it if this turn also ends the call.
@@ -1450,11 +1567,6 @@ class ConversationRouter:
 
         prev_lang = self.state.language
 
-        is_gujarati_detected = (
-            detected_lang == "gu"
-            or src == "script_gu_markers"
-        )
-
         # Decay the lock after 10 turns — allows the call to re-evaluate language
         # within a reasonable window when the caller switches naturally.
         # An explicit language_switch intent resets lock_turns to -10 so it
@@ -1466,96 +1578,117 @@ class ConversationRouter:
                 self.state.language_locked = False
                 logger.info("[LANG] Lock expired after %d turns", self.state.language_lock_turns)
 
-        # Override an incorrect Hindi/English lock to Gujarati when the evidence is clear.
-        # Two-tier threshold:
-        #   - Strong Devanagari Gujarati markers (छे/छो/छु/केम/etc.) are EXCLUSIVELY
-        #     Gujarati — a single turn's evidence is sufficient to override the lock.
-        #   - All other Gujarati signals require 2 consecutive turns for confidence.
-        # This prevents a Gujarati caller from receiving 2 Hindi responses before the
-        # system adapts, while still requiring consistency for weaker signals.
-        if is_gujarati_detected and self.state.language_locked and prev_lang != "gu":
-            recent_gu = sum(1 for l in history[-2:] if l == "gu")
-            single_strong = (recent_gu >= 1 and src == "script_gu_markers")
-            if recent_gu >= 2 or single_strong:
-                logger.info(
-                    "[LANG] Overriding lock to Gujarati (src=%s, recent_gu=%d, "
-                    "single_strong=%s)",
-                    src, recent_gu, single_strong,
-                )
-                self.state.language = "gu"
-                self.state.language_locked = False
-                self.state.language_lock_turns = 0
-
-        # Override a Gujarati lock to Hindi/English when the caller clearly switches.
-        # Mirrors the Gujarati override above: 2 consecutive non-Gujarati turns confirm
-        # the switch so a single code-switched word doesn't flip the language.
-        if (
-            not is_gujarati_detected
-            and self.state.language_locked
-            and prev_lang == "gu"
-            and detected_lang in ("hi", "en")
-            and conf >= 0.7
-        ):
-            recent_non_gu = sum(1 for l in history[-2:] if l != "gu")
-            if recent_non_gu >= 2:
-                logger.info(
-                    "[LANG] Overriding Gujarati lock to %s "
-                    "(recent_non_gu=%d, src=%s, conf=%.2f)",
-                    detected_lang, recent_non_gu, src, conf,
-                )
-                self.state.language = detected_lang
-                self.state.language_locked = False
-                self.state.language_lock_turns = 0
-
-        # Gujarati script or markers — switch ONLY if not locked to a different
-        # language. Explicit user request (intent="language_switch") is the only
-        # thing that can override the lock; Devanagari Gujarati-marker words
-        # like "माने" / "छे" appearing inside otherwise-Hindi STT output must
-        # not flip the agent back to Gujarati.
-        if is_gujarati_detected and (
-            not self.state.language_locked or prev_lang == "gu"
-        ):
-            if self.state.language != "gu":
-                logger.info("[LANG] Switching to Gujarati (src=%s)", src)
-            self.state.language = "gu"
-        elif is_gujarati_detected:
-            logger.info(
-                "[LANG] Ignoring Gujarati markers (locked to %s, src=%s)",
-                prev_lang, src,
+        if self._evidence_switch_enabled():
+            # ── A2 (2026-07-30): evidence-density switching ──────────────
+            # One uniform scorer for every pair, both directions. Replaces
+            # the single-strong-marker fast path and the 2/4-ASCII-word
+            # English switch — both switched whole calls on a single signal
+            # (live incident: one buggy marker hit on "अच्छे" turned a Hindi
+            # call Gujarati; the name "alvin anthony" turned it English).
+            # Explicit requests (intent=language_switch, handled below) stay
+            # instant for all pairs and are the only path that sets a lock.
+            if self._turn_stt_source in ("fallback", "primary-script-retry"):
+                # Tier 0: recovered transcripts are mishear-prone (', angie?'
+                # from "हाँजी") — they never vote on language.
+                logger.info("[LANG] Turn doesn't vote (stt_source=%s)",
+                            self._turn_stt_source)
+            elif self._capture_slot is not None or self._name_pending:
+                # Tier 0: names/emails being captured are language-neutral.
+                logger.info("[LANG] Turn doesn't vote (capture/name pending)")
+            elif self.state.language_locked:
+                # An explicit caller choice is honored until its lock decays.
+                logger.info("[LANG] Evidence switching paused (explicit lock on %s)",
+                            prev_lang)
+            else:
+                _target, _reason = self._evidence_switch_decision(text)
+                if _target is not None:
+                    logger.info("[LANG] Evidence switch %s → %s (%s)",
+                                prev_lang, _target, _reason)
+                    self.state.language = _target
+                    self._last_evidence_switch_turn = self.state.turn_count
+                elif _reason not in ("current",):
+                    logger.info("[LANG] No switch (%s, staying %s)",
+                                _reason, prev_lang)
+        else:
+            # ── Legacy single-signal switching (LANG_EVIDENCE_SWITCH=false) ──
+            is_gujarati_detected = (
+                detected_lang == "gu"
+                or src == "script_gu_markers"
             )
-        elif src == "pattern" and conf >= 0.7:
-            # Pattern-based detection: Hindi/Gujarati romanized words
-            self.state.language = detected_lang
-        elif src == "script" and detected_lang == "hi":
-            # Devanagari text — could be Hindi OR Gujarati via STT.
-            # Only switch to Hindi if not currently Gujarati, or if
-            # language is not locked.
-            if prev_lang != "gu" or not self.state.language_locked:
-                self.state.language = "hi"
-        elif detected_lang == "en" and src in ("default", "pattern"):
-            # Pure-Latin / non-Indic text. Switch to English only on a
-            # confident multi-word signal with a raised threshold to prevent
-            # Hinglish sentences (e.g. "haan theek hai ok") from flipping a
-            # Hindi session. Require 4+ words if currently locked, 2+ if not.
-            word_count = len(text.split())
-            min_words_for_switch = 4 if self.state.language_locked and prev_lang in ("hi", "gu") else 2
-            if word_count >= min_words_for_switch and prev_lang != "en":
+
+            # Override an incorrect Hindi/English lock to Gujarati when the evidence is clear.
+            if is_gujarati_detected and self.state.language_locked and prev_lang != "gu":
+                recent_gu = sum(1 for l in history[-2:] if l == "gu")
+                single_strong = (recent_gu >= 1 and src == "script_gu_markers")
+                if recent_gu >= 2 or single_strong:
+                    logger.info(
+                        "[LANG] Overriding lock to Gujarati (src=%s, recent_gu=%d, "
+                        "single_strong=%s)",
+                        src, recent_gu, single_strong,
+                    )
+                    self.state.language = "gu"
+                    self.state.language_locked = False
+                    self.state.language_lock_turns = 0
+
+            # Override a Gujarati lock to Hindi/English when the caller clearly switches.
+            if (
+                not is_gujarati_detected
+                and self.state.language_locked
+                and prev_lang == "gu"
+                and detected_lang in ("hi", "en")
+                and conf >= 0.7
+            ):
+                recent_non_gu = sum(1 for l in history[-2:] if l != "gu")
+                if recent_non_gu >= 2:
+                    logger.info(
+                        "[LANG] Overriding Gujarati lock to %s "
+                        "(recent_non_gu=%d, src=%s, conf=%.2f)",
+                        detected_lang, recent_non_gu, src, conf,
+                    )
+                    self.state.language = detected_lang
+                    self.state.language_locked = False
+                    self.state.language_lock_turns = 0
+
+            # Gujarati script or markers — switch ONLY if not locked to a different
+            # language.
+            if is_gujarati_detected and (
+                not self.state.language_locked or prev_lang == "gu"
+            ):
+                if self.state.language != "gu":
+                    logger.info("[LANG] Switching to Gujarati (src=%s)", src)
+                self.state.language = "gu"
+            elif is_gujarati_detected:
                 logger.info(
-                    "[LANG] Switching to English (ascii multi-word, src=%s, "
-                    "words=%d, min=%d, locked=%s)",
-                    src, word_count, min_words_for_switch, self.state.language_locked,
+                    "[LANG] Ignoring Gujarati markers (locked to %s, src=%s)",
+                    prev_lang, src,
                 )
-                self.state.language = "en"
-                # Soft-decay any prior lock so subsequent turns aren't re-locked
-                self.state.language_locked = False
-                self.state.language_lock_turns = 0
-            elif word_count < min_words_for_switch and prev_lang in ("hi", "gu"):
-                logger.info(
-                    "[LANG] Suppressing English switch (too few words=%d, min=%d, "
-                    "maintaining %s)",
-                    word_count, min_words_for_switch, prev_lang,
-                )
-        # Ambiguous/default: preserve current language
+            elif src == "pattern" and conf >= 0.7:
+                # Pattern-based detection: Hindi/Gujarati romanized words
+                self.state.language = detected_lang
+            elif src == "script" and detected_lang == "hi":
+                # Devanagari text — could be Hindi OR Gujarati via STT.
+                if prev_lang != "gu" or not self.state.language_locked:
+                    self.state.language = "hi"
+            elif detected_lang == "en" and src in ("default", "pattern"):
+                # Pure-Latin / non-Indic text: multi-word threshold.
+                word_count = len(text.split())
+                min_words_for_switch = 4 if self.state.language_locked and prev_lang in ("hi", "gu") else 2
+                if word_count >= min_words_for_switch and prev_lang != "en":
+                    logger.info(
+                        "[LANG] Switching to English (ascii multi-word, src=%s, "
+                        "words=%d, min=%d, locked=%s)",
+                        src, word_count, min_words_for_switch, self.state.language_locked,
+                    )
+                    self.state.language = "en"
+                    self.state.language_locked = False
+                    self.state.language_lock_turns = 0
+                elif word_count < min_words_for_switch and prev_lang in ("hi", "gu"):
+                    logger.info(
+                        "[LANG] Suppressing English switch (too few words=%d, min=%d, "
+                        "maintaining %s)",
+                        word_count, min_words_for_switch, prev_lang,
+                    )
+            # Ambiguous/default: preserve current language
 
         self.state.lang_confidence = conf
         self.state.lang_source = src
@@ -1948,6 +2081,24 @@ class ConversationRouter:
                 yield EngineResult(text=resp, is_shortcut=True, intent="language_switch")
                 return
 
+        # --- B2/B3: deterministic contact capture (all agents) ---
+        # Runs after the explicit language-switch branch (a caller may still
+        # switch languages mid-capture) and before normal routing. Yields
+        # nothing when the turn is unrelated — normal routing continues.
+        if self._capture_slot is not None:
+            _capture_handled = False
+            async for _cr in self._handle_capture_turn(text, intent,
+                                                       _cancel_llm):
+                _capture_handled = True
+                yield _cr
+            if _capture_handled:
+                return
+            # A silently-buffered fragment also ends the turn (agent stays
+            # quiet while the caller finishes spelling).
+            if self._capture_buf and self._capture_buf[-1] == text:
+                _cancel_llm()
+                return
+
         # =============================================================
         # NON-SHORTCUT ROUTING — extract data, advance stage, let LLM respond
         # =============================================================
@@ -1996,7 +2147,15 @@ class ConversationRouter:
         for _slot in _pending_confirm:
             _since = self._slot_confirm_turn.setdefault(_slot, self.state.turn_count)
             _val = self.state_mgr.state.get(_slot)
-            if intent == "affirmation" and _val is not None:
+            # B3: a contact slot only confirms on a BARE yes — "okay tell
+            # me more" opens with an affirmation but is not an email
+            # confirmation (the capture branch above handles these turns;
+            # this guard covers the fall-through path).
+            _is_contact = (getattr(self.state_mgr.slots.get(_slot), "type", "")
+                           in ("email", "phone"))
+            if (intent == "affirmation" and _val is not None
+                    and (not _is_contact
+                         or (len(text.split()) <= 3 and "?" not in text))):
                 self.state_mgr.set_externally(_slot, _val, source="system")
                 self._slot_confirm_turn.pop(_slot, None)
                 logger.info("[CONFIRM] Slot %s confirmed: %r", _slot, _val)
@@ -2004,7 +2163,12 @@ class ConversationRouter:
                 self.state_mgr.discard_pending(_slot)
                 self._slot_confirm_turn.pop(_slot, None)
                 logger.info("[CONFIRM] Slot %s rejected — discarded", _slot)
-            elif self.state.turn_count - _since >= 2 and _val is not None:
+            elif (self.state.turn_count - _since >= 2 and _val is not None
+                    and getattr(self.state_mgr.slots.get(_slot), "type", "")
+                    not in ("email", "phone")):
+                # B3: contact slots are NEVER auto-accepted — silently
+                # promoting an unconfirmed email is exactly how a wrong
+                # value becomes permanent ground truth.
                 self.state_mgr.set_externally(_slot, _val, source="system")
                 self._slot_confirm_turn.pop(_slot, None)
                 logger.info("[CONFIRM] Slot %s auto-accepted after 2 turns: %r", _slot, _val)
@@ -2549,6 +2713,15 @@ class ConversationRouter:
         if len(text.split()) < 3:
             return
         missing = self.state_mgr.detect_missing_slots()["missing"]
+        # B4 (2026-07-30): contact-typed slots are deterministic-only — the
+        # LLM once assembled 'bell@gmail.com' from garbled ASR and the
+        # fill-only merge made the guess immortal. merge_state also rejects
+        # source="llm" for these as a second wall.
+        missing = [
+            m for m in missing
+            if getattr(self.state_mgr.slots.get(m), "type", "")
+            not in ("email", "phone")
+        ]
         if not missing:
             return
         if self._slot_extract_task and not self._slot_extract_task.done():
@@ -2558,6 +2731,21 @@ class ConversationRouter:
         )
 
     async def _llm_extract_slots(self, text: str, missing: list[str]) -> None:
+        # B4: a caller explicitly correcting an earlier value ("actually…",
+        # "nahi, …") may overwrite FILLED slots — the fill-only default made
+        # the first (possibly wrong) value immortal. Contact-typed slots stay
+        # excluded; validators and merge policies still gate every write.
+        from .state_manager import _CORRECTION_MARKER_RE
+        _correction = bool(_CORRECTION_MARKER_RE.search(text or ""))
+        if _correction:
+            _filled = [
+                n for n, v in self.state_mgr.state.items()
+                if v is not None and n in self.state_mgr.slots
+                and n != "name"
+                and getattr(self.state_mgr.slots[n], "type", "")
+                not in ("email", "phone")
+            ]
+            missing = list(dict.fromkeys(list(missing) + _filled))
         try:
             if self._tools_mode == "shadow":
                 # P1 shadow: same trigger, same fill-only trust level, but
@@ -2598,9 +2786,21 @@ class ConversationRouter:
                     if isinstance(v, (str, int, float)) and str(v).strip()
                     and str(v).lower() not in ("null", "none", "unknown", "n/a")}
             data = self._scrub_hello_values(data)
+            # B4 echo guard: a value that appears in the agent's own last
+            # utterance but NOT in the caller's is the LLM echoing the
+            # agent's read-back into state, not information the caller gave.
+            _agent_last = (self.last_agent_response or "").lower()
+            if _agent_last:
+                _caller = text.lower()
+                data = {
+                    k: v for k, v in data.items()
+                    if not (str(v).lower() in _agent_last
+                            and str(v).lower() not in _caller)
+                }
             if data:
                 changes = self.state_mgr.merge_state(
-                    data, source="llm", utterance=text, fill_only=True)
+                    data, source="llm", utterance=text,
+                    fill_only=not _correction)
                 if changes:
                     logger.info("[STATE:LLM] Gap-filled %s",
                                 ", ".join(f"{c.field}={c.new!r}" for c in changes))
@@ -3735,6 +3935,90 @@ class ConversationRouter:
     # Language detection
     # ------------------------------------------------------------------
 
+    def _evidence_switch_enabled(self) -> bool:
+        """A2 master gate: env knob AND per-agent languages.evidence_switch."""
+        if not LANG_EVIDENCE_SWITCH:
+            return False
+        return getattr(self._def.languages, "evidence_switch", True) is not False
+
+    def _language_votes(self, text: str) -> tuple[dict[str, int], int]:
+        """A2 per-word vote count for (en, hi, gu) plus the en function-word
+        count. Neutral (no vote): digits/emails/spelled letters, names and
+        unknown Latin tokens, bare acks, ambiguous romanized words, weak
+        Gujarati-in-Devanagari markers, unsupported scripts."""
+        votes = {"en": 0, "hi": 0, "gu": 0}
+        en_function = 0
+        for raw in text.lower().split():
+            w = raw.strip(_SCORER_STRIP_CHARS)
+            if not w or "@" in w or any(ch.isdigit() for ch in w):
+                continue
+            if any("઀" <= c <= "૿" for c in w):
+                votes["gu"] += 1
+                continue
+            if any("ऀ" <= c <= "ॿ" for c in w):
+                if _STRONG_GU_DEVA_RE.search(w):
+                    votes["gu"] += 1
+                elif _WEAK_GU_DEVA_RE.search(w):
+                    pass    # ambiguous marker — neutral
+                else:
+                    votes["hi"] += 1
+                continue
+            if not w.isascii():
+                continue    # unsupported script — validation's problem
+            if w in _SCORER_ACK_NEUTRAL:
+                continue
+            in_hi = w in _HI_ROMAN_VOTE_WORDS
+            in_gu = w in _GU_ROMAN_VOTE_WORDS
+            if in_hi and in_gu:
+                continue
+            if in_hi:
+                votes["hi"] += 1
+            elif in_gu:
+                votes["gu"] += 1
+            elif w in _EN_FUNCTION_WORDS:
+                votes["en"] += 1
+                en_function += 1
+        return votes, en_function
+
+    def _evidence_switch_decision(self, text: str) -> tuple[str | None, str]:
+        """A2 (2026-07-30): decide a mid-call language switch from word
+        evidence inside THIS utterance. Returns (target | None, reason).
+
+        Tiers: zero votes → the turn doesn't vote at all; density ≥ 0.6 with
+        ≥ 2 votes → instant switch (en additionally needs a function word —
+        structurally guaranteed since only function words vote en); one vote
+        or density in [0.3, 0.6) → confirmation band: hold, arm
+        _pending_lang_switch, complete on any supporting vote next voting
+        turn; a turn voting the current language disarms. After any
+        evidence switch, non-explicit switching pauses for 1 turn.
+        """
+        cur = self.state.language
+        votes, en_function = self._language_votes(text)
+        total = sum(votes.values())
+        if total == 0:
+            return None, "no_votes"
+        best = max(votes, key=lambda k: votes[k])
+        if votes[best] == 0 or best == cur:
+            self._pending_lang_switch = None
+            return None, "current"
+        density = votes[best] / total
+        if density < 0.3:
+            self._pending_lang_switch = None
+            return None, f"weak(density={density:.2f})"
+        if self.state.turn_count - self._last_evidence_switch_turn <= 1:
+            return None, "cooldown"
+        if best == "en" and en_function < 1:
+            return None, "en_no_function_word"
+        detail = f"votes={votes[best]}/{total},density={density:.2f}"
+        if votes[best] >= 2 and density >= 0.6:
+            self._pending_lang_switch = None
+            return best, f"evidence({detail})"
+        if self._pending_lang_switch == best:
+            self._pending_lang_switch = None
+            return best, f"evidence_confirmed({detail})"
+        self._pending_lang_switch = best
+        return None, f"pending({detail})"
+
     async def detect_language_v3(self, text: str) -> tuple[str, float, str]:
         text_lower = text.lower().strip()
         if not text_lower:
@@ -3806,25 +4090,13 @@ class ConversationRouter:
         get transcribed as "गेम छो" (Devanagari via hi-IN STT), producing only
         one marker hit ("छो") that the old >= 2 threshold would reject.
         """
-        # Strong tier: one word-boundary match is enough
+        # Strong tier: one boundary-clean match is enough
         if _STRONG_GU_DEVA_RE.search(text):
             return True
 
-        # Weak tier: ambiguous markers, need 2+ hits
-        markers = [
-            "जोईए", "जोइये",
-            "माने", "तमने", "अमने", "अमारा", "तमारा",
-            "बरोबर", "सारु", "सारुं", "माजामा",
-            "केमछो", "केम छो",
-            "शुं", "क्यां",
-            "आवजो",
-            "हतु", "हती",
-            "अत्यारे",
-            "जोवा", "जोई", "जोवुं",
-            "बतावो", "जणावो",
-        ]
-        hits = sum(1 for m in markers if m in text)
-        return hits >= 2
+        # Weak tier: ambiguous markers, need 2+ boundary-clean hits (the old
+        # substring scan matched inside Hindi words — see _WEAK_GU_DEVA_RE)
+        return len(_WEAK_GU_DEVA_RE.findall(text)) >= 2
 
     async def _classify_language_llm(self, text: str) -> str:
         try:
@@ -4176,9 +4448,185 @@ class ConversationRouter:
         if short == "hi":
             return has_dev or _pattern_score(t, _HINDI_PATTERNS) > 0
         if short == "en":
+            # A3 hardening (2026-07-30): pure-Latin + multi-word is not
+            # enough — the name "alvin anthony" passed and flipped a Hindi
+            # call to English mid-conversation. An en claim must carry at
+            # least one English FUNCTION word; names/brands carry none.
+            words = [w.strip(_SCORER_STRIP_CHARS) for w in t.split()]
             return (not has_dev and not has_guj
-                    and len(t.split()) >= 2)
+                    and len(words) >= 2
+                    and any(w in _EN_FUNCTION_WORDS for w in words))
         return False
+
+    # ------------------------------------------------------------------
+    # B2/B3: deterministic contact capture (2026-07-30)
+    # ------------------------------------------------------------------
+
+    def _refresh_capture_slot(self) -> None:
+        """Arm capture mode when the engine is collecting a contact-typed
+        slot: either its confirmation is pending, or it is the FIRST missing
+        slot and the ask instruction has already been emitted. Agents with
+        no contact-typed slots never arm — zero behavior change for them."""
+        slot: str | None = None
+        if CAPTURE_MODE_ENV:
+            try:
+                gaps = self.state_mgr.detect_missing_slots()
+                for n in gaps["pending"]:
+                    spec = self.state_mgr.slots.get(n)
+                    if spec is not None and spec.type in ("email", "phone"):
+                        slot = n
+                        break
+                if slot is None and gaps["missing"]:
+                    n = gaps["missing"][0]
+                    spec = self.state_mgr.slots.get(n)
+                    if (spec is not None and spec.type in ("email", "phone")
+                            and self.state_mgr.asked_count.get(n, 0) >= 1):
+                        slot = n
+            except Exception:
+                slot = None
+        if slot != self._capture_slot:
+            logger.info("[CAPTURE] %s",
+                        f"armed for slot {slot!r}" if slot else "released")
+            self._capture_buf.clear()
+        self._capture_slot = slot
+
+    def _capture_line(self, bank: dict[str, str]) -> str:
+        lang = self.state.language if self.state.language in ("en", "hi", "gu") \
+            else "en"
+        return bank.get(lang) or bank["en"]
+
+    async def _handle_capture_turn(self, text: str, intent: str,
+                                   cancel_llm) -> "AsyncIterator[EngineResult]":
+        """Deterministic handling of one turn while an email capture is
+        armed. Yields nothing at all when the turn is unrelated to the
+        capture — the caller then falls through to normal routing. Fully
+        handles: payload assembly, silent buffering of partial spellings,
+        read-back, yes/no confirmation, corrections, and the re-ask cap
+        (→ `<slot>_unresolved` flag, never a stored guess).
+
+        Phone-typed slots arm capture (endpointing/STT effects) but their
+        turns route normally — the existing phone regex + digit read-back
+        machinery already handles digits well.
+        """
+        from .contact_capture import (looks_like_partial_email,
+                                      normalize_spoken_email,
+                                      spelled_readback)
+        slot = self._capture_slot
+        spec = self.state_mgr.slots.get(slot)
+        if spec is None or spec.type != "email":
+            return
+        pending = slot in self.state_mgr._pending_fields
+        now = time.time()
+
+        # Stale buffer: fragments older than 30s belong to an abandoned
+        # attempt, not this turn.
+        if self._capture_buf and now - self._capture_buf_ts > 30.0:
+            self._capture_buf.clear()
+
+        joined = " ".join(self._capture_buf + [text])
+        candidate = (normalize_spoken_email(joined)
+                     or normalize_spoken_email(text))
+
+        # (a) Confirmation resolution for a pending value. A turn carrying a
+        # parseable email (new OR restated — the typed extractor may have
+        # pre-filled the slot from this same utterance) goes to read-back;
+        # a bare yes/no resolves. "Bare" is load-bearing: "okay tell me
+        # more" starts with an affirmation but is NOT an email confirmation.
+        _bare_confirm = len(text.split()) <= 3 and "?" not in text
+        if pending and candidate:
+            pass          # fall through to (b) — read back the value
+        elif pending and intent == "affirmation" and _bare_confirm:
+            cancel_llm()
+            val = self.state_mgr.state.get(slot)
+            self.state_mgr.set_externally(slot, val, source="system")
+            self._capture_buf.clear()
+            logger.info("[CAPTURE] %s confirmed: %r", slot, val)
+            resp = self._capture_line(_CAPTURE_CONFIRMED)
+            self.memory.add_assistant(resp, language=self.state.language)
+            self._store_last_response(resp)
+            yield EngineResult(text=resp, is_shortcut=True,
+                               intent="capture_confirmed")
+            return
+        elif pending and intent == "negation" and _bare_confirm:
+            cancel_llm()
+            self.state_mgr.discard_pending(slot)
+            logger.info("[CAPTURE] %s rejected by caller — re-asking", slot)
+            async for r in self._capture_reask_or_giveup(slot):
+                yield r
+            return
+        elif pending:
+            # Neither yes/no nor a new value — let the LLM handle the
+            # digression; the pending confirm instruction stays in the
+            # prompt context.
+            return
+
+        # (b) Payload turn.
+        if candidate:
+            cancel_llm()
+            self._capture_buf.clear()
+            old = self.state_mgr.state.get(slot)
+            self.state_mgr.state[slot] = candidate
+            self.state_mgr.mark_pending(slot)
+            self.state_mgr.update_audit_log(
+                slot, old, candidate, "capture", text)
+            logger.info("[CAPTURE] %s candidate %r → read-back", slot,
+                        candidate)
+            resp = self._capture_line(_CAPTURE_READBACK).format(
+                spelled=spelled_readback(candidate))
+            self.memory.add_assistant(resp, language=self.state.language)
+            self._store_last_response(resp)
+            yield EngineResult(text=resp, is_shortcut=True,
+                               intent="capture_readback")
+            return
+
+        # (c) Partial spelling — buffer silently and let the caller finish.
+        # The pipeline's stretched merge window catches most fragments; this
+        # catches the ones that still arrive as separate turns.
+        if looks_like_partial_email(text):
+            cancel_llm()
+            self._capture_buf.append(text)
+            self._capture_buf_ts = now
+            if len(self._capture_buf) >= 4:
+                # Enough fragments that assembly should have worked — the
+                # attempt is garbled beyond recovery. Re-ask or give up.
+                self._capture_buf.clear()
+                async for r in self._capture_reask_or_giveup(slot):
+                    yield r
+                return
+            logger.info("[CAPTURE] buffering fragment %r (%d buffered)",
+                        text[:40], len(self._capture_buf))
+            # Yield nothing: the agent stays silent while the caller spells.
+            return
+
+        # (d) Unrelated turn — normal routing continues, capture stays armed.
+        return
+
+    async def _capture_reask_or_giveup(self, slot: str):
+        """One more deterministic ask, or — past the cap — mark the slot
+        unresolved (skipped + flagged for follow-up) and move on. Never
+        stores a low-confidence guess."""
+        spec = self.state_mgr.slots.get(slot)
+        cap = getattr(spec, "max_asks", 0) or 3
+        self._capture_reasks = getattr(self, "_capture_reasks", {})
+        self._capture_reasks[slot] = self._capture_reasks.get(slot, 0) + 1
+        if self._capture_reasks[slot] >= cap and slot not in self._capture_fallback_said:
+            self._capture_fallback_said.add(slot)
+            self.state_mgr.discard_pending(slot)
+            self.state_mgr.skipped.add(slot)
+            self.state_mgr.extra_flags[f"{slot}_unresolved"] = True
+            self._capture_slot = None
+            logger.info("[CAPTURE] %s unresolved after %d attempts — "
+                        "flagged for follow-up", slot,
+                        self._capture_reasks[slot])
+            resp = self._capture_line(_CAPTURE_UNRESOLVED)
+        elif slot in self._capture_fallback_said:
+            return
+        else:
+            resp = self._capture_line(_CAPTURE_REASK)
+        self.memory.add_assistant(resp, language=self.state.language)
+        self._store_last_response(resp)
+        yield EngineResult(text=resp, is_shortcut=True,
+                           intent="capture_reask")
 
     def connect_intro_line(self) -> str:
         """Full identity intro for the connect hello fast path (and for the

@@ -996,3 +996,66 @@ selection, stage flow, barge-in, cache-key formula, existing agent YAMLs.
 caller turn for the conversation's own (guarded) language path; stage-goal
 fragments spliced into callback greetings (separate bug, recorded in the
 plan); per-chunk long-sentence pace damping variation.
+
+## 20. Language fidelity + deterministic contact capture — platform-wide (2026-07-30)
+
+Two live-call failures on `918076562864_20260730_120613` (full diagnosis:
+`deploy/PLAN-language-fidelity-and-contact-capture.md`): the agent answered a
+pure-Hindi caller in **Gujarati** (twice, back-to-back), and the caller's
+email was stored as the LLM's guess `bell@gmail.com`, which the caller's
+correction could never overwrite. Everything below is engine-level — it
+applies to every existing agent and every future Copilot agent.
+
+### Part A — language fidelity
+
+| Layer | Fix |
+|---|---|
+| A1 marker regex | `_STRONG_GU_DEVA_RE`/weak tier use Devanagari-block boundaries `(?<![ऀ-ॿ])` — Python's `\w` excludes matras/virama, so "अच्छे" matched marker "छे" mid-word and flipped the call. Weak tier is no longer a substring scan. |
+| A2 evidence switch | One per-word vote scorer for all pairs (en/hi/gu): instant switch at density ≥0.6 with ≥2 votes (en additionally needs a function word); single-vote/0.3–0.6 evidence → one-turn confirmation band; acks, names, digits, emails are neutral. Replaces the single-marker fast path and the 2-ASCII-word English switch. 1-turn oscillation guard. Explicit requests stay instant, all pairs. |
+| A3 neutral turns | Whisper/script-retry-recovered transcripts never vote (`Transcript.stt_source`), capture/name-pending turns never vote, and the STT mirror's en claim now needs an English function word ("alvin anthony" can no longer flip a call). Mirror skipped entirely for recovered sources. |
+| A4 STT pinning | After 2 stable turns the streaming WS reconnects (turn boundary only) pinned to the conversation language — kills the 29×/day pa/bn/kn/ml script roulette. Unpins the moment state moves off it. Mixed-script finalizes salvage clean tokens before any retry ('ਇਹ। K L W Y N' keeps the letters). The forced-language script-retry now actually re-uploads audio via the HTTP rescue client (under streaming it silently retried nothing). Whisper gets the conversation language as a hint. |
+| A5 delivery epoch | Every supersede (cont-merge rollback, barge-in drain, deferred kill) bumps an epoch; the TTS player re-checks it between dequeue and synthesis — the double-spoken pre-/post-merge replies are structurally dead. Replays (`Response.replay`) are dropped when a newer response already played. |
+| A6 telemetry | `grep RESPONSE-MISMATCH` finds every reply whose text language differs from the directed language. Warning-only. |
+
+### Part B — deterministic contact capture
+
+The LLM asks; the engine captures. `app/voice/contact_capture.py` owns the
+spoken-form normalizer (at/dot/एट/डॉट operators, spelled-letter runs incl.
+Devanagari letter names "एल दब्यू वाय एल", the ITN `www.` artifact, provider
+snap gmial→gmail, TLD fixes). Email-typed slots (engine infers the type for
+slots NAMED email even when authored `type: text` — the live LesCall agent):
+
+- **Only writers**: the deterministic normalizer (typed extraction + capture
+  turns). `merge_state` rejects `source="llm"` for email/phone slots and
+  rejects validator-failing emails from ANY source.
+- **Pending until a bare yes**: policy `confirm`, spelled read-back
+  ("b. e. n. — at — gmail dot com"), no 2-turn auto-accept, and "okay tell
+  me more" does NOT confirm (bare ≤3-word affirmations only). Corrections
+  re-enter read-back with the new value.
+- **Capture mode** while the email is being asked/confirmed: merge window
+  stretches to `CAPTURE_MERGE_WINDOW_MS` (2000ms, up to 8 fragments), STT
+  forced en-IN, barge-in threshold ×2, partial spellings buffer silently
+  (agent stays quiet while the caller spells).
+- **Cap → unresolved, never a guess**: after `max_asks` (2) failed
+  read-backs the slot is skipped, `extra_flags.email_unresolved=true` rides
+  collected_data into the intel pipeline for human follow-up.
+- Copilot provisions new agents' email slots explicitly (type email +
+  confirm + spelled + 2 asks) and teaches: ask ONCE, never "speak slowly".
+- Phone slots keep their authored merge policy (live outbound flows must
+  not stall); they gain digit-groups read-back and capture-mode endpointing.
+
+### Knobs (env unless noted)
+
+`LANG_EVIDENCE_SWITCH` (true) / per-agent `languages.evidence_switch`;
+`STT_LANG_PIN` (true), `STT_LANG_PIN_TURNS` (2); `CAPTURE_MODE` (true),
+`CAPTURE_MERGE_WINDOW_MS` (2000); accent-era knobs unchanged
+(`TTS_LANG_FROM_TEXT`, `LANG_MIRROR_GUARDED`). Compose env changes need
+`up -d`, not restart.
+
+### Verification
+
+Tests: `tests/test_language_fidelity.py` (26) + `tests/test_contact_capture.py`
+(31); full suite green. On a live call grep for: `[LANG] Evidence switch`,
+`[LANG] Turn doesn't vote`, `[STT] Language pinned`, `[STT] Script salvage`,
+`[TTS] Dropped stale response`, `[CAPTURE] armed/candidate/confirmed`,
+`RESPONSE-MISMATCH`.

@@ -101,6 +101,11 @@ def format_readback(value: Any, mode: str) -> str:
         digits = re.sub(r"\D", "", s)
         if digits:
             return " ".join(digits[i:i + 2] for i in range(0, len(digits), 2))
+    if mode == "spelled":
+        # B3: local part letter-by-letter, domain spoken naturally —
+        # 'ben@gmail.com' → 'b. e. n. — at — gmail dot com'.
+        from .contact_capture import spelled_readback
+        return spelled_readback(s)
     return s
 
 
@@ -349,6 +354,11 @@ class ConversationStateManager:
                 if re.search(r"\b(no|nahi|nope|नहीं|ના|નહીં)\b", lower):
                     return "No"
             return None
+        if t == "email":
+            # B1 (2026-07-30): deterministic spoken-form assembly — the ONLY
+            # writer for email slots (merge_state rejects source="llm").
+            from .contact_capture import normalize_spoken_email
+            return normalize_spoken_email(text)
         # text/date/time: deferred to the LLM gap-filler.
         return None
 
@@ -531,6 +541,43 @@ class ConversationStateManager:
             # (_name_pending in conversation.py) stays untouched.
             spec = self.slots.get(key)
             policy = getattr(spec, "merge_policy", "free") if spec else "free"
+            slot_type = getattr(spec, "type", "") if spec else ""
+            # B1/B4 (2026-07-30): contact-typed slots have exactly one
+            # writer — the deterministic capture path. A live call stored
+            # the LLM's guess 'bell@gmail.com' (assembled from ASR "bell
+            # www.gmail.com") as ground truth; fill_only then made it
+            # immortal. LLM extraction may not touch these slots at all,
+            # and no source may store a value that fails the validator.
+            if slot_type in ("email", "phone") and source == "llm":
+                self.update_audit_log(
+                    key, old, old, source,
+                    f"REJECTED llm write {new!r} (contact slots are "
+                    f"deterministic-only)")
+                continue
+            if slot_type == "email":
+                from .contact_capture import validate_email
+                if not validate_email(str(new)):
+                    self.update_audit_log(
+                        key, old, old, source,
+                        f"REJECTED invalid email {new!r}")
+                    continue
+                new = str(new).strip().lower()
+            elif slot_type in ("date", "time") and source == "llm":
+                # A gap-filled date/time must at least parse-ish: carry a
+                # digit or a recognizable day/time word ('after office' was
+                # stored as preferred_time from a discovery answer).
+                _sv = str(new).lower()
+                if not (any(ch.isdigit() for ch in _sv)
+                        or re.search(
+                            r"\b(morning|afternoon|evening|noon|night|today|"
+                            r"tomorrow|tonight|monday|tuesday|wednesday|"
+                            r"thursday|friday|saturday|sunday|subah|dopahar|"
+                            r"shaam|raat|aaj|kal|parso|savare|bapore|saanje)\b",
+                            _sv)):
+                    self.update_audit_log(
+                        key, old, old, source,
+                        f"REJECTED unparseable {slot_type} {new!r}")
+                    continue
             if key != "name" and policy == "correction_gated" and old is not None:
                 if not (_NEGATED_VALUE_RE.search(utterance or "")
                         or _CORRECTION_MARKER_RE.search(utterance or "")):
@@ -890,20 +937,51 @@ def build_state_manager(agent_def, language: str = "hi") -> ConversationStateMan
     for s in getattr(agent_def, "slots", None) or []:
         # Copy ALL SlotDefinition fields (summary_known/unknown used to be
         # dropped here — the plan's L4 finding).
+        _type = getattr(s, "type", "") or ""
+        _policy = getattr(s, "merge_policy", "free") or "free"
+        _readback = getattr(s, "confirm_readback", "") or ""
+        _max_asks = int(getattr(s, "max_asks", 0) or 0)
+        # B6 engine-level contact provisioning (2026-07-30, platform-wide —
+        # every existing and future agent): a slot NAMED email is email-typed
+        # even without YAML migration (no legacy name-keyed email extractor
+        # exists, so typing it costs nothing), and contact-typed slots get
+        # the confirm/read-back/cap machinery unless the YAML says otherwise.
+        # This is what makes captured emails pending-until-confirmed and
+        # correctable instead of first-guess-immortal.
+        # "text" counts as untyped here: it is the generic default the
+        # Copilot used to stamp on every slot (the live LesCall agent's
+        # email slot is `type: text`), not a deliberate opt-out.
+        if _type in ("", "text") and s.name.strip().lower() in (
+                "email", "email_id", "email_address"):
+            _type = "email"
+        if _type == "email":
+            # Email is the incident class: pending-until-confirmed, spelled
+            # read-back, capped asks. Phone deliberately keeps its authored
+            # policy — live outbound flows capture numbers passively and a
+            # forced confirm gate could stall their stage advancement; it
+            # only gains the digit read-back hint when none is set.
+            if _policy == "free":
+                _policy = "confirm"
+            if not _readback:
+                _readback = "spelled"
+            if _max_asks <= 0:
+                _max_asks = 2
+        elif _type == "phone" and not _readback:
+            _readback = "digit_groups_2"
         slots.append(SlotSpec(
             name=s.name, priority=s.priority, required=s.required,
             label=getattr(s, "label", "") or "",
             question=dict(getattr(s, "question", {}) or {}),
             summary_known=getattr(s, "summary_known", "") or "",
             summary_unknown=getattr(s, "summary_unknown", "") or "",
-            type=getattr(s, "type", "") or "",
+            type=_type,
             enum_values=list(getattr(s, "enum_values", None) or []),
             enum_synonyms=dict(getattr(s, "enum_synonyms", None) or {}),
             extract_patterns=list(getattr(s, "extract_patterns", None) or []),
             depends_on=list(getattr(s, "depends_on", None) or []),
-            merge_policy=getattr(s, "merge_policy", "free") or "free",
-            confirm_readback=getattr(s, "confirm_readback", "") or "",
-            max_asks=int(getattr(s, "max_asks", 0) or 0),
+            merge_policy=_policy,
+            confirm_readback=_readback,
+            max_asks=_max_asks,
             reask_question=dict(getattr(s, "reask_question", None) or {}),
         ))
     if not slots:

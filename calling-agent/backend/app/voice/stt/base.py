@@ -33,6 +33,12 @@ class STTResult:
     text: str
     confidence: float | None = None
     detected_language: str | None = None
+    # Which path produced the transcript: "primary" (clean first-attempt),
+    # "primary-script-retry" (forced-language re-run after a script reject),
+    # or "fallback" (Whisper). Recovered paths are mishear-prone — the
+    # pipeline's language mirror and the router's evidence scorer treat
+    # them as non-voting (A3, 2026-07-30).
+    source: str = "primary"
 
 
 def normalize_pcm_audio(

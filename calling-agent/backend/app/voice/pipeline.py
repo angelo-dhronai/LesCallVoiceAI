@@ -77,6 +77,10 @@ class Transcript:
     speech_end_ts: float = 0.0
     # Derived STT confidence (0..1) from the router; None = unknown.
     confidence: "float | None" = None
+    # Which STT path produced the text ("primary" | "primary-script-retry" |
+    # "fallback"). Recovered paths are mishear-prone: they never vote on the
+    # conversation language (A3, 2026-07-30).
+    stt_source: str = "primary"
 
 
 @dataclass
@@ -100,6 +104,11 @@ class Response:
     # a fully-English reply as hi-IN). None → derived from the text itself in
     # _resolve_tts_language.
     language: str | None = None
+    # A5: replay of the agent's previous utterance (early-"hello?" repair /
+    # repeat request). A replay exists to fill a silence — if a NEWER
+    # response started playing after this replay was created, the silence is
+    # gone and the replay must be dropped, not double-spoken.
+    replay: bool = False
 
 
 QUEUE_SIZE_AUDIO = 40
@@ -254,6 +263,22 @@ TTS_LANG_FROM_TEXT = os.environ.get(
     "TTS_LANG_FROM_TEXT", "true").lower() == "true"
 LANG_MIRROR_GUARDED = os.environ.get(
     "LANG_MIRROR_GUARDED", "true").lower() == "true"
+# A4a (2026-07-30): once the conversation language has been stable for
+# STT_LANG_PIN_TURNS accepted transcripts, pin the streaming STT to it —
+# per-segment auto-detect rendered short Hindi in Punjabi/Bengali/Kannada
+# script 29×/day, each costing a 2-4s retry/fallback chain and often an
+# English mishear. Unpins the moment conversation state moves off the
+# pinned language (explicit request or evidence switch), so genuine
+# switching is never locked out. false = always auto-detect (legacy).
+STT_LANG_PIN = os.environ.get("STT_LANG_PIN", "true").lower() == "true"
+STT_LANG_PIN_TURNS = int(os.environ.get("STT_LANG_PIN_TURNS", "2"))
+# B2 (2026-07-30): spelled contact capture. While the conversation is
+# capturing an email/phone the merge window stretches so letter-by-letter
+# spelling with natural pauses aggregates into one turn instead of three
+# separately-answered fragments.
+CAPTURE_MODE = os.environ.get("CAPTURE_MODE", "true").lower() == "true"
+CAPTURE_MERGE_WINDOW_MS = float(os.environ.get(
+    "CAPTURE_MERGE_WINDOW_MS", "2000"))
 
 # Fallback phrases played when STT returns empty on substantial speech,
 # or when TTS receives an empty string or fails to play (feature 2 & 5).
@@ -349,6 +374,18 @@ class VoicePipeline:
         self._tasks: list[asyncio.Task] = []
         self._current_generation_task: asyncio.Task | None = None
         self._tts_playing = False
+        # A5 delivery epoch (2026-07-30): every supersede event (cont-merge
+        # rollback, barge-in drain, deferred-barge kill) bumps this. The TTS
+        # player snapshots it at dequeue and re-checks before synthesis — a
+        # Response dequeued a moment before its turn was superseded used to
+        # synthesize and play anyway (both pre- and post-merge replies were
+        # spoken back-to-back on a live call).
+        self._delivery_epoch: int = 0
+        self._last_playback_start_ts: float = 0.0
+        # A4a streaming-STT language pin state.
+        self._stt_lang_pin: str | None = None      # BCP-47 or None (=unknown)
+        self._stt_lang_last: str | None = None
+        self._stt_lang_stable: int = 0
         # Live "is the caller currently speaking" flag — read-only signal for
         # external monitoring (dashboard live-call snapshot); never consulted
         # by any pipeline control-flow branch.
@@ -726,6 +763,12 @@ class VoicePipeline:
                     self.vad.threshold * CONTINUATION_BARGE_FACTOR, 300.0)
             else:
                 barge_threshold = self.vad.barge_in_threshold
+            # B2: while capturing an email the agent's prompts are short and
+            # the caller often talks over them mid-spelling — demand a much
+            # louder interrupt so the capture prompt actually finishes.
+            if (CAPTURE_MODE and self.conversation is not None
+                    and getattr(self.conversation, "_capture_slot", None)):
+                barge_threshold *= 2.0
             loud = self.vad.last_energy > barge_threshold
 
             if loud:
@@ -1073,6 +1116,7 @@ class VoicePipeline:
             self._merge_chain_count = 0
 
     def _flush_pipeline_queues(self) -> None:
+        self._delivery_epoch += 1   # A5: anything dequeued earlier is stale
         drained = 0
         for q in (self._tts_queue, self._stt_queue, self._transcript_queue):
             while not q.empty():
@@ -1091,6 +1135,39 @@ class VoicePipeline:
     # -----------------------------------------------------------------------
     # Layer 2: STT Worker
     # -----------------------------------------------------------------------
+
+    def _update_stt_lang_pin(self) -> None:
+        """A4a: pin the streaming STT once the conversation language has been
+        stable for STT_LANG_PIN_TURNS accepted transcripts; release the pin
+        the moment conversation state moves off it (explicit request or
+        evidence switch flips state → one auto-detect turn → re-pin). The
+        reconnect itself happens inside the stream client at the next turn
+        boundary — never mid-turn."""
+        if not STT_LANG_PIN or self.conversation is None:
+            return
+        cur = getattr(getattr(self.conversation, "state", None),
+                      "language", None)
+        if cur not in ("en", "hi", "gu"):
+            return
+        if cur == self._stt_lang_last:
+            self._stt_lang_stable += 1
+        else:
+            self._stt_lang_last = cur
+            self._stt_lang_stable = 1
+        setter = getattr(self.stt, "set_stream_language", None)
+        mapped = {"en": "en-IN", "hi": "hi-IN", "gu": "gu-IN"}[cur]
+        if self._stt_lang_pin and self._stt_lang_pin != mapped:
+            self._stt_lang_pin = None
+            if callable(setter):
+                setter("unknown")
+            logger.info("[STT] Language pin released (state now %s)", cur)
+        elif (self._stt_lang_pin is None
+                and self._stt_lang_stable >= STT_LANG_PIN_TURNS):
+            self._stt_lang_pin = mapped
+            if callable(setter):
+                setter(mapped)
+            logger.info("[STT] Language pinned to %s (stable %d turns)",
+                        mapped, self._stt_lang_stable)
 
     async def _stt_worker(self) -> None:
         """
@@ -1155,6 +1232,17 @@ class VoicePipeline:
                             "[STT-WORKER] Connect window: forcing lang=%s "
                             "for %.0fms segment", _stt_lang,
                             segment.duration_ms)
+                elif (CAPTURE_MODE and self.conversation is not None
+                        and getattr(self.conversation, "_capture_slot", None)):
+                    # B2: spelled emails/letters are Latin — en-IN stops the
+                    # letter-name transliteration ("एल दब्यू वाय एल") and the
+                    # junk-script roulette mid-capture.
+                    _stt_lang = "en-IN"
+                    logger.info(
+                        "[STT-WORKER] Capture mode: forcing lang=en-IN")
+                elif STT_LANG_PIN and self._stt_lang_pin:
+                    _stt_lang = self._stt_lang_pin
+                    logger.debug("[STT-WORKER] stt_lang pinned to %s", _stt_lang)
                 else:
                     logger.debug("[STT-WORKER] stt_lang=unknown (auto-detect every turn)")
                 _seg_samples = np.frombuffer(segment.audio, dtype=np.int16).astype(np.float32)
@@ -1384,6 +1472,15 @@ class VoicePipeline:
                 # rejection guard — apply Sarvam's detection only if it is
                 # plausible for this text (script/markers agree; a lone
                 # "okay" is not an English switch).
+                # A3 (2026-07-30): recovered transcripts (script-retry /
+                # Whisper) are mishear-prone — a Whisper ", angie?" for
+                # "हाँजी?" must never flip the conversation language.
+                if getattr(stt_result, "source", "primary") != "primary":
+                    if _pending_mirror:
+                        logger.info(
+                            "[STT] Language mirror skipped (source=%s)",
+                            getattr(stt_result, "source", "?"))
+                    _pending_mirror = None
                 if _pending_mirror and self.conversation:
                     if self.conversation.stt_mirror_consistent(
                             _pending_mirror, transcript_text):
@@ -1397,6 +1494,8 @@ class VoicePipeline:
                             "inconsistent with transcript %r",
                             _pending_mirror, transcript_text[:40])
                 logger.info("[STT] %r (%.0fms latency)", transcript_text, stt_latency)
+
+                self._update_stt_lang_pin()
 
                 if self._hub is not None:
                     self._hub.emit_nowait({
@@ -1413,6 +1512,7 @@ class VoicePipeline:
                     speech_start_ts=segment.speech_start_ts,
                     speech_end_ts=segment.speech_end_ts,
                     confidence=getattr(stt_result, "confidence", None),
+                    stt_source=getattr(stt_result, "source", "primary"),
                 )
 
                 try:
@@ -1701,6 +1801,23 @@ class VoicePipeline:
                 "total_latency_ms": 0,
             })
 
+    def _lang_conformance_check(self, stamp: str | None, text: str) -> None:
+        """A6 telemetry (warning only, never behavioral): the language the
+        response text actually carries vs the language the LLM was directed
+        to answer in. A mismatch is either legitimate code-mix or the exact
+        wrong-language-reply class the 2026-07-30 incident belonged to —
+        one grep (`RESPONSE-MISMATCH`) now finds every case."""
+        try:
+            directed = getattr(
+                getattr(self.conversation, "state", None), "language", None)
+            if (stamp and directed and stamp != directed
+                    and directed in ("en", "hi", "gu")):
+                logger.warning(
+                    "[LANG] RESPONSE-MISMATCH directed=%s got=%s text=%r",
+                    directed, stamp, text[:60])
+        except Exception:
+            pass
+
     async def _conversation_layer(self) -> None:
         """
         Consumes transcripts, routes through conversation engine.
@@ -1739,6 +1856,7 @@ class VoicePipeline:
                     logger.info(
                         "[BARGE-IN] Deferred kill — caller said %r "
                         "(not a hello)", transcript.text[:40])
+                    self._delivery_epoch += 1   # A5: stale anything dequeued
                     interrupt = getattr(self.sink, "interrupt_playback", None)
                     if interrupt is not None:
                         await interrupt()
@@ -1759,9 +1877,22 @@ class VoicePipeline:
             # queued, a segment is in STT, or the caller is speaking right
             # now — when none of those hold, the wait is pure dead air and is
             # skipped (was an unconditional ~550ms tax on every turn).
-            merge_wait_s = TRANSCRIPT_MERGE_WINDOW_MS / 1000.0
+            # B2: while an email/phone capture is armed, the window
+            # stretches so letter-by-letter spelling with natural pauses
+            # aggregates into ONE turn — three separately-answered
+            # fragments is how a live capture attempt fell apart. The
+            # idle skip is also disabled: mid-spelling the pipeline IS
+            # idle between fragments; that is exactly the pause to absorb.
+            _capture_active = (
+                CAPTURE_MODE and self.conversation is not None
+                and getattr(self.conversation, "_capture_slot", None)
+                is not None)
+            merge_wait_s = (
+                CAPTURE_MERGE_WINDOW_MS if _capture_active
+                else TRANSCRIPT_MERGE_WINDOW_MS) / 1000.0
             if (
                 TRANSCRIPT_MERGE_SKIP_WHEN_IDLE
+                and not _capture_active
                 and self._transcript_queue.empty()
                 and self._stt_queue.empty()
                 and self._stt_inflight == 0
@@ -1771,19 +1902,28 @@ class VoicePipeline:
                 logger.info("[ENGINE] Merge window skipped (idle)")
             elif merge_wait_s > 0.0:
                 logger.info(
-                    "[ENGINE] Merge window %.0fms (queued=%d stt_q=%d inflight=%d speaking=%s)",
+                    "[ENGINE] Merge window %.0fms%s (queued=%d stt_q=%d inflight=%d speaking=%s)",
                     merge_wait_s * 1000.0,
+                    " [capture]" if _capture_active else "",
                     self._transcript_queue.qsize(), self._stt_queue.qsize(),
                     self._stt_inflight, self._prev_speech,
                 )
             if merge_wait_s > 0.0:
-                try:
-                    follow_on = await asyncio.wait_for(
-                        self._transcript_queue.get(),
-                        timeout=merge_wait_s,
-                    )
+                # In capture mode every merged fragment re-opens the window
+                # (up to 8) so a full spelled email lands as one turn.
+                _max_follow_ons = 8 if _capture_active else 1
+                for _fo_i in range(_max_follow_ons):
+                    try:
+                        follow_on = await asyncio.wait_for(
+                            self._transcript_queue.get(),
+                            timeout=merge_wait_s,
+                        )
+                    except asyncio.TimeoutError:
+                        break  # No follow-on within window — proceed
                     time_gap = follow_on.timestamp - transcript.timestamp
-                    if (time_gap < 3.0 and self._bare_hello(transcript.text)
+                    _gap_cap = 3.0 if not _capture_active else (
+                        CAPTURE_MERGE_WINDOW_MS / 1000.0 + 1.0)
+                    if (time_gap < _gap_cap and self._bare_hello(transcript.text)
                             and self._bare_hello(follow_on.text)):
                         # Two bare hellos are ONE repair signal, not a
                         # sentence — merging them builds the 'hello hello
@@ -1791,7 +1931,7 @@ class VoicePipeline:
                         logger.info(
                             "[ENGINE] Dropping repeated hello follow-on "
                             "(%.1fs gap)", time_gap)
-                    elif time_gap < 3.0:
+                    elif time_gap < _gap_cap:
                         # Close in time — continuation of the same utterance; merge.
                         merged_text = transcript.text.rstrip(" .,") + " " + follow_on.text.lstrip()
                         logger.info(
@@ -1806,6 +1946,10 @@ class VoicePipeline:
                             # First fragment's onset, last fragment's end.
                             speech_start_ts=transcript.speech_start_ts,
                             speech_end_ts=follow_on.speech_end_ts,
+                            # Any recovered fragment taints the merged turn.
+                            stt_source=(transcript.stt_source
+                                        if transcript.stt_source != "primary"
+                                        else follow_on.stt_source),
                         )
                     else:
                         # Gap too large — from a genuinely separate prior turn; discard.
@@ -1813,8 +1957,6 @@ class VoicePipeline:
                             "[ENGINE] Dropping old segment (%.1fs gap): %r",
                             time_gap, follow_on.text[:40],
                         )
-                except asyncio.TimeoutError:
-                    pass  # No follow-on within window — proceed with single transcript
 
             # Drain any remaining queued transcripts.
             # Transcripts that arrived recently (within 3 s) are very likely
@@ -1842,6 +1984,9 @@ class VoicePipeline:
                             stt_latency_ms=candidate.stt_latency_ms,
                             speech_start_ts=transcript.speech_start_ts,
                             speech_end_ts=candidate.speech_end_ts,
+                            stt_source=(transcript.stt_source
+                                        if transcript.stt_source != "primary"
+                                        else candidate.stt_source),
                         )
                         logger.info(
                             "[ENGINE] Merging late continuation (%.1fs): %r + %r",
@@ -1884,6 +2029,10 @@ class VoicePipeline:
                     ):
                         # Cut the agent's superseded reply wherever it is:
                         # still generating, queued for TTS, or playing.
+                        # A5: the epoch bump also catches the reply the TTS
+                        # player has DEQUEUED but not yet started synthesizing
+                        # — the 300ms window the queue drain below can't reach.
+                        self._delivery_epoch += 1
                         if self._tts_playing:
                             await self.tts.stop()
                             self._tts_playing = False
@@ -2020,6 +2169,14 @@ class VoicePipeline:
             if sink is not None and hasattr(sink, "flush"):
                 sink.turn_trace_ref = trace
 
+            # A3: the router's language-evidence tiering needs to know when
+            # a turn came from a mishear-prone recovery path.
+            if self.conversation is not None:
+                try:
+                    self.conversation._turn_stt_source = transcript.stt_source
+                except Exception:
+                    pass
+
             try:
                 async def _run_generation():
 
@@ -2072,6 +2229,7 @@ class VoicePipeline:
                                         # barge-ins at any call age.
                                         protected=(result.intent in
                                                    ("repeat", "connect_intro")),
+                                        replay=(result.intent == "repeat"),
                                         # Fillers are romanized ("Ek minute…")
                                         # and picked BY the state language —
                                         # stamp it so text-derivation can't
@@ -2116,18 +2274,20 @@ class VoicePipeline:
                                     llm_parts.append(result.text)
                                 else:
                                     try:
+                                        # Accent decided WITH the words: a
+                                        # state flip while this waits in the
+                                        # queue once spoke an English reply
+                                        # as hi-IN.
+                                        _stamp = (self.conversation
+                                                  .tts_language_for(result.text))
+                                        self._lang_conformance_check(
+                                            _stamp, result.text)
                                         self._tts_queue.put_nowait(
                                             Response(
                                                 text=result.text,
                                                 is_shortcut=False,
                                                 timestamp=time.monotonic(),
-                                                # Accent decided WITH the
-                                                # words: a state flip while
-                                                # this waits in the queue
-                                                # once spoke an English
-                                                # reply as hi-IN.
-                                                language=self.conversation
-                                                .tts_language_for(result.text),
+                                                language=_stamp,
                                             )
                                         )
                                         logger.debug(
@@ -2147,13 +2307,15 @@ class VoicePipeline:
                     if llm_parts:
                         combined_text = " ".join(llm_parts)
                         try:
+                            _stamp = (self.conversation
+                                      .tts_language_for(combined_text))
+                            self._lang_conformance_check(_stamp, combined_text)
                             self._tts_queue.put_nowait(
                                 Response(
                                     text=combined_text,
                                     is_shortcut=False,
                                     timestamp=time.monotonic(),
-                                    language=self.conversation
-                                    .tts_language_for(combined_text),
+                                    language=_stamp,
                                 )
                             )
                         except asyncio.QueueFull:
@@ -2248,6 +2410,11 @@ class VoicePipeline:
             except asyncio.CancelledError:
                 break
 
+            # A5: snapshot the delivery epoch the moment the Response leaves
+            # the queue — a supersede event (cont-merge rollback, barge-in)
+            # after this point must still be able to kill it.
+            _epoch_at_dequeue = self._delivery_epoch
+
             # Drop genuinely-orphaned responses. Cap is intentionally generous:
             # a multi-sentence streamed response can spend tens of seconds in
             # the queue waiting for earlier chunks to finish speaking. Barge-in
@@ -2257,6 +2424,16 @@ class VoicePipeline:
             if age_ms > 8000:
                 logger.warning("[TTS] Dropping stale response (%.0fms old): %r",
                                age_ms, response.text[:50])
+                continue
+
+            # A5: a replay exists to fill a silence. If a newer response
+            # started playing after this replay was created, the silence is
+            # gone — speaking it now double-answers the caller (live case:
+            # "Sure, am I speaking with Angelo?" played twice back-to-back).
+            if response.replay and self._last_playback_start_ts > response.timestamp:
+                logger.info(
+                    "[TTS] Dropped replay — a newer response already played: %r",
+                    response.text[:50])
                 continue
 
             if self._tts_playing:
@@ -2293,10 +2470,22 @@ class VoicePipeline:
                 # Collapse multiple spaces/newlines that may appear in LLM output
                 tts_text = re.sub(r'\s+', ' ', tts_text).strip()
 
+                # A5: last gate before synthesis. Covers the dequeue→synth
+                # window (including the stop()/sleep awaits above) where a
+                # cont-merge rollback used to lose the race and both the
+                # superseded and the merged reply were spoken.
+                if self._delivery_epoch != _epoch_at_dequeue:
+                    logger.info(
+                        "[TTS] Dropped stale response (epoch %d < %d): %r",
+                        _epoch_at_dequeue, self._delivery_epoch,
+                        tts_text[:50])
+                    continue
+
                 logger.info("[TTS] Playing: %r (queued %.0fms ago)", tts_text, age_ms)
 
                 self._tts_playing = True
                 self._tts_start_time = time.monotonic()
+                self._last_playback_start_ts = self._tts_start_time
                 # Connect delivery guard bookkeeping: new utterance, nothing
                 # of it flushed yet, protected status from the Response.
                 self._utt_seq += 1

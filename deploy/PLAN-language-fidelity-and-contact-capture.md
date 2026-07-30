@@ -1,6 +1,19 @@
 # PLAN — Language Fidelity + Contact Capture (emails) — platform-wide
 
-**Status: PLAN ONLY — nothing implemented. Authored 2026-07-30 from live-call evidence.**
+**Status: IMPLEMENTED 2026-07-30 (same day) — RUNBOOK §20.** All of Part A
+(A1–A6) and Part B (B1–B6) are live. Notable deltas from the plan text:
+B6 is engine-level slot provisioning in `build_state_manager` (slots named
+"email" are email-typed even when authored `type: text`) instead of a YAML
+migration — agents' files stay as their authors wrote them; phone slots
+keep their authored merge policy (a forced confirm gate could stall live
+outbound flows); contact confirmations require a BARE yes (≤3 words) so
+"okay tell me more" can't confirm an email; and the A4 work also fixed a
+latent bug — under streaming STT the forced-language script-retry never
+re-uploaded audio (it only flushed the already-consumed stream) and now
+retries via the HTTP rescue client. Tests:
+`tests/test_language_fidelity.py`, `tests/test_contact_capture.py`.
+
+*Original plan (authored 2026-07-30 from live-call evidence) follows.*
 
 Owner report (2026-07-30, after test call `918076562864_20260730_120613`):
 

@@ -102,6 +102,16 @@ class SarvamStreamingSTT(STTProvider):
         self._sender_task: asyncio.Task | None = None
         self._recv_task: asyncio.Task | None = None
 
+        # A4a language pin (2026-07-30): the WS used to run language_code=
+        # "unknown" for the whole call — per-segment auto-detect rendered
+        # short Hindi as Punjabi/Bengali/Kannada 29×/day. The pipeline calls
+        # set_language() once the conversation stabilizes; the reconnect
+        # happens only at a turn boundary (end of transcribe()) so buffered
+        # server-side audio is never lost mid-turn.
+        self._desired_language: str = "unknown"
+        self._ws_language: str = "unknown"
+        self._reconnect_wanted: bool = False
+
         self._pending = bytearray()
         # (generation, text) — reset_turn() bumps the generation so dropped
         # turns can never contribute text to a later one.
@@ -209,7 +219,46 @@ class SarvamStreamingSTT(STTProvider):
                 self._call_id_provider(),
                 len(audio_bytes) / (sample_rate * 2),
                 provider="sarvam")
+        # A4a: apply any pending language pin now — the turn just finalized,
+        # so this is the safe boundary to swap the WS.
+        await self._maybe_reconnect_for_pin()
         return result
+
+    def set_language(self, code: str) -> None:
+        """A4a: pin (or unpin with "unknown") the stream's language. The
+        actual reconnect is deferred to the next turn boundary."""
+        code = code or "unknown"
+        if code == self._desired_language:
+            return
+        self._desired_language = code
+        if self._ws is not None and self._ws_language != code:
+            self._reconnect_wanted = True
+            logger.info(
+                "[STT:Stream] Language pin %s requested (ws currently %s) — "
+                "will reconnect at next turn boundary",
+                code, self._ws_language)
+
+    async def _maybe_reconnect_for_pin(self) -> None:
+        """Turn-boundary reconnect for a pending language pin. Loses nothing:
+        the turn's segments were just finalized and no new audio is buffered
+        at this point in the pipeline's flow."""
+        if not self._reconnect_wanted or self._broken:
+            return
+        self._reconnect_wanted = False
+        try:
+            await self.close()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(self._ensure_connected(), timeout=5.0)
+            logger.info("[STT:Stream] Reconnected with lang=%s",
+                        self._ws_language)
+        except Exception as exc:
+            # Non-fatal: the next feed's _ensure_tasks → _sender_loop →
+            # _ensure_connected retries; rescue batch covers a bad turn.
+            logger.warning(
+                "[STT:Stream] Pin reconnect failed (%r) — next feed retries",
+                exc)
 
     async def warmup(self) -> None:
         """Open the WS before the first turn so turn 1 doesn't pay the
@@ -256,13 +305,13 @@ class SarvamStreamingSTT(STTProvider):
         if self._client is None:
             from sarvamai import AsyncSarvamAI
             self._client = AsyncSarvamAI(api_subscription_key=self._api_key)
-        logger.info("[STT:Stream] Opening WS model=%s lang=unknown", self._model)
-        # Single "unknown" connection for the whole call: saaras detects the
-        # language per segment and reports it in data.language_code, which
-        # the router/pipeline already use for language locking. Reconnecting
-        # on lock would risk losing buffered server-side audio mid-turn.
+        logger.info("[STT:Stream] Opening WS model=%s lang=%s",
+                    self._model, self._desired_language)
+        # One connection per language phase: "unknown" until the pipeline
+        # pins a stabilized conversation language (A4a), then that code.
+        # Reconnects happen only at turn boundaries — never mid-turn.
         self._ctx = self._client.speech_to_text_streaming.connect(
-            language_code="unknown",
+            language_code=self._desired_language,
             model=self._model,
             mode="transcribe",
             flush_signal="true",
@@ -270,6 +319,7 @@ class SarvamStreamingSTT(STTProvider):
             vad_signals="true",
         )
         self._ws = await self._ctx.__aenter__()
+        self._ws_language = self._desired_language
         if self._recv_task is None or self._recv_task.done():
             self._recv_task = asyncio.get_running_loop().create_task(
                 self._recv_loop())

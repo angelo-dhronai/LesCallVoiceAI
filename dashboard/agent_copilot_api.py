@@ -58,6 +58,9 @@ from backend.app.agent_definition.schema import (                   # noqa: E402
     PostCallConfig,
 )
 from backend.app.agent_definition.registry import agent_registry    # noqa: E402
+from backend.app.agent_definition.voice_catalog import (            # noqa: E402
+    recommended_speaker,
+)
 from backend.app.agent_definition.boot_check import engine_boot_check  # noqa: E402
 from backend.app.agent_definition import store as agent_store       # noqa: E402
 from backend.app.agent_definition.diff import (                     # noqa: E402
@@ -315,7 +318,11 @@ def _default_definition(name: str, provided: dict) -> dict:
     def s(lang: str, key: str):
         return (_LANG_STRINGS.get(lang) or _LANG_STRINGS["en"])[key]
 
-    tts_voices = {l: {"model": "bulbul:v3", "speaker": "simran", "pace": 1.15} for l in supported}
+    # ONE speaker across all languages (mid-call speaker switches change the
+    # person), picked for the DEFAULT language per Sarvam's CER tables —
+    # the old hardcoded simran spoke English below its recommended tier.
+    _speaker = recommended_speaker(default_lang, "female")
+    tts_voices = {l: {"model": "bulbul:v3", "speaker": _speaker, "pace": 1.15} for l in supported}
     register_notes = {l: s(l, "register_note") for l in supported}
 
     # Outbound agents lead the call and need a pitch-shaped flow, not the
@@ -1997,9 +2004,17 @@ def _enforce_invariants(merged: dict, notes: list[str]) -> None:
     tv = langs.get("tts_voices")
     if not isinstance(tv, dict):
         tv = langs["tts_voices"] = {}
+    # A missing per-language entry inherits the agent's existing speaker
+    # (one voice across languages); a fully-unvoiced agent gets the
+    # recommended speaker for its default language.
+    _existing_spk = next(
+        (v.get("speaker") for v in
+         [tv.get(langs["default"])] + list(tv.values())
+         if isinstance(v, dict) and v.get("speaker")), None)
+    _fill_spk = _existing_spk or recommended_speaker(langs["default"], "female")
     for code in clean_sup:
         if not isinstance(tv.get(code), dict):
-            tv[code] = {"model": "bulbul:v3", "speaker": "simran", "pace": 1.15}
+            tv[code] = {"model": "bulbul:v3", "speaker": _fill_spk, "pace": 1.15}
     rn = langs.get("register_notes")
     if not isinstance(rn, dict):
         rn = langs["register_notes"] = {}

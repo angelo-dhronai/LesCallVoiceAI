@@ -726,7 +726,14 @@ class ConversationRouter:
         _qa_signals = self._def.knowledge_base.qa_field_signals or None
         self.memory = ConversationMemory(field_signals=_qa_signals)
         self.state = ConversationState()
-        self.state.language = default_language
+        # Seeded from the agent's languages.default by the bridge/run.py; an
+        # unseeded session used to start hardcoded-Hindi, so English agents
+        # opened with hi-IN accents (PLAN-tts-accent-consistency.md P0).
+        # Codes outside the conversational trio keep the legacy "hi" seed —
+        # fillers/responses are only authored for en/hi/gu.
+        self.state.language = (default_language
+                               if default_language in ("en", "hi", "gu")
+                               else "hi")
         self._response_counter = 0
         self._lang_cache: dict[str, tuple[str, float, str]] = {}
         self._filler_counter = 0
@@ -4126,6 +4133,52 @@ class ConversationRouter:
         "hi": "क्या मेरी आवाज़ साफ़ आ रही है?",
         "gu": "શું મારો અવાજ બરાબર આવે છે?",
     }
+
+    def tts_language_for(self, text: str) -> str:
+        """Language code the TTS should speak `text` in — decided by the text
+        itself, not the conversation state. Mislabeling English as hi-IN
+        pushes it through Sarvam's Hindi pronunciation frontend at the Hindi
+        pace factor — the measured "rural accent" incident
+        (deploy/PLAN-tts-accent-consistency.md). Script wins outright; Latin
+        text follows the conversation language only when it carries romanized
+        Hindi/Gujarati markers (fillers, Hinglish openers)."""
+        t = (text or "").strip().lower()
+        if not t:
+            return self.state.language or "en"
+        if any("઀" <= c <= "૿" for c in t):
+            return "gu"
+        if any("ऀ" <= c <= "ॿ" for c in t):
+            # Code-mixed Devanagari+Latin stays hi-IN: Sarvam speaks embedded
+            # English words natively; Devanagari under en-IN does not work.
+            return "gu" if self._has_gujarati_markers_devanagari(t) else "hi"
+        if self.state.language in ("hi", "gu") and (
+                _pattern_score(t, _HINDI_PATTERNS) > 0
+                or _pattern_score(t, _GUJARATI_PATTERNS) > 0):
+            return self.state.language
+        return "en"
+
+    def stt_mirror_consistent(self, short: str, text: str) -> bool:
+        """Whether Sarvam's per-segment language claim is plausible for the
+        transcript it arrived with. Gates the pipeline's state mirror:
+        acoustic misdetection (Indian-accented English → hi-IN, bare "hello"
+        → anything) must not flip the agent's language, and a lone "okay"
+        from a Hindi speaker is not an English switch — same ≥2-word bar as
+        the conversation-side switch threshold."""
+        t = (text or "").strip().lower()
+        if not t:
+            return False
+        has_guj = any("઀" <= c <= "૿" for c in t)
+        has_dev = any("ऀ" <= c <= "ॿ" for c in t)
+        if short == "gu":
+            return (has_guj
+                    or (has_dev and self._has_gujarati_markers_devanagari(t))
+                    or _pattern_score(t, _GUJARATI_PATTERNS) > 0)
+        if short == "hi":
+            return has_dev or _pattern_score(t, _HINDI_PATTERNS) > 0
+        if short == "en":
+            return (not has_dev and not has_guj
+                    and len(t.split()) >= 2)
+        return False
 
     def connect_intro_line(self) -> str:
         """Full identity intro for the connect hello fast path (and for the

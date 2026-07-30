@@ -233,6 +233,38 @@ def test_enrich_fills_missing_opening_with_short_hello(cop):
     assert any("opening_greeting was empty" in n for n in notes)
 
 
+def test_default_voices_use_recommended_speaker(cop):
+    """New agents get the Sarvam-recommended speaker for their default
+    language (the old hardcoded simran spoke English below tier), and ONE
+    speaker across all languages."""
+    d = cop._default_definition(
+        "acme", {"languages": {"supported": ["en"], "default": "en"}})
+    assert all(v["speaker"] == "ishita"
+               for v in d["languages"]["tts_voices"].values())
+    d2 = cop._default_definition(
+        "acme", {"languages": {"supported": ["hi", "en"], "default": "hi"}})
+    voices = d2["languages"]["tts_voices"]
+    assert set(voices) == {"hi", "en"}
+    assert all(v["speaker"] == "priya" for v in voices.values())
+
+
+def test_normalize_missing_voice_inherits_existing_speaker(cop):
+    """A missing per-language voice entry inherits the agent's existing
+    speaker — never a different voice mid-call."""
+    d = maya_shape(languages={
+        "supported": ["hi", "en"], "default": "hi",
+        "tts_voices": {"hi": {"model": "bulbul:v3", "speaker": "shubh",
+                              "pace": 1.0}}})
+    cop._enforce_invariants(d, [])
+    assert d["languages"]["tts_voices"]["en"]["speaker"] == "shubh"
+
+
+def test_normalize_unvoiced_agent_gets_recommended(cop):
+    d = maya_shape()          # languages: en only, no tts_voices at all
+    cop._enforce_invariants(d, [])
+    assert d["languages"]["tts_voices"]["en"]["speaker"] == "ishita"
+
+
 def test_normalize_connect_shapes(cop):
     notes: list[str] = []
     d = maya_shape()

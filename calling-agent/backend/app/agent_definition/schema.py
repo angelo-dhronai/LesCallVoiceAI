@@ -211,6 +211,12 @@ class LanguageConfig:
     # single pure language. Makes phone conversations sound human. Default
     # False preserves the strict single-language behaviour for other agents.
     allow_code_mixing: bool = False
+    # When True (platform default), the TTS target_language_code is derived
+    # from the script/markers of the text actually being spoken, so the
+    # accent always matches the words. False restores the legacy behaviour
+    # (accent follows conversation state — English replies could go out
+    # hi-IN). Per-agent opt-out for TTS_LANG_FROM_TEXT.
+    tts_lang_from_text: bool = True
     # Language of the opening greeting ('' = languages.default — today).
     greeting_language: str = ""
     # Hint that the greeting should be bilingual (informational for now).
@@ -792,6 +798,7 @@ class AgentDefinition:
             register_notes=_as_dict(lang_d, "register_notes"),
             stt_forced_language=_as_str(lang_d, "stt_forced_language"),
             allow_code_mixing=_as_bool(lang_d, "allow_code_mixing", False),
+            tts_lang_from_text=_as_bool(lang_d, "tts_lang_from_text", True),
             greeting_language=_as_str(lang_d, "greeting_language"),
             bilingual_greeting=_as_bool(lang_d, "bilingual_greeting", False),
             closing_language_policy=_as_str(lang_d, "closing_language_policy"),

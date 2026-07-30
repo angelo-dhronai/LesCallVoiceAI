@@ -53,6 +53,36 @@ SPEAKER_CATALOG: dict[str, dict] = {
 }
 
 
+# Sarvam's per-language recommended speakers (best-practices CER tables,
+# docs.sarvam.ai, captured 2026-07-30): not all speakers pronounce every
+# language equally — shubh is a Hindi-tier voice and is NOT recommended for
+# English (ratan/ishita are). Keyed (short_lang, gender). Used by the Copilot
+# when generating tts_voices for NEW agents; existing agents are never
+# rewritten. ONE speaker per agent across its languages — switching speakers
+# mid-call changes the person, which is worse than an accent shift.
+RECOMMENDED_SPEAKERS: dict[tuple[str, str], str] = {
+    ("en", "male"): "ratan", ("en", "female"): "ishita",
+    ("hi", "male"): "shubh", ("hi", "female"): "priya",
+    ("gu", "male"): "ratan", ("gu", "female"): "priya",
+    ("mr", "male"): "ratan", ("mr", "female"): "priya",
+    ("ta", "male"): "ratan", ("ta", "female"): "ishita",
+    ("te", "male"): "shubh", ("te", "female"): "neha",
+    ("kn", "male"): "shubh", ("kn", "female"): "neha",
+    ("bn", "male"): "rehan", ("bn", "female"): "roopa",
+    ("pa", "male"): "mani",  ("pa", "female"): "roopa",
+    ("od", "male"): "shubh", ("od", "female"): "ritu",
+    ("ml", "male"): "shubh", ("ml", "female"): "pooja",
+}
+
+
+def recommended_speaker(language: str, gender: str = "female") -> str:
+    """Best default speaker for a language+gender per Sarvam's CER tables.
+    Falls back to the top overall voices (priya / mani) for unknown codes."""
+    g = (gender or "female").strip().lower()
+    key = ((language or "en").strip().lower(), g)
+    return RECOMMENDED_SPEAKERS.get(key, "priya" if g == "female" else "mani")
+
+
 def speaker_gender(speaker: str) -> str:
     """'male' / 'female' / '' (unknown speaker)."""
     return SPEAKER_CATALOG.get((speaker or "").strip().lower(), {}).get("gender", "")

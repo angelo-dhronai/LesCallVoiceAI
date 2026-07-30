@@ -541,7 +541,13 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
         pace=tts_pace,
         sample_rate=TTS_OUTPUT_SR,
     )
-    conversation = ConversationRouter(agent_def=agent_def)
+    # Seed the session language from the agent's own default — without this
+    # every call opened in the hardcoded "hi" and English agents greeted with
+    # a hi-IN accent (PLAN-tts-accent-consistency.md P0).
+    conversation = ConversationRouter(
+        agent_def=agent_def,
+        default_language=(agent_def.languages.default or "hi") if agent_def else "hi",
+    )
     return slug, conversation, stt, tts, agent_health
 
 class TelephonySession:

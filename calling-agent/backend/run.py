@@ -120,7 +120,12 @@ def main() -> None:
             )
 
             pipeline = VoicePipeline(
-                conversation=ConversationRouter(agent_def=agent_def),
+                conversation=ConversationRouter(
+                    agent_def=agent_def,
+                    default_language=(
+                        (agent_def.languages.default or "hi")
+                        if agent_def else "hi"),
+                ),
                 event_hub=hub,
                 stt=stt,
                 tts=tts,

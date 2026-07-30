@@ -517,8 +517,10 @@ class SarvamTTS(StreamingTTS):
                 try:
                     await self._sink.start()
                     logger.info(
-                        "[TTS:Sarvam] Cache HIT (%.1fs) for %r",
-                        len(pcm) / (self._sample_rate * 2), text[:50],
+                        "[TTS:Sarvam] Cache HIT (%.1fs, %s, %s) for %r",
+                        len(pcm) / (self._sample_rate * 2),
+                        _LANG_CODE_MAP.get(self._language, "en-IN"),
+                        self._speaker, text[:50],
                     )
                     try:
                         os.utime(path)  # LRU touch

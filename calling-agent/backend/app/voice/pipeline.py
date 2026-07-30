@@ -94,6 +94,12 @@ class Response:
     # The connect delivery guard protects these from hello barge-ins at any
     # call age, not just inside CONNECT_WINDOW_S.
     protected: bool = False
+    # Short language code ("en"/"hi"/"gu") stamped when the text was chosen,
+    # so the accent is decided with the words — not re-read from mutable
+    # conversation state at dequeue time (a mid-queue language flip once spoke
+    # a fully-English reply as hi-IN). None → derived from the text itself in
+    # _resolve_tts_language.
+    language: str | None = None
 
 
 QUEUE_SIZE_AUDIO = 40
@@ -235,6 +241,19 @@ CONNECT_SHORT_SEG_MS = float(os.environ.get("CONNECT_SHORT_SEG_MS", "800"))
 # self-loop.
 EMPTY_STREAK_DAMPER = os.environ.get(
     "EMPTY_STREAK_DAMPER", "true").lower() == "true"
+# TTS accent consistency (PLAN-tts-accent-consistency.md).
+# TTS_LANG_FROM_TEXT: the target_language_code sent to Sarvam is derived from
+# the text actually being spoken (script/marker detection) instead of raw
+# conversation state — English replies were going out hi-IN ("rural accent").
+# LANG_MIRROR_GUARDED: Sarvam's per-segment language detection updates
+# conversation state only when the transcript survives validation AND the
+# claim is consistent with the transcript's own script/markers — a bare
+# "hello" misdetected as Odia, or Indian-accented English tagged hi-IN, no
+# longer flips the agent's language mid-call.
+TTS_LANG_FROM_TEXT = os.environ.get(
+    "TTS_LANG_FROM_TEXT", "true").lower() == "true"
+LANG_MIRROR_GUARDED = os.environ.get(
+    "LANG_MIRROR_GUARDED", "true").lower() == "true"
 
 # Fallback phrases played when STT returns empty on substantial speech,
 # or when TTS receives an empty string or fails to play (feature 2 & 5).
@@ -308,7 +327,10 @@ class VoicePipeline:
         if conversation is None:
             # CLI/dev default only — telephony always passes a conversation.
             from ..agent_definition import get_pramukh_agent
-            conversation = ConversationRouter(agent_def=get_pramukh_agent())
+            _cli_def = get_pramukh_agent()
+            conversation = ConversationRouter(
+                agent_def=_cli_def,
+                default_language=_cli_def.languages.default or "hi")
         self.conversation = conversation
         self._hub = event_hub
 
@@ -1167,8 +1189,16 @@ class VoicePipeline:
                 transcript_text = stt_result.text
                 stt_latency = (time.monotonic() - latency_start) * 1000
 
-                # Update conversation language from Sarvam's native detection result.
-                # Applied on every turn — no lock. Enables truly dynamic language switching.
+                # Update conversation language from Sarvam's native detection
+                # result. Guarded by default (LANG_MIRROR_GUARDED): the write
+                # is deferred until the transcript survives validation, and
+                # only lands when the claim is consistent with the
+                # transcript's own script/markers — acoustic misdetection
+                # (bare "hello" → anything, Indian-accented English → hi-IN)
+                # used to flip the agent's accent mid-call before the
+                # transcript was even accepted. LANG_MIRROR_GUARDED=false
+                # restores the legacy immediate unconditional write.
+                _pending_mirror: str | None = None
                 if (
                     stt_result.detected_language
                     and self.conversation
@@ -1177,12 +1207,15 @@ class VoicePipeline:
                     _bcp47_to_short = {"en-IN": "en", "hi-IN": "hi", "gu-IN": "gu"}
                     short = _bcp47_to_short.get(stt_result.detected_language)
                     if short:
-                        logger.info(
-                            "[STT] Language auto-detected by Sarvam: %s → %s",
-                            stt_result.detected_language, short,
-                        )
-                        self.conversation.state.language = short
-                        # Do NOT lock — allow every utterance to update language dynamically
+                        if LANG_MIRROR_GUARDED:
+                            _pending_mirror = short
+                        else:
+                            logger.info(
+                                "[STT] Language auto-detected by Sarvam: %s → %s",
+                                stt_result.detected_language, short,
+                            )
+                            self.conversation.state.language = short
+                            # Do NOT lock — allow every utterance to update language dynamically
 
                 # Duration-aware plausibility: natural speech maxes at ~4 words/sec.
                 # A transcript with far more words than the audio can contain is a
@@ -1306,6 +1339,8 @@ class VoicePipeline:
                                         text=close_text,
                                         is_shortcut=True,
                                         timestamp=time.monotonic(),
+                                        language=(lang if lang in
+                                                  ("en", "hi", "gu") else "en"),
                                     ))
                                 except asyncio.QueueFull:
                                     pass
@@ -1334,6 +1369,8 @@ class VoicePipeline:
                                         text=fallback,
                                         is_shortcut=True,
                                         timestamp=time.monotonic(),
+                                        language=(lang if lang in
+                                                  ("en", "hi", "gu") else "en"),
                                     ))
                                 except asyncio.QueueFull:
                                     logger.warning("[STT] TTS queue full — cannot play language-fallback phrase")
@@ -1343,6 +1380,22 @@ class VoicePipeline:
                     continue
 
                 self._stt_consecutive_fallbacks = 0  # successful transcript — reset failure streak
+                # Deferred language mirror: the transcript survived every
+                # rejection guard — apply Sarvam's detection only if it is
+                # plausible for this text (script/markers agree; a lone
+                # "okay" is not an English switch).
+                if _pending_mirror and self.conversation:
+                    if self.conversation.stt_mirror_consistent(
+                            _pending_mirror, transcript_text):
+                        logger.info(
+                            "[STT] Language auto-detected by Sarvam: %s → %s (guarded)",
+                            stt_result.detected_language, _pending_mirror)
+                        self.conversation.state.language = _pending_mirror
+                    else:
+                        logger.info(
+                            "[STT] Language mirror suppressed: %r claim "
+                            "inconsistent with transcript %r",
+                            _pending_mirror, transcript_text[:40])
                 logger.info("[STT] %r (%.0fms latency)", transcript_text, stt_latency)
 
                 if self._hub is not None:
@@ -1440,6 +1493,29 @@ class VoicePipeline:
         if now - self._call_start_ts < CONNECT_WINDOW_S:
             return min(CONNECT_MIN_SPEECH_MS, MIN_SPEECH_MS)
         return MIN_SPEECH_MS
+
+    def _resolve_tts_language(self, response: "Response", text: str) -> tuple[str, str]:
+        """(language, source) the TTS speaks this utterance in. A language
+        stamped on the Response (decided with the words) always wins; else
+        the text's own script/markers decide (TTS_LANG_FROM_TEXT, per-agent
+        opt-out languages.tts_lang_from_text); conversation state is the
+        fallback and the pre-fix behaviour."""
+        conv = self.conversation
+        state_lang = (getattr(conv.state, "language", None) or "en") if conv else "en"
+        if response.language:
+            return response.language, "stamp"
+        if not TTS_LANG_FROM_TEXT:
+            return state_lang, "state"
+        if conv is not None and getattr(
+                conv._def.languages, "tts_lang_from_text", True) is False:
+            return state_lang, "state"
+        fn = getattr(conv, "tts_language_for", None) if conv else None
+        if callable(fn):
+            try:
+                return fn(text), "text"
+            except Exception:
+                return state_lang, "state"
+        return state_lang, "state"
 
     @staticmethod
     def _empty_fallback_speaks(streak: int) -> bool:
@@ -1996,6 +2072,17 @@ class VoicePipeline:
                                         # barge-ins at any call age.
                                         protected=(result.intent in
                                                    ("repeat", "connect_intro")),
+                                        # Fillers are romanized ("Ek minute…")
+                                        # and picked BY the state language —
+                                        # stamp it so text-derivation can't
+                                        # misroute them to en-IN.
+                                        language=(
+                                            self.conversation.state.language
+                                            if (result.intent == "filler"
+                                                and self.conversation
+                                                and self.conversation.state
+                                                .language in ("en", "hi", "gu"))
+                                            else None),
                                     )
                                 )
                             except asyncio.QueueFull:
@@ -2034,6 +2121,13 @@ class VoicePipeline:
                                                 text=result.text,
                                                 is_shortcut=False,
                                                 timestamp=time.monotonic(),
+                                                # Accent decided WITH the
+                                                # words: a state flip while
+                                                # this waits in the queue
+                                                # once spoke an English
+                                                # reply as hi-IN.
+                                                language=self.conversation
+                                                .tts_language_for(result.text),
                                             )
                                         )
                                         logger.debug(
@@ -2058,6 +2152,8 @@ class VoicePipeline:
                                     text=combined_text,
                                     is_shortcut=False,
                                     timestamp=time.monotonic(),
+                                    language=self.conversation
+                                    .tts_language_for(combined_text),
                                 )
                             )
                         except asyncio.QueueFull:
@@ -2122,6 +2218,7 @@ class VoicePipeline:
                         text="Sorry, could you say that again?",
                         is_shortcut=True,
                         timestamp=time.monotonic(),
+                        language="en",
                     ))
                 except asyncio.QueueFull:
                     pass
@@ -2184,6 +2281,7 @@ class VoicePipeline:
                         text=fallback,
                         is_shortcut=True,
                         timestamp=response.timestamp,
+                        language=lang if lang in ("en", "hi", "gu") else "en",
                     )
 
                 # Preprocess text to avoid gibberish: normalize punctuation that
@@ -2227,7 +2325,8 @@ class VoicePipeline:
                 self._speech_frame_streak = 0
 
                 if hasattr(self.tts, 'set_language') and self.conversation:
-                    _lang = self.conversation.state.language
+                    _lang, _lang_src = self._resolve_tts_language(
+                        response, tts_text)
                     self.tts.set_language(_lang)
                     # v2: per-language voice on mid-call language switch —
                     # only when the agent defines a voice for that language
@@ -2240,6 +2339,13 @@ class VoicePipeline:
                                                pace=getattr(_vcfg, 'pace', None))
                     except Exception:
                         pass
+                    # One audit line per utterance: the accent decision used
+                    # to be reconstructable only by cross-referencing three
+                    # log families.
+                    logger.info(
+                        "[TTS] lang=%s src=%s speaker=%s",
+                        _lang, _lang_src,
+                        getattr(self.tts, "_speaker", "?"))
 
                 # Canned lines (greeting, fillers, response-bank phrases) go
                 # through the disk cache: repeat plays cost zero synthesis

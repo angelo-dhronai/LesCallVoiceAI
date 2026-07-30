@@ -948,3 +948,51 @@ pins this). For short-opening agents, keep `identity.agent_name` /
 segments born INSIDE the 3.2s ECHO-MUTE window still reached STT — the
 echo-gate early-exit (5 frames ≈ 100ms) is the suspect. The damper contains
 the blast radius; tuning `ECHO_EARLY_EXIT_FRAMES` needs its own canary.
+
+## 19. TTS accent consistency — platform-wide (2026-07-30)
+
+**Problem (measured, Jul 25-30 logs).** English replies spoken with a heavy
+Hindi accent; accent flips mid-call. 87/88 calls opened with hi-IN audio
+(state.language was hardcoded "hi" — the agent's `languages.default` only
+picked the voice, never the language); the TTS `target_language_code`
+followed conversation state, not the text (28 clearly-English lines sent
+hi-IN in 5 days, +8% Hindi pace factor riding along); Sarvam's per-segment
+STT detection rewrote state unguarded BEFORE transcript validation (21
+mid-call accent switches on Jul 29 alone; a Gujarati carrier hold message
+flipped an en agent to gu-IN); wrong-accent PCM persisted in the canned
+cache ('Hello' replayed 62× from hi-IN audio). Full diagnosis:
+`deploy/PLAN-tts-accent-consistency.md`.
+
+**Fixes (one shared engine — every agent, current and future).**
+
+| Layer | Behaviour | Where |
+|---|---|---|
+| Session | `state.language` seeded from the agent's `languages.default` (clamped to en/hi/gu; exotic codes keep the legacy hi seed). | `ConversationRouter.__init__`, bridge, `run.py`, CLI fallback |
+| TTS | `target_language_code` derived from the TEXT being spoken (`tts_language_for`: script wins; code-mixed Devanagari stays hi-IN; Latin follows state only with romanized hi/gu markers). Resolver precedence: Response.language stamp > text > state. | `conversation.py`, `pipeline.py _resolve_tts_language` |
+| TTS | LLM sentences stamp their language at ENQUEUE (a mid-queue state flip once spoke an English reply as hi-IN); fillers stamp the state language they were picked by; STT fallback lines stamp their chosen language. | `Response.language` |
+| STT | Language mirror guarded: applied only after the transcript survives validation AND the claim matches the transcript's script/markers (bare "hello" and lone "okay" can never flip; en switch needs ≥2 words — same bar as the conversation-side threshold). | `stt_mirror_consistent`, `_stt_worker` deferred write |
+| Pace | Follows the same corrected language — English no longer gets the hi ×1.08 factor. | free via the resolver |
+| Copilot | New agents get the Sarvam-recommended speaker for their default language (en→ishita/ratan; the old hardcoded simran is below tier for English); missing per-language voice entries inherit the agent's existing speaker (one voice per agent). Existing agents untouched. | `voice_catalog.RECOMMENDED_SPEAKERS`, `_default_definition`, `_enforce_invariants` |
+| Logs | One audit line per utterance: `[TTS] lang=<code> src=stamp|text|state speaker=<s>`; `Cache HIT` now records language + speaker. | `pipeline.py`, `tts_sarvam.py` |
+
+**Env knobs.** `TTS_LANG_FROM_TEXT` (true) · `LANG_MIRROR_GUARDED` (true).
+Per-agent opt-out: `languages.tts_lang_from_text: false`.
+
+**Cache purge (one-time, at deploy).** `data/tts_cache/` held 13 pure-English
+entries keyed hi-IN (created while state was mislabeled). Purge after the
+runtime restart: `rm -f data/tts_cache/*.pcm` — self-rebuilding, one synth
+per canned line on first play.
+
+**Rollback.** `TTS_LANG_FROM_TEXT=false` → accent follows state again;
+`LANG_MIRROR_GUARDED=false` → legacy unguarded immediate mirror; P0 seed is
+a constructor arg (one-line revert per call site). Compose env changes need
+`up -d` — restart alone does not re-read env.
+
+**Tests.** `tests/test_tts_accent.py` (21) + 4 voice tests in
+`test_copilot_quality_lints.py`. Not changed: LLM prompting, response
+selection, stage flow, barge-in, cache-key formula, existing agent YAMLs.
+
+**Deliberately out of scope.** IVR/hold-announcement text still counts as a
+caller turn for the conversation's own (guarded) language path; stage-goal
+fragments spliced into callback greetings (separate bug, recorded in the
+plan); per-chunk long-sentence pace damping variation.

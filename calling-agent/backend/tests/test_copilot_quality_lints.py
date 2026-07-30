@@ -56,7 +56,10 @@ def _run(coro):
 MARK_CALLER_PICKS = "let the CALLER propose the time"
 MARK_FIRST_BEAT = "only the FIRST beat"
 MARK_NO_TIMES = "no times to offer"
-ALL_MARKS = (MARK_CALLER_PICKS, MARK_FIRST_BEAT, MARK_NO_TIMES)
+MARK_DEAD_END_RULES = "no way to act"
+MARK_TINY_CAP = "barely covers a greeting"
+ALL_MARKS = (MARK_CALLER_PICKS, MARK_FIRST_BEAT, MARK_NO_TIMES,
+             MARK_DEAD_END_RULES, MARK_TINY_CAP)
 
 
 def maya_shape(**over) -> dict:
@@ -140,6 +143,64 @@ def test_production_agents_trigger_no_new_lints(cop, slug, wiring):
     warnings = cop._quality_warnings(merged, include_wiring_lints=wiring)
     for mark in ALL_MARKS:
         assert not any(mark in w for w in warnings), (slug, mark, warnings)
+
+
+# ── termination lints + normalization (call_flow.termination, 2026-07-29) ──
+
+def test_lint_end_conditions_with_llm_end_call_off(cop):
+    d = maya_shape()
+    d["call_flow"]["termination"] = {
+        "end_conditions": ["once booked, end the call"],
+        "llm_end_call": False,
+    }
+    assert _warned(cop, d, MARK_DEAD_END_RULES)
+    d["call_flow"]["termination"]["llm_end_call"] = True
+    assert not _warned(cop, d, MARK_DEAD_END_RULES)
+
+
+def test_lint_tiny_duration_cap(cop):
+    d = maya_shape()
+    d["call_flow"]["termination"] = {"max_call_minutes": 1}
+    assert _warned(cop, d, MARK_TINY_CAP)
+    d["call_flow"]["termination"]["max_call_minutes"] = 10
+    assert not _warned(cop, d, MARK_TINY_CAP)
+
+
+def test_normalize_termination_shapes(cop):
+    notes: list[str] = []
+    d = maya_shape()
+    d["call_flow"]["termination"] = {
+        "end_conditions": "once booked, end the call",   # str → [str]
+        "farewell_patterns": ["ok", "chalo rakhte hain"],  # "ok" is unsafe
+        "max_call_minutes": "not-a-number",
+        "silence_hangup": "yes please",                  # bad shape → dropped
+    }
+    out = cop._normalize_definition(d, notes)
+    term = out["call_flow"]["termination"]
+    assert term["end_conditions"] == ["once booked, end the call"]
+    assert term["farewell_patterns"] == ["chalo rakhte hain"]
+    assert "max_call_minutes" not in term
+    assert "silence_hangup" not in term
+    assert any("too short" in n for n in notes)
+
+
+def test_normalize_termination_bad_root_shape(cop):
+    notes: list[str] = []
+    d = maya_shape()
+    d["call_flow"]["termination"] = ["end", "the", "call"]
+    out = cop._normalize_definition(d, notes)
+    assert "termination" not in out["call_flow"]
+    assert any("termination" in n for n in notes)
+
+
+def test_system_prompt_teaches_termination(cop):
+    """The Copilot must be told termination requests are engine wiring —
+    the old doctrine ordered it to refuse them."""
+    p = cop._system_prompt()
+    for pin in ("CALL-ENDING REQUIREMENTS GO IN call_flow.termination",
+                "end_conditions", "farewell_patterns", "max_call_minutes",
+                "silence_hangup"):
+        assert pin in p, pin
 
 
 # ── surgical tools now surface quality + the mission ────────────────────────

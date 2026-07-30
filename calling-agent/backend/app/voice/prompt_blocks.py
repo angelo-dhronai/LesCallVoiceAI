@@ -841,17 +841,36 @@ def call_closure_block(agent_def: AgentDefinition, lang: str = "en") -> list[str
        follow-up call from it, so a vague "sure, we'll call you" is a broken
        promise.
     """
-    return [
-        "",
-        "━━ ENDING THE CALL ━━",
+    term = getattr(agent_def.call_flow, "termination", None) or {}
+    llm_end = bool(term.get("llm_end_call", True))
+    conds = [str(c).strip() for c in (term.get("end_conditions") or [])
+             if str(c).strip()]
+
+    permission_rule = (
         "✗ NEVER end or wrap up the call on your own — before any goodbye, "
         "ALWAYS ask the caller's permission first, e.g. 'Is there anything "
         "else I can help you with?', and only close after they confirm "
-        "they're done",
+        "they're done")
+    if conds:
+        permission_rule += (" (exception: when one of the END-CALL RULES "
+                            "below clearly applies, close directly)")
+
+    goodbye_rule = (
         "✓ When the caller says goodbye or confirms they're done, reply with "
         "ONE warm goodbye line and nothing more — the platform ends the call "
         "after your goodbye, so never mention hanging up, disconnecting, or "
-        "any technical step",
+        "any technical step")
+    if llm_end:
+        goodbye_rule += (
+            ", and append the exact token [END_CALL] at the very end of that "
+            "goodbye — it is a silent signal that ends the call and is never "
+            "spoken")
+
+    lines = [
+        "",
+        "━━ ENDING THE CALL ━━",
+        permission_rule,
+        goodbye_rule,
         "✓ When the caller asks to be called later ('call me in 10 minutes', "
         "'call me tomorrow'), politely agree and pin down ONE specific time "
         "before letting them go — confirm it back in one short sentence "
@@ -866,3 +885,18 @@ def call_closure_block(agent_def: AgentDefinition, lang: str = "en") -> list[str
         "or has declined twice — accept gracefully, ask permission to close, "
         "and say goodbye",
     ]
+    if llm_end:
+        lines.append(
+            "✗ NEVER write [END_CALL] on any turn that is not a goodbye — "
+            "the call ends right after your words when you use it")
+    if conds:
+        lines.append("━━ END-CALL RULES (set by the business — follow exactly) ━━")
+        lines.extend(f"▸ {c}" for c in conds)
+        closing = ("✓ The moment one of these rules applies, deliver ONE "
+                   "short polite closing line")
+        if llm_end:
+            closing += " ending with [END_CALL]"
+        closing += (" — these rules take precedence over asking permission "
+                    "to close")
+        lines.append(closing)
+    return lines

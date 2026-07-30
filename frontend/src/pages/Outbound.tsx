@@ -42,8 +42,10 @@ type ContactsResp = { contacts?: Contact[]; total?: number }
 type CampaignStatus = {
   running?: boolean; total?: number; completed?: number; answered?: number
   no_answer?: number; busy?: number; declined?: number; failed?: number
-  skipped?: number; current_phone?: string | null; current_name?: string | null
+  skipped?: number; dnd_skipped?: number; capped?: boolean
+  current_phone?: string | null; current_name?: string | null
   started_at?: string | null; stopped?: boolean; error?: string | null
+  max_calls_limit?: number; min_delay_seconds?: number
 }
 
 const DISPOSITION_OPTS = [
@@ -99,6 +101,7 @@ function CampaignTallies({ camp }: { camp: CampaignStatus }) {
       <Badge tone="rose">Declined {num(camp.declined)}</Badge>
       <Badge tone="rose">Failed {num(camp.failed)}</Badge>
       <Badge tone="neutral">Skipped {num(camp.skipped)}</Badge>
+      {!!camp.dnd_skipped && <Badge tone="rose">Do not call {num(camp.dnd_skipped)}</Badge>}
     </div>
   )
 }
@@ -177,6 +180,10 @@ export default function Outbound() {
     all: stats.total,
   }
   const queued = statsQ.data ? Number(audienceCounts[whoFilter] ?? 0) : null
+  // Server-declared ceilings (defaults match dashboard/server.py) — stated in
+  // the form so it can't promise an unlimited run the API would truncate.
+  const maxLimit = Number(camp.max_calls_limit ?? 200)
+  const minDelay = Number(camp.min_delay_seconds ?? 3)
 
   async function addContact() {
     if (!phone.trim()) { toast('Phone is required', 'warn'); return }
@@ -291,14 +298,35 @@ export default function Outbound() {
   }
 
   async function startCampaign() {
+    // A campaign rings real phones in bulk, so the number gets said out loud
+    // and confirmed before anything dials — the same human-in-the-loop rule
+    // the follow-up dialer now runs under.
+    const audience = CAMPAIGN_WHO.find((o) => o.value === whoFilter)?.label ?? whoFilter
+    const asked = Number(maxCalls) || 0
+    // queued is null only while stats are still loading — fall back to the
+    // ceiling rather than claiming "0 contacts" and asking them to confirm it.
+    const willDial = Math.min(asked > 0 ? asked : maxLimit, queued ?? maxLimit, maxLimit)
+    const ok = await confirm({
+      title: `Call ${num(willDial)} ${willDial === 1 ? 'contact' : 'contacts'}?`,
+      description:
+        `Audience: ${audience}. Each contact is dialled once, ${minDelay}s apart or more, `
+        + `up to ${num(maxLimit)} calls per campaign. Contacts marked Rejected are never dialled, `
+        + `and the run stops when calling hours end.`,
+      confirmLabel: 'Start calling',
+    })
+    if (!ok) return
     setStarting(true)
     try {
-      await post('/outbound/campaign/start', {
-        call_status_filter: whoFilter,
-        delay_seconds: Number(delay) || 0,
-        max_calls: Number(maxCalls) || 0,
-      })
-      toast('Campaign started', 'success')
+      const res = await post<{ total?: number; dnd_skipped?: number; capped?: boolean }>(
+        '/outbound/campaign/start', {
+          call_status_filter: whoFilter,
+          delay_seconds: Number(delay) || 0,
+          max_calls: Number(maxCalls) || 0,
+        })
+      const bits = [`Campaign started — ${num(res?.total)} queued`]
+      if (res?.dnd_skipped) bits.push(`${num(res.dnd_skipped)} on do-not-call skipped`)
+      if (res?.capped) bits.push(`capped at ${num(maxLimit)}`)
+      toast(bits.join(' · '), 'success')
       qc.invalidateQueries({ queryKey: ['campaign'] })
     } catch (e) {
       toast(`Start failed: ${String((e as Error)?.message ?? e)}`, 'error')
@@ -467,7 +495,8 @@ export default function Outbound() {
 
       {/* 3. Campaign Runner */}
       <Card className="p-5">
-        <SectionHead title="Campaign Runner" sub="Dials contacts sequentially with a delay between calls" />
+        <SectionHead title="Campaign Runner"
+          sub={`Dials contacts one at a time inside calling hours. Contacts marked Rejected are never called; a run is capped at ${num(maxLimit)} calls.`} />
         <div className="grid gap-3 sm:grid-cols-3">
           <Field label="Who to call">
             <div>
@@ -476,7 +505,10 @@ export default function Outbound() {
               </Select>
               {queued != null && (
                 queued > 0 ? (
-                  <div className="mt-1 text-xs text-dim tabular-nums">{num(queued)} contacts will be queued</div>
+                  <div className="mt-1 text-xs text-dim tabular-nums">
+                    up to {num(queued)} contacts
+                    {!!disp.rejected && <span className="text-dim"> · {num(disp.rejected)} rejected excluded</span>}
+                  </div>
                 ) : (
                   <div className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-300">No contacts match — nothing to dial</div>
                 )
@@ -484,10 +516,20 @@ export default function Outbound() {
             </div>
           </Field>
           <Field label="Delay (seconds)">
-            <Input type="number" min={0} value={delay} onChange={(e) => setDelay(e.target.value)} />
+            <div>
+              <Input type="number" min={minDelay} value={delay} onChange={(e) => setDelay(e.target.value)} />
+              <div className="mt-1 text-xs text-dim tabular-nums">Minimum {minDelay}s between calls</div>
+            </div>
           </Field>
-          <Field label="Max calls (0 = no limit)">
-            <Input type="number" min={0} value={maxCalls} onChange={(e) => setMaxCalls(e.target.value)} />
+          <Field label={`Max calls (0 = up to ${num(maxLimit)})`}>
+            <div>
+              <Input type="number" min={0} max={maxLimit} value={maxCalls} onChange={(e) => setMaxCalls(e.target.value)} />
+              {Number(maxCalls) > maxLimit && (
+                <div className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-300">
+                  Capped at {num(maxLimit)} per campaign
+                </div>
+              )}
+            </div>
           </Field>
         </div>
         <div className="mt-4 flex gap-2">

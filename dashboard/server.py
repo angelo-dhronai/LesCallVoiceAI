@@ -2424,7 +2424,8 @@ def _fresh_campaign() -> dict:
     return {
         "running": False, "campaign_id": None, "total": 0, "completed": 0,
         "answered": 0, "no_answer": 0, "busy": 0, "declined": 0, "failed": 0,
-        "skipped": 0, "current_phone": "", "current_name": "",
+        "skipped": 0, "dnd_skipped": 0, "capped": False,
+        "current_phone": "", "current_name": "",
         "started_at": None, "stopped": False, "error": None,
     }
 
@@ -4334,11 +4335,94 @@ def _is_founding_owner(owner: str) -> bool:
 
 
 # ── Campaign engine ────────────────────────────────────────────────────────
+#
+# A campaign is the only path in the platform that dials a LIST of people from
+# one click, so a mistake here is a mistake times N. After the 2026-07-29
+# autodial incident (RUNBOOK §16) it obeys the same three physical limits the
+# follow-up dialer obeys: never a do-not-call contact, never outside calling
+# hours, never an unbounded number of calls.
+CAMPAIGN_MAX_CALLS = int(os.environ.get("CAMPAIGN_MAX_CALLS", "200"))
+CAMPAIGN_MIN_DELAY_S = float(os.environ.get("CAMPAIGN_MIN_DELAY_SECONDS", "3"))
+
+
+def _campaign_audience(contacts: list[dict], filter_cs: str) -> list[dict]:
+    """Resolve the audience picker to the contacts it names.
+
+    The picker mixes two different columns: 'not_called'/'no_answer' are
+    call_status values, 'to_contact_later' is a disposition. Matching only
+    call_status — as this did until 2026-07-29 — made the "To contact later"
+    audience resolve to zero while the UI counted dozens, and the start call
+    then returned ok:false with HTTP 200, which the SPA toasted as success.
+    """
+    if filter_cs == "all":
+        return list(contacts)
+    if filter_cs in DISPOSITIONS:
+        return [c for c in contacts if c.get("disposition") == filter_cs]
+    return [c for c in contacts if c.get("call_status") == filter_cs]
+
+
+def _campaign_limits(body: dict) -> tuple[float, int]:
+    """(delay between calls, hard ceiling on calls) for one campaign.
+
+    Both are clamped server-side. The form used to send delay_seconds:0 and
+    max_calls:0 ("no limit") straight through, which is an unbounded burst of
+    dials from one click.
+    """
+    delay = max(CAMPAIGN_MIN_DELAY_S, float(body.get("delay_seconds") or 0))
+    asked = int(body.get("max_calls") or 0)
+    return delay, (CAMPAIGN_MAX_CALLS if asked <= 0
+                   else min(asked, CAMPAIGN_MAX_CALLS))
+
+
+def _campaign_plan(contacts: list[dict], filter_cs: str,
+                   max_calls: int) -> tuple[list[dict], int, bool]:
+    """Who this campaign will actually dial → (to_call, dnd_skipped, capped).
+
+    Do-not-call is applied BEFORE the cap, so a list full of rejected contacts
+    can never silently consume the whole budget, and 'rejected' as an audience
+    resolves to nobody rather than to exactly the people who opted out.
+    """
+    audience = _campaign_audience(contacts, filter_cs)
+    dnd_skipped = sum(1 for c in audience if c.get("disposition") == "rejected")
+    to_call = [c for c in audience if c.get("disposition") != "rejected"]
+    capped = len(to_call) > max_calls
+    return to_call[:max_calls], dnd_skipped, capped
+
+
+def _contact_is_dnd(db_id: Any, owner: str) -> bool:
+    """Whether this contact is on do-not-call, read fresh from the database.
+
+    Fails CLOSED — if we cannot establish that someone is callable, we do not
+    call them. Same direction every guardrail added on 2026-07-29 points; see
+    shared/intelligence/autodial.blocked_reason.
+    """
+    if not db_id:
+        logger.error("campaign DND check: contact has no db_id — skipping the "
+                     "call rather than dialling an unverifiable number")
+        return True
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            row = db.execute(
+                "SELECT disposition FROM contacts WHERE id=? AND owner=?",
+                (int(db_id), owner)).fetchone()
+    except Exception as exc:
+        logger.error("campaign DND check failed for contact %s: %r — skipping",
+                     db_id, exc)
+        return True
+    # Deleted mid-run: deletion is not a do-not-call signal, and the operator's
+    # queued list is the record of what they asked for.
+    return bool(row) and (row["disposition"] or "") == "rejected"
+
 
 @app.get("/api/outbound/campaign/status")
 async def campaign_status(request: Request) -> JSONResponse:
     # The CALLER's own campaign only — never another tenant's live state.
-    return JSONResponse(dict(_campaign_for(_acting_owner(request))))
+    # The limits ride along so the form can state the real ceiling instead of
+    # promising "0 = no limit", which stopped being true on 2026-07-29.
+    return JSONResponse({**_campaign_for(_acting_owner(request)),
+                         "max_calls_limit": CAMPAIGN_MAX_CALLS,
+                         "min_delay_seconds": CAMPAIGN_MIN_DELAY_S})
 
 
 @app.post("/api/outbound/campaign/start")
@@ -4351,21 +4435,38 @@ async def campaign_start(request: Request) -> JSONResponse:
     from shared.audit import record as _audit
     _audit(camp_owner, "campaign_start", ip=request.client.host if request.client else None)
 
+    from shared.intelligence import autodial, config as intel_config
+
     body = await request.json()
     filter_cs   = body.get("call_status_filter", "not_called")   # which contacts to call
-    delay_secs  = float(body.get("delay_seconds", 4.0))
-    max_calls   = int(body.get("max_calls", 0)) or None
+    # A floor and a ceiling, not suggestions: dialling with no gap puts a burst
+    # of legs on one trunk and reads to the carrier as spam.
+    delay_secs, max_calls = _campaign_limits(body)
 
-    contacts = _load_outbound(camp_owner)
-    if filter_cs == "all":
-        to_call = contacts
-    else:
-        to_call = [c for c in contacts if c.get("call_status") == filter_cs]
-    if max_calls:
-        to_call = to_call[:max_calls]
+    # Calling hours — the same window the follow-up dialer obeys. A bulk
+    # campaign is the last thing that should ever ring someone at 6am.
+    now_ist = autodial.now_local()
+    if not autodial.within_window(now_ist):
+        opens = autodial.next_window_open(now_ist)
+        return JSONResponse({"ok": False, "reason":
+            f"Outside calling hours ({intel_config.AUTODIAL_HOUR_START:02d}:00–"
+            f"{intel_config.AUTODIAL_HOUR_END:02d}:00 IST, Mon–Sat). "
+            f"Campaigns can start again {opens.strftime('%a %d %b at %H:%M')} IST."},
+            status_code=400)
+
+    # Do-not-call is not a preference this screen can override: a contact
+    # marked 'rejected' asked us to stop.
+    to_call, dnd_skipped, capped = _campaign_plan(
+        _load_outbound(camp_owner), filter_cs, max_calls)
 
     if not to_call:
-        return JSONResponse({"ok": False, "reason": "No contacts match the filter"})
+        reason = ("Every contact in this audience is marked Rejected — they "
+                  "asked not to be called") if dnd_skipped else \
+                 "No contacts match the filter"
+        # 400, not 200: an ok:false body with a success status was toasted by
+        # the SPA as "Campaign started" while nothing had been queued.
+        return JSONResponse({"ok": False, "reason": reason,
+                             "dnd_skipped": dnd_skipped}, status_code=400)
 
     # Resolve the caller's own number/trunk ONCE, up front — the whole campaign
     # dials from it, and we refuse to start if they have no number of their own.
@@ -4382,19 +4483,46 @@ async def campaign_start(request: Request) -> JSONResponse:
         "total": len(to_call), "completed": 0,
         "answered": 0, "no_answer": 0, "busy": 0,
         "declined": 0, "failed": 0, "skipped": 0,
+        "dnd_skipped": dnd_skipped, "capped": capped,
         "current_phone": "", "current_name": "",
         "started_at": datetime.datetime.utcnow().isoformat() + "Z",
         "stopped": False, "error": None,
     })
+    if dnd_skipped or capped:
+        logger.info("CAMPAIGN [%s owner=%s] queued %s · %s on do-not-call skipped"
+                    " · cap %s%s", cid, camp_owner, len(to_call), dnd_skipped,
+                    max_calls, " (truncated)" if capped else "")
 
     async def _run():
         try:
             for contact in to_call:
                 if camp.get("stopped"):
                     break
+                # Hours are re-checked every iteration: a long run started at
+                # 18:55 must not still be dialling people at 20:30.
+                if not autodial.within_window(autodial.now_local()):
+                    remaining = camp["total"] - camp["completed"]
+                    camp["stopped"] = True
+                    camp["error"] = (
+                        f"Stopped at {intel_config.AUTODIAL_HOUR_END:02d}:00 IST — "
+                        f"calling hours ended with {remaining} contacts undialled.")
+                    logger.info("CAMPAIGN [%s] halted at window close, %s undialled",
+                                cid, remaining)
+                    break
+
                 contact_id = contact["id"]
                 phone = re.sub(r"[^\d]", "", contact.get("phone", ""))
                 if len(phone) < 7:
+                    camp["skipped"] += 1
+                    camp["completed"] += 1
+                    continue
+
+                # Do-not-call re-read from the DB, not from the start-time
+                # snapshot: someone who says "stop calling me" on call 3 must
+                # not be dialled again on call 40 of the same run.
+                if await asyncio.to_thread(_contact_is_dnd, contact.get("db_id"), camp_owner):
+                    logger.info("CAMPAIGN [%s] skipping %s — do-not-call", cid, phone)
+                    camp["dnd_skipped"] = camp.get("dnd_skipped", 0) + 1
                     camp["skipped"] += 1
                     camp["completed"] += 1
                     continue
@@ -4433,10 +4561,13 @@ async def campaign_start(request: Request) -> JSONResponse:
             camp["current_phone"] = ""
             camp["current_name"] = ""
             logger.info("CAMPAIGN [%s] done: %s", cid, {k: camp[k] for k in
-                        ("total","completed","answered","no_answer","busy","declined","failed","skipped")})
+                        ("total","completed","answered","no_answer","busy",
+                         "declined","failed","skipped","dnd_skipped")})
 
     _campaign_tasks[camp_owner] = asyncio.create_task(_run())
-    return JSONResponse({"ok": True, "campaign_id": cid, "total": len(to_call)})
+    return JSONResponse({"ok": True, "campaign_id": cid, "total": len(to_call),
+                         "dnd_skipped": dnd_skipped, "capped": capped,
+                         "max_calls": max_calls, "delay_seconds": delay_secs})
 
 
 @app.post("/api/outbound/campaign/stop")

@@ -658,6 +658,9 @@ minutes). Platform universal rule, every agent:
   from writing guardrails that claim the agent will "end the call"; a
   real user incident (2026-07-27) had the Copilot ship exactly that
   rule, which also fought the pin-down ("do NOT ask for a better time").
+  **Superseded 2026-07-29 (§17)**: termination requests are now REAL
+  engine wiring via `call_flow.termination` — the doctrine directs the
+  Copilot to write them there instead of refusing.
 - **Execution**: `TelephonySession._playback_loop` polls (0.5s get
   timeout) → `_maybe_agent_hangup` waits for wav_queue empty +
   `playback_busy_until` + grace, min 3s after arming (covers TTS synth
@@ -823,3 +826,63 @@ had none of the above. All in `dashboard/server.py`, pinned by
   our own DIDs from `phone_numbers` — it does **not** ring customers today. If a
   BYON tenant ever registers a number that terminates on a human handset it
   would, so make it per-number opt-in before that happens.
+
+## 17. Call-termination policy — configurable, Copilot-controlled (2026-07-29)
+
+**Why.** Live calls were effectively only ending when the caller said a
+literal "bye" (§15's consented paths). Everything else — the LLM's own
+judgment that the conversation was over, callers who walked away mid-call,
+business rules like "end once the booking is confirmed" — had no path to a
+hangup, and the Copilot doctrine explicitly refused such requests. Fixed by
+making termination a per-agent config the engine executes.
+
+**Config: `call_flow.termination`** (agent YAML; all keys optional, `{}` =
+platform defaults; Copilot writes this from user requirements):
+
+- `llm_end_call` (default **true**): the `━━ ENDING THE CALL ━━` prompt band
+  teaches the model to append the token `[END_CALL]` after its goodbye line.
+  The engine strips the token BEFORE `_validate_response` (whose markdown
+  filter would leave spoken "ENDCALL" litter) in `_call_llm_stream`, then
+  `_consume_llm_with_filler` arms `hangup_pending` exactly like the
+  deterministic farewell paths. Caller speech still cancels; §15's drain
+  logic unchanged. Marker regex: `_END_CALL_RE` (bracketed any-case, bare
+  form upper-case only so prose "end call" survives).
+- `end_conditions: [str]`: plain-English business rules rendered every turn
+  as `━━ END-CALL RULES ━━`; they take precedence over the permission-to-
+  close question and act through `[END_CALL]`.
+- `farewell_patterns: [str]`: extra caller phrases (any language/script)
+  that close deterministically via `_contains_farewell` — which also gained
+  built-in unambiguous hangup phrases ("phone rakhta hoon", "મૂકું છું",
+  "gotta go"...). `_DONE_REPLY_RE` now accepts bare thanks
+  ("thank you/dhanyavaad/aabhar") as the close-permission confirm.
+- `silence_hangup: {enabled, grace_s}` (default enabled, grace 10s): after
+  both §13 dead-air reprompts go unanswered plus the grace window,
+  `generate_silence_goodbye()` plays one goodbye, stamps
+  `call_outcome=no_response` + `extra_flags.silence_hangup`, arms
+  `hangup_pending`. The caller speaking re-opens the call and re-arms the
+  full repair cycle. Env: `SILENCE_HANGUP_ENABLED` (telephony-default on),
+  `SILENCE_HANGUP_GRACE_S`.
+- `max_call_minutes` (0/absent = no cap): watchdog fires at the first quiet
+  moment past the cap — `generate_timeout_goodbye()` plays a wrap-up line
+  and arms a **hard** hangup (`_hangup_hard`), the ONE close caller speech
+  does not cancel. `call_outcome=max_duration`.
+
+**Where.** Engine: `conversation.py` (marker strip/arm, farewell vocab,
+goodbye generators, hard-close gate at top of `process_stream`). Watchdog:
+`pipeline.py` `_silence_watchdog` (now also max-duration + silence-hangup;
+decisions in `_silence_hangup_due` / `_max_duration_due`, shared
+`_pipeline_quiet`). Prompt: `prompt_blocks.call_closure_block`. Schema:
+`CallFlowConfig.termination`. Copilot: schema docs + rewritten hanging-up
+doctrine + `_normalize_definition` shape guards (drops <4-char farewell
+patterns — "ok" would cut live calls) + two `_quality_warnings` lints
+(end_conditions with llm_end_call=false; cap under 2 minutes).
+
+**Tests.** `test_call_termination.py` (30: vocab, marker, silence/max-dur,
+watchdog decisions, prompt rendering), `test_copilot_quality_lints.py`
+(termination lints + normalization + doctrine pins), golden prompts
+regenerated (closure band now carries the token doctrine).
+
+**Rollback.** Per-agent: `termination: {llm_end_call: false}` (kills the
+LLM signal), `silence_hangup: {enabled: false}`. Platform:
+`SILENCE_HANGUP_ENABLED=false`; §15's `ENABLE_AGENT_HANGUP=false` still
+kills ALL agent-initiated hangups at the bridge.

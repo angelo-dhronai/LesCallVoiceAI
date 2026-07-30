@@ -1411,6 +1411,50 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
                     good_brs.append(b)
                 s["branches"] = good_brs
 
+    # ── call_flow.termination shape validation ──────────────────────────────
+    if isinstance(cf2, dict) and "termination" in cf2:
+        term = cf2.get("termination")
+        if not isinstance(term, dict):
+            cf2.pop("termination", None)
+            notes.append("call_flow.termination had an unusable shape — ignored")
+        else:
+            for lk in ("end_conditions", "farewell_patterns"):
+                if lk in term:
+                    v = term[lk]
+                    if isinstance(v, str):
+                        term[lk] = [v] if v.strip() else []
+                    elif isinstance(v, list):
+                        term[lk] = [str(x).strip() for x in v if str(x).strip()]
+                    else:
+                        term.pop(lk)
+                        notes.append(f"call_flow.termination.{lk} had an "
+                                     "unusable shape — ignored")
+            # A single short token ("ok", "no", "बस") as a farewell pattern
+            # would cut live calls mid-conversation on a stray affirmation.
+            fps = term.get("farewell_patterns") or []
+            risky = [p for p in fps if len(str(p).strip()) < 4]
+            if risky:
+                term["farewell_patterns"] = [p for p in fps if p not in risky]
+                notes.append(
+                    "call_flow.termination.farewell_patterns dropped entries "
+                    "too short to be safe (they would cut live calls): "
+                    + ", ".join(repr(p) for p in risky))
+            if "llm_end_call" in term:
+                term["llm_end_call"] = bool(term["llm_end_call"])
+            if "max_call_minutes" in term:
+                try:
+                    term["max_call_minutes"] = max(
+                        0.0, float(term["max_call_minutes"]))
+                except (TypeError, ValueError):
+                    term.pop("max_call_minutes")
+                    notes.append("call_flow.termination.max_call_minutes was "
+                                 "not a number — ignored")
+            if "silence_hangup" in term and not isinstance(
+                    term["silence_hangup"], dict):
+                term.pop("silence_hangup")
+                notes.append("call_flow.termination.silence_hangup had an "
+                             "unusable shape — ignored")
+
     # ── knowledge_base v2 fields ─────────────────────────────────────────────
     kb2 = d.get("knowledge_base")
     if isinstance(kb2, dict):
@@ -2513,6 +2557,30 @@ def _quality_warnings(merged: dict,
                 "call_flow.scheduling to {\"style\": \"flexible\"} (the "
                 "caller proposes the time) or add real calendar.mock_slots."
             )
+
+    # Termination sanity: rules that can never fire, or caps that would cut
+    # every call short, must be flagged before they reach a live agent.
+    term = cf.get("termination") if isinstance(cf, dict) else None
+    term = term if isinstance(term, dict) else {}
+    if (term.get("end_conditions")
+            and term.get("llm_end_call") is False):
+        w.append(
+            "call_flow.termination.end_conditions is set but llm_end_call is "
+            "false — the agent is given END-CALL RULES it has no way to act "
+            "on, so no call will ever end from them. Remove the conditions "
+            "or set llm_end_call true."
+        )
+    try:
+        _cap = float(term.get("max_call_minutes") or 0)
+    except (TypeError, ValueError):
+        _cap = 0.0
+    if 0 < _cap < 2:
+        w.append(
+            f"call_flow.termination.max_call_minutes is {_cap:g} — under two "
+            "minutes barely covers a greeting and one question; every call "
+            "would be cut mid-conversation. Confirm the user really wants a "
+            "cap this low, or raise it."
+        )
     return w
 
 
@@ -4468,7 +4536,7 @@ DEFINITION FIELDS you may set (all optional — deep-merged onto defaults). SHAP
 - personality: pronouns (she|he), energy (low|medium|high), tone, style, custom_instructions, traits [str], energy_mirroring (bool), ai_disclosure ("deflect"|"admit"|"admit_if_pressed"), verbosity_max_sentences (int)
 - languages MUST be an OBJECT, never a list: {{"supported": ["hi","en"], "default": "hi", "allow_code_mixing": true, "stt_forced_language": "", "tts_voices": {{"hi": {{"model":"bulbul:v3","speaker":"simran","pace":1.15}}, "en": {{...}}}}}}. tts_voices lives INSIDE languages — never at the top level. pace = speaking speed 0.5–2.0 (1.0 natural, 1.15 platform default) and is PER LANGUAGE. SPEED COMPLAINTS ('talks too fast', 'too slow' — overall or in one language): do NOT silently change anything. FIRST tell the user the current setting and the scale, read from the agent (get_agent's spoken_surfaces.pace has it), e.g. 'LesCall currently speaks at pace 1.15 on a 0.5–2.0 scale, where 1.0 is natural' — THEN ask what they'd prefer (slower or faster, or an exact number) and apply their choice to that language's pace in ±0.1 steps via update_agent. Never change the voice to fix speed.
 - call_direction: the STRING "inbound" or "outbound" — never a list. If the user wants BOTH, use "inbound" — the platform automatically applies the outbound approach whenever it places the call.
-- call_flow: {{"call_goal": "one-sentence mission", "stages": [{{id, order, goal, turns_until_advance, role, collect: [slot names], advance_when: {{all_collect_filled|slots|min_turns|intent|appointment_captured, max_turns: N (time escape — the stage also advances at turn N even if the condition never fires)}}, branches: [{{when_intent: affirmation|negation|question, goto: STAGE_ID, max_takes, actions: [capture_phone|promise_whatsapp_media|book_visit|schedule_callback]}}]}}], "scheduling": {{style: exact_n|flexible — flexible means the CALLER proposes the time; SET flexible whenever the user says not to suggest times or to ask when the caller is free; exact_n (the default) makes the platform force N specific time offers every turn, offer_count, enabled: false when the business doesn't book}}, "callback_policy": {{enabled, capture_slot, responses: {{lang: str}}, counts_as_decline}}, "completed_when": {{required_slots, require_appointment}}}}. Stage roles: greeting|confirm_person|discovery|pitch|recommend|scheduling|confirmation|closing. Write goals in ENGLISH as instructions (the agent replies in the caller's language). STAGE WIRING IS WHAT MAKES THE FLOW ACTUALLY RUN: every stage SHOULD carry role; a stage whose goal asks for slots lists them in collect and uses advance_when {{all_collect_filled: true, max_turns: 6}}; a yes/no confirmation stage gets turns_until_advance 2-3 or advance_when {{intent: affirmation, max_turns: 3}}; NEVER leave a mid-flow stage needing 8+ caller turns — one such stage consumes an entire call and the rest of your flow never plays (this is exactly how a live agent ignored its whole script). If you omit the wiring at create time the platform derives it from the goals and slots — but wiring you write explicitly always wins.
+- call_flow: {{"call_goal": "one-sentence mission", "stages": [{{id, order, goal, turns_until_advance, role, collect: [slot names], advance_when: {{all_collect_filled|slots|min_turns|intent|appointment_captured, max_turns: N (time escape — the stage also advances at turn N even if the condition never fires)}}, branches: [{{when_intent: affirmation|negation|question, goto: STAGE_ID, max_takes, actions: [capture_phone|promise_whatsapp_media|book_visit|schedule_callback]}}]}}], "scheduling": {{style: exact_n|flexible — flexible means the CALLER proposes the time; SET flexible whenever the user says not to suggest times or to ask when the caller is free; exact_n (the default) makes the platform force N specific time offers every turn, offer_count, enabled: false when the business doesn't book}}, "callback_policy": {{enabled, capture_slot, responses: {{lang: str}}, counts_as_decline}}, "completed_when": {{required_slots, require_appointment}}, "termination": {{"end_conditions": ["plain-English rules for when the agent should wrap up and END the call — e.g. 'once the site visit is booked and confirmed, thank them and end', 'if the caller becomes abusive, apologise briefly and end immediately' — injected into every turn as END-CALL RULES the agent acts on"], "farewell_patterns": ["extra caller phrases in ANY language/script that mean goodbye and hang up deterministically, e.g. 'chalo rakhta hu' — NEVER single common words like 'ok'/'no'/'haan', they would cut live calls"], "llm_end_call": true (default — lets the agent itself end the call after its goodbye; set false ONLY if the business wants hangups on caller-goodbye alone), "silence_hangup": {{"enabled": true, "grace_s": 10}} (after both couldn't-hear reprompts go unanswered, say goodbye and end instead of holding the line open), "max_call_minutes": N (hard call-length ceiling — one polite wrap-up line, then the platform ends the call even mid-conversation; 0/omitted = no cap)}}}}. Stage roles: greeting|confirm_person|discovery|pitch|recommend|scheduling|confirmation|closing. Write goals in ENGLISH as instructions (the agent replies in the caller's language). STAGE WIRING IS WHAT MAKES THE FLOW ACTUALLY RUN: every stage SHOULD carry role; a stage whose goal asks for slots lists them in collect and uses advance_when {{all_collect_filled: true, max_turns: 6}}; a yes/no confirmation stage gets turns_until_advance 2-3 or advance_when {{intent: affirmation, max_turns: 3}}; NEVER leave a mid-flow stage needing 8+ caller turns — one such stage consumes an entire call and the rest of your flow never plays (this is exactly how a live agent ignored its whole script). If you omit the wiring at create time the platform derives it from the goals and slots — but wiring you write explicitly always wins.
 - slots (TOP-LEVEL list — the qualification schema, the heart of data capture): [{{name, priority (lower asked first), required, label, question: {{hi/en/gu: exact wording}}, type: text|number|money|enum|boolean|phone|date|time|location, enum_values, enum_synonyms, depends_on: [slot names never asked before], merge_policy: free|correction_gated|confirm, confirm_readback: ""|verbatim|digit_groups_2 (phone in 2-digit groups), max_asks (2 recommended), reask_question: {{lang}}}}]. EVERY new agent gets slots for what it must collect, with questions in EVERY supported language.
 - knowledge_base: portfolio_prompt_text (plain-English paragraph — injected every turn), portfolio_section_label, locations, objection_patterns, known_projects {{"lowercase key": ["Canonical Name", "location or price"]}}, catalog [{{id, name, location, configurations, price_range, availability, positioning_tag, pitch_points, aliases, facts}}], match_rules [{{when: {{slot: value or "<=40L"}}, recommend: [ids], reason}}], pricing_policy {{mode: on_request|state_freely|defer, defer_line: {{lang}}}}, stt_corrections {{use_builtin_tables: false for non-real-estate agents}}
 - brand: spoken_company_name, positioning_tagline, credibility_markers [str], trust_proofs [top 2-3 — objection ammo], regions_served, contact_phone, whatsapp_number
@@ -4496,9 +4564,9 @@ THE OPENING LINE & PLACEHOLDERS (get this right — it burned a real user):
 CALL-REPAIR BEHAVIOUR THE PLATFORM APPLIES TO EVERY AGENT (know this before you "fix" a greeting — these are NOT settings and you cannot edit them):
 - Bare "hello?" from the caller within ~25s of the opening line: the agent replays its last utterance (up to twice), on the assumption the caller didn't hear it. This deliberately does NOT fire when the opening line is itself just "Hello?" — a hello answering a hello means contact is established, so the agent moves straight on to its script.
 - ~6s of caller silence: the agent says it couldn't hear and re-asks.
-- ENDING CALLS (platform-wide): before wrapping up, every agent asks the caller's permission ("anything else I can help you with?") and only says goodbye after the caller confirms they're done — then the PLATFORM hangs the call up automatically after the goodbye. The agent never cuts a call the caller hasn't agreed to end.
+- ENDING CALLS (platform-wide): before wrapping up, every agent asks the caller's permission ("anything else I can help you with?") and only says goodbye after the caller confirms they're done — then the PLATFORM hangs the call up automatically after the goodbye. The platform also ends the call on the caller's own goodbye, after the couldn't-hear reprompts go unanswered (silence hangup), and — by default — whenever the agent itself judges the conversation is over per its END-CALL RULES (see call_flow.termination).
 - CALLBACK REQUESTS & BUSY CALLERS (platform-wide): when a caller says "call me later / in 10 minutes / tomorrow" or brushes off with "sorry, not free right now", every agent stops pitching, pins down ONE specific time, confirms it with a goodbye, and the platform HANGS UP the call by itself right after that confirmation — then automatically places a real follow-up call at the agreed time, opening with a polite reference to the earlier conversation. This is on for all agents by default; a business can opt an agent out of the automatic calling (follow_up.auto_execute enabled false) but the time pin-down stays.
-- HANGING UP IS PLATFORM CODE, NOT A PROMPT: no guardrail, stage goal, or script text can make (or stop) the agent physically cutting a call — the platform's own engine decides that, on the consented paths above. If a user asks you to make the agent "cut the call" on goodbyes, busy callers, or callback requests, tell them it already happens automatically — do NOT write a rule claiming the agent will "end the call" (it would be a false promise) and do NOT add rules like "never reschedule / never ask for a better time", which fight the platform's callback pin-down.
+- CALL-ENDING REQUIREMENTS GO IN call_flow.termination, NOT IN PROMPT TEXT: when a user asks for anything about cutting/ending/hanging up calls — "end the call once the booking is done", "hang up if they abuse the agent", "don't let calls run past 10 minutes", "cut the call when they say chalo rakhta hu" — map it into call_flow.termination (end_conditions for judgment-based rules, farewell_patterns for exact caller phrases, max_call_minutes for duration caps, silence_hangup for no-response behaviour). That section is real engine wiring: the platform physically ends the call from it. A guardrails rule or stage-goal sentence saying "end the call" does NOTHING by itself — never implement a termination request as prompt text alone, and never claim call-cutting behaviour you did not write into termination. Do NOT add rules like "never reschedule / never ask for a better time", which fight the platform's callback pin-down. After setting it, tell the user plainly which of their conditions now end the call.
 So if a user reports "it keeps repeating hello" or "it won't start its script", explain what actually happens rather than guessing — and do NOT rewrite their opening line to dodge a platform rule unless they want different words. Changing a greeting they liked, to work around behaviour you misdiagnosed, is a failure.
 If a tool result includes "notes", the platform auto-corrected or DROPPED some of your input — read them; if content was dropped, put it where the note says (usually a stage goal) with update_agent in the SAME turn.
 If a tool result includes non-empty "quality" warnings, the agent is too shallow — you MUST resolve every one with update_agent in the SAME turn before telling the user it's ready. Do not report a hollow agent as done.

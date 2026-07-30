@@ -135,6 +135,8 @@ def test_silence_reprompt_empty_without_last_response():
 # ---------------------------------------------------------------------------
 
 def _pipeline_state(**over):
+    from app.voice.pipeline import VoicePipeline
+
     ns = types.SimpleNamespace(
         _greeting_done=True, _tts_playing=False, _reprompt_count=0,
         conversation=types.SimpleNamespace(call_outcome=""),
@@ -144,7 +146,12 @@ def _pipeline_state(**over):
         _tts_queue=asyncio.Queue(),
         sink=types.SimpleNamespace(playback_busy_until=0.0),
         _tts_end_time=0.0, _last_voice_activity=0.0, _last_reprompt_ts=0.0,
+        _silence_hangup_fired=False, _maxdur_fired=False, _call_start_ts=0.0,
     )
+    # The decision methods share helpers on the class — bind them so the
+    # stand-in behaves like a real pipeline object.
+    for helper in ("_pipeline_quiet", "_silence_anchor", "_termination_cfg"):
+        setattr(ns, helper, types.MethodType(getattr(VoicePipeline, helper), ns))
     for k, v in over.items():
         setattr(ns, k, v)
     return ns

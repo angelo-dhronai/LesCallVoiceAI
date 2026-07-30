@@ -226,6 +226,17 @@ SILENCE_REPROMPT_ENABLED = os.environ.get(
 SILENCE_REPROMPT_S = float(os.environ.get("SILENCE_REPROMPT_S", "6.0"))
 SILENCE_REPROMPT_MAX = int(os.environ.get("SILENCE_REPROMPT_MAX", "2"))
 
+# Silence hangup (platform rule, every agent; per-agent override via
+# call_flow.termination.silence_hangup): once every repair reprompt is spent
+# and the caller still shows no voice activity for a further grace window,
+# say ONE goodbye and end the call — a walked-away caller used to leave the
+# channel (and the billing meter) open until the far end gave up. Same
+# telephony-only default as the reprompts themselves.
+SILENCE_HANGUP_ENABLED = os.environ.get(
+    "SILENCE_HANGUP_ENABLED",
+    "true" if TELEPHONY_MODE else "false").lower() == "true"
+SILENCE_HANGUP_GRACE_S = float(os.environ.get("SILENCE_HANGUP_GRACE_S", "10.0"))
+
 
 class VoicePipeline:
     """
@@ -344,6 +355,12 @@ class VoicePipeline:
         self._last_voice_activity: float = 0.0
         self._reprompt_count: int = 0
         self._last_reprompt_ts: float = 0.0
+        # Call-termination watchdog state: one-shot latches for the silence
+        # hangup (re-armed if the caller comes back) and the max-duration
+        # close (never re-armed — it's a hard cap), plus the call-age anchor.
+        self._silence_hangup_fired: bool = False
+        self._maxdur_fired: bool = False
+        self._call_start_ts: float = time.monotonic()
 
         # VAD + buffering state
         self._audio_buffer = bytearray()
@@ -1258,17 +1275,11 @@ class VoicePipeline:
     # Layer 3: Conversation Engine
     # -----------------------------------------------------------------------
 
-    def _silence_reprompt_due(self, now: float) -> bool:
-        """Pure decision: is the call in genuine dead air the agent should
-        repair? True only when the agent has spoken, nothing is playing or
-        in flight anywhere in the pipeline, the caller has produced no voice
-        activity for SILENCE_REPROMPT_S, and the repair cap isn't spent."""
+    def _pipeline_quiet(self, now: float) -> bool:
+        """Shared precondition for every dead-air decision: the agent has
+        spoken, nothing is playing or in flight anywhere in the pipeline,
+        and estimated wire playback has drained."""
         if not self._greeting_done or self._tts_playing:
-            return False
-        if self._reprompt_count >= SILENCE_REPROMPT_MAX:
-            return False
-        # Call is wrapping up (farewell/outcome decided) — silence is normal.
-        if getattr(self.conversation, "call_outcome", ""):
             return False
         gen = self._current_generation_task
         if gen is not None and not gen.done():
@@ -1279,22 +1290,135 @@ class VoicePipeline:
                 or not self._tts_queue.empty()):
             return False
         busy_until = getattr(self.sink, 'playback_busy_until', 0.0)
-        if now < busy_until + 0.5:
+        return now >= busy_until + 0.5
+
+    def _silence_anchor(self) -> float:
+        """Timestamp of the last activity in either direction — silence is
+        measured from here."""
+        busy_until = getattr(self.sink, 'playback_busy_until', 0.0)
+        return max(self._tts_end_time, busy_until,
+                   self._last_voice_activity, self._last_reprompt_ts)
+
+    def _termination_cfg(self) -> dict:
+        """The active agent's call_flow.termination ({} when absent — e.g.
+        mock conversations in tests)."""
+        fn = getattr(self.conversation, "_termination_cfg", None)
+        if callable(fn):
+            try:
+                return fn() or {}
+            except Exception:
+                return {}
+        return {}
+
+    def _silence_reprompt_due(self, now: float) -> bool:
+        """Pure decision: is the call in genuine dead air the agent should
+        repair? True only when the agent has spoken, nothing is playing or
+        in flight anywhere in the pipeline, the caller has produced no voice
+        activity for SILENCE_REPROMPT_S, and the repair cap isn't spent."""
+        if self._reprompt_count >= SILENCE_REPROMPT_MAX:
             return False
-        anchor = max(self._tts_end_time, busy_until,
-                     self._last_voice_activity, self._last_reprompt_ts)
+        # Call is wrapping up (farewell/outcome decided) — silence is normal.
+        if getattr(self.conversation, "call_outcome", ""):
+            return False
+        if not self._pipeline_quiet(now):
+            return False
+        anchor = self._silence_anchor()
         return anchor > 0.0 and now - anchor >= SILENCE_REPROMPT_S
 
+    def _silence_hangup_due(self, now: float) -> bool:
+        """Silence hangup (call_flow.termination.silence_hangup): every
+        repair reprompt is spent — or the call already reached a wrap-up
+        outcome where reprompts don't fire — and the line has stayed dead
+        for a further grace window. The caller always gets the full repair
+        cycle's benefit of the doubt before the platform closes."""
+        if not SILENCE_HANGUP_ENABLED or self._silence_hangup_fired:
+            return False
+        sh = self._termination_cfg().get("silence_hangup")
+        sh = sh if isinstance(sh, dict) else {}
+        if not bool(sh.get("enabled", True)):
+            return False
+        conv = self.conversation
+        if not hasattr(conv, "generate_silence_goodbye"):
+            return False
+        if getattr(conv, "hangup_pending", False):
+            return False  # a close is already draining — don't double-fire
+        cap_spent = (not SILENCE_REPROMPT_ENABLED
+                     or self._reprompt_count >= SILENCE_REPROMPT_MAX
+                     or bool(getattr(conv, "call_outcome", "")))
+        if not cap_spent:
+            return False
+        if not self._pipeline_quiet(now):
+            return False
+        try:
+            grace = float(sh.get("grace_s", SILENCE_HANGUP_GRACE_S))
+        except (TypeError, ValueError):
+            grace = SILENCE_HANGUP_GRACE_S
+        anchor = self._silence_anchor()
+        return anchor > 0.0 and now - anchor >= SILENCE_REPROMPT_S + max(grace, 0.0)
+
+    def _max_duration_due(self, now: float) -> bool:
+        """Hard duration cap (call_flow.termination.max_call_minutes > 0):
+        the call has outlived the business's ceiling. Fires once, and only
+        at a quiet moment — the wrap-up line never talks over anyone."""
+        if self._maxdur_fired:
+            return False
+        try:
+            cap_min = float(self._termination_cfg().get("max_call_minutes") or 0)
+        except (TypeError, ValueError):
+            cap_min = 0.0
+        if cap_min <= 0:
+            return False
+        conv = self.conversation
+        if not hasattr(conv, "generate_timeout_goodbye"):
+            return False
+        if getattr(conv, "hangup_pending", False):
+            return False
+        if now - self._call_start_ts < cap_min * 60.0:
+            return False
+        return self._pipeline_quiet(now)
+
     async def _silence_watchdog(self) -> None:
-        """Dead-air repair (platform rule): the caller went quiet past their
-        turn — most likely STT missed their reply. Say we couldn't hear them
-        and re-ask, at most SILENCE_REPROMPT_MAX times per silence."""
-        if not SILENCE_REPROMPT_ENABLED:
-            return
+        """Dead-air repair + call termination (platform rules): re-ask a
+        quiet caller (at most SILENCE_REPROMPT_MAX times per silence), then
+        close the call if they never come back; also enforces the per-agent
+        max-call-duration cap."""
         while self._running:
             try:
                 await asyncio.sleep(0.5)
                 now = time.monotonic()
+
+                # Hard duration cap — checked first: it outranks repair.
+                if self._max_duration_due(now):
+                    self._maxdur_fired = True
+                    try:
+                        text = self.conversation.generate_timeout_goodbye()
+                    except Exception:
+                        logger.exception("[HANGUP] max-duration goodbye failed")
+                        continue
+                    logger.info("[HANGUP] max_call_minutes reached after "
+                                "%.1f min — wrap-up line queued",
+                                (now - self._call_start_ts) / 60.0)
+                    self._queue_watchdog_line(text, now)
+                    continue
+
+                # Silence hangup — the repair cycle is spent and the line is
+                # still dead; close it with one goodbye.
+                if self._silence_hangup_due(now):
+                    self._silence_hangup_fired = True
+                    try:
+                        text = self.conversation.generate_silence_goodbye()
+                    except Exception:
+                        logger.exception("[HANGUP] silence goodbye failed")
+                        continue
+                    anchor = self._silence_anchor()
+                    logger.info("[HANGUP] silence hangup after %.1fs dead air "
+                                "— goodbye queued",
+                                now - anchor if anchor else 0.0)
+                    self._queue_watchdog_line(text, now)
+                    continue
+
+                if not SILENCE_REPROMPT_ENABLED:
+                    continue
                 if not self._silence_reprompt_due(now):
                     continue
                 text = ""
@@ -1314,18 +1438,25 @@ class VoicePipeline:
                             now - anchor if anchor else 0.0,
                             self._reprompt_count, SILENCE_REPROMPT_MAX,
                             text[:80])
-                self._tts_queue.put_nowait(Response(
-                    text=text, is_shortcut=True, timestamp=now))
-                if self._hub is not None:
-                    self._hub.emit_nowait({
-                        "type": "agent", "text": text,
-                        "llm_latency_ms": 0, "first_chunk_ms": 0,
-                        "total_latency_ms": 0,
-                    })
+                self._queue_watchdog_line(text, now)
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("[REPAIR] silence watchdog error")
+
+    def _queue_watchdog_line(self, text: str, now: float) -> None:
+        """Speak a watchdog-originated line (reprompt / silence goodbye /
+        max-duration wrap-up) through the normal TTS path."""
+        if not text:
+            return
+        self._tts_queue.put_nowait(Response(
+            text=text, is_shortcut=True, timestamp=now))
+        if self._hub is not None:
+            self._hub.emit_nowait({
+                "type": "agent", "text": text,
+                "llm_latency_ms": 0, "first_chunk_ms": 0,
+                "total_latency_ms": 0,
+            })
 
     async def _conversation_layer(self) -> None:
         """
@@ -1345,8 +1476,11 @@ class VoicePipeline:
             except asyncio.CancelledError:
                 break
 
-            # A real caller turn arrived — the dead-air repair cycle resets.
+            # A real caller turn arrived — the dead-air repair cycle resets,
+            # and a caller who came back after the silence goodbye gets the
+            # full repair + close cycle again before any future silence close.
             self._reprompt_count = 0
+            self._silence_hangup_fired = False
 
             # Debounce: wait a short window for a follow-on segment from the same
             # utterance. VAD may split one sentence at a natural pause and fire
@@ -1573,7 +1707,8 @@ class VoicePipeline:
             trace = {
                 "turn_index": len(self.turn_traces),
                 "ts": time.time(),
-                "stage": (str(getattr(state, "conversation_stage", ""))
+                "stage": (str(getattr(state, "conversation_stage", "")
+                              or getattr(state, "stage", "") or "")
                           or None),
                 "language": getattr(state, "language", None) or None,
                 "user_chars": len(effective_text),

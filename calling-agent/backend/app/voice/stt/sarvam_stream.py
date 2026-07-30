@@ -78,10 +78,20 @@ class SarvamStreamingSTT(STTProvider):
         api_key: str | None = None,
         model: str = "saaras:v3",
         sample_rate: int = 16_000,
+        call_id_provider=None,
     ) -> None:
         self._api_key = api_key or os.environ.get("SARVAM_API_KEY", "")
         self._model = model
         self._sample_rate = sample_rate
+        # Credit metering parity with TrackingSarvamSTT: the local buffer
+        # passed to transcribe() IS the fed audio, so metering it gives the
+        # same audio-seconds the batch path records. Covers the rescue path
+        # too (rescue is a plain, untracked SarvamSTT).
+        self._call_id_provider = call_id_provider
+        self._tracker = None
+        if call_id_provider is not None:
+            from ..credit_tracker import SarvamCreditTracker
+            self._tracker = SarvamCreditTracker.get()
         self._chunk_bytes = int(sample_rate * 2 * _CHUNK_MS / 1000.0)
 
         self._client = None
@@ -106,6 +116,18 @@ class SarvamStreamingSTT(STTProvider):
         # been fed since the last finalize/reset are residue of an already-
         # consumed turn still draining server-side — they belong to no turn.
         self._fed_since_finalize = False
+        # Coverage accounting for the router's derived-confidence scorer:
+        # a streamed transcript can legitimately cover MORE audio than the
+        # local segment passed to transcribe() (e.g. speech straddling a
+        # barge-in flush — the server stitches it, the local buffer was
+        # dropped). Scoring words-per-second against the short local buffer
+        # falsely flagged such turns as hallucination (observed live:
+        # 7 words / 464ms → 15 wps → rejected). Deliberately NOT reset in
+        # reset_turn(): the server may still stitch pre-reset audio into the
+        # next finalize, and a slightly lax wps gate for one turn beats
+        # rejecting real speech.
+        self._fed_seconds = 0.0
+        self.last_covered_seconds = 0.0
 
         # Rescue path: plain HTTP batch STT with the SAME semantics as the
         # production default. Any stream failure downgrades to this for the
@@ -120,6 +142,7 @@ class SarvamStreamingSTT(STTProvider):
         if self._broken or not pcm:
             return
         self._fed_since_finalize = True
+        self._fed_seconds += len(pcm) / (2.0 * self._sample_rate)
         self._pending.extend(pcm)
         if len(self._pending) < self._chunk_bytes:
             return
@@ -166,17 +189,27 @@ class SarvamStreamingSTT(STTProvider):
         sample_rate: int = 16_000,
         language: str = "en",
     ) -> STTResult:
+        # Rescue/batch results are scored against the local buffer alone.
+        self.last_covered_seconds = 0.0
         if self._broken:
-            return await self._rescue.transcribe(audio_bytes, sample_rate, language)
-        try:
-            text, detected = await self._finalize()
-            return STTResult(text=text, detected_language=detected)
-        except Exception as exc:
-            logger.warning(
-                "[STT:Stream] finalize failed (%r) — downgrading to HTTP "
-                "batch STT for the remainder of the call", exc)
-            self._mark_broken()
-            return await self._rescue.transcribe(audio_bytes, sample_rate, language)
+            result = await self._rescue.transcribe(audio_bytes, sample_rate, language)
+        else:
+            try:
+                text, detected = await self._finalize()
+                result = STTResult(text=text, detected_language=detected)
+            except Exception as exc:
+                logger.warning(
+                    "[STT:Stream] finalize failed (%r) — downgrading to HTTP "
+                    "batch STT for the remainder of the call", exc)
+                self._mark_broken()
+                result = await self._rescue.transcribe(
+                    audio_bytes, sample_rate, language)
+        if self._tracker is not None:
+            await self._tracker.record_stt(
+                self._call_id_provider(),
+                len(audio_bytes) / (sample_rate * 2),
+                provider="sarvam")
+        return result
 
     async def warmup(self) -> None:
         """Open the WS before the first turn so turn 1 doesn't pay the
@@ -352,6 +385,7 @@ class SarvamStreamingSTT(STTProvider):
         self._gen = gen + 1
         self._segments = [s for s in self._segments if s[0] >= self._gen]
         self._fed_since_finalize = False
+        self.last_covered_seconds, self._fed_seconds = self._fed_seconds, 0.0
         text = " ".join(parts).strip()
         logger.info(
             "[STT:Stream] finalize %.0fms → %r (segments=%d)",

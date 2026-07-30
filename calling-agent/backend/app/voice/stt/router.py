@@ -667,6 +667,8 @@ class STTRouter:
                     confidence = self._derive_confidence(
                         processed, audio_bytes, sample_rate,
                         latency_ms, provider_conf,
+                        covered_seconds=float(getattr(
+                            provider, "last_covered_seconds", 0.0) or 0.0),
                     )
                     if confidence < self._min_confidence:
                         # Low-score turns are routed to a re-ask, not
@@ -722,6 +724,7 @@ class STTRouter:
         sample_rate: int,
         latency_ms: float,
         provider_confidence: float | None,
+        covered_seconds: float = 0.0,
     ) -> float:
         """Derived 0–1 confidence for a validated transcript.
 
@@ -739,12 +742,19 @@ class STTRouter:
 
         A provider-reported confidence, when one ever exists, is the
         starting point instead of 1.0.
+
+        covered_seconds: how much audio the transcript ACTUALLY covers when
+        that exceeds the local segment — a streaming provider can return
+        text for speech the local pipeline dropped (barge-in stitch), and
+        scoring wps against the short local buffer falsely reads as
+        over-generation (observed live: 7 words / 464ms local → rejected).
         """
         score = (provider_confidence
                  if provider_confidence is not None else 1.0)
         words = len(text.split())
         duration_s = (len(audio_bytes) / (2.0 * sample_rate)
                       if sample_rate else 0.0)
+        duration_s = max(duration_s, covered_seconds)
         wps = words / duration_s if duration_s > 0.15 else 0.0
         if wps > 8.0:
             score *= 0.3

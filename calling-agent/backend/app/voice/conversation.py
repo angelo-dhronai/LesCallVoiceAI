@@ -3353,6 +3353,18 @@ class ConversationRouter:
         if self._turn_lang_directive:
             _final = self._turn_lang_directive + "\n" + _final
             self._turn_lang_directive = None
+        # Tools directive ("on" mode): declaring tools alone is not enough —
+        # with the full agent prompt the model simply answers in text and
+        # never calls them (observed on the first live E2E). Lives in this
+        # trailer, not _build_system_prompt, so the golden fixtures stay
+        # env-independent.
+        if self._tools_mode == "on":
+            _final += (
+                "\nTOOLS: use the provided tools to record details the "
+                "customer states and actions they agree to — booking a "
+                "visit, a callback request, do-not-call, or ending the "
+                "call. ALWAYS also reply with your normal 1-2 spoken "
+                "sentences alongside any tool call.")
         # ONE system message, always. Gemini's OpenAI-compat endpoint keeps
         # only a single systemInstruction — with the language trailer sent as
         # a SECOND system message it silently REPLACED the entire agent
@@ -3467,6 +3479,9 @@ class ConversationRouter:
 
             if _tool_acc is not None and _tool_acc.has_calls:
                 self._pending_tool_proposals = _tool_acc.finish()
+                logger.info("[TOOLS] stream produced %d proposal(s): %s",
+                            len(self._pending_tool_proposals),
+                            [p.name for p in self._pending_tool_proposals])
 
             tail = self._strip_end_call_marker(buffer.strip())
             if timed_out:

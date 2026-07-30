@@ -513,13 +513,13 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
     call_id_provider = lambda: conn_id  # noqa: E731 - tiny provider closure
     corrections = agent_def.knowledge_base.stt_corrections if agent_def else None
     if os.environ.get("ENABLE_STREAMING_STT", "false").lower() == "true":
-        # Streaming canary: saaras:v3 over WebSocket, fed live by the
-        # pipeline's VAD layer (see pipeline.ENABLE_STREAMING_STT). Bypasses
-        # TrackingSarvamSTT credit metering — the per-second STT figures in
-        # credit_log undercount while the flag is on. Self-downgrades to
-        # batch HTTP on any stream failure.
+        # Streaming STT: saaras:v3 over WebSocket, fed live by the
+        # pipeline's VAD layer (see pipeline.ENABLE_STREAMING_STT).
+        # call_id_provider gives it TrackingSarvamSTT-parity credit
+        # metering (local buffer duration == fed audio duration).
+        # Self-downgrades to batch HTTP on any stream failure.
         from backend.app.voice.stt.sarvam_stream import SarvamStreamingSTT
-        stt_primary = SarvamStreamingSTT()
+        stt_primary = SarvamStreamingSTT(call_id_provider=call_id_provider)
     else:
         stt_primary = TrackingSarvamSTT(call_id_provider=call_id_provider)
     stt = STTRouter(

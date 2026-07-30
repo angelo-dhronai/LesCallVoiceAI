@@ -69,6 +69,18 @@ services:
       # exactly pre-canary (10 rollback tests + no-filler-replay pin green).
       ENABLE_CONTINUATION_MERGE: "true"
       HARD_FLUSH_SILENCE_FRAMES: "20"
+      # ── Streaming STT + native tool calling LIVE (2026-07-29) ────────────
+      # Streaming: saaras:v3 WS fed during speech — transcription overlaps
+      # the caller talking, finalize at the endpoint is one flush round-trip
+      # (~300-800ms measured) instead of the full batch POST. Self-downgrades
+      # to batch on any stream failure; credit-metered at parity.
+      # Tools: gated execution on the main LLM call (record/book/callback/
+      # dnd/end_call as validated proposals; stages still advance only in
+      # code). ROLLBACK: delete these two lines and `docker compose up -d
+      # runtime` — streaming returns to batch, tools return to the per-agent
+      # YAML default (shadow). Verify: grep [STT:Stream] and [TOOLS].
+      ENABLE_STREAMING_STT: "true"
+      LLM_TOOLS_MODE: "on"
     volumes:
       - /home/angelo/lescall:/home/angelo/lescall
       - /home/angelo/.config/gcloud:/gcloud:ro

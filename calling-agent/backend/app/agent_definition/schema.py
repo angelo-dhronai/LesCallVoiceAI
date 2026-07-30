@@ -338,6 +338,15 @@ class CallFlowConfig:
     #   max_call_minutes: number — hard duration cap (0 = no cap); the agent
     #     delivers one wrap-up line and the platform ends the call.
     termination: dict = field(default_factory=dict)
+    # Connect-window behaviour (all keys optional; {} = platform defaults —
+    # every protection ON). Counters the repeated-"hello" loop at call start:
+    #   hello_fastpath: bool (default True) — a bare "hello?" early in the
+    #     call gets an instant full identity intro instead of an LLM turn.
+    #   delivery_guard: bool (default True) — during the connect window a
+    #     short burst of caller speech cannot cancel an agent reply the
+    #     caller has not heard yet; the kill is deferred until STT proves
+    #     the interruption was more than a "hello?".
+    connect: dict = field(default_factory=dict)
 
     # Convenience accessors -------------------------------------------------
 
@@ -830,6 +839,7 @@ class AgentDefinition:
             scheduling=_as_dict(cf_d, "scheduling"),
             callback_policy=_as_dict(cf_d, "callback_policy"),
             termination=_as_dict(cf_d, "termination"),
+            connect=_as_dict(cf_d, "connect"),
         )
 
         kb_d = _as_dict(d, "knowledge_base")

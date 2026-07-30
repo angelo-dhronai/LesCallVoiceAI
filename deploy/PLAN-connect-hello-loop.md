@@ -1,6 +1,8 @@
 # PLAN — Repeated "hello"s at call connect / agent long pause
 
-**Date:** 2026-07-30 · **Status:** PROPOSAL (nothing implemented)
+**Date:** 2026-07-30 · **Status:** IMPLEMENTED 2026-07-30 (all phases;
+see RUNBOOK §18 for the operational reference; NOT yet deployed —
+bind-mounted containers serve stale code until restarted)
 **Symptom (user report):** right after connect, the caller says "hello" repeatedly;
 the agent takes a long pause and "keeps waiting" through the hellos. Most calls
 show this at connect.
@@ -117,34 +119,70 @@ reply lands inside ~1.5s and isn't barged, there is no loop.
 
 ## 3. The plan
 
+### Scope — platform-wide by construction
+
+This is a **platform fix, not a maya fix**. Agents on this system are data
+(YAML under `agents/<slug>/`); there is exactly ONE engine —
+`pipeline.py` (VAD/STT/TTS/barge-in/watchdog), `conversation.py`
+(ConversationRouter), `stt/` — shared by every agent, every tenant, inbound
+and outbound. Phases 1.2 and 2–6 change that shared engine, so they apply
+automatically to **all existing agents and every agent Copilot creates in
+the future**, with zero per-agent configuration. The only per-agent items
+are Phase 0 (repairing the three YAMLs that carry the bad opening today)
+and the Copilot-side guards in 1.1 that stop the bad pattern from ever
+being authored again. Where behaviour should be business-tunable, it gets a
+`call_flow.*` knob with the platform default ON (same doctrine as
+`call_flow.termination`) — Copilot can tune it per agent, but no agent has
+to opt in to be protected.
+
 ### Phase 0 — config-only, deployable today (no code)
 
-**0.1 Rewrite the maya openings.** `opening_greeting: Hello` →  a full
-identity line, e.g. "Hello! This is Maya calling from LesCall by DhronAI —
-am I speaking with {contact_name}?" (outbound) / "Hello, thanks for calling
-LesCall! This is Maya — how can I help you today?" (inbound). This alone
-removes the trigger from 14/19 affected calls, makes the opening replayable by
-the hello-repair rule, and gives the dead-air watchdog something worth
-repeating.
+**0.1 Rewrite the bare openings (repo sweep, 2026-07-30).** A sweep of all
+27 `agents/*/agent.yaml` found exactly three with `opening_greeting: Hello`:
+`maya_lescall_sdr-inbound`, `maya_lescall_sdr-outbound`, and
+`outbound_lead_qualifier-inbound`. Every other agent already opens with a
+full identity line. Rewrite all three, e.g. "Hello! This is Maya calling
+from LesCall by DhronAI — am I speaking with {contact_name}?" (outbound) /
+"Hello, thanks for calling LesCall! This is Maya — how can I help you
+today?" (inbound). This alone removes the trigger from 14/19 affected calls,
+makes the opening replayable by the hello-repair rule, and gives the
+dead-air watchdog something worth repeating.
 
-### Phase 1 — stop inviting the loop (platform)
+### Phase 1 — stop inviting the loop (Copilot authoring layer, all agents)
 
-**1.1 Copilot lint + normalization: ban bare/near-bare openings.**
-`_quality_warnings` in `dashboard/agent_copilot_api.py`: warn when
-`opening_greeting` is < ~15 chars or matches `_is_bare_hello_text` — "the
-opening must identify the agent/company; a bare Hello triggers a hello
-ping-pong at connect." Same lint for stage-0 goals that instruct the agent to
-open with just a greeting word.
+**1.1 Make a bare opening impossible to author.** Three hooks in
+`dashboard/agent_copilot_api.py`, mirroring how termination was made
+doctrine:
+  - **Create-time default** in `_enrich_new_agent` (line ~2108, CREATE-ONLY
+    per the call-fidelity doctrine — never in `_normalize_definition`): when
+    a new agent's `opening_greeting` is missing, < ~15 chars, or
+    bare-hello-like, compose one from `identity.agent_name` +
+    `identity.company_name` (+ `{contact_name}` for outbound). Every future
+    Copilot-created agent starts safe by default.
+  - **Quality lint** in `_quality_warnings`: warn on any create/edit when
+    `opening_greeting` is bare/near-bare — "the opening must identify the
+    agent/company; a bare Hello triggers a hello ping-pong at connect."
+    Same lint for stage-0 goals that instruct the agent to open with just a
+    greeting word. Add to `ALL_MARKS` in `test_copilot_quality_lints.py` so
+    the production-nag guard proves no healthy agent gets nagged.
+  - **System-prompt doctrine**: teach the Copilot the opening rule
+    explicitly (the same pattern as "CALL-ENDING REQUIREMENTS GO IN
+    call_flow.termination") so it repairs bare openings when asked to edit
+    an agent, instead of preserving them.
 
-**1.2 Instant intro on the first bare hello (kill the LLM tax on turn 1).**
-In `ConversationRouter.process_stream`, before LLM routing: if we are in the
-greeting stage, `turn_count == 0..1`, and `_is_bare_hello_text(text)` — reply
-deterministically with the full configured intro (opening_greeting if it is a
-full line, else the stage-0 opening question), 0ms think time. This replaces
-the current path where the first hello pays 1.2–1.5s TTFT to have the LLM
-improvise a greeting. Pre-synthesise this line into the TTS PCM cache at call
-setup (the greeting warmup already exists — extend it to cover the intro
-line) so the whole turn is STT + ~0ms.
+**1.2 Instant intro on the first bare hello (kill the LLM tax on turn 1) —
+engine, all agents.** In `ConversationRouter.process_stream`, before LLM
+routing: if we are in the greeting stage, `turn_count == 0..1`, and
+`_is_bare_hello_text(text)` — reply deterministically with the full
+configured intro, 0ms think time. Source order: `opening_greeting` if it is
+a full line → stage-0 opening question → **identity-composed fallback**
+("Hello, this is {agent_name} from {company_name}…") so the fast path works
+even for an agent whose config is still bad — it must never depend on
+per-agent data being clean. This replaces the current path where the first
+hello pays 1.2–1.5s TTFT to have the LLM improvise a greeting.
+Pre-synthesise this line into the TTS PCM cache at call setup (the greeting
+warmup already exists — extend it to cover the intro line) so the whole
+turn is STT + ~0ms.
 
 ### Phase 2 — a hello must not kill an unheard reply (pipeline)
 
@@ -217,6 +255,16 @@ echo energy defeats the gate) and the busy_until anchor when playback was
 just barged. Outcome: either raise exit frames within the window or gate
 segment *submission* (not just capture) during the mute window.
 
+### Per-agent tunability (Copilot control, defaults ON)
+
+Phases 2–5 are platform defaults for every agent. For businesses that need
+different behaviour, expose a small `call_flow.connect` block (same shape
+discipline as `call_flow.termination`): `hello_fastpath` (default true),
+`delivery_guard` (default true), `replay_cap` (default 2). Copilot schema
+docs + `_normalize_definition` shape-validation + lints follow the
+termination template exactly. No agent has to set any of this to be
+protected — the block exists only to opt OUT or tune.
+
 ### Phase 6 — observability + rollout
 
 - Per-call counters in the session summary + `call_turns`: hello-replay count,
@@ -246,8 +294,8 @@ segment *submission* (not just capture) during the mute window.
 
 | Phase | Impact | Effort | Risk |
 |---|---|---|---|
-| 0 (maya openings) | High — removes trigger in most affected calls | trivial | none |
-| 1 (lint + instant intro) | High — removes 1.5s LLM tax on turn 1 | S | low |
+| 0 (3 bare-opening YAMLs) | High — removes trigger in most affected calls | trivial | none |
+| 1 (authoring guards + instant intro) | High — removes 1.5s LLM tax on turn 1, prevents recurrence | S | low |
 | 2 (delivery guard) | High — breaks the kill loop | M | medium (barge-in feel — canary) |
 | 3 (STT fast lane) | Medium — ~0.3–0.7s off hello turns | S | low |
 | 4 (pollution) | Medium — correctness | S | low |

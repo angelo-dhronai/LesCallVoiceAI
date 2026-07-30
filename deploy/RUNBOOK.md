@@ -886,3 +886,53 @@ regenerated (closure band now carries the token doctrine).
 LLM signal), `silence_hangup: {enabled: false}`. Platform:
 `SILENCE_HANGUP_ENABLED=false`; §15's `ENABLE_AGENT_HANGUP=false` still
 kills ALL agent-initiated hangups at the bridge.
+
+## 18. Connect hello-loop counters — platform-wide (2026-07-30)
+
+**Problem (measured, 2026-07-29 logs).** Calls looped at connect: caller
+says "hello" every ~2s, agent stays quiet. Root causes: bare `Hello`
+openings (3 agents) invited the ping-pong; median speech-end→first-audio
+was 2.47s (p90 3.26s) ≥ the human hello timeout; each next hello BARGED IN
+and killed the reply before its first WAV was flushed (socket_server showed
+zero PLAYBACK_SEND for the killed replies); Sarvam misdetected bare hellos
+as Odia/Kannada forcing a retry (+350ms, 33×/day); a 240ms hello fell under
+the 300ms STT floor; merged `hello hello hello` chains filled `name` and
+burned stage max_turns. Full diagnosis: `deploy/PLAN-connect-hello-loop.md`.
+
+**Fixes (one shared engine — every agent, current and future).**
+
+| Layer | Behaviour | Where |
+|---|---|---|
+| Router | Instant identity intro on the first early bare "hello" when the last utterance was itself bare — no LLM turn. Composed from identity when the config opening is bare/placeholder (`connect_intro_line`). | `conversation.py` fast path after the hello-replay branch |
+| Router | Dead-air reprompt never parrots a bare "Hello" — substitutes the intro. | `generate_silence_reprompt` |
+| Router | Bare hellos never answer QA fields, never gap-fill slots (`_scrub_hello_values`), never burn `discovery_turns`. | `conversation.py` |
+| Pipeline | **Delivery guard**: barge-in against a reply with <1s audible (or nothing flushed) is DEFERRED; the STT verdict kills playback only if the interruption wasn't a bare hello. Greeting/replays/intro/watchdog lines are `Response.protected` → guarded at any call age. | `_connect_barge_defer` + deferred verdict in `_conversation_layer` |
+| Pipeline | Bare hellos excluded from merge-window/drain merges, CONT-MERGE rollbacks, and accumulator prepends (no more `hello hello hello…`). | `_conversation_layer` |
+| STT | Connect window: short segments (<800ms) force the agent's default language instead of `unknown` (kills the Odia/Kannada retry tax); STT floor lowered to 200ms. | `_stt_worker`, `_min_speech_ms` |
+| STT | Empty-streak damper: only the SECOND consecutive empty speaks "couldn't hear you" (was: every one of 4 — fed an echo→empty→sorry loop). | `_empty_fallback_speaks` |
+| Copilot | Bare openings impossible to author: create-time identity opening in `_enrich_new_agent` (CREATE-ONLY), bare-opening quality lint, OPENING doctrine in the system prompt, `call_flow.connect` schema + normalization. | `agent_copilot_api.py` |
+| Config | 3 bare openings rewritten: `maya_lescall_sdr-in/outbound`, `outbound_lead_qualifier-inbound`. | agent YAMLs |
+
+**Env knobs (all default ON; delivery guard telephony-only by default).**
+`CONNECT_HELLO_FASTPATH` (true) · `CONNECT_DELIVERY_GUARD` (true if
+TELEPHONY_MODE) · `CONNECT_WINDOW_S` (12) · `CONNECT_MIN_PLAYED_S` (1.0) ·
+`CONNECT_MIN_SPEECH_MS` (200) · `CONNECT_FORCE_LANG` (true) ·
+`CONNECT_SHORT_SEG_MS` (800) · `EMPTY_STREAK_DAMPER` (true).
+Per-agent: `call_flow.connect: {hello_fastpath: bool, delivery_guard: bool}`
+(defaults ON; the block exists only to opt out).
+
+**Rollback.** Per-agent: `call_flow.connect: {hello_fastpath: false,
+delivery_guard: false}`. Platform: set the matching env to `false` in
+compose (remember: compose *restart* does not re-read env — `up -d`).
+All other guards (merge/QA/slot/reprompt hygiene) are unconditional
+correctness fixes with no knob.
+
+**Tests.** `tests/test_connect_hello.py` (29) + opening/enricher/connect
+tests in `test_copilot_quality_lints.py`. Watchdog/guard decisions are pure
+functions tested via SimpleNamespace with bound methods (same pattern as
+§17). Golden prompts untouched (no prompt-band changes).
+
+**Open item (5.2 audit).** In call b217ca93 (2026-07-29 11:04) echo
+segments born INSIDE the 3.2s ECHO-MUTE window still reached STT — the
+echo-gate early-exit (5 frames ≈ 100ms) is the suspect. The damper contains
+the blast radius; tuning `ECHO_EARLY_EXIT_FRAMES` needs its own canary.

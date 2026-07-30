@@ -509,6 +509,12 @@ def _slot_period(time_str: str) -> str:
 # greeting means the caller didn't hear us — replay the last utterance
 # instead of chatting. Tunable via env; see ConversationRouter._is_early_hello.
 EARLY_HELLO_WINDOW_S = float(os.environ.get("CALL_REPAIR_HELLO_WINDOW_S", "25"))
+# Connect hello fast path: when the opening line was itself just "Hello" (so
+# there is nothing worth replaying), answer the caller's early bare "hello?"
+# with an instant identity intro instead of a 1.2-1.5s LLM turn. Per-agent
+# opt-out via call_flow.connect.hello_fastpath.
+CONNECT_HELLO_FASTPATH = (
+    os.environ.get("CONNECT_HELLO_FASTPATH", "true").lower() == "true")
 # Hello words across the platform's scripts (en / Devanagari / Gujarati).
 _HELLO_CORE = {"hello", "hallo", "helo", "hullo", "hellow",
                "हेलो", "हैलो", "हलो", "हॅलो", "હેલો", "હલો", "હૅલો"}
@@ -734,6 +740,9 @@ class ConversationRouter:
         # replay window anchor + replay counter, see _is_early_hello().
         self._opening_ts: float = 0.0
         self._hello_replays: int = 0
+        # Connect hello fast path: the composed identity intro fires at most
+        # once; after that the normal replay branch repeats it.
+        self._intro_delivered: bool = False
         # Name-capture confirmation mode (feature 4)
         self._name_pending: str | None = None
         self._name_confirmed: bool = False
@@ -1110,6 +1119,12 @@ class ConversationRouter:
         last = (self.last_agent_response or "").strip()
         if not last:
             return ""
+        # Never parrot a bare "Hello" back into more dead air — replay the
+        # full identity intro instead (live incident: "Hello" … 12s silence
+        # … "Hello" → caller hung up).
+        if self._is_bare_hello_text(last):
+            last = self.connect_intro_line()
+            self._store_last_response(last)
         if self.state.turn_count == 0:
             text = last
         else:
@@ -1379,8 +1394,12 @@ class ConversationRouter:
 
         self.memory.add_user(text, language=self.state.language)
 
-        # QA: record this user turn against any pending asked-fields
-        self.memory.qa_tracker.observe_user_turn(text, self.memory.turn_index)
+        # QA: record this user turn against any pending asked-fields.
+        # A bare "hello?" is a can-you-hear-me repair signal, not an answer —
+        # marking the asked field answered with it makes the agent never
+        # re-ask (live incident: name recorded as 'hello hello hello').
+        if not self._is_bare_hello_text(text):
+            self.memory.qa_tracker.observe_user_turn(text, self.memory.turn_index)
 
         # ── Conversation State layer: extract + merge EVERY user turn ──
         # Runs BEFORE shortcut routing so slot values embedded in shortcut
@@ -1623,6 +1642,30 @@ class ConversationRouter:
             self._store_last_response(resp)
             yield EngineResult(text=resp, is_shortcut=True, intent="repeat")
             return
+
+        # --- Connect hello fast path (platform rule, all agents) ---
+        # The complement of the replay above: when the last utterance was
+        # ITSELF just "hello" (bare opening) there is nothing worth
+        # replaying, and before this branch existed the caller's first
+        # "hello?" paid a full 1.2-1.5s LLM turn — dead air that keeps the
+        # hello loop alive. Answer instantly with a full identity intro.
+        if (CONNECT_HELLO_FASTPATH
+                and self._connect_cfg().get("hello_fastpath") is not False
+                and not self._intro_delivered
+                and self._is_early_hello(text)
+                and (not self.last_agent_response
+                     or self._is_bare_hello_text(self.last_agent_response))):
+            resp = self.connect_intro_line()
+            if resp:
+                _cancel_llm()
+                self._intro_delivered = True
+                logger.info("[REPAIR] Connect hello — instant intro: %r",
+                            resp[:60])
+                self.memory.add_assistant(resp, language=self.state.language)
+                self._store_last_response(resp)
+                yield EngineResult(text=resp, is_shortcut=True,
+                                   intent="connect_intro")
+                return
 
         # --- Repeat request (feature 3) — replay or re-render last agent response ---
         if self._is_repeat_request(text) and self.last_agent_response:
@@ -2084,7 +2127,11 @@ class ConversationRouter:
 
         # ── Sync all layers into CallState ───────────────────────────────
         self._update_call_state()
-        self.state.discovery_turns += 1
+        # A bare early "hello?" is dead-air repair, not conversation — it
+        # must not burn the stage budget (four connect hellos once pushed a
+        # call past identity into BUSINESS_DISCOVERY via max_turns).
+        if not self._is_early_hello(text):
+            self.state.discovery_turns += 1
 
     def _post_greeting_stage(self) -> str:
         """Stage to enter after the greeting turn. Legacy flows land on
@@ -2543,6 +2590,7 @@ class ConversationRouter:
             data = {k: v for k, v in json.loads(m.group(0)).items()
                     if isinstance(v, (str, int, float)) and str(v).strip()
                     and str(v).lower() not in ("null", "none", "unknown", "n/a")}
+            data = self._scrub_hello_values(data)
             if data:
                 changes = self.state_mgr.merge_state(
                     data, source="llm", utterance=text, fill_only=True)
@@ -2594,7 +2642,7 @@ class ConversationRouter:
             if not p.valid:
                 continue
             if p.name == "record_customer_details":
-                data = clean_slot_args(p.args)
+                data = self._scrub_hello_values(clean_slot_args(p.args))
                 wanted = {k: v for k, v in data.items() if k in missing}
                 if wanted:
                     changes = self.state_mgr.merge_state(
@@ -4050,6 +4098,70 @@ class ConversationRouter:
         """call_flow.termination with a safe empty default."""
         cfg = getattr(self._def.call_flow, "termination", None)
         return cfg if isinstance(cfg, dict) else {}
+
+    def _connect_cfg(self) -> dict:
+        """call_flow.connect with a safe empty default."""
+        cfg = getattr(self._def.call_flow, "connect", None)
+        return cfg if isinstance(cfg, dict) else {}
+
+    # Identity-composed connect intro, per language. First-person forms are
+    # gender-neutral on purpose — agent voices vary per language. Separate
+    # with/without-agent shapes: "This is  from X" / "ये X से का कॉल है"
+    # read broken when the agent name is empty or IS the company name.
+    _INTRO_LINES = {
+        ("en", True): "Hello! This is {agent} from {company}.",
+        ("en", False): "Hello! This is {company}.",
+        ("hi", True): "नमस्ते! मैं {agent}, {company} से।",
+        ("hi", False): "नमस्ते! ये {company} की ओर से कॉल है।",
+        ("gu", True): "નમસ્તે! હું {agent}, {company} તરફથી.",
+        ("gu", False): "નમસ્તે! આ {company} તરફથી કૉલ છે.",
+    }
+    _INTRO_TAIL_INBOUND = {
+        "en": "How may I help you today?",
+        "hi": "बताइए, मैं आपकी क्या मदद करूँ?",
+        "gu": "બોલો, હું તમારી શું મદદ કરું?",
+    }
+    _INTRO_TAIL_OUTBOUND = {
+        "en": "Can you hear me clearly?",
+        "hi": "क्या मेरी आवाज़ साफ़ आ रही है?",
+        "gu": "શું મારો અવાજ બરાબર આવે છે?",
+    }
+
+    def connect_intro_line(self) -> str:
+        """Full identity intro for the connect hello fast path (and for the
+        dead-air reprompt when the last utterance was a bare hello). Prefers
+        the configured opening when it is a real line; otherwise composes one
+        from identity so the protection never depends on clean agent config."""
+        last = (self.last_agent_response or "").strip()
+        if last and not self._is_bare_hello_text(last):
+            return last
+        opening = (self._def.response_bank.opening_greeting or "").strip()
+        if len(opening) >= 15 and not self._is_bare_hello_text(opening) \
+                and "{" not in opening:
+            return opening
+        ident = self._def.identity
+        agent = (ident.agent_name or "").strip()
+        company = (ident.company_name or "").strip() or agent or "our team"
+        lang = self.state.language if self.state.language in ("en", "hi", "gu") \
+            else "en"
+        has_agent = bool(agent) and agent.lower() not in company.lower()
+        line = self._INTRO_LINES[(lang, has_agent)].format(
+            agent=agent, company=company)
+        tail = (self._INTRO_TAIL_OUTBOUND
+                if getattr(self._def, "call_direction", "") == "outbound"
+                else self._INTRO_TAIL_INBOUND)[lang]
+        return f"{line} {tail}"
+
+    def _scrub_hello_values(self, data: dict) -> dict:
+        """Drop extracted slot values that are just hello noise — a caller's
+        repeated 'hello hello' must never become their recorded name."""
+        clean = {k: v for k, v in data.items()
+                 if not self._is_bare_hello_text(str(v))}
+        dropped = set(data) - set(clean)
+        if dropped:
+            logger.info("[STATE] Dropped hello-noise value(s) for %s",
+                        ", ".join(sorted(dropped)))
+        return clean
 
     def _strip_end_call_marker(self, text: str) -> str:
         """Remove the [END_CALL] token before validation — _validate_response

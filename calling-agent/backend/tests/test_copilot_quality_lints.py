@@ -58,8 +58,9 @@ MARK_FIRST_BEAT = "only the FIRST beat"
 MARK_NO_TIMES = "no times to offer"
 MARK_DEAD_END_RULES = "no way to act"
 MARK_TINY_CAP = "barely covers a greeting"
+MARK_BARE_OPENING = "looping the call at connect"
 ALL_MARKS = (MARK_CALLER_PICKS, MARK_FIRST_BEAT, MARK_NO_TIMES,
-             MARK_DEAD_END_RULES, MARK_TINY_CAP)
+             MARK_DEAD_END_RULES, MARK_TINY_CAP, MARK_BARE_OPENING)
 
 
 def maya_shape(**over) -> dict:
@@ -191,6 +192,70 @@ def test_normalize_termination_bad_root_shape(cop):
     out = cop._normalize_definition(d, notes)
     assert "termination" not in out["call_flow"]
     assert any("termination" in n for n in notes)
+
+
+def test_lint_bare_opening(cop):
+    """maya_shape ships the live incident's bare 'Hello' opening."""
+    assert _warned(cop, maya_shape(), MARK_BARE_OPENING)
+    fixed = maya_shape(response_bank={
+        "opening_greeting": "Hello! This is Maya from LesCall. "
+                            "Am I speaking with {contact_name}?"})
+    assert not _warned(cop, fixed, MARK_BARE_OPENING)
+
+
+def test_enrich_new_agent_composes_opening(cop):
+    notes: list[str] = []
+    d = maya_shape(identity={"agent_name": "Maya", "company_name": "Acme"})
+    cop._enrich_new_agent(d, notes)
+    opening = d["response_bank"]["opening_greeting"]
+    assert opening.startswith("Hello! This is Maya from Acme")
+    assert "{contact_name}" in opening          # outbound shape
+    assert any("identity opening_greeting" in n for n in notes)
+
+
+def test_enrich_new_agent_keeps_full_opening(cop):
+    notes: list[str] = []
+    d = maya_shape(
+        identity={"agent_name": "Maya", "company_name": "Acme"},
+        response_bank={"opening_greeting":
+                       "Namaste! Acme se Maya bol rahi hoon."})
+    cop._enrich_new_agent(d, notes)
+    assert d["response_bank"]["opening_greeting"] == \
+        "Namaste! Acme se Maya bol rahi hoon."
+
+
+def test_enrich_new_agent_inbound_opening_shape(cop):
+    notes: list[str] = []
+    d = maya_shape(identity={"agent_name": "Maya", "company_name": "Acme"},
+                   call_direction="inbound")
+    cop._enrich_new_agent(d, notes)
+    opening = d["response_bank"]["opening_greeting"]
+    assert "{contact_name}" not in opening
+    assert "How can I help you today?" in opening
+
+
+def test_normalize_connect_shapes(cop):
+    notes: list[str] = []
+    d = maya_shape()
+    d["call_flow"]["connect"] = {"hello_fastpath": 0, "delivery_guard": 1}
+    out = cop._normalize_definition(d, notes)
+    conn = out["call_flow"]["connect"]
+    assert conn["hello_fastpath"] is False
+    assert conn["delivery_guard"] is True
+
+    d2 = maya_shape()
+    d2["call_flow"]["connect"] = "yes please"
+    notes2: list[str] = []
+    out2 = cop._normalize_definition(d2, notes2)
+    assert "connect" not in out2["call_flow"]
+    assert any("connect" in n for n in notes2)
+
+
+def test_system_prompt_teaches_openings(cop):
+    p = cop._system_prompt()
+    for pin in ("OPENING LINES MUST IDENTIFY THE AGENT",
+                "call_flow.connect", "hello_fastpath", "delivery_guard"):
+        assert pin in p, pin
 
 
 def test_system_prompt_teaches_termination(cop):

@@ -89,6 +89,11 @@ class Response:
     # grant the filler — and the real response that follows it — a longer
     # barge-in guard so the filler's own echo can't cancel the real response.
     is_filler: bool = False
+    # True for utterances that exist because the caller missed something
+    # (hello replays, the connect intro, watchdog reprompts, the greeting).
+    # The connect delivery guard protects these from hello barge-ins at any
+    # call age, not just inside CONNECT_WINDOW_S.
+    protected: bool = False
 
 
 QUEUE_SIZE_AUDIO = 40
@@ -202,6 +207,34 @@ CONTINUATION_BARGE_FRAMES = int(os.environ.get("CONTINUATION_BARGE_FRAMES", "5")
 CONTINUATION_ECHO_EXIT_FRAMES = int(os.environ.get("CONTINUATION_ECHO_EXIT_FRAMES", "4"))
 # Cap on consecutive rollback-merges per chain (background-noise guard).
 CONTINUATION_MAX_MERGES = int(os.environ.get("CONTINUATION_MAX_MERGES", "3"))
+
+# ── Connect window (repeated-"hello" loop counter) ──────────────────────────
+# In the first CONNECT_WINDOW_S of a call the caller's patience is ~2s and a
+# "hello?" is the most likely utterance. Three protections apply, each with
+# its own kill switch and a per-agent opt-out via call_flow.connect:
+#   delivery guard — a barge-in against a reply the caller has NOT heard yet
+#     (nothing flushed, or < CONNECT_MIN_PLAYED_S played) is deferred until
+#     STT shows the interruption was more than a bare hello. Replayed /
+#     intro utterances (Response.protected) get the guard at any call age.
+#   force-language — short first segments skip lang=unknown (bare "hello"
+#     routinely misdetects as Odia/Kannada, doubling STT latency exactly on
+#     the loop's critical turns).
+#   lower min-speech — a clipped 240ms "hello" must still reach STT.
+CONNECT_DELIVERY_GUARD = os.environ.get(
+    "CONNECT_DELIVERY_GUARD",
+    "true" if TELEPHONY_MODE else "false").lower() == "true"
+CONNECT_WINDOW_S = float(os.environ.get("CONNECT_WINDOW_S", "12"))
+CONNECT_MIN_PLAYED_S = float(os.environ.get("CONNECT_MIN_PLAYED_S", "1.0"))
+CONNECT_MIN_SPEECH_MS = float(os.environ.get("CONNECT_MIN_SPEECH_MS", "200"))
+CONNECT_FORCE_LANG = os.environ.get(
+    "CONNECT_FORCE_LANG", "true").lower() == "true"
+CONNECT_SHORT_SEG_MS = float(os.environ.get("CONNECT_SHORT_SEG_MS", "800"))
+# Empty-transcript streak damper: speak "sorry, couldn't hear you" only on
+# the SECOND consecutive empty (first stays silent, later ones defer to the
+# dead-air watchdog). Four sorries in a row once fed an echo→empty→sorry
+# self-loop.
+EMPTY_STREAK_DAMPER = os.environ.get(
+    "EMPTY_STREAK_DAMPER", "true").lower() == "true"
 
 # Fallback phrases played when STT returns empty on substantial speech,
 # or when TTS receives an empty string or fails to play (feature 2 & 5).
@@ -321,6 +354,15 @@ class VoicePipeline:
         # a clean TTS completion and should be merged with the previous turn.
         self._last_user_text: str = ""
         self._last_tts_end: float = 0.0
+        # Connect delivery guard state: per-utterance sequence number,
+        # protected flag, when this utterance's audio first reached the
+        # sink's playback clock, and the deferred-barge latch (see
+        # _connect_barge_defer / the deferred verdict in _conversation_layer).
+        self._utt_seq: int = 0
+        self._utt_protected: bool = False
+        self._utt_first_flush_ts: float = 0.0
+        self._bargein_deferred: bool = False
+        self._bargein_deferred_utt: int = -1
         # Continuation-merge state (see ENABLE_CONTINUATION_MERGE):
         # window during which resumed caller speech is a probable
         # continuation, timing anchors, and the per-chain merge counter.
@@ -507,6 +549,7 @@ class VoicePipeline:
                 text=opening.text,
                 is_shortcut=True,
                 timestamp=time.monotonic(),
+                protected=True,
             ))
             logger.info("[PIPELINE] Agent opening: %r", opening.text)
             if self._hub is not None:
@@ -688,6 +731,29 @@ class VoicePipeline:
                 self._speech_frame_streak >= min_frames
                 and elapsed > self._barge_in_min_elapsed_ms
             ):
+                # Connect delivery guard: never let a burst of energy kill a
+                # reply the caller has not heard yet (the repeated-"hello"
+                # loop: each hello killed the answer before its first WAV
+                # was flushed, so the caller heard only dead air). Latch the
+                # deferral; the STT verdict in _conversation_layer kills the
+                # playback iff the interruption was more than a bare hello.
+                _defer_now = time.monotonic()
+                if self._connect_barge_defer(_defer_now):
+                    if not self._bargein_deferred:
+                        self._bargein_deferred = True
+                        self._bargein_deferred_utt = self._utt_seq
+                        logger.info(
+                            "[BARGE-IN] Deferred (delivery window) "
+                            "frames=%d energy=%.0f played=%.2fs — "
+                            "awaiting STT verdict",
+                            self._speech_frame_streak,
+                            self.vad.last_energy,
+                            max(0.0, _defer_now - self._utt_first_flush_ts)
+                            if self._utt_first_flush_ts > 0.0 else 0.0,
+                        )
+                    self._speech_frame_streak = 0
+                    return
+
                 logger.info(
                     "[BARGE-IN] Interrupting TTS "
                     "frames=%d energy=%.0f threshold=%.0f cont_window=%s",
@@ -877,7 +943,7 @@ class VoicePipeline:
         # the caller stops speaking while tolerating mid-sentence breath pauses.
         if (
             not speech
-            and self._speech_duration_ms >= MIN_SPEECH_MS
+            and self._speech_duration_ms >= self._min_speech_ms(time.monotonic())
             and self._silence_frames >= HARD_FLUSH_SILENCE_FRAMES
         ):
             logger.info(
@@ -894,7 +960,7 @@ class VoicePipeline:
                 len(self._audio_buffer),
             )
 
-            if self._speech_duration_ms < MIN_SPEECH_MS:
+            if self._speech_duration_ms < self._min_speech_ms(time.monotonic()):
                 logger.debug(
                     "[TURN] Too short (%.0fms) — discarding",
                     self._speech_duration_ms
@@ -1043,6 +1109,30 @@ class VoicePipeline:
                 if _forced_lang:
                     _stt_lang = _forced_lang
                     logger.debug("[STT-WORKER] stt_lang forced to %s by agent config", _stt_lang)
+                elif (
+                    CONNECT_FORCE_LANG
+                    and segment.duration_ms < CONNECT_SHORT_SEG_MS
+                    and (time.monotonic() - self._call_start_ts)
+                    < CONNECT_WINDOW_S
+                ):
+                    # Connect window: a short first segment is almost always
+                    # "hello" — with lang=unknown Sarvam routinely labels it
+                    # Odia/Kannada, forcing a retry round-trip that doubles
+                    # STT latency exactly where dead air feeds the hello
+                    # loop. Anchor to the agent's default language; real
+                    # sentences (≥ CONNECT_SHORT_SEG_MS) keep auto-detect.
+                    _default_short = "en"
+                    if self.conversation and hasattr(self.conversation, "_def"):
+                        _default_short = (
+                            getattr(self.conversation._def.languages,
+                                    "default", "") or "en")
+                    _stt_lang = {"en": "en-IN", "hi": "hi-IN",
+                                 "gu": "gu-IN"}.get(_default_short, "unknown")
+                    if _stt_lang != "unknown":
+                        logger.info(
+                            "[STT-WORKER] Connect window: forcing lang=%s "
+                            "for %.0fms segment", _stt_lang,
+                            segment.duration_ms)
                 else:
                     logger.debug("[STT-WORKER] stt_lang=unknown (auto-detect every turn)")
                 _seg_samples = np.frombuffer(segment.audio, dtype=np.int16).astype(np.float32)
@@ -1219,6 +1309,19 @@ class VoicePipeline:
                                     ))
                                 except asyncio.QueueFull:
                                     pass
+                            elif not self._empty_fallback_speaks(
+                                    self._stt_consecutive_fallbacks):
+                                # Damper: only the SECOND consecutive empty
+                                # speaks. The first stays silent (one garbled
+                                # segment is normal), later ones defer to the
+                                # dead-air watchdog — a spoken "sorry" per
+                                # empty once fed an echo→empty→sorry loop.
+                                logger.info(
+                                    "[STT] Unrecognized speech (%.0fms, lang=%s, "
+                                    "attempt %d/%d) — staying silent (empty-streak damper)",
+                                    segment.duration_ms, lang,
+                                    self._stt_consecutive_fallbacks, _MAX_STT_FALLBACKS,
+                                )
                             else:
                                 fallback = _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
                                 logger.info(
@@ -1309,6 +1412,70 @@ class VoicePipeline:
             except Exception:
                 return {}
         return {}
+
+    def _connect_cfg(self) -> dict:
+        """The active agent's call_flow.connect ({} when absent)."""
+        fn = getattr(self.conversation, "_connect_cfg", None)
+        if callable(fn):
+            try:
+                return fn() or {}
+            except Exception:
+                return {}
+        return {}
+
+    def _bare_hello(self, text: str) -> bool:
+        """Delegate to the router's script-aware bare-hello check."""
+        fn = getattr(self.conversation, "_is_bare_hello_text", None)
+        if callable(fn):
+            try:
+                return bool(fn(text))
+            except Exception:
+                return False
+        return False
+
+    def _min_speech_ms(self, now: float) -> float:
+        """Effective STT floor: lowered inside the connect window so a
+        clipped 240ms "hello" still reaches STT instead of being dropped
+        into dead air (the watchdog then parrots the greeting)."""
+        if now - self._call_start_ts < CONNECT_WINDOW_S:
+            return min(CONNECT_MIN_SPEECH_MS, MIN_SPEECH_MS)
+        return MIN_SPEECH_MS
+
+    @staticmethod
+    def _empty_fallback_speaks(streak: int) -> bool:
+        """Empty-transcript damper decision: with EMPTY_STREAK_DAMPER on,
+        only the SECOND consecutive empty speaks the "couldn't hear you"
+        line — one garbled segment is normal, and a sorry per empty once
+        fed an echo→empty→sorry self-loop."""
+        return (not EMPTY_STREAK_DAMPER) or streak == 2
+
+    def _connect_barge_defer(self, now: float) -> bool:
+        """Should this barge-in be DEFERRED instead of killing playback?
+
+        True while the currently-playing utterance is one the caller cannot
+        have meaningfully heard — nothing flushed to the playback clock yet,
+        or less than CONNECT_MIN_PLAYED_S audible — during the connect
+        window (or any time for Response.protected utterances). The kill is
+        not lost: the transcript verdict in _conversation_layer performs it
+        the moment STT shows real content. A bare "hello?" releases the
+        deferral and playback simply continues.
+        """
+        if not CONNECT_DELIVERY_GUARD:
+            return False
+        if self._connect_cfg().get("delivery_guard") is False:
+            return False
+        if not self._tts_playing:
+            return False
+        if not (self._utt_protected
+                or now - self._call_start_ts < CONNECT_WINDOW_S):
+            return False
+        busy_until = getattr(self.sink, "playback_busy_until", 0.0)
+        if self._utt_first_flush_ts <= 0.0:
+            if busy_until > now:
+                # First audio of this utterance just reached the clock.
+                self._utt_first_flush_ts = now
+            return True
+        return (now - self._utt_first_flush_ts) < CONNECT_MIN_PLAYED_S
 
     def _silence_reprompt_due(self, now: float) -> bool:
         """Pure decision: is the call in genuine dead air the agent should
@@ -1450,7 +1617,7 @@ class VoicePipeline:
         if not text:
             return
         self._tts_queue.put_nowait(Response(
-            text=text, is_shortcut=True, timestamp=now))
+            text=text, is_shortcut=True, timestamp=now, protected=True))
         if self._hub is not None:
             self._hub.emit_nowait({
                 "type": "agent", "text": text,
@@ -1481,6 +1648,32 @@ class VoicePipeline:
             # full repair + close cycle again before any future silence close.
             self._reprompt_count = 0
             self._silence_hangup_fired = False
+
+            # Deferred-barge verdict (connect delivery guard): the energy
+            # burst that would have killed playback is now text. A bare
+            # "hello?" means the caller just couldn't hear us — keep
+            # playing. Anything else is a real interruption — kill the
+            # playback now, exactly as the immediate barge path would have.
+            if self._bargein_deferred:
+                self._bargein_deferred = False
+                _is_hello_defer = self._bare_hello(transcript.text)
+                if (not _is_hello_defer
+                        and self._tts_playing
+                        and self._utt_seq == self._bargein_deferred_utt):
+                    logger.info(
+                        "[BARGE-IN] Deferred kill — caller said %r "
+                        "(not a hello)", transcript.text[:40])
+                    interrupt = getattr(self.sink, "interrupt_playback", None)
+                    if interrupt is not None:
+                        await interrupt()
+                    await self.tts.stop()
+                    self._tts_playing = False
+                    self._speech_frame_streak = 0
+                else:
+                    logger.info(
+                        "[BARGE-IN] Deferred barge released — %s",
+                        "bare hello, playback continues" if _is_hello_defer
+                        else "utterance already finished")
 
             # Debounce: wait a short window for a follow-on segment from the same
             # utterance. VAD may split one sentence at a natural pause and fire
@@ -1514,7 +1707,15 @@ class VoicePipeline:
                         timeout=merge_wait_s,
                     )
                     time_gap = follow_on.timestamp - transcript.timestamp
-                    if time_gap < 3.0:
+                    if (time_gap < 3.0 and self._bare_hello(transcript.text)
+                            and self._bare_hello(follow_on.text)):
+                        # Two bare hellos are ONE repair signal, not a
+                        # sentence — merging them builds the 'hello hello
+                        # hello' garbage that poisons slots and the LLM.
+                        logger.info(
+                            "[ENGINE] Dropping repeated hello follow-on "
+                            "(%.1fs gap)", time_gap)
+                    elif time_gap < 3.0:
                         # Close in time — continuation of the same utterance; merge.
                         merged_text = transcript.text.rstrip(" .,") + " " + follow_on.text.lstrip()
                         logger.info(
@@ -1551,7 +1752,12 @@ class VoicePipeline:
                 try:
                     candidate = self._transcript_queue.get_nowait()
                     age_s = _drain_now - candidate.timestamp
-                    if age_s <= 3.0:
+                    if (age_s <= 3.0 and self._bare_hello(transcript.text)
+                            and self._bare_hello(candidate.text)):
+                        logger.info(
+                            "[ENGINE] Dropping repeated hello continuation "
+                            "(%.1fs old)", age_s)
+                    elif age_s <= 3.0:
                         merged_text = transcript.text.rstrip(" .,") + " " + candidate.text.lstrip()
                         transcript = Transcript(
                             text=merged_text,
@@ -1581,6 +1787,12 @@ class VoicePipeline:
             now = time.monotonic()
             effective_text = transcript.text
             merged_from_rollback = False
+            # A bare "hello?" is a repair signal, never a continuation of the
+            # caller's own sentence and never context worth prepending — it
+            # must reach the router clean so the replay / instant-intro
+            # branches can recognize it (a merged 'hello hello hello hello
+            # hello' is >4 tokens and stops matching entirely).
+            _hello_turn = self._bare_hello(transcript.text)
             if ENABLE_CONTINUATION_MERGE and self._greeting_done:
                 conv = self.conversation
                 if (hasattr(conv, "has_pending_turn") and conv.has_pending_turn()):
@@ -1588,7 +1800,8 @@ class VoicePipeline:
                         transcript.speech_start_ts - self._turn_txn_speech_end
                     ) * 1000.0
                     if (
-                        transcript.speech_start_ts > 0.0
+                        not _hello_turn
+                        and transcript.speech_start_ts > 0.0
                         and self._turn_txn_speech_end > 0.0
                         and 0.0 <= gap_ms <= CONTINUATION_WINDOW_MS
                         and self._merge_chain_count < CONTINUATION_MAX_MERGES
@@ -1654,6 +1867,11 @@ class VoicePipeline:
             # the previous turn's text.
             if merged_from_rollback:
                 pass  # effective_text already merged with full state rollback
+            elif _hello_turn:
+                # Keep the hello clean — no prior-fragment prepend, no
+                # post-response merge. The router's repair branches need the
+                # bare form, and 'prior sentence + hello' is noise anyway.
+                pass
             elif self._turn_accumulator:
                 effective_text = (
                     self._turn_accumulator.rstrip(" .,") + " " + transcript.text.lstrip()
@@ -1675,9 +1893,11 @@ class VoicePipeline:
                     "[ENGINE] Merging post-response fragment %r with prior turn %r → %r",
                     transcript.text[:35], self._last_user_text[:35], effective_text[:60],
                 )
-            # Save for potential next barge-in
-            self._turn_accumulator = effective_text
-            self._last_user_text = effective_text
+            # Save for potential next barge-in — but never a bare hello:
+            # stored hellos become the 'hello hello …' prepend chains.
+            if not _hello_turn:
+                self._turn_accumulator = effective_text
+                self._last_user_text = effective_text
             # Anchor for the next continuation-gap measurement: when the
             # caller's speech for THIS turn actually ended.
             if transcript.speech_end_ts > 0.0:
@@ -1770,6 +1990,12 @@ class VoicePipeline:
                                         is_shortcut=True,
                                         timestamp=time.monotonic(),
                                         is_filler=(result.intent == "filler"),
+                                        # Replays / connect intros exist
+                                        # because the caller missed them —
+                                        # shield their delivery from hello
+                                        # barge-ins at any call age.
+                                        protected=(result.intent in
+                                                   ("repeat", "connect_intro")),
                                     )
                                 )
                             except asyncio.QueueFull:
@@ -1973,6 +2199,11 @@ class VoicePipeline:
 
                 self._tts_playing = True
                 self._tts_start_time = time.monotonic()
+                # Connect delivery guard bookkeeping: new utterance, nothing
+                # of it flushed yet, protected status from the Response.
+                self._utt_seq += 1
+                self._utt_protected = response.protected
+                self._utt_first_flush_ts = 0.0
                 # Barge-in guard for THIS utterance.  If this utterance is a
                 # filler, or it is the real response that immediately follows a
                 # filler, use the longer FILLER_ECHO_GRACE_MS so the filler's
@@ -2038,6 +2269,9 @@ class VoicePipeline:
             finally:
                 self._tts_playing = False
                 self._tts_end_time = time.monotonic()
+                # This utterance is over — a still-latched deferral must not
+                # leak onto the next one.
+                self._bargein_deferred = False
 
                 # Issue 4 / Issue 1: mark greeting as done after the very first
                 # TTS utterance finishes.  From this point barge-in and STT

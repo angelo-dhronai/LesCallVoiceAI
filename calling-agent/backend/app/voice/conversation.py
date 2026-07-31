@@ -559,6 +559,54 @@ _CAPTURE_UNRESOLVED = {
     "gu": ("કંઈ વાંધો નહીં — ઈમેલ અત્યારે રહેવા દઈએ; અમારી ટીમ પછીથી "
            "તમારી પાસેથી લઈ લેશે."),
 }
+# C2 (2026-07-31): progress queries mid-capture ("नोट कर लिया आपने?",
+# "कितना नोट किया?") are answered deterministically — the LLM once claimed
+# "noted" for a value that was never in state.
+_CAPTURE_PROGRESS_PENDING = {
+    "en": "So far I have: {spelled}. Is that correct?",
+    "hi": "अभी तक मैंने यह नोट किया है: {spelled} — क्या यह सही है?",
+    "gu": "અત્યાર સુધી મેં આ નોંધ્યું છે: {spelled} — બરાબર છે?",
+}
+_CAPTURE_PROGRESS_PARTIAL = {
+    "en": "I'm noting it down — please continue with the full email.",
+    "hi": "जी, मैं नोट कर रहा हूँ — पूरा ईमेल बता दीजिए।",
+    "gu": "જી, હું નોંધી રહ્યો છું — પૂરું ઈમેલ કહી દો.",
+}
+
+# C3: a confirmation/rejection is "bare" when EVERY token is an
+# affirmation/negation word — an emphatic Hindi yes ("हाँ सही है सही है।",
+# 5 tokens) failed the old ≤3-words bar and fell to the LLM.
+_AFFIRM_TOKENS = frozenset({
+    "yes", "yeah", "yep", "ok", "okay", "sure", "correct", "right", "perfect",
+    "haan", "han", "ha", "haanji", "hanji", "ji", "sahi", "theek", "thik",
+    "bilkul", "barobar", "बिल्कुल", "हाँ", "हां", "जी", "सही", "है", "हैं",
+    "ठीक", "एकदम", "બરાબર", "હા", "જી", "સાચું", "એકદમ", "ચોક્કસ",
+})
+_NEG_TOKENS = frozenset({
+    "no", "nope", "wrong", "nahi", "nahin", "nai", "na", "galat",
+    "नहीं", "नहि", "ना", "नो", "गलत", "ના", "નહીં", "ખોટું",
+})
+
+
+# C2: email-shaped strings inside LLM speech (unanchored, case-lax).
+_EMAIL_ANY_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._+\-]*@[A-Za-z0-9][A-Za-z0-9\-]*"
+    r"(?:\.[A-Za-z0-9\-]+)+")
+_EMAIL_GENERIC = {"en": "your email", "hi": "आपका ईमेल", "gu": "તમારું ઈમેલ"}
+
+
+def _all_tokens_in(text: str, vocab: frozenset) -> bool:
+    """True when every token of the turn is from `vocab` — a repetition-proof
+    bare yes/no ("हाँ सही है सही है।") regardless of length."""
+    if "?" in text:
+        return False
+    toks = [w.strip(".,!;:।॥\"'") for w in text.lower().split()]
+    toks = [w for w in toks if w]
+    return bool(toks) and all(w in vocab for w in toks)
+
+
+def _short_turn(text: str) -> bool:
+    return "?" not in text and len(text.split()) <= 3
 
 
 def _pattern_score(text: str, patterns: list[str]) -> int:
@@ -868,6 +916,22 @@ class ConversationRouter:
         self._capture_buf: list[str] = []
         self._capture_buf_ts: float = 0.0
         self._capture_fallback_said: set[str] = set()
+        # C1 (2026-07-31): armed the moment the AGENT asks for the email —
+        # note_asked only fires on scheduler-driven asks, so an LLM/stage-goal
+        # ask left capture dark through five spelling turns on a live call.
+        self._capture_asked_slot: str | None = None
+        # C3/C4: what the engine's most recent utterance makes it expect.
+        # awaiting_payload → the ask/re-ask just played (spelling next);
+        # awaiting_confirm → a read-back just played (bare yes/no next).
+        # Both cleared by _store_last_response and re-set by the yield sites,
+        # so an intervening LLM digression always resets the expectation.
+        self._capture_awaiting_payload: bool = False
+        self._capture_awaiting_confirm: bool = False
+        # C6: the non-contact slot the agent's last utterance asked about —
+        # the caller's direct answer may overwrite a filled value ("अभी
+        # बात कर लो" filled preferred_time='Now'; the booked "आज 4 बजे"
+        # could then never land).
+        self._last_asked_slot: str | None = None
 
         # Call context — direction defaults to the agent's configured type;
         # the telephony bridge overrides per call via set_call_context()
@@ -1249,6 +1313,14 @@ class ConversationRouter:
             text = last
         else:
             phrase = _COULDNT_HEAR.get(self.state.language, _COULDNT_HEAR["en"])
+            # H7: replaying a long multi-sentence answer verbatim reads as a
+            # malfunction (live: 166 chars ≈ 13s of TTS after an apology).
+            # Condense to the final sentence — that is the question.
+            if len(last) > 90:
+                _sents = [s.strip() for s in
+                          re.split(r"(?<=[।?.!])\s+", last) if s.strip()]
+                if _sents and len(_sents[-1]) >= 15:
+                    last = _sents[-1]
             if len(last) <= 220:
                 text = f"{phrase} {last}"
             else:
@@ -2153,13 +2225,21 @@ class ConversationRouter:
             # this guard covers the fall-through path).
             _is_contact = (getattr(self.state_mgr.slots.get(_slot), "type", "")
                            in ("email", "phone"))
+            # C3 (2026-07-31): a contact slot resolves on a bare yes/no ONLY
+            # when the agent's last utterance actually read the value back —
+            # a "नहीं नहीं" answering "any more questions?" once discarded a
+            # good email here.
+            _contact_ctx_ok = (not _is_contact
+                               or self._capture_awaiting_confirm)
             if (intent == "affirmation" and _val is not None
+                    and _contact_ctx_ok
                     and (not _is_contact
+                         or _all_tokens_in(text, _AFFIRM_TOKENS)
                          or (len(text.split()) <= 3 and "?" not in text))):
                 self.state_mgr.set_externally(_slot, _val, source="system")
                 self._slot_confirm_turn.pop(_slot, None)
                 logger.info("[CONFIRM] Slot %s confirmed: %r", _slot, _val)
-            elif intent == "negation":
+            elif intent == "negation" and _contact_ctx_ok:
                 self.state_mgr.discard_pending(_slot)
                 self._slot_confirm_turn.pop(_slot, None)
                 logger.info("[CONFIRM] Slot %s rejected — discarded", _slot)
@@ -2712,6 +2792,11 @@ class ConversationRouter:
             return
         if len(text.split()) < 3:
             return
+        # C5 (2026-07-31): spelling turns are noise to the extractor — a
+        # live caller spelling "angelo" got their name overwritten to
+        # 'Panj Loa'. While the engine expects spelled input, extract nothing.
+        if self._capture_slot is not None and self.capture_expecting_input():
+            return
         missing = self.state_mgr.detect_missing_slots()["missing"]
         # B4 (2026-07-30): contact-typed slots are deterministic-only — the
         # LLM once assembled 'bell@gmail.com' from garbled ASR and the
@@ -2722,6 +2807,10 @@ class ConversationRouter:
             if getattr(self.state_mgr.slots.get(m), "type", "")
             not in ("email", "phone")
         ]
+        # C5: and while a capture is merely ARMED, the name slot stays
+        # off-limits too — email digressions are full of name-shaped noise.
+        if self._capture_slot is not None:
+            missing = [m for m in missing if m != "name"]
         if not missing:
             return
         if self._slot_extract_task and not self._slot_extract_task.done():
@@ -2789,8 +2878,14 @@ class ConversationRouter:
             # B4 echo guard: a value that appears in the agent's own last
             # utterance but NOT in the caller's is the LLM echoing the
             # agent's read-back into state, not information the caller gave.
+            # C5 (2026-07-31): Latin-script caller turns only — the guard is
+            # script-blind, and a caller answering "ज़ूम चलेगा" to "Zoom या
+            # Google Meet?" had their answer dropped as an "echo" (the value
+            # is Latin in the agent's turn, Devanagari in the caller's).
             _agent_last = (self.last_agent_response or "").lower()
-            if _agent_last:
+            _caller_has_indic = bool(
+                re.search(r"[ऀ-ॿ઀-૿]", text))
+            if _agent_last and not _caller_has_indic:
                 _caller = text.lower()
                 data = {
                     k: v for k, v in data.items()
@@ -2798,9 +2893,24 @@ class ConversationRouter:
                             and str(v).lower() not in _caller)
                 }
             if data:
-                changes = self.state_mgr.merge_state(
-                    data, source="llm", utterance=text,
-                    fill_only=not _correction)
+                # C6: a value answering the slot the agent JUST asked about
+                # may overwrite (the agent asked "आज कितने बजे?" precisely
+                # because the filled 'Now' needed refining) — everything
+                # else stays fill-only.
+                _answer_slot = self._last_asked_slot
+                _answer = {}
+                if (_answer_slot and _answer_slot in data
+                        and not _correction):
+                    _answer = {_answer_slot: data.pop(_answer_slot)}
+                changes = []
+                if data:
+                    changes += self.state_mgr.merge_state(
+                        data, source="llm", utterance=text,
+                        fill_only=not _correction)
+                if _answer:
+                    changes += self.state_mgr.merge_state(
+                        _answer, source="answer", utterance=text,
+                        fill_only=False)
                 if changes:
                     logger.info("[STATE:LLM] Gap-filled %s",
                                 ", ".join(f"{c.field}={c.new!r}" for c in changes))
@@ -3487,6 +3597,15 @@ class ConversationRouter:
             self.last_agent_language = self.state.language
             # QA: detect which field this agent response is asking about
             self.memory.qa_tracker.observe_agent_turn(full_text, self.memory.turn_index)
+            # C1/C4/C6: LLM utterances reset + re-derive the capture
+            # expectation exactly like shortcut ones — the live email ask
+            # came from the LLM and capture stayed dark for five turns.
+            self._capture_awaiting_payload = False
+            self._capture_awaiting_confirm = False
+            try:
+                self._note_ask_signals(full_text)
+            except Exception:
+                logger.exception("[CAPTURE] ask-signal scan failed (continuing)")
             logger.info("[LAST-RESPONSE] Stored LLM response (lang=%s, len=%d)",
                         self.last_agent_language, len(full_text))
 
@@ -3728,8 +3847,9 @@ class ConversationRouter:
                         buffer = buffer[match.end():]
                         sentence = self._strip_end_call_marker(sentence)
                         if sentence:
-                            yield _validate_response(sentence, self.state.language,
-                                                      self._def.llm_config.max_response_length)
+                            yield self._scrub_llm_email(
+                                _validate_response(sentence, self.state.language,
+                                                   self._def.llm_config.max_response_length))
                             _first_emitted = True
 
             if _tool_acc is not None and _tool_acc.has_calls:
@@ -3741,8 +3861,9 @@ class ConversationRouter:
             tail = self._strip_end_call_marker(buffer.strip())
             if timed_out:
                 if tail:
-                    yield _validate_response(tail, self.state.language,
-                                             self._def.llm_config.max_response_length)
+                    yield self._scrub_llm_email(
+                        _validate_response(tail, self.state.language,
+                                           self._def.llm_config.max_response_length))
                 else:
                     # Never hang up on the heels of a timeout fallback — the
                     # line promises a follow-up, not a goodbye.
@@ -3750,8 +3871,9 @@ class ConversationRouter:
                     yield (self._lang_response(self._def.response_bank.timeout_fallbacks)
                            or "Let me get back to you on that.")
             elif tail:
-                yield _validate_response(tail, self.state.language,
-                                             self._def.llm_config.max_response_length)
+                yield self._scrub_llm_email(
+                    _validate_response(tail, self.state.language,
+                                       self._def.llm_config.max_response_length))
 
         except asyncio.CancelledError:
             return
@@ -3913,6 +4035,21 @@ class ConversationRouter:
             *pb.firm_rules_block(self._def, lang),
             *pb.call_closure_block(self._def, lang),
         ]
+
+        # C2 (2026-07-31): while an email capture is armed, the engine owns
+        # the value end-to-end — the LLM once read back four assemblies it
+        # could not write and "confirmed" one that was never in state.
+        # Runtime injection so EXISTING agents get the doctrine too (the
+        # Copilot enrichment only reaches newly built ones).
+        if self._capture_slot is not None:
+            parts.append("")
+            parts.append(
+                "━━ EMAIL CAPTURE (ENGINE-OWNED) ━━\n"
+                "The system is capturing the caller's email deterministically. "
+                "NEVER state, spell, read back, or confirm an email address "
+                "yourself — the system does that. NEVER claim the email has "
+                "been noted. NEVER ask the caller to speak slowly; if needed, "
+                "ask them to say the full email in one go.")
 
         # QA tracker block — second layer of anti-repetition enforcement
         qa_block = self.memory.qa_tracker.to_prompt_block()
@@ -4470,12 +4607,28 @@ class ConversationRouter:
         slot: str | None = None
         if CAPTURE_MODE_ENV:
             try:
+                # C1: an ask the ENGINE detected in the agent's own utterance
+                # arms capture even when the scheduler never emitted the ask
+                # instruction (LLM/stage-goal asks — the live norm). Cleared
+                # once the slot is resolved (filled-and-confirmed or skipped).
+                asked = self._capture_asked_slot
+                if asked is not None:
+                    spec_a = self.state_mgr.slots.get(asked)
+                    resolved = (
+                        spec_a is None
+                        or asked in self.state_mgr.skipped
+                        or (self.state_mgr.state.get(asked) is not None
+                            and asked not in self.state_mgr._pending_fields))
+                    if resolved:
+                        self._capture_asked_slot = asked = None
                 gaps = self.state_mgr.detect_missing_slots()
                 for n in gaps["pending"]:
                     spec = self.state_mgr.slots.get(n)
                     if spec is not None and spec.type in ("email", "phone"):
                         slot = n
                         break
+                if slot is None and asked is not None:
+                    slot = asked
                 if slot is None and gaps["missing"]:
                     n = gaps["missing"][0]
                     spec = self.state_mgr.slots.get(n)
@@ -4489,6 +4642,15 @@ class ConversationRouter:
                         f"armed for slot {slot!r}" if slot else "released")
             self._capture_buf.clear()
         self._capture_slot = slot
+
+    def capture_expecting_input(self) -> bool:
+        """C4: the pipeline's capture affordances (2s merge window, follow-on
+        loop, en-IN STT, raised barge threshold) apply only while the
+        engine's LAST utterance actually solicited spelled input or a yes/no
+        — an armed-but-digressing turn (Zoom, booking) pays normal latency."""
+        return bool(self._capture_slot) and (
+            self._capture_awaiting_payload or self._capture_awaiting_confirm
+            or bool(self._capture_buf))
 
     def _capture_line(self, bank: dict[str, str]) -> str:
         lang = self.state.language if self.state.language in ("en", "hi", "gu") \
@@ -4529,13 +4691,21 @@ class ConversationRouter:
 
         # (a) Confirmation resolution for a pending value. A turn carrying a
         # parseable email (new OR restated — the typed extractor may have
-        # pre-filled the slot from this same utterance) goes to read-back;
-        # a bare yes/no resolves. "Bare" is load-bearing: "okay tell me
-        # more" starts with an affirmation but is NOT an email confirmation.
-        _bare_confirm = len(text.split()) <= 3 and "?" not in text
+        # pre-filled the slot from this same utterance) goes to read-back.
+        # A bare yes/no resolves — but ONLY when the engine's own last
+        # utterance was the read-back (C3): a "नहीं नहीं" answering "any
+        # more questions?" six turns later once DISCARDED a good email.
+        # "Bare" is token-based (C3): every word an affirmation/negation
+        # word — an emphatic "हाँ सही है सही है।" (5 tokens) must confirm,
+        # while "okay tell me more" must not.
+        _bare_yes = ((intent == "affirmation" and _short_turn(text))
+                     or _all_tokens_in(text, _AFFIRM_TOKENS))
+        _bare_no = ((intent == "negation" and _short_turn(text))
+                    or _all_tokens_in(text, _NEG_TOKENS))
+        _confirm_ctx = self._capture_awaiting_confirm
         if pending and candidate:
             pass          # fall through to (b) — read back the value
-        elif pending and intent == "affirmation" and _bare_confirm:
+        elif pending and _confirm_ctx and _bare_yes and not _bare_no:
             cancel_llm()
             val = self.state_mgr.state.get(slot)
             self.state_mgr.set_externally(slot, val, source="system")
@@ -4547,17 +4717,28 @@ class ConversationRouter:
             yield EngineResult(text=resp, is_shortcut=True,
                                intent="capture_confirmed")
             return
-        elif pending and intent == "negation" and _bare_confirm:
+        elif pending and _confirm_ctx and _bare_no:
             cancel_llm()
             self.state_mgr.discard_pending(slot)
             logger.info("[CAPTURE] %s rejected by caller — re-asking", slot)
             async for r in self._capture_reask_or_giveup(slot):
                 yield r
             return
+        elif pending and self._is_capture_progress_query(text):
+            # "नोट कर लिया आपने?" — answer from state, never the LLM.
+            cancel_llm()
+            resp = self._capture_line(_CAPTURE_PROGRESS_PENDING).format(
+                spelled=spelled_readback(self.state_mgr.state.get(slot) or ""))
+            self.memory.add_assistant(resp, language=self.state.language)
+            self._store_last_response(resp)
+            self._capture_awaiting_confirm = True
+            yield EngineResult(text=resp, is_shortcut=True,
+                               intent="capture_readback")
+            return
         elif pending:
-            # Neither yes/no nor a new value — let the LLM handle the
-            # digression; the pending confirm instruction stays in the
-            # prompt context.
+            # Neither yes/no in read-back context nor a new value — let the
+            # LLM handle the digression; the pending confirm instruction
+            # stays in the prompt context.
             return
 
         # (b) Payload turn.
@@ -4575,6 +4756,7 @@ class ConversationRouter:
                 spelled=spelled_readback(candidate))
             self.memory.add_assistant(resp, language=self.state.language)
             self._store_last_response(resp)
+            self._capture_awaiting_confirm = True   # C3: bare yes/no is live
             yield EngineResult(text=resp, is_shortcut=True,
                                intent="capture_readback")
             return
@@ -4586,6 +4768,7 @@ class ConversationRouter:
             cancel_llm()
             self._capture_buf.append(text)
             self._capture_buf_ts = now
+            self._capture_awaiting_payload = True   # C4: still spelling
             if len(self._capture_buf) >= 4:
                 # Enough fragments that assembly should have worked — the
                 # attempt is garbled beyond recovery. Re-ask or give up.
@@ -4598,8 +4781,55 @@ class ConversationRouter:
             # Yield nothing: the agent stays silent while the caller spells.
             return
 
+        # (c2) Progress query with only a partial buffer ("नोट कर लिया?")
+        # — acknowledge deterministically and ask them to continue.
+        if self._capture_buf and self._is_capture_progress_query(text):
+            cancel_llm()
+            resp = self._capture_line(_CAPTURE_PROGRESS_PARTIAL)
+            self.memory.add_assistant(resp, language=self.state.language)
+            self._store_last_response(resp)
+            self._capture_awaiting_payload = True
+            yield EngineResult(text=resp, is_shortcut=True,
+                               intent="capture_reask")
+            return
+
         # (d) Unrelated turn — normal routing continues, capture stays armed.
         return
+
+    _PROGRESS_QUERY_RE = re.compile(
+        r"(?:नोट|note|लिख|likha?|नोंध|written|got)", re.IGNORECASE)
+
+    def _is_capture_progress_query(self, text: str) -> bool:
+        """'नोट कर लिया आपने?' / 'कितना नोट किया?' — the caller is asking
+        what the agent has captured so far."""
+        return (bool(self._PROGRESS_QUERY_RE.search(text))
+                and ("?" in text or len(text.split()) <= 6))
+
+    def _scrub_llm_email(self, text: str) -> str:
+        """C2: while an email capture is armed the LLM may not SPEAK an
+        address — on the live call it read back four different assemblies
+        it could not write, and the caller confirmed a value state never
+        held. Any email in LLM output is replaced with the spelled read-back
+        of the engine's pending value (making the LLM's own confirm question
+        point at state truth), or a generic reference when nothing is
+        captured yet."""
+        if not text or self._capture_slot is None:
+            return text
+        if not _EMAIL_ANY_RE.search(text):
+            return text
+        from .contact_capture import spelled_readback
+        slot = self._capture_slot
+        val = self.state_mgr.state.get(slot)
+        if val:
+            repl = spelled_readback(val)
+        else:
+            repl = _EMAIL_GENERIC.get(self.state.language,
+                                      _EMAIL_GENERIC["en"])
+        scrubbed = _EMAIL_ANY_RE.sub(repl, text)
+        logger.info("[CAPTURE] LLM spoke an email while capture armed — "
+                    "replaced with %s", "state read-back" if val else
+                    "generic reference")
+        return scrubbed
 
     async def _capture_reask_or_giveup(self, slot: str):
         """One more deterministic ask, or — past the cap — mark the slot
@@ -4615,16 +4845,20 @@ class ConversationRouter:
             self.state_mgr.skipped.add(slot)
             self.state_mgr.extra_flags[f"{slot}_unresolved"] = True
             self._capture_slot = None
+            self._capture_asked_slot = None
             logger.info("[CAPTURE] %s unresolved after %d attempts — "
                         "flagged for follow-up", slot,
                         self._capture_reasks[slot])
             resp = self._capture_line(_CAPTURE_UNRESOLVED)
+            self.memory.add_assistant(resp, language=self.state.language)
+            self._store_last_response(resp)
         elif slot in self._capture_fallback_said:
             return
         else:
             resp = self._capture_line(_CAPTURE_REASK)
-        self.memory.add_assistant(resp, language=self.state.language)
-        self._store_last_response(resp)
+            self.memory.add_assistant(resp, language=self.state.language)
+            self._store_last_response(resp)
+            self._capture_awaiting_payload = True   # C4: spelling expected
         yield EngineResult(text=resp, is_shortcut=True,
                            intent="capture_reask")
 
@@ -5135,8 +5369,68 @@ class ConversationRouter:
         self.last_agent_response = text
         self.last_agent_language = self.state.language
         self.memory.qa_tracker.observe_agent_turn(text, self.memory.turn_index)
+        # C1/C3/C4/C6: every agent utterance resets the capture expectation
+        # and re-derives it from what was actually said; the capture yield
+        # sites re-set their flag right after calling this.
+        self._capture_awaiting_payload = False
+        self._capture_awaiting_confirm = False
+        try:
+            self._note_ask_signals(text)
+        except Exception:
+            logger.exception("[CAPTURE] ask-signal scan failed (continuing)")
         logger.debug("[LAST-RESPONSE] Stored shortcut response (lang=%s): %r",
                      self.last_agent_language, text[:60])
+
+    _EMAIL_ASK_RE = re.compile(
+        r"(?:e-?mail|ईमेल|इमेल|ई-मेल|મેલ|ઈમેલ|મેઈલ)", re.IGNORECASE)
+    _ASK_VERB_RE = re.compile(
+        r"(?:\?|बता|बोलिए|भेज|दीजिए|लिख|spell|share|give|provide|send|"
+        r"કહો|જણાવ|લખાવ)", re.IGNORECASE)
+
+    def _note_ask_signals(self, response: str) -> None:
+        """C1 + C6: derive, from the agent's own utterance, (a) whether an
+        email capture should arm and (b) which non-contact slot a direct
+        answer may overwrite next turn."""
+        self._last_asked_slot = None
+        if not response:
+            return
+        low = response.lower()
+        # C3: whenever the utterance that just played reads back the pending
+        # value (engine template OR a scrubbed LLM readback), a bare yes/no
+        # next turn resolves it. " — at — " is the spelled-readback marker.
+        _cap = self._capture_slot
+        if _cap and _cap in self.state_mgr._pending_fields:
+            _val = str(self.state_mgr.state.get(_cap) or "")
+            if _val and (" — at — " in response or _val.lower() in low):
+                self._capture_awaiting_confirm = True
+        # (a) email-ask → arm capture for the first unresolved email slot.
+        if self._EMAIL_ASK_RE.search(response) and self._ASK_VERB_RE.search(response):
+            for n, spec in self.state_mgr.slots.items():
+                if spec.type != "email" or n in self.state_mgr.skipped:
+                    continue
+                if (self.state_mgr.state.get(n) is None
+                        or n in self.state_mgr._pending_fields):
+                    if self._capture_asked_slot != n:
+                        logger.info("[CAPTURE] ask detected for slot %r", n)
+                    self._capture_asked_slot = n
+                    self._capture_awaiting_payload = (
+                        n not in self.state_mgr._pending_fields)
+                    break
+        # (b) which slot does this utterance ask about? (question turns only)
+        if "?" not in response:
+            return
+        for n, spec in self.state_mgr.slots.items():
+            if spec.type in ("email", "phone") or n == "name":
+                continue
+            kws = {n.lower()} | {w for w in spec.display().lower().split()
+                                 if len(w) >= 3}
+            if spec.type == "time" or "time" in n:
+                kws |= {"बजे", "समय", "टाइम", "time", "વાગ્યે", "સમય"}
+            elif spec.type == "date" or "day" in n or "date" in n:
+                kws |= {"day", "दिन", "तारीख", "date", "દિવસ", "તારીખ"}
+            if any(k in low for k in kws):
+                self._last_asked_slot = n
+                break
 
     def _is_repeat_request(self, text: str) -> bool:
         """Return True if the caller is asking to repeat the last agent response."""

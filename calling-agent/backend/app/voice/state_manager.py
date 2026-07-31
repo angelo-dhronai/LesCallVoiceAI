@@ -548,10 +548,10 @@ class ConversationStateManager:
             # www.gmail.com") as ground truth; fill_only then made it
             # immortal. LLM extraction may not touch these slots at all,
             # and no source may store a value that fails the validator.
-            if slot_type in ("email", "phone") and source == "llm":
+            if slot_type in ("email", "phone") and source in ("llm", "answer"):
                 self.update_audit_log(
                     key, old, old, source,
-                    f"REJECTED llm write {new!r} (contact slots are "
+                    f"REJECTED {source} write {new!r} (contact slots are "
                     f"deterministic-only)")
                 continue
             if slot_type == "email":
@@ -562,7 +562,7 @@ class ConversationStateManager:
                         f"REJECTED invalid email {new!r}")
                     continue
                 new = str(new).strip().lower()
-            elif slot_type in ("date", "time") and source == "llm":
+            elif slot_type in ("date", "time") and source in ("llm", "answer"):
                 # A gap-filled date/time must at least parse-ish: carry a
                 # digit or a recognizable day/time word ('after office' was
                 # stored as preferred_time from a discovery answer).

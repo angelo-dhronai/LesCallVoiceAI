@@ -29,7 +29,9 @@ EMAIL_RE = re.compile(
 _OPERATOR_SUBS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bat\s+the\s+rate\s+of\b"), " @ "),
     (re.compile(r"\bat\s+the\s+rate\b"), " @ "),
-    (re.compile(r"\bएट\s+द\s+रेट\b"), " @ "),
+    (re.compile(r"\bat\s+(?:d|da|de)\s+rate\b"), " @ "),
+    (re.compile(r"\bएट\s+(?:द|दी|डी|दि)\s+रेट\b"), " @ "),
+    (re.compile(r"\bएट\s+रेट\b"), " @ "),
     (re.compile(r"\b(?:at|एट|एट्)\b"), " @ "),
     (re.compile(r"\b(?:dot|डॉट|डाट|dott)\b"), " . "),
     (re.compile(r"\b(?:underscore|अंडरस्कोर)\b"), " _ "),
@@ -227,8 +229,34 @@ def normalize_spoken_email(raw: str) -> str | None:
     t = re.sub(r"(?<=[@._+\-])\s+(?=[a-z0-9])", "", t)
 
     # Pick the best email-shaped token out of the remaining speech.
-    candidates = [w.strip(".,;:!?\"'()") for w in t.split() if "@" in w]
-    for cand in sorted(candidates, key=len, reverse=True):
+    # RC9 (2026-07-31): spelled local-part material immediately BEFORE the
+    # @-token belongs to the address — 'angelo.pa knaan@gmail.com' (from
+    # 'ए एन जी ई एल ओ। डॉट। पी ए। knaan@…') must assemble as
+    # 'angelo.pa.knaan@gmail.com', not drop the spelled prefix. Only tokens
+    # that are clearly spelled material qualify (contain a ./_ separator or
+    # are a single letter) — ordinary words ("is", "email") never join.
+    _words = t.split()
+    scored: list[tuple[int, int, str]] = []          # (len, -idx, candidate)
+    for _idx, _w in enumerate(_words):
+        if "@" not in _w:
+            continue
+        cand = _w.strip(".,;:!?\"'()")
+        local, _, domain = cand.partition("@")
+        prefix: list[str] = []
+        j = _idx - 1
+        while j >= 0 and len(prefix) < 3:
+            p = _words[j].strip(".,;:!?\"'()")
+            if not (re.fullmatch(r"[a-z0-9]+(?:[._][a-z0-9]+)+", p)
+                    or (len(p) == 1 and p.isalnum())):
+                break
+            prefix.insert(0, p)
+            j -= 1
+        if prefix and local:
+            local = ".".join(prefix + [local])
+        elif prefix:
+            local = ".".join(prefix)
+        scored.append((len(local) + len(domain), -_idx, f"{local}@{domain}"))
+    for _, _, cand in sorted(scored, reverse=True):
         local, _, domain = cand.partition("@")
         local = local.strip("._+-")
         domain = _snap_domain(domain)

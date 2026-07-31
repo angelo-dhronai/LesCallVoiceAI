@@ -126,6 +126,12 @@ class SarvamStreamingSTT(STTProvider):
         # been fed since the last finalize/reset are residue of an already-
         # consumed turn still draining server-side — they belong to no turn.
         self._fed_since_finalize = False
+        # H3 (2026-07-31): a NON-empty segment in that state is usually the
+        # tail of the caller's speech episode still draining out of the
+        # server (live: 'अभी तो दिक्कत नहीं है…' was discarded while the next
+        # finalize sat waiting 2s for exactly that text). Stash it briefly;
+        # the next finalize picks it up instead of timing out empty.
+        self._late_segment: tuple[float, str] | None = None
         # Coverage accounting for the router's derived-confidence scorer:
         # a streamed transcript can legitimately cover MORE audio than the
         # local segment passed to transcribe() (e.g. speech straddling a
@@ -182,6 +188,7 @@ class SarvamStreamingSTT(STTProvider):
         self._gen += 1
         self._pending.clear()
         self._fed_since_finalize = False
+        self._late_segment = None   # a dropped turn's tail must not leak
         self._segments = [s for s in self._segments if s[0] >= self._gen]
         if self._ws is not None and not self._broken:
             try:
@@ -354,11 +361,18 @@ class SarvamStreamingSTT(STTProvider):
                     if detected:
                         self._detected_language = detected
                     if not self._fed_since_finalize:
-                        # Residue of an already-finalized turn draining out
-                        # of the server buffer between turns — discard.
-                        logger.info(
-                            "[STT:Stream] dropping stale inter-turn "
-                            "segment %r", text)
+                        if text:
+                            # H3: real words draining late — stash for the
+                            # next finalize (2.5s TTL) instead of losing them.
+                            self._late_segment = (time.monotonic(), text)
+                            logger.info(
+                                "[STT:Stream] late-segment stash %r", text)
+                        else:
+                            # Residue of an already-finalized turn draining
+                            # out of the server buffer — discard.
+                            logger.info(
+                                "[STT:Stream] dropping stale inter-turn "
+                                "segment %r", text)
                         continue
                     self._segments.append((self._gen, text))
                     self._data_seq += 1
@@ -391,6 +405,22 @@ class SarvamStreamingSTT(STTProvider):
     async def _finalize(self) -> tuple[str, str | None]:
         """Flush the stream and collect this turn's segments."""
         t0 = time.monotonic()
+        # H3: pick up a stashed late segment (tail of the previous episode
+        # that drained after its finalize). Fresh = within 2.5s.
+        _stash = ""
+        if self._late_segment is not None:
+            _age = time.monotonic() - self._late_segment[0]
+            if _age <= 2.5:
+                _stash = self._late_segment[1]
+            self._late_segment = None
+        if _stash and not self._fed_since_finalize:
+            # Nothing new was fed — the stash IS this turn's text; skip the
+            # flush round-trip entirely (it would time out empty).
+            logger.info(
+                "[STT:Stream] finalize served from late-segment stash → %r",
+                _stash)
+            self.last_covered_seconds, self._fed_seconds = self._fed_seconds, 0.0
+            return _stash, self._detected_language
         await self._ensure_connected()
         # Push any sub-chunk remainder so the flush covers ALL fed audio.
         if self._pending:
@@ -428,6 +458,9 @@ class SarvamStreamingSTT(STTProvider):
                     "(no speech server-side)", _FLUSH_TIMEOUT_S)
 
         parts = [t for g, t in self._segments if g == gen and t]
+        if _stash:
+            # New audio was fed too — the stash precedes it chronologically.
+            parts.insert(0, _stash)
         # END the generation: a segment that finalizes server-side after the
         # grace window belongs to no turn — without the bump it stayed
         # tagged with the current gen and leaked into the NEXT turn's

@@ -1059,3 +1059,95 @@ Tests: `tests/test_language_fidelity.py` (26) + `tests/test_contact_capture.py`
 `[LANG] Turn doesn't vote`, `[STT] Language pinned`, `[STT] Script salvage`,
 `[TTS] Dropped stale response`, `[CAPTURE] armed/candidate/confirmed`,
 `RESPONSE-MISMATCH`.
+
+---
+
+## §21 — Call hearing + capture hardening, platform-wide (2026-07-31)
+
+Follow-up to §20, driven by call `918076562864_20260731_052423` (Hindi, maya
+outbound): the §20 language layer held, but streaming-STT segment accounting
+silently destroyed real caller speech, and the email capture armed five turns
+after the ask, fought the LLM for ownership, then discarded the confirmed
+address at call end (DB got `email: null`, `name: "Panj Loa"` — a spelling
+fragment). Full diagnosis + fix spec:
+`deploy/PLAN-call-hearing-and-capture-hardening.md`. All fixes are
+engine-level — every existing agent and every future Copilot agent inherits
+them with zero YAML changes.
+
+### Part H — hearing (pipeline / stream)
+
+- **Covered-seconds plausibility** (H1): the words-per-duration hallucination
+  guard now scores against `STTRouter.last_covered_seconds` (audio the
+  streamed finalize actually covered), not the single VAD chunk. Live: real
+  answers rejected as "14 words in 1440ms".
+- **Barge-in keeps fed caller audio** (H2, `BARGE_KEEP_STREAM_AUDIO=true`):
+  the queue flush no longer `reset_turn()`s the stream — the interrupting
+  speech IS the next turn ("cleaning and helping…" and a spelled email
+  fragment both vanished via the generation bump).
+- **Late-segment stash** (H3): a non-empty stream segment arriving between
+  turns is stashed 2.5s and served to the next finalize instantly (was:
+  dropped as "stale inter-turn segment" while that same finalize sat in a
+  2s timeout).
+- **Consumed-episode empties** (H4): an empty finalize <3s after an
+  over-covered transcript no longer counts as "unrecognized speech" (was:
+  "आवाज़ स्पष्ट नहीं आई" to a caller who had been perfectly heard).
+- **Continuation hold** (H5, `MERGE_HOLD_CONTINUATION=true`, 1200ms): a
+  transcript ending in a dangling word (जो/कि/तो/and/because/અને…) never
+  takes the idle-skip fast path — the resumed speech merges into one turn.
+- **"हेलो" allowlisted** (H6): the spelling Sarvam actually emits joins the
+  single-word greeting allowlist (the caller's are-you-alive probe was
+  skipped; dead-air watchdog fired instead).
+- **Condensed watchdog replay** (H7): dead-air reprompts >90 chars replay
+  only the final sentence (the question), not the whole essay.
+
+### Part C — capture ownership + state
+
+- **Ask-time arming** (C1, `CAPTURE_ASK_ARM=true`): the engine detects an
+  email-ask in the agent's own utterance (LLM or template) and arms capture
+  immediately; rejection no longer releases it. `note_asked` was
+  scheduler-only — LLM/stage-goal asks (the live norm) left capture dark.
+- **Engine-owned readbacks** (C2): while armed, any email in LLM output is
+  replaced with the spelled read-back of the engine's pending value (or a
+  generic reference) — the LLM can never again "confirm" a value state does
+  not hold. Progress queries ("नोट कर लिया?") answered from state. Runtime
+  system-prompt doctrine injection covers EXISTING agents (never spell-slowly,
+  never claim noted).
+- **Read-back-context confirms** (C3): bare yes/no resolves a pending
+  contact value only right after a read-back; "हाँ सही है सही है।"
+  (all-affirmation-token turns) now confirms; a late "नहीं नहीं" answering
+  "any more questions?" no longer discards the email. Applies to the generic
+  confirm loop too. Confirmed values are immune to later negations.
+- **Expectation-scoped affordances** (C4): the 2s capture merge window,
+  en-IN STT forcing and raised barge threshold apply only while the engine's
+  last utterance solicited spelling/confirmation — armed-but-digressing turns
+  (Zoom, booking) pay normal latency (was: 2s tax on five closing turns).
+- **Extraction hygiene** (C5): the LLM slot extractor is skipped during
+  spelling turns (name='Panj Loa' from spelled "angelo"); the echo guard
+  applies only to Latin-script caller turns (Devanagari "ज़ूम" answering
+  "Zoom या Google Meet?" was dropped as an agent echo).
+- **Answer-slot overwrite** (C6, `SLOT_ANSWER_OVERWRITE=true`): a caller
+  directly answering the slot question the agent just asked may overwrite a
+  filled non-contact slot via `source="answer"` (preferred_time='Now' was
+  immortal; the booked "आज 4 बजे" never landed). Contact slots stay
+  deterministic-only for "answer" too.
+- **Normalizer** (C7): "एट द रेट"/"at the rate" variants → @; spelled
+  material before an @-token joins the local part
+  ("ए एन जी ई एल ओ। डॉट। पी ए। knaan@gmail.com" → angelo.pa.knaan@gmail.com).
+
+### Knobs
+
+`BARGE_KEEP_STREAM_AUDIO` (true), `MERGE_HOLD_CONTINUATION` (true),
+`MERGE_HOLD_CONTINUATION_MS` (1200), `CAPTURE_ASK_ARM` (true),
+`SLOT_ANSWER_OVERWRITE` (true). H1/H3/H4 ride `ENABLE_STREAMING_STT`;
+C2–C5 ride `CAPTURE_MODE`. Compose env changes need `up -d`, not restart.
+
+### Verification
+
+Tests: `tests/test_hearing_capture_hardening.py` (43, seeded with this
+call's exact ASR); full suite 800 green. On a live call grep for:
+`[STT:Stream] late-segment stash`, `[ENGINE] Merge window held`,
+`[CAPTURE] ask detected`, `[CAPTURE] LLM spoke an email`,
+`[STATE] … source=answer`, absence of `Rejecting implausible` on
+multi-chunk streamed turns. Note: `opening handshake failed` every 20s in
+ws_audio_receiver.log is the docker healthcheck probing :9001 — cosmetic,
+not the Sarvam stream.

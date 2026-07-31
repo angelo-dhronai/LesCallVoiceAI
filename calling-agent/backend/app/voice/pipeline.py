@@ -323,6 +323,27 @@ def _ends_with_continuation_cue(text: str) -> bool:
     last = words[-1].strip(".।॥?!,;:\"'").lower()
     return last in _CONTINUATION_CUE_WORDS
 
+
+# Single-word segments below the duration threshold pass only when they are
+# an affirmation/negation or a greeting (H6: "हेलो" — the spelling Sarvam
+# actually produces — was missing, so the caller's are-you-alive probe was
+# skipped and the dead-air watchdog fired instead).
+_SINGLE_WORD_AFFIRMATIONS = frozenset({
+    "yes", "yeah", "yep", "ok", "okay", "sure",
+    "haan", "ha", "ji", "na", "nahi", "no",
+    "nope", "theek", "barobar", "aavjo",
+    "हां", "हाँ", "जी", "ठीक", "हा", "ना", "नहीं",
+    "હા", "જી", "ઠીક", "ના", "નહીં",
+})
+_SINGLE_WORD_GREETINGS = frozenset({
+    "hello", "hallo", "helo", "hi", "hey", "yello",
+    "namaste", "namaskar", "salaam", "salam",
+    "kemcho", "kem", "bolo", "boliye", "haanji", "hanji",
+    "नमस्ते", "नमस्कार", "हैलो", "हलो", "हेलो", "हॅलो",
+    "हैल्लो", "हल्लो", "बोलो", "बोलिए",
+    "નમસ્તે", "નમસ્કાર", "હેલો", "હલો", "કેમ", "બોલો",
+})
+
 # Fallback phrases played when STT returns empty on substantial speech,
 # or when TTS receives an empty string or fails to play (feature 2 & 5).
 _STT_FALLBACK_PHRASES: dict[str, str] = {
@@ -847,8 +868,12 @@ class VoicePipeline:
             # B2: while capturing an email the agent's prompts are short and
             # the caller often talks over them mid-spelling — demand a much
             # louder interrupt so the capture prompt actually finishes.
+            # C4: spelling-context turns only — an armed-but-digressing turn
+            # (booking, Zoom) keeps normal barge sensitivity.
             if (CAPTURE_MODE and self.conversation is not None
-                    and getattr(self.conversation, "_capture_slot", None)):
+                    and getattr(self.conversation, "_capture_slot", None)
+                    and getattr(self.conversation, "capture_expecting_input",
+                                lambda: True)()):
                 barge_threshold *= 2.0
             loud = self.vad.last_energy > barge_threshold
 
@@ -1341,10 +1366,16 @@ class VoicePipeline:
                             "for %.0fms segment", _stt_lang,
                             segment.duration_ms)
                 elif (CAPTURE_MODE and self.conversation is not None
-                        and getattr(self.conversation, "_capture_slot", None)):
+                        and getattr(self.conversation, "_capture_slot", None)
+                        and getattr(self.conversation,
+                                    "capture_expecting_input",
+                                    lambda: True)()):
                     # B2: spelled emails/letters are Latin — en-IN stops the
                     # letter-name transliteration ("एल दब्यू वाय एल") and the
-                    # junk-script roulette mid-capture.
+                    # junk-script roulette mid-capture. C4: only while the
+                    # engine actually expects spelled input — a digression
+                    # turn mid-capture is normal conversation in the
+                    # caller's language.
                     _stt_lang = "en-IN"
                     logger.info(
                         "[STT-WORKER] Capture mode: forcing lang=en-IN")
@@ -1458,25 +1489,8 @@ class VoicePipeline:
                     # must come off before the allowlist lookup — otherwise even
                     # 'Yes.' falls through and the turn is lost.
                     _single = transcript_text.strip().lower().strip(".,!?;:।॥'\"")
-                    _affirmation_negation = {
-                        "yes", "yeah", "yep", "ok", "okay", "sure",
-                        "haan", "ha", "ji", "haan", "na", "nahi", "no",
-                        "nope", "theek", "barobar", "aavjo",
-                        "हां", "हाँ", "जी", "ठीक", "हा", "ना", "नहीं",
-                        "હા", "જી", "ઠીક", "ના", "નહીં",
-                    }
-                    # A caller answering the agent's greeting with a bare greeting is
-                    # the most predictable turn of the call — it must never be dropped,
-                    # or the agent goes silent and the call stalls before stage 1.
-                    _greetings = {
-                        "hello", "hallo", "helo", "hi", "hey", "yello",
-                        "namaste", "namaskar", "salaam", "salam",
-                        "kemcho", "kem", "bolo", "boliye", "haanji", "hanji",
-                        "नमस्ते", "नमस्कार", "हैलो", "हलो", "हेलो", "हॅलो",
-                        "हैल्लो", "हल्लो", "बोलो", "बोलिए",
-                        "નમસ્તે", "નમસ્કાર", "હેલો", "હલો", "કેમ", "બોલો",
-                    }
-                    if _single not in _affirmation_negation and _single not in _greetings:
+                    if (_single not in _SINGLE_WORD_AFFIRMATIONS
+                            and _single not in _SINGLE_WORD_GREETINGS):
                         logger.info(
                             "[STT-WORKER] Single-word fragment %r from %.0fms segment — "
                             "below duration threshold, skipping",

@@ -398,6 +398,14 @@ class STTRouter:
         if callable(fn):
             fn(code)
 
+    @property
+    def last_covered_seconds(self) -> float:
+        """H1: audio seconds the last streamed transcript actually covered
+        (0.0 for batch providers). A streamed finalize can legitimately span
+        several VAD chunks, so words-per-chunk plausibility must score
+        against this, not the local segment duration."""
+        return float(getattr(self._primary, "last_covered_seconds", 0.0) or 0.0)
+
     async def transcribe(
         self,
         audio_bytes: bytes,

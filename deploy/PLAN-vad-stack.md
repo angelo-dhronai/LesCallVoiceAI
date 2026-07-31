@@ -1,6 +1,17 @@
 # PLAN — Two-stage model VAD + endpointer + call-session state machine
 
-Status: **proposal — awaiting approval** · 2026-07-30
+Status: **IMPLEMENTED & LIVE 2026-07-30** (VAD_ENGINE=fsmn in the runtime
+compose env; rollback = delete that line + `up -d runtime`). Delivered:
+`vad_stack.py` (WebRTC pre-gate + FSMN worker thread, frame path 65µs
+p50), `audio_events.py` (DSP classifier: DTMF/RINGBACK/BUSY/FAX/BEEP/
+MUSIC/SPEECH/SILENCE/NOISE), `endpointer.py` (fast/default/hold semantic
+profiles), `call_session.py` (shadow FSM, IVR/voicemail interpretation
+for outbound). Model vendored at data/models/fsmn_vad (Apache-2.0).
+funasr_onnx installed --no-deps in Dockerfile.app (stale numpy cap;
+runtime-verified on 2.4.4). Pre-speech ring deepened to 400ms on this
+engine (model onset lag). E2E-verified through the live ingress:
+FSMN events, endpoint profiles, full session lifecycle
+CALL_INIT→…→USER_INTERRUPTED→…→CALL_ENDED in one call. · 2026-07-30
 Replaces the energy-threshold VAD with WebRTC-VAD (pre-filter) →
 FSMN-VAD (primary), splits endpoint detection out of VAD, and introduces
 an explicit call-session state machine every component reads instead of

@@ -81,6 +81,13 @@ services:
       # YAML default (shadow). Verify: grep [STT:Stream] and [TOOLS].
       ENABLE_STREAMING_STT: "true"
       LLM_TOOLS_MODE: "on"
+      # ── VAD stack LIVE (2026-07-30, PLAN-vad-stack.md) ───────────────────
+      # WebRTC pre-filter → FSMN-VAD model (vendored onnx) + semantic
+      # EndpointController + audio-event classifier + shadow session FSM.
+      # Kills the 500ms calibration deafness and the amplitude floor for
+      # quiet callers. ROLLBACK: delete this line + `up -d runtime` —
+      # energy VAD + fixed 400ms hard flush return exactly as before.
+      VAD_ENGINE: "fsmn"
     volumes:
       - /home/angelo/lescall:/home/angelo/lescall
       - /home/angelo/.config/gcloud:/gcloud:ro

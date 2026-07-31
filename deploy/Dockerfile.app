@@ -17,5 +17,11 @@ COPY calling-agent/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt openpyxl \
     && rm /tmp/requirements.txt
 
+# funasr_onnx (FSMN-VAD runtime) declares a stale numpy<=1.26.4 cap that
+# fights the repo's numpy pin; it is runtime-verified on 2.4.4 (full FSMN
+# inference), so install it dependency-blind — its real deps are pinned in
+# requirements.txt above.
+RUN pip install --no-cache-dir --no-deps funasr_onnx==0.4.2
+
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1

@@ -37,3 +37,14 @@ watchfiles==1.1.1
 websockets==16.0
 psycopg[binary]==3.3.4
 google-cloud-storage==3.12.1
+# VAD stack (deploy/PLAN-vad-stack.md): WebRTC pre-filter + FSMN-VAD onnx.
+# Model files are vendored at data/models/fsmn_vad (Apache-2.0) — no hub
+# download at boot. funasr_onnx itself is installed in Dockerfile.app with
+# --no-deps: it declares a stale numpy<=1.26.4 cap but is runtime-verified
+# on the 2.4.4 pin above (full FSMN inference exercised). Its REAL deps:
+webrtcvad-wheels==2.0.14  # manylinux wheel; import name is still `webrtcvad`
+onnxruntime==1.28.0
+kaldi-native-fbank==1.22.3
+librosa==0.11.0
+sentencepiece==0.2.2
+jieba==0.42.1

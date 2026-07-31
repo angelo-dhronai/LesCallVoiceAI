@@ -50,6 +50,12 @@ ENABLE_BARGE_IN = os.environ.get("ENABLE_BARGE_IN", "true").lower() == "true"
 # failure.
 ENABLE_STREAMING_STT = (
     os.environ.get("ENABLE_STREAMING_STT", "false").lower() == "true")
+
+# VAD engine (deploy/PLAN-vad-stack.md): "energy" = legacy threshold VAD,
+# "fsmn" = WebRTC pre-filter → FSMN-VAD model stack + EndpointController +
+# audio-event classifier + shadow session state machine. Rollback is this
+# one env var.
+VAD_ENGINE = os.environ.get("VAD_ENGINE", "energy").strip().lower()
 TELEPHONY_MODE = os.environ.get("TELEPHONY_MODE", "false").lower() == "true"
 
 
@@ -279,6 +285,43 @@ STT_LANG_PIN_TURNS = int(os.environ.get("STT_LANG_PIN_TURNS", "2"))
 CAPTURE_MODE = os.environ.get("CAPTURE_MODE", "true").lower() == "true"
 CAPTURE_MERGE_WINDOW_MS = float(os.environ.get(
     "CAPTURE_MERGE_WINDOW_MS", "2000"))
+# H2 (2026-07-31): the barge-in queue flush used to reset_turn() the
+# streaming STT, discarding echo-gate-vetted caller audio fed before the
+# barge threshold tripped (live: "cleaning and helping…" and a spelled
+# email fragment both vanished this way). The interrupting speech IS the
+# next turn — keep it. false = legacy discard.
+BARGE_KEEP_STREAM_AUDIO = os.environ.get(
+    "BARGE_KEEP_STREAM_AUDIO", "true").lower() == "true"
+# H5 (2026-07-31): a transcript ending in a continuation word ("हम बेसिकली
+# जो।") must not take the idle-skip fast path — hold the merge window so
+# the caller's resumed speech joins the same turn instead of racing the LLM.
+MERGE_HOLD_CONTINUATION = os.environ.get(
+    "MERGE_HOLD_CONTINUATION", "true").lower() == "true"
+MERGE_HOLD_CONTINUATION_MS = float(os.environ.get(
+    "MERGE_HOLD_CONTINUATION_MS", "1200"))
+
+# Words a finished thought does not end on — dangling conjunctions,
+# postpositions and discourse connectors in the three call languages
+# (Sarvam appends daṇḍa/period even mid-thought, so punctuation is
+# stripped before the check).
+_CONTINUATION_CUE_WORDS = frozenset({
+    # Hindi / Hinglish
+    "जो", "कि", "तो", "और", "या", "पर", "लेकिन", "यानी", "मतलब",
+    "बेसिकली", "से", "का", "की", "के", "में", "वाला", "वाले",
+    # English
+    "and", "but", "so", "or", "because", "like", "basically", "mean",
+    "umm", "uhh",
+    # Gujarati + romanized
+    "અને", "પણ", "કે", "એટલે", "ane", "etle",
+})
+
+
+def _ends_with_continuation_cue(text: str) -> bool:
+    words = (text or "").strip().split()
+    if not words:
+        return False
+    last = words[-1].strip(".।॥?!,;:\"'").lower()
+    return last in _CONTINUATION_CUE_WORDS
 
 # Fallback phrases played when STT returns empty on substantial speech,
 # or when TTS receives an empty string or fails to play (feature 2 & 5).
@@ -339,6 +382,31 @@ class VoicePipeline:
         self.sink = audio_sink or LocalSpeakerSink(sample_rate=SAMPLE_RATE)
         
         # Phase 17: Adjust VAD for telephony mode
+        self._session = None
+        self._endpointer = None
+        if vad is None and VAD_ENGINE == "fsmn":
+            try:
+                from .vad_stack import FsmnVadStack
+                from .audio_events import AudioEventClassifier
+                from .call_session import CallSession
+                from .endpointer import EndpointController
+                self._session = CallSession(
+                    direction=getattr(conversation, "call_direction",
+                                      "inbound") or "inbound",
+                    event_hub=event_hub)
+                classifier = AudioEventClassifier(
+                    on_label=self._session.on_audio_label)
+                vad = FsmnVadStack(
+                    minimum_threshold=260.0 if TELEPHONY_MODE else 150.0,
+                    minimum_rms_floor=60.0 if TELEPHONY_MODE else 50.0,
+                    event_sink=classifier)
+                self._endpointer = EndpointController()
+            except Exception:
+                logger.exception(
+                    "[VAD-STACK] init failed — falling back to energy VAD")
+                vad = None
+                self._session = None
+                self._endpointer = None
         if vad is None:
             vad = VoiceActivityDetector(
                 minimum_threshold=260.0 if TELEPHONY_MODE else 150.0,
@@ -450,6 +518,12 @@ class VoicePipeline:
         # pipeline plays the agent's graceful-close phrase and stops queuing
         # more fallbacks — preventing an infinite "sorry I couldn't hear you" loop.
         self._stt_consecutive_fallbacks: int = 0
+        # H4: when a streamed finalize consumed a whole speech episode, the
+        # NEXT VAD chunk's finalize legitimately comes back empty — that
+        # empty must not count as "unrecognized speech" (live: it queued a
+        # "couldn't hear you" while the caller had been perfectly heard).
+        self._last_accept_ts: float = 0.0
+        self._last_accept_overcovered: bool = False
         # Dead-air repair state (see _silence_watchdog): last time the VAD saw
         # caller speech, consecutive reprompts without a real caller turn, and
         # when the last reprompt fired.
@@ -633,6 +707,13 @@ class VoicePipeline:
             except Exception:
                 logger.exception("[PIPELINE] commit_pending_turn at stop failed")
         await self.audio.stop()
+        if self._session is not None:
+            self._session.set("CALL_ENDED")
+        if hasattr(self.vad, "close"):
+            try:
+                self.vad.close()
+            except Exception:
+                pass
         if self._streaming_stt is not None:
             try:
                 await self._streaming_stt.close()
@@ -841,6 +922,8 @@ class VoicePipeline:
 
                 self._tts_playing = False
                 self._barge_in_occurred = True
+                if self._session is not None:
+                    self._session.set("USER_INTERRUPTED", "barge-in")
                 if self.turn_traces:
                     self.turn_traces[-1]["barged_in"] = True
                 self._vad_mute_until = 0.0
@@ -945,9 +1028,15 @@ class VoicePipeline:
         else:
             self._silence_frames += 1
             self._speech_onset_frames = 0
-            # Keep a 2-frame look-back so onset clip is recoverable
+            # Look-back ring so onset clip is recoverable. Energy engine:
+            # 2 frames (decision is instant). FSMN engine: 20 frames
+            # (400ms) — the model confirms speech ~100-300ms after true
+            # onset, and the ring is what recovers those first syllables
+            # into the STT buffer.
             self._pre_speech_buffer.append(frame)
-            if len(self._pre_speech_buffer) > SPEECH_ONSET_MIN_FRAMES:
+            _ring_max = (20 if self._endpointer is not None
+                         else SPEECH_ONSET_MIN_FRAMES)
+            if len(self._pre_speech_buffer) > _ring_max:
                 self._pre_speech_buffer.pop(0)
 
         if raw_speech and self._speech_onset_frames < self._speech_onset_min_frames and not self._prev_speech:
@@ -978,6 +1067,9 @@ class VoicePipeline:
             self._speech_duration_ms += 20.0
             if self._streaming_stt is not None:
                 self._streaming_stt.feed_nowait(frame)
+            if self._session is not None:
+                # Monologue-length tick (outbound IVR/voicemail heuristics).
+                self._session.on_speech_run(self._speech_duration_ms)
 
             if len(self._audio_buffer) > MAX_BUFFER_BYTES:
                 del self._audio_buffer[:len(self._audio_buffer) - MAX_BUFFER_BYTES]
@@ -1004,18 +1096,31 @@ class VoicePipeline:
 
         # Hard flush: after enough accumulated speech, a long consecutive
         # silence window triggers a flush even if TurnManager hasn't fired.
-        # Using HARD_FLUSH_SILENCE_FRAMES (1100 ms) to flush STT buffer after
-        # the caller stops speaking while tolerating mid-sentence breath pauses.
+        # Legacy energy engine: fixed HARD_FLUSH_SILENCE_FRAMES. FSMN engine
+        # (VAD_ENGINE=fsmn): the model already absorbed FSMN_MAX_END_SIL_MS
+        # of pause tolerance before is_speech flipped false, so the
+        # EndpointController decides with small semantic-aware residuals
+        # (fast on complete sentences, hold on dangling/digit dictation).
         if (
             not speech
             and self._speech_duration_ms >= self._min_speech_ms(time.monotonic())
-            and self._silence_frames >= HARD_FLUSH_SILENCE_FRAMES
         ):
-            logger.info(
-                "[TURN] Hard-flush: duration=%.0fms silence_frames=%d",
-                self._speech_duration_ms, self._silence_frames,
-            )
-            should_flush = True
+            if self._endpointer is not None:
+                _flush_due = self._endpointer.should_flush(
+                    self._silence_frames,
+                    self._speech_duration_ms,
+                    (self._streaming_stt.turn_text
+                     if self._streaming_stt is not None else ""),
+                    self._streaming_stt is not None,
+                )
+            else:
+                _flush_due = self._silence_frames >= HARD_FLUSH_SILENCE_FRAMES
+            if _flush_due:
+                logger.info(
+                    "[TURN] Hard-flush: duration=%.0fms silence_frames=%d",
+                    self._speech_duration_ms, self._silence_frames,
+                )
+                should_flush = True
 
         if should_flush:
             logger.info(
@@ -1127,9 +1232,12 @@ class VoicePipeline:
                     break
         if drained:
             logger.info("[BARGE-IN] Drained %d items from pipeline queues", drained)
-        if self._streaming_stt is not None:
-            # Audio fed for the dropped segments must not resurface as
-            # stale text in the next turn.
+        if self._streaming_stt is not None and not BARGE_KEEP_STREAM_AUDIO:
+            # Legacy behavior: invalidate everything fed to the stream. This
+            # also discarded the caller's own interrupting speech (fed before
+            # the barge threshold tripped), so it is off by default — the
+            # superseded turn's segments were already consumed by its own
+            # finalize, which bumps the generation itself.
             self._streaming_stt.reset_turn()
 
     # -----------------------------------------------------------------------
@@ -1309,14 +1417,21 @@ class VoicePipeline:
                 # A transcript with far more words than the audio can contain is a
                 # hallucination (STT filling silence with fluent-sounding text).
                 # Threshold: 250 ms/word (4 wps) with a floor of 4 words for short segments.
+                # H1: a streamed finalize spans the whole speech EPISODE
+                # (server-stitched across VAD chunks), so score against the
+                # audio it actually covered — the local chunk alone rejected
+                # real answers as hallucination (14 words / 1440ms, live).
                 if transcript_text and transcript_text.strip():
+                    _covered_ms = getattr(self.stt, "last_covered_seconds",
+                                          0.0) * 1000.0
+                    _effective_ms = max(segment.duration_ms, _covered_ms)
                     _word_count = len(transcript_text.split())
-                    _max_plausible = max(4, int(segment.duration_ms / 250))
+                    _max_plausible = max(4, int(_effective_ms / 250))
                     if _word_count > _max_plausible * 2:
                         logger.warning(
                             "[STT] Rejecting implausible transcript: %d words in %.0fms "
                             "(max_plausible=%d) — likely hallucination: %r",
-                            _word_count, segment.duration_ms, _max_plausible,
+                            _word_count, _effective_ms, _max_plausible,
                             transcript_text[:80],
                         )
                         transcript_text = ""
@@ -1324,7 +1439,7 @@ class VoicePipeline:
                         logger.warning(
                             "[STT] Suspicious word count: %d words in %.0fms "
                             "(max_plausible=%d): %r",
-                            _word_count, segment.duration_ms, _max_plausible,
+                            _word_count, _effective_ms, _max_plausible,
                             transcript_text[:80],
                         )
 
@@ -1357,8 +1472,9 @@ class VoicePipeline:
                         "hello", "hallo", "helo", "hi", "hey", "yello",
                         "namaste", "namaskar", "salaam", "salam",
                         "kemcho", "kem", "bolo", "boliye", "haanji", "hanji",
-                        "नमस्ते", "नमस्कार", "हैलो", "हलो", "बोलो", "बोलिए",
-                        "નમસ્તે", "નમસ્કાર", "હેલો", "કેમ", "બોલો",
+                        "नमस्ते", "नमस्कार", "हैलो", "हलो", "हेलो", "हॅलो",
+                        "हैल्लो", "हल्लो", "बोलो", "बोलिए",
+                        "નમસ્તે", "નમસ્કાર", "હેલો", "હલો", "કેમ", "બોલો",
                     }
                     if _single not in _affirmation_negation and _single not in _greetings:
                         logger.info(
@@ -1380,7 +1496,17 @@ class VoicePipeline:
                     #   3. not _tts_playing   — agent is not currently speaking
                     #   4. _vad_mute_until elapsed — not inside echo-cooldown window
                     if segment.duration_ms >= _STT_FALLBACK_MIN_SPEECH_MS:
-                        if not self._greeting_done:
+                        if (self._last_accept_overcovered
+                                and time.monotonic() - self._last_accept_ts < 3.0):
+                            # H4: previous streamed transcript covered this
+                            # chunk's audio too — nothing was missed.
+                            logger.info(
+                                "[STT] Empty finalize (%.0fms) right after an "
+                                "over-covered streamed transcript — episode "
+                                "already consumed, skipping",
+                                segment.duration_ms,
+                            )
+                        elif not self._greeting_done:
                             logger.info(
                                 "[STT] Skipping fallback — greeting not yet complete "
                                 "(startup/warmup audio, %.0fms)", segment.duration_ms,
@@ -1468,6 +1594,13 @@ class VoicePipeline:
                     continue
 
                 self._stt_consecutive_fallbacks = 0  # successful transcript — reset failure streak
+                # H4 bookkeeping: remember whether this transcript covered
+                # more audio than its own VAD chunk (streamed episode).
+                self._last_accept_ts = time.monotonic()
+                self._last_accept_overcovered = (
+                    getattr(self.stt, "last_covered_seconds", 0.0) * 1000.0
+                    > segment.duration_ms + 500.0
+                )
                 # Deferred language mirror: the transcript survived every
                 # rejection guard — apply Sarvam's detection only if it is
                 # plausible for this text (script/markers agree; a lone
@@ -1886,13 +2019,26 @@ class VoicePipeline:
             _capture_active = (
                 CAPTURE_MODE and self.conversation is not None
                 and getattr(self.conversation, "_capture_slot", None)
-                is not None)
+                is not None
+                and getattr(self.conversation, "capture_expecting_input",
+                            lambda: True)())
+            # H5: an utterance ending mid-thought ("हम बेसिकली जो।") predicts
+            # a resumed continuation — never fast-path it, and widen the
+            # window so the continuation merges instead of racing the LLM.
+            _dangling = (
+                MERGE_HOLD_CONTINUATION
+                and not _capture_active
+                and _ends_with_continuation_cue(transcript.text))
             merge_wait_s = (
                 CAPTURE_MERGE_WINDOW_MS if _capture_active
                 else TRANSCRIPT_MERGE_WINDOW_MS) / 1000.0
+            if _dangling:
+                merge_wait_s = max(merge_wait_s,
+                                   MERGE_HOLD_CONTINUATION_MS / 1000.0)
             if (
                 TRANSCRIPT_MERGE_SKIP_WHEN_IDLE
                 and not _capture_active
+                and not _dangling
                 and self._transcript_queue.empty()
                 and self._stt_queue.empty()
                 and self._stt_inflight == 0
@@ -1900,6 +2046,10 @@ class VoicePipeline:
             ):
                 merge_wait_s = 0.0
                 logger.info("[ENGINE] Merge window skipped (idle)")
+            elif _dangling:
+                logger.info(
+                    "[ENGINE] Merge window held %.0fms (dangling ending %r)",
+                    merge_wait_s * 1000.0, transcript.text[-24:])
             elif merge_wait_s > 0.0:
                 logger.info(
                     "[ENGINE] Merge window %.0fms%s (queued=%d stt_q=%d inflight=%d speaking=%s)",
@@ -2164,6 +2314,11 @@ class VoicePipeline:
                           * 1000.0, 1)
                     if transcript.speech_end_ts > 0.0 else None),
             }
+            if self._session is not None:
+                self._session.mark_exchange()
+                trace["session_state"] = self._session.state
+            if self._endpointer is not None:
+                trace["endpoint_profile"] = self._endpointer.last_profile
             if len(self.turn_traces) < 500:
                 self.turn_traces.append(trace)
             if sink is not None and hasattr(sink, "flush"):
@@ -2361,6 +2516,8 @@ class VoicePipeline:
                                 "total_latency_ms": round(total_latency),
                             })
 
+                if self._session is not None:
+                    self._session.set("THINKING", "llm turn")
                 self._current_generation_task = asyncio.create_task(
                     _run_generation()
                 )
@@ -2484,6 +2641,8 @@ class VoicePipeline:
                 logger.info("[TTS] Playing: %r (queued %.0fms ago)", tts_text, age_ms)
 
                 self._tts_playing = True
+                if self._session is not None:
+                    self._session.set("AI_SPEAKING")
                 self._tts_start_time = time.monotonic()
                 self._last_playback_start_ts = self._tts_start_time
                 # Connect delivery guard bookkeeping: new utterance, nothing
@@ -2563,6 +2722,8 @@ class VoicePipeline:
                     logger.warning("[TTS] Fallback phrase also failed — accepting silence")
             finally:
                 self._tts_playing = False
+                if self._session is not None:
+                    self._session.set("LIVE_CONVERSATION", "tts done")
                 self._tts_end_time = time.monotonic()
                 # This utterance is over — a still-latched deferral must not
                 # leak onto the next one.

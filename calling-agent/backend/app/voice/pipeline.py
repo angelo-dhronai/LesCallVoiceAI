@@ -59,6 +59,9 @@ class AudioSegment:
     # segment (continuation-merge timing anchors; 0.0 = unknown).
     speech_start_ts: float = 0.0
     speech_end_ts: float = 0.0
+    # True when part of this audio was captured over agent playback (shadow
+    # ring) — such transcripts pass the agent-echo text guard before use.
+    shadow: bool = False
 
 
 @dataclass
@@ -160,6 +163,33 @@ FILLER_ECHO_GRACE_MS = 1500.0
 # (see ECHO_EARLY_EXIT_FRAMES below), providing a second layer of protection.
 TTS_ECHO_COOLDOWN_MS = float(os.environ.get(
     "TTS_ECHO_COOLDOWN_MS", "400" if TELEPHONY_MODE else "600"))
+
+# ── Playback shadow capture (2026-08-03 fleet audit, defect #1) ──────────────
+# While TTS is playing, frames that don't reach the barge-in bar used to be
+# DISCARDED — a caller answering at normal volume during agent speech was
+# simply never heard (18/31 fleet agents lost whole turns; heads of
+# straddling utterances were cut: "my name is rahul sharma" → "rahul
+# sharma."). Instead, speech-energy frames during playback are kept in a
+# bounded shadow ring and joined to the caller's turn when one of three
+# things confirms it was real speech: a barge-in fires, speech continues
+# into the clear window after playback, or the ring alone holds a
+# substantial utterance at playback end. Echo protection moves from
+# time-domain (mute everything) to text-domain: a shadow-tainted transcript
+# that matches what the agent itself was saying is discarded as echo.
+ENABLE_PLAYBACK_SHADOW = os.environ.get(
+    "ENABLE_PLAYBACK_SHADOW", "true").lower() == "true"
+# Ring cap: keep at most this much audio (oldest dropped first).
+SHADOW_MAX_MS = float(os.environ.get("SHADOW_MAX_MS", "6000"))
+# A frame enters the ring when energy exceeds vad.threshold × this factor.
+SHADOW_ENERGY_FACTOR = float(os.environ.get("SHADOW_ENERGY_FACTOR", "0.8"))
+# Standalone submission floor: at playback end, ring speech shorter than
+# this is discarded (echo blips), longer is seeded as a caller segment.
+SHADOW_MIN_SPEECH_MS = float(os.environ.get("SHADOW_MIN_SPEECH_MS", "350"))
+# After playback ends, a new speech onset within this window may claim the
+# ring as its (playback-era) head.
+SHADOW_JOIN_WINDOW_MS = float(os.environ.get("SHADOW_JOIN_WINDOW_MS", "1500"))
+# Echo-text guard: shadow transcript vs the agent's own utterance text.
+SHADOW_ECHO_TEXT_RATIO = float(os.environ.get("SHADOW_ECHO_TEXT_RATIO", "0.75"))
 
 # Minimum consecutive loud frames during the echo cooldown window that signal
 # real caller speech rather than echo. Echo is short-lived (1-3 frames);
@@ -300,6 +330,12 @@ MERGE_HOLD_CONTINUATION = os.environ.get(
     "MERGE_HOLD_CONTINUATION", "true").lower() == "true"
 MERGE_HOLD_CONTINUATION_MS = float(os.environ.get(
     "MERGE_HOLD_CONTINUATION_MS", "1200"))
+# Absolute ceiling on merge-window re-arming while caller input is in
+# flight (speaking / STT round-trip running). Bounds the fleet-audit fix
+# that stops the engine answering the head of a sentence whose tail is
+# still on its way.
+MERGE_HOLD_MAX_TOTAL_S = float(os.environ.get(
+    "MERGE_HOLD_MAX_TOTAL_S", "6.0"))
 
 # Words a finished thought does not end on — dangling conjunctions,
 # postpositions and discourse connectors in the three call languages
@@ -317,10 +353,20 @@ _CONTINUATION_CUE_WORDS = frozenset({
 })
 
 
+# Digit dictation tail (phone/pincode/budget read-outs): callers pause
+# BETWEEN digit groups — the same continuation hold applies (fleet-audit
+# defect #3: the endpointer's semantic profiles can't see text on the batch
+# path, so the merge layer is where number bursts get stitched).
+_DIGIT_TAIL_CUE = re.compile(r"[\d०-९૦-૯][\d०-९૦-૯\s\-]{1,}\s*[.।॥]?\s*$")
+
+
 def _ends_with_continuation_cue(text: str) -> bool:
-    words = (text or "").strip().split()
+    stripped = (text or "").strip()
+    words = stripped.split()
     if not words:
         return False
+    if _DIGIT_TAIL_CUE.search(stripped):
+        return True
     last = words[-1].strip(".।॥?!,;:\"'").lower()
     return last in _CONTINUATION_CUE_WORDS
 
@@ -582,6 +628,15 @@ class VoicePipeline:
         self._silence_frames = 0       # debounce: frames since last speech
         self._pre_speech_buffer: list[bytes] = []  # look-back to recover onset clip
         self._echo_gate_speech_frames: int = 0    # sustained frames during echo cooldown
+        # Playback shadow capture (fleet-audit defect #1) — see constants.
+        self._shadow_frames: list[bytes] = []
+        self._shadow_speech_ms: float = 0.0
+        self._shadow_started_ts: float = 0.0
+        self._shadow_until: float = 0.0          # claim deadline after TTS end
+        self._shadow_seeded: bool = False        # buffer holds shadow audio
+        self._segment_has_shadow: bool = False
+        self._current_tts_text: str = ""         # for the echo-text guard
+        self._prev_tts_text: str = ""
 
         # Diagnostic counters — logged at session end to trace audio path
         self._vad_frames_seen: int = 0
@@ -835,6 +890,12 @@ class VoicePipeline:
         # Barge-in uses a stricter threshold than turn-detection so TTS
         # echo / ambient noise can't masquerade as a sustained interrupt.
         if self._tts_playing:
+            # Shadow capture: keep what the caller says OVER agent audio.
+            # Runs before every return in this block so no path can discard
+            # speech-energy frames anymore. Greeting included — capture never
+            # interrupts anything, it only prevents loss.
+            if ENABLE_PLAYBACK_SHADOW:
+                self._shadow_capture(frame)
             # Issue 4: never allow barge-in during the opening greeting.
             # The greeting echo (via mod_audio_stream) is often loud enough to
             # trip the barge-in threshold, cutting the greeting short and leaving
@@ -962,7 +1023,24 @@ class VoicePipeline:
                     ):
                     self._current_generation_task.cancel()
                     
+                # Fleet-audit fix: the buffer holds caller speech captured
+                # BEFORE our reply started playing (appends pause during
+                # playback) — the head of the very utterance that is now
+                # barging in. The old reset wiped it; preserve it through
+                # the reset, then reattach the playback-era shadow after it.
+                _pre_barge_audio = bytes(self._audio_buffer)
+                _pre_barge_ms = self._speech_duration_ms
+                _pre_barge_start = self._cur_speech_start_ts
                 self._reset_vad_state()
+                if _pre_barge_ms >= 200.0:
+                    self._audio_buffer.extend(_pre_barge_audio)
+                    self._speech_duration_ms = _pre_barge_ms
+                    self._cur_speech_start_ts = _pre_barge_start
+                    self._prev_speech = True
+                    logger.info(
+                        "[SHADOW] Preserved %.0fms pre-playback caller audio "
+                        "through barge-in reset", _pre_barge_ms)
+                self._claim_shadow("barge-in")
 
             else:
                 return
@@ -1025,16 +1103,31 @@ class VoicePipeline:
                 # Fall through to normal VAD processing below
             else:
                 if self._audio_buffer:
-                    logger.debug(
-                        "[ECHO-GATE] Discarding %d bytes of post-TTS audio "
-                        "(%.0fms cooldown remaining, echo_frames=%d)",
-                        len(self._audio_buffer),
-                        (self._vad_mute_until - time.monotonic()) * 1000,
-                        self._echo_gate_speech_frames,
-                    )
-                    self._audio_buffer.clear()
-                    self._speech_duration_ms = 0.0
-                    self._turn.flush()
+                    # Fleet-audit fix: a non-empty buffer entering this gate
+                    # was captured BEFORE the agent spoke (appends never run
+                    # during playback or this gate) — it is the caller's
+                    # unfinished segment, not TTS residue. Wiping it here is
+                    # how the tail of a split utterance used to vanish
+                    # entirely. Preserve substantial speech; let it flush
+                    # after the gate.
+                    if (self._speech_duration_ms >= 300.0
+                            or self._shadow_seeded):
+                        logger.info(
+                            "[ECHO-GATE] Preserving %.0fms pre-TTS caller "
+                            "segment through cooldown",
+                            self._speech_duration_ms)
+                    else:
+                        logger.debug(
+                            "[ECHO-GATE] Discarding %d bytes of post-TTS audio "
+                            "(%.0fms cooldown remaining, echo_frames=%d)",
+                            len(self._audio_buffer),
+                            (self._vad_mute_until - time.monotonic()) * 1000,
+                            self._echo_gate_speech_frames,
+                        )
+                        self._audio_buffer.clear()
+                        self._speech_duration_ms = 0.0
+                        self._segment_has_shadow = False
+                        self._turn.flush()
                 self._prev_speech = False
                 self._speech_onset_frames = 0
                 self._silence_frames = 0
@@ -1074,6 +1167,12 @@ class VoicePipeline:
                 self._cur_speech_start_ts = (
                     time.monotonic() - 0.02 * len(self._pre_speech_buffer)
                 )
+                # Speech resuming shortly after playback: the utterance may
+                # have BEGUN over the agent's audio — reattach that head
+                # from the shadow ring (chronologically before the pre-ring).
+                if (ENABLE_PLAYBACK_SHADOW and self._shadow_frames
+                        and time.monotonic() < self._shadow_until):
+                    self._claim_shadow("post-playback onset")
                 # Prepend buffered pre-onset frames to recover clipped onset
                 if self._pre_speech_buffer:
                     for pre_frame in self._pre_speech_buffer:
@@ -1152,6 +1251,8 @@ class VoicePipeline:
                 )
                 self._audio_buffer.clear()
                 self._speech_duration_ms = 0.0
+                self._segment_has_shadow = False
+                self._shadow_seeded = False
                 self._turn.flush()
                 return
 
@@ -1163,7 +1264,10 @@ class VoicePipeline:
                 timestamp=_now_flush,
                 speech_start_ts=self._cur_speech_start_ts,
                 speech_end_ts=_speech_end_ts,
+                shadow=self._segment_has_shadow,
             )
+            self._segment_has_shadow = False
+            self._shadow_seeded = False
             self._segments_created += 1
 
             # Arm the continuation-likely window: for CONTINUATION_WINDOW_MS
@@ -1200,7 +1304,96 @@ class VoicePipeline:
         self._silence_frames = 0
         self._speech_frame_streak = 0
         self._pre_speech_buffer.clear()
+        self._segment_has_shadow = False
+        self._shadow_seeded = False
         self._turn.flush()
+
+    # ── Playback shadow capture (fleet-audit defect #1) ──────────────────
+
+    def _shadow_capture(self, frame: bytes) -> None:
+        """Ring frames spoken over agent playback instead of dropping them.
+
+        Entry condition is speech-level energy; once the ring is non-empty,
+        quieter gap frames are kept too so a claimed utterance stays
+        contiguous. Bounded to SHADOW_MAX_MS (oldest first out)."""
+        energetic = self.vad.last_energy > self.vad.threshold * SHADOW_ENERGY_FACTOR
+        if not energetic and not self._shadow_frames:
+            return
+        if not self._shadow_frames:
+            self._shadow_started_ts = time.monotonic()
+        self._shadow_frames.append(frame)
+        if energetic:
+            self._shadow_speech_ms += 20.0
+        max_frames = int(SHADOW_MAX_MS / 20)
+        while len(self._shadow_frames) > max_frames:
+            dropped = self._shadow_frames.pop(0)
+            self._shadow_started_ts += 0.02
+            # Approximation: assume dropped frames carried speech at ring
+            # density; exact bookkeeping isn't worth per-frame energy storage.
+            if self._shadow_speech_ms > 0:
+                self._shadow_speech_ms = max(
+                    0.0, self._shadow_speech_ms - 20.0)
+
+    def _drop_shadow(self, reason: str) -> None:
+        if self._shadow_frames:
+            logger.info("[SHADOW] Dropped %.0fms ring (%.0fms speech) — %s",
+                        len(self._shadow_frames) * 20.0,
+                        self._shadow_speech_ms, reason)
+        self._shadow_frames.clear()
+        self._shadow_speech_ms = 0.0
+        self._shadow_started_ts = 0.0
+
+    def _claim_shadow(self, reason: str) -> bool:
+        """Move the shadow ring to the FRONT of the live segment buffer so
+        speech that began over playback keeps its head. Returns True if
+        anything was claimed."""
+        if not self._shadow_frames or self._shadow_speech_ms < 100.0:
+            self._drop_shadow(f"{reason}: below floor")
+            return False
+        # Chronology: anything already buffered was captured BEFORE playback
+        # started (pre-TTS caller speech) — the shadow follows it; the
+        # pre-speech ring / live frames are appended after by the caller.
+        self._audio_buffer.extend(b"".join(self._shadow_frames))
+        added_ms = len(self._shadow_frames) * 20.0
+        self._speech_duration_ms += added_ms
+        # True onset is the shadow's first frame when that is earlier than
+        # whatever anchor the normal path just computed.
+        if self._shadow_started_ts > 0.0 and (
+                self._cur_speech_start_ts <= 0.0
+                or self._shadow_started_ts < self._cur_speech_start_ts):
+            self._cur_speech_start_ts = self._shadow_started_ts
+        self._segment_has_shadow = True
+        self._shadow_seeded = True
+        self._prev_speech = True
+        logger.info(
+            "[SHADOW] Claimed %.0fms of playback-era audio (%.0fms speech) "
+            "into segment — %s", added_ms, self._shadow_speech_ms, reason)
+        self._shadow_frames.clear()
+        self._shadow_speech_ms = 0.0
+        self._shadow_started_ts = 0.0
+        return True
+
+    def _is_agent_echo_text(self, text: str) -> bool:
+        """True when `text` reads as an echo of the agent's own utterance
+        (current or previous): most of its tokens appear in what the agent
+        just said. Guards only shadow-tainted transcripts."""
+        import re as _re
+
+        def _toks(s: str) -> set:
+            return {t for t in _re.sub(r"[^\w\s]", " ", (s or "").lower())
+                    .split() if len(t) > 1}
+
+        spoken = _toks(text)
+        if len(spoken) < 2:
+            return False
+        for agent_text in (self._current_tts_text, self._prev_tts_text):
+            agent = _toks(agent_text)
+            if not agent:
+                continue
+            overlap = len(spoken & agent) / len(spoken)
+            if overlap >= SHADOW_ECHO_TEXT_RATIO:
+                return True
+        return False
 
     def _maybe_commit_pending_turn(self) -> None:
         """Lazily commit the pending turn transaction once the continuation
@@ -1674,6 +1867,18 @@ class VoicePipeline:
                             _pending_mirror, transcript_text[:40])
                 logger.info("[STT] %r (%.0fms latency)", transcript_text, stt_latency)
 
+                # Echo-text guard: shadow-tainted audio may be the acoustic
+                # echo of OUR OWN utterance. Echo transcribes to the agent's
+                # words; a real caller's don't. Text-domain check, so a
+                # clean line (no echo) costs nothing.
+                if segment.shadow and transcript_text.strip() and \
+                        self._is_agent_echo_text(transcript_text):
+                    logger.info(
+                        "[SHADOW] [ECHO-TEXT] Discarding transcript that "
+                        "matches the agent's own speech: %r",
+                        transcript_text[:60])
+                    continue
+
                 self._update_stt_lang_pin()
 
                 if self._hub is not None:
@@ -2108,13 +2313,35 @@ class VoicePipeline:
                 # In capture mode every merged fragment re-opens the window
                 # (up to 8) so a full spelled email lands as one turn.
                 _max_follow_ons = 8 if _capture_active else 1
-                for _fo_i in range(_max_follow_ons):
+                _hold_started = time.monotonic()
+                _follow_ons_taken = 0
+                while _follow_ons_taken < _max_follow_ons:
                     try:
                         follow_on = await asyncio.wait_for(
                             self._transcript_queue.get(),
                             timeout=merge_wait_s,
                         )
                     except asyncio.TimeoutError:
+                        # Fleet-audit fix (defect #3): the window used to
+                        # expire while the caller was LITERALLY STILL
+                        # SPEAKING the continuation (or its segment was in
+                        # STT flight) — the engine answered the head of the
+                        # sentence and the tail became an orphan double-
+                        # reply. Never conclude the turn while caller input
+                        # is demonstrably in flight; re-arm, bounded.
+                        _in_flight = (
+                            self._prev_speech
+                            or self._stt_inflight > 0
+                            or not self._stt_queue.empty()
+                        )
+                        if _in_flight and (time.monotonic() - _hold_started
+                                           < MERGE_HOLD_MAX_TOTAL_S):
+                            logger.info(
+                                "[ENGINE] Merge window re-armed — caller "
+                                "input still in flight (speaking=%s "
+                                "stt_inflight=%d)",
+                                self._prev_speech, self._stt_inflight)
+                            continue
                         break  # No follow-on within window — proceed
                     time_gap = follow_on.timestamp - transcript.timestamp
                     _gap_cap = 3.0 if not _capture_active else (
@@ -2153,6 +2380,7 @@ class VoicePipeline:
                             "[ENGINE] Dropping old segment (%.1fs gap): %r",
                             time_gap, follow_on.text[:40],
                         )
+                    _follow_ons_taken += 1
 
             # Drain any remaining queued transcripts.
             # Transcripts that arrived recently (within 3 s) are very likely
@@ -2758,6 +2986,13 @@ class VoicePipeline:
                 # Canned lines (greeting, fillers, response-bank phrases) go
                 # through the disk cache: repeat plays cost zero synthesis
                 # time and zero Sarvam credits. LLM output is never cached.
+                # Echo-text guard bookkeeping + shadow hygiene: a ring left
+                # unclaimed from the PREVIOUS playback window must not leak
+                # under this new utterance's audio.
+                self._prev_tts_text = self._current_tts_text
+                self._current_tts_text = tts_text
+                if ENABLE_PLAYBACK_SHADOW and self._shadow_frames:
+                    self._drop_shadow("stale — new utterance starting")
                 if response.is_shortcut and hasattr(self.tts, "speak_cached"):
                     await self.tts.speak_cached(tts_text)
                 else:
@@ -2855,5 +3090,17 @@ class VoicePipeline:
                     else:
                         mute_s = TTS_ECHO_COOLDOWN_MS / 1000.0
                     self._vad_mute_until = now + mute_s
+
+                # Shadow disposition at utterance end (fleet defect #1):
+                # a substantial ring = the caller spoke a whole utterance
+                # over our audio — seed it as a live segment so the normal
+                # silence path flushes it to STT (echo-gate preserves seeded
+                # buffers). A thin ring may still be claimed by an onset
+                # within the join window; after that it is dropped.
+                if ENABLE_PLAYBACK_SHADOW:
+                    self._shadow_until = (
+                        self._vad_mute_until + SHADOW_JOIN_WINDOW_MS / 1000.0)
+                    if self._shadow_speech_ms >= SHADOW_MIN_SPEECH_MS:
+                        self._claim_shadow("utterance spoken over playback")
 
         logger.info("[TTS] Layer stopped")

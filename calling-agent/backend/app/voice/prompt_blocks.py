@@ -11,6 +11,8 @@ No I/O, no globals, no state — pure string building.
 
 from __future__ import annotations
 
+import os
+
 from ..agent_definition.schema import AgentDefinition
 from ..agent_definition.catalog import (
     catalog_item_names,
@@ -154,10 +156,27 @@ def mission_block(agent_def: AgentDefinition) -> list[str]:
 # Personality
 # ---------------------------------------------------------------------------
 
+# Platform-wide spoken-delivery ceiling (2026-08-03 fleet audit, defect #2):
+# agents whose YAML never asked for brevity produced 8–16s TTS monoliths and
+# queued behind their own audio. This rule applies to EVERY agent regardless
+# of its personality.style — "detailed" style still explains, just in
+# caller-sized pieces. Kill switch: PLATFORM_REPLY_BREVITY=false.
+PLATFORM_REPLY_BREVITY = os.environ.get(
+    "PLATFORM_REPLY_BREVITY", "true").lower() == "true"
+_PLATFORM_BREVITY_RULE = (
+    "HARD LIMIT (live phone call): never speak more than ~40 words in one "
+    "reply. If the full answer needs more, give the most useful part in one "
+    "or two short sentences, then ask whether to continue. Never read lists "
+    "of more than three items in one breath."
+)
+
+
 def personality_block(agent_def: AgentDefinition) -> list[str]:
     """━━ PERSONALITY ━━ — energy / tone / style / lingo / persona notes."""
     _pers = getattr(agent_def, "personality", None)
     if not _pers:
+        if PLATFORM_REPLY_BREVITY:
+            return ["", "━━ PERSONALITY ━━", _PLATFORM_BREVITY_RULE]
         return []
     _energy_map = {
         "low": "Calm and measured. Speak slowly and thoughtfully. Never rush.",
@@ -182,6 +201,8 @@ def personality_block(agent_def: AgentDefinition) -> list[str]:
         f"Tone: {_tone_map.get(_pers.tone, _tone_map['conversational'])}",
         f"Response length: {_style_map.get(_pers.style, _style_map['natural'])}",
     ]
+    if PLATFORM_REPLY_BREVITY:
+        lines.append(_PLATFORM_BREVITY_RULE)
     traits = getattr(_pers, "traits", None) or []
     if traits:
         lines.append(f"Traits: {', '.join(traits)}.")

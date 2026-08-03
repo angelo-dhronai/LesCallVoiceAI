@@ -168,6 +168,15 @@ _INTER_WAV_PACING_S = 0.1
 TTS_EARLY_FLUSH = os.environ.get("TTS_EARLY_FLUSH", "true").lower() == "true"
 _EARLY_FLUSH_MIN_S = float(os.environ.get("TTS_EARLY_FLUSH_MIN_S", "0.9"))
 _EARLY_FLUSH_MAX_S = float(os.environ.get("TTS_EARLY_FLUSH_MAX_S", "1.6"))
+# Hard flush ceiling (2026-08-03 fleet audit, defect #2): no single WAV may
+# exceed this much audio. Unpunctuated LLM sentences produced 8–16s
+# monoliths — while one plays, the reply to the caller's NEXT turn queues
+# behind it (up to +10s wire latency), and barge-in has that much more to
+# kill. Applies to live synthesis (mid-part) and cached replay alike.
+_MAX_FLUSH_S = float(os.environ.get("TTS_MAX_FLUSH_S", "4.0"))
+# Cached openers additionally cut their FIRST piece short so the caller
+# hears the agent fast (greeting dead-air, fleet defect #4).
+_CACHE_FIRST_FLUSH_S = float(os.environ.get("TTS_CACHE_FIRST_FLUSH_S", "2.0"))
 _EARLY_FLUSH_TAIL_MS = 40          # window scanned for the pause
 _EARLY_FLUSH_SILENCE_RMS = 300     # ≲1% full-scale ≈ inter-word gap
 
@@ -388,12 +397,15 @@ class SarvamTTS(StreamingTTS):
                 part_bytes = 0
                 part_tail = b""
                 early_flushed = False
+                unflushed_bytes = 0
+                ceiling_bytes = int(self._sample_rate * 2 * _MAX_FLUSH_S)
                 async for chunk in self._stream_audio(part):
                     if self._cancelled:
                         logger.info("[TTS:Sarvam] Cancelled mid-stream")
                         break
 
                     await self._sink.write_frame(chunk.audio)
+                    unflushed_bytes += len(chunk.audio)
                     if self._capture_buf is not None:
                         self._capture_buf += chunk.audio
                     chunk_count += 1
@@ -420,11 +432,30 @@ class SarvamTTS(StreamingTTS):
                                 self._sink, 'last_flush_duration', 0.0)
                             flushed_parts += 1
                             early_flushed = True
+                            unflushed_bytes = 0
                             logger.info(
                                 "[TTS:Sarvam] Early flush %.2fs after %.0fms",
                                 part_bytes / (self._sample_rate * 2),
                                 (time.monotonic() - speak_t0) * 1000,
                             )
+
+                    # Flush ceiling: an unpunctuated part can synthesize to
+                    # many seconds of audio in one piece — cut it so playback
+                    # stays interleavable (prefer a pause, force at +25%).
+                    if (sink_flushable and self._capture_buf is None
+                            and unflushed_bytes >= ceiling_bytes):
+                        tail = chunk.audio[-4096:]
+                        if (_tail_is_pause(tail, self._sample_rate)
+                                or unflushed_bytes >= ceiling_bytes * 1.25):
+                            await self._sink.flush()
+                            total_duration += getattr(
+                                self._sink, 'last_flush_duration', 0.0)
+                            flushed_parts += 1
+                            logger.info(
+                                "[TTS:Sarvam] Ceiling flush %.2fs "
+                                "(part still streaming)",
+                                unflushed_bytes / (self._sample_rate * 2))
+                            unflushed_bytes = 0
                 if self._cancelled:
                     break
                 # Incremental flush: hand this part's audio to the transport
@@ -545,9 +576,29 @@ class SarvamTTS(StreamingTTS):
                         os.utime(path)  # LRU touch
                     except OSError:
                         pass
-                    await self._sink.write_frame(pcm)
+                    # Chunked replay (fleet defects #2/#4): a long cached
+                    # opener used to land as ONE WAV — first audio waited on
+                    # the whole file and barge-in had the whole file to kill.
+                    # First piece is short so the caller hears the agent
+                    # fast; the rest flushes in ceiling-sized pieces.
                     if hasattr(self._sink, "flush"):
-                        await self._sink.flush()
+                        first_b = int(self._sample_rate * 2
+                                      * _CACHE_FIRST_FLUSH_S)
+                        max_b = int(self._sample_rate * 2 * _MAX_FLUSH_S)
+                        min_tail_b = int(self._sample_rate * 2 * 0.25)
+                        off = 0
+                        piece = min(first_b, len(pcm))
+                        while off < len(pcm) and not self._cancelled:
+                            # Never leave a sub-250ms orphan piece — the
+                            # sink's WAV validator rejects <100ms files.
+                            if len(pcm) - off - piece < min_tail_b:
+                                piece = len(pcm) - off
+                            await self._sink.write_frame(pcm[off:off + piece])
+                            await self._sink.flush()
+                            off += piece
+                            piece = max_b
+                    else:
+                        await self._sink.write_frame(pcm)
                     self._playing = False
                     self._reset()
                     return

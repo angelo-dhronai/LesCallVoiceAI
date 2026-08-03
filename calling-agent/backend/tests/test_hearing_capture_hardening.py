@@ -64,6 +64,10 @@ def test_batch_flush_drains_queues_without_stream_hooks():
         _tts_queue=asyncio.Queue(),
         _stt_queue=asyncio.Queue(),
         _transcript_queue=asyncio.Queue(),
+        # Batch STT prefetch (3f36209): the flush also cancels prefetched
+        # transcription tasks — part of the batch path, not a stream hook.
+        _stt_ready_queue=asyncio.Queue(),
+        _stt_inflight=0,
     )
     ns._tts_queue.put_nowait("stale")
     ns._transcript_queue.put_nowait("stale")

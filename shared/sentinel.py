@@ -19,6 +19,11 @@ Checks & remedies (cycle = SENTINEL_INTERVAL, default 30 s):
   disk          < DISK_ALERT_PCT used                     -> prune docker + old run logs
   memory        > MEM_MIN_MB available                    -> ALERT
   gcs           storage round-trip (hourly)               -> ALERT (re-auth needed)
+  voice         Sarvam STT/TTS health: live-call timeout/  -> ALERT + optional
+                latency scan every cycle + timed API        escalation call
+                probes (shared/voice_health.py — added       (see that module)
+                after the 2026-08-03 incident went
+                undetected by everything above)
 
 Safety rails:
   - Per-target restart cooldown (10 min) and cap (3/hour) — a genuinely broken
@@ -654,6 +659,11 @@ def run_cycle(state: State, cycle: int) -> dict:
     status["web"] = check_web(state, cycle)
     status["db_ok"] = check_db(state)
     status["live_state_ok"] = check_live_state(state)
+    try:
+        from shared import voice_health
+        status["voice"] = voice_health.check_voice(state, cycle, alert)
+    except Exception:
+        logger.exception("voice health check failed")
     if cycle % 10 == 0:          # every ~5 min
         status["workers_ok"] = check_workers(state)
         status["inbound"] = check_inbound_flow(state)

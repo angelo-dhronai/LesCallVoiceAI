@@ -336,6 +336,14 @@ MERGE_HOLD_CONTINUATION_MS = float(os.environ.get(
 # still on its way.
 MERGE_HOLD_MAX_TOTAL_S = float(os.environ.get(
     "MERGE_HOLD_MAX_TOTAL_S", "6.0"))
+# Stale-fragment suppression (post-deploy fleet 2026-08-03: double replies
+# 12→25 once the deafness fix started surfacing previously-lost tails). A
+# fragment whose speech BEGAN before our delivered reply started playing is
+# the tail of the turn we already answered — not a reaction to the reply.
+# Absorb it into the next turn's context instead of answering it again.
+# A barged (cut) reply never suppresses: the caller interrupted on purpose.
+STALE_FRAGMENT_SUPPRESS = os.environ.get(
+    "STALE_FRAGMENT_SUPPRESS", "true").lower() == "true"
 
 # Words a finished thought does not end on — dangling conjunctions,
 # postpositions and discourse connectors in the three call languages
@@ -2438,6 +2446,28 @@ class VoicePipeline:
             # branches can recognize it (a merged 'hello hello hello hello
             # hello' is >4 tokens and stops matching entirely).
             _hello_turn = self._bare_hello(transcript.text)
+
+            # Stale-fragment suppression: this speech BEGAN before the reply
+            # we have since fully delivered started playing — it is the tail
+            # of the turn that reply answered, not a reaction to it. Absorb
+            # into the accumulator (the next real turn carries it as context,
+            # slots included) and do not speak a second answer.
+            if (STALE_FRAGMENT_SUPPRESS and self._greeting_done
+                    and not _hello_turn and not _capture_active
+                    and transcript.speech_start_ts > 0.0
+                    and getattr(self, "_last_reply_tts_start", 0.0) > 0.0
+                    and transcript.speech_start_ts
+                    < self._last_reply_tts_start
+                    and getattr(self, "_last_reply_completed_clean", False)):
+                self._turn_accumulator = (
+                    (self._turn_accumulator + " " + transcript.text).strip())
+                logger.info(
+                    "[ENGINE] Stale fragment absorbed, not answered "
+                    "(spoke %.1fs before delivered reply): %r",
+                    self._last_reply_tts_start - transcript.speech_start_ts,
+                    transcript.text[:60])
+                continue
+
             if ENABLE_CONTINUATION_MERGE and self._greeting_done:
                 conv = self.conversation
                 if (hasattr(conv, "has_pending_turn") and conv.has_pending_turn()):
@@ -3032,6 +3062,11 @@ class VoicePipeline:
                     self._greeting_done = True
                     logger.info("[PIPELINE] Greeting complete — barge-in and STT fallback now active")
 
+                # Stale-fragment anchors: when this reply started playing and
+                # whether the caller let it finish (a cut reply must never
+                # suppress the interrupting speech).
+                self._last_reply_tts_start = self._tts_start_time
+                self._last_reply_completed_clean = not self._barge_in_occurred
                 if self._barge_in_occurred:
                     self._barge_in_occurred = False
                     # Accumulator intentionally kept: the next transcript will be

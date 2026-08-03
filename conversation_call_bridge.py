@@ -1619,7 +1619,20 @@ class TelephonySession:
                     if self.stats["first_transcript_t"] is None:
                         self.stats["first_transcript_t"] = time.time()
                         logger.info(f"[{self.conn_id}] First transcript received")
-                    audit_manager.add_event(self.conn_id, "Caller", event.get("text", ""))
+                    # Convert the pipeline's monotonic speech span to
+                    # recording-relative seconds (t=0 ≈ first pushed frame)
+                    # so the transcript carries exact caller-audio offsets.
+                    span = None
+                    sst = event.get("speech_start_mono") or 0.0
+                    sen = event.get("speech_end_mono") or 0.0
+                    fa = self.stats.get("first_audio_t")
+                    if sst > 0.0 and sen > sst and fa:
+                        _nm, _nw = time.monotonic(), time.time()
+                        span = (max(0.0, _nw - (_nm - sst) - fa),
+                                max(0.0, _nw - (_nm - sen) - fa))
+                    audit_manager.add_event(self.conn_id, "Caller",
+                                            event.get("text", ""),
+                                            span=span)
                     self.transcript_tail.append({"speaker": "Caller", "text": event.get("text", "")})
                 elif etype == "agent":
                     audit_manager.add_event(self.conn_id, "Agent", event.get("text", ""))

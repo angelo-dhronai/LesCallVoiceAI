@@ -107,14 +107,21 @@ class CallAuditSession:
         except asyncio.QueueFull:
             pass  # Drop oldest-equivalent: just skip this frame
 
-    def add_event(self, speaker: str, text: str) -> None:
-        """Record a transcript entry (caller or agent) with elapsed timestamp."""
+    def add_event(self, speaker: str, text: str,
+                  span: "tuple[float, float] | None" = None) -> None:
+        """Record a transcript entry (caller or agent) with elapsed timestamp.
+
+        span: exact (start_s, end_s) of this speech within caller_audio.wav
+        (live VAD boundaries) — makes the recording a self-documenting
+        corpus segment; absent = legacy format, fully compatible."""
         if not text:
             return
         elapsed = time.time() - self._start_time
         minutes = int(elapsed // 60)
         seconds = elapsed % 60
         timestamp_str = f"[{minutes:02d}:{seconds:06.3f}]"
+        if span is not None:
+            timestamp_str += f" [spoke {span[0]:.2f}-{span[1]:.2f}s]"
         entry = f"{timestamp_str}\n{speaker}: {text}\n\n"
         try:
             self._txt_file.write(entry)
@@ -237,12 +244,13 @@ class CallAuditManager:
         if session is not None:
             session.push_audio(pcm_bytes)
 
-    def add_event(self, call_id: str, speaker: str, text: str) -> None:
+    def add_event(self, call_id: str, speaker: str, text: str,
+                  span: "tuple[float, float] | None" = None) -> None:
         if not ENABLE_CALL_AUDIT:
             return
         session = self._sessions.get(call_id)
         if session is not None:
-            session.add_event(speaker, text)
+            session.add_event(speaker, text, span=span)
 
     async def close(
         self,

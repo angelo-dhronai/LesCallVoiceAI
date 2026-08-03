@@ -1894,6 +1894,12 @@ class VoicePipeline:
                         "type": "user",
                         "text": transcript_text.strip(),
                         "stt_latency_ms": round(stt_latency),
+                        # Exact live VAD boundaries (monotonic) — the bridge
+                        # converts to recording-relative time so the audit
+                        # transcript self-documents each turn's audio span
+                        # (corpus cutting + ASR-bench alignment).
+                        "speech_start_mono": segment.speech_start_ts,
+                        "speech_end_mono": segment.speech_end_ts,
                     })
 
                 transcript = Transcript(

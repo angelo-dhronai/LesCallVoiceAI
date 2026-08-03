@@ -3,6 +3,7 @@ import {
   MessagesSquare, BrainCircuit, Microscope, PhoneOutgoing,
   Boxes, CalendarClock, FileText, LayoutDashboard,
   MessageCircle, PhoneForwarded, Settings as SettingsIcon, BookUser,
+  CreditCard,
 } from 'lucide-react'
 
 // Every user sees the same navigation — roles are flattened; there is no
@@ -60,6 +61,9 @@ export const NAV: NavGroup[] = [
   },
   {
     title: 'Account',
-    items: [{ to: '/settings', label: 'Settings', icon: SettingsIcon }],
+    items: [
+      { to: '/billing', label: 'Billing', icon: CreditCard },
+      { to: '/settings', label: 'Settings', icon: SettingsIcon },
+    ],
   },
 ]

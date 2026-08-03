@@ -3,9 +3,9 @@ import { Link } from 'react-router-dom'
 import { Check, Copy, Download, FileAudio, Link2, RefreshCw, SearchX, Sparkles } from 'lucide-react'
 import { useGet, useRefresh } from '../api/hooks/useApi'
 import { Badge, Button, Card, EmptyState, IconButton, Spinner, cx } from '../components/ui'
-import { PageHeader, Table, THead, TH, TR, TD, Pagination, SearchInput, AsyncState } from '../components/kit'
+import { PageHeader, Table, THead, TH, TR, TD, Pagination, SearchInput, AsyncState, ContactLabel } from '../components/kit'
 import { AudioPlayer } from '../components/AudioPlayer'
-import { useDebounced, useUrlNumber, useUrlParam } from '../lib/hooks'
+import { useDebounced, useUrlNumber, useUrlParam, useUrlPatch } from '../lib/hooks'
 
 /** The shared Button skin (ghost · sm · rounded-md) as a class string, for the
  *  two link-shaped actions below — ui.Button only renders a <button>, but a
@@ -17,6 +17,8 @@ type Recording = {
   folder: string
   call_id: string | null
   caller: string
+  /** Saved phone-book name for `caller`, resolved server-side ('' if unknown). */
+  contact_name?: string
   folder_dt: string
   /** Public tokenized download link (unguessable, shareable without login). */
   download_url?: string | null
@@ -55,16 +57,18 @@ export default function Recordings() {
   // Search + page live in the URL — deep links like /recordings?q=<call id>
   // (from Activity's cross-link) land directly on the filtered view.
   const [page, setPage] = useUrlNumber('page', 1)
-  const [search, setSearch] = useUrlParam('q')
+  const [search] = useUrlParam('q')
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const copyTimer = useRef<number | null>(null)
   const refresh = useRefresh()
 
   // Debounce keystrokes so the query (and the table) doesn't churn per character.
   const debounced = useDebounced(search, 300)
-  // Typing a new search resets the page inside the change handler (not an
-  // effect) so URL deep links with an explicit page survive the mount.
-  const changeSearch = (v: string) => { setSearch(v); setPage(1) }
+  // ONE navigation for both params. As two calls (setSearch then setPage) the
+  // page reset recomputed the URL from pre-update state and dropped the letter
+  // just typed — the box looked like it refused input.
+  const patch = useUrlPatch()
+  const changeSearch = (v: string) => patch({ q: v, page: null })
 
   useEffect(() => () => {
     if (copyTimer.current) window.clearTimeout(copyTimer.current)
@@ -163,7 +167,7 @@ export default function Recordings() {
                     const d = parseDate(r?.folder_dt)
                     return (
                       <TR key={folder || r?.call_id || Math.random()} className="group">
-                        <TD className="font-medium text-[var(--text)]">{r?.caller || '—'}</TD>
+                        <TD><ContactLabel name={r?.contact_name} phone={r?.caller} /></TD>
                         <TD className="whitespace-nowrap tabular-nums" title={d ? d.toLocaleString() : undefined}>
                           {d ? (
                             <>

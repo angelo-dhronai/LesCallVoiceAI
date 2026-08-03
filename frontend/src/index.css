@@ -41,6 +41,28 @@
   --spotlight: rgba(0, 245, 160, 0.055);
 }
 
+/**
+ * Shell geometry — where the app chrome ends and the content region begins.
+ * Overlays that should sit *inside* the shell (keeping the sidebar and topbar
+ * visible and clickable) inset themselves by these instead of hardcoding the
+ * numbers, so collapsing the sidebar moves them automatically.
+ *
+ *   --shell-nav-w    left edge of the content region (0 on mobile: the sidebar
+ *                    is an overlay drawer there, not a reserved column)
+ *   --shell-top-h    height of the sticky topbar (h-14)
+ *
+ * Mirrors AppShell's lg:pl-[260px] / lg:pl-[92px]; `data-nav` is stamped on
+ * <html> by AppShell.
+ */
+:root {
+  --shell-nav-w: 0px;
+  --shell-top-h: 3.5rem;
+}
+@media (min-width: 1024px) {
+  :root { --shell-nav-w: 260px; }
+  :root[data-nav="collapsed"] { --shell-nav-w: 92px; }
+}
+
 * { border-color: var(--border); }
 
 /* Keyboard users get a visible ring everywhere; mouse clicks stay clean. */

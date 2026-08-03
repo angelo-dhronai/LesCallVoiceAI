@@ -87,6 +87,31 @@ MIGRATIONS: list[str] = [
     # that talked to the contact); editable via the hub API. Cross-owner
     # sharing lives in contact_grants (versioned migration 0006).
     "ALTER TABLE contacts ADD COLUMN primary_agent_slug TEXT",
+    # Billing (deploy/PLAN-razorpay-subscriptions.md §4.2). These two touch
+    # PRE-EXISTING tables, so they belong here rather than in migration 0013 —
+    # versioned migrations and this boot list have no ordering relationship.
+    #
+    # agents.archived_at: DELETE /api/agents/{name} moves the folder to
+    # _archived/ but leaves the agents row owned, so a naive COUNT(*) counts
+    # dead agents against the tenant's plan cap forever. Every cap check and
+    # every usage display filters archived_at IS NULL.
+    "ALTER TABLE agents ADD COLUMN archived_at TIMESTAMP",
+    # usage_ledger.entitlement_check: 'ok' | 'error' | 'unattributed'. The
+    # inbound gate fails OPEN on a DB error (a live call must not drop because
+    # Postgres hiccupped), so the minutes it lets through have to be
+    # identifiable afterwards rather than silently indistinguishable from
+    # properly admitted usage.
+    "ALTER TABLE usage_ledger ADD COLUMN entitlement_check TEXT",
+    # answer_state: how the connected call actually went, as opposed to whether
+    # the leg connected. 'answered' = a real two-way conversation happened;
+    # 'empty' = the callee picked up but never really spoke (silence, noise
+    # only, a voicemail greeting, or an instant hang-up). The dial result alone
+    # cannot tell these apart — FreeSWITCH reports +OK for all of them — so it
+    # is computed at teardown from the transcript. NULL on every pre-existing
+    # row and on any call the detector could not classify; readers must treat
+    # NULL as 'answered'.
+    "ALTER TABLE calls ADD COLUMN answer_state TEXT",
+    "ALTER TABLE calls ADD COLUMN answer_state_reason TEXT",
 ]
 
 # Follow-up statements run ONLY on the migration run that actually added the

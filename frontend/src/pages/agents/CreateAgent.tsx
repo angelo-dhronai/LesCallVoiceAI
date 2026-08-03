@@ -110,6 +110,8 @@ export default function CreateAgent() {
   const [r, setR] = useState<Routing>({ did: '', caller_id_prefixes: [], fallback_agent: '', time_windows: [] })
   const [win, setWin] = useState<TimeWindowDraft>({ start: '', end: '' })
   const [saving, setSaving] = useState(false)
+  /** Set when the server refuses the create with a 402 plan-cap refusal. */
+  const [capRefusal, setCapRefusal] = useState('')
   const [extracting, setExtracting] = useState(false)
   const [extractingName, setExtractingName] = useState('')
   const [dragging, setDragging] = useState(false)
@@ -279,7 +281,15 @@ export default function CreateAgent() {
       createdRef.current = true
       nav(`/build/agents/${slug}`)
     } catch (e: any) {
-      toast(`Create failed: ${e.message || e}`, 'error')
+      // A plan-cap refusal is a 402 carrying `code` and `reason`. Toasting it
+      // as "Create failed: 402 …" reads as a server fault and invites a retry
+      // that cannot succeed — say what the limit is and where to change it.
+      if (e?.status === 402) {
+        setCapRefusal(e.reason || e.message || 'Your plan does not allow another agent.')
+        toast(e.reason || 'Agent limit reached', 'error')
+      } else {
+        toast(`Create failed: ${e.message || e}`, 'error')
+      }
       setStep(STEPS.length - 1)
     } finally {
       setSaving(false)
@@ -306,6 +316,26 @@ export default function CreateAgent() {
   return (
     <div className="space-y-6">
       <PageHeader title="Create Agent" sub="Define a new voice agent step by step" />
+
+      {capRefusal && (
+        <Card className="border-amber-300 bg-amber-50 p-4 dark:border-amber-900/60 dark:bg-amber-950/30">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+            <div>
+              <p className="text-sm font-semibold">Agent limit reached</p>
+              <p className="mt-1 text-sm text-soft">{capRefusal}</p>
+              <p className="mt-2 text-xs text-dim">
+                Nothing you have entered is lost — your existing agents keep
+                working, and archiving one frees a slot immediately.
+              </p>
+              <div className="mt-3 flex gap-2">
+                <a href="/billing"><Button variant="primary" size="sm">See plans</Button></a>
+                <a href="/build/agents"><Button variant="ghost" size="sm">Manage agents</Button></a>
+              </div>
+            </div>
+          </div>
+        </Card>
+      )}
 
       {/* Start from a document — also a drop target */}
       <div

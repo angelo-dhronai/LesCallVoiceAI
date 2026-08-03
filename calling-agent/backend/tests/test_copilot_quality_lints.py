@@ -58,6 +58,7 @@ MARK_FIRST_BEAT = "only the FIRST beat"
 MARK_NO_TIMES = "no times to offer"
 MARK_DEAD_END_RULES = "no way to act"
 MARK_TINY_CAP = "barely covers a greeting"
+MARK_NO_CLOSE_CONFIRM = "hang up on the first thing it hears"
 ALL_MARKS = (MARK_CALLER_PICKS, MARK_FIRST_BEAT, MARK_NO_TIMES,
              MARK_DEAD_END_RULES, MARK_TINY_CAP)
 
@@ -164,6 +165,33 @@ def test_lint_tiny_duration_cap(cop):
     assert _warned(cop, d, MARK_TINY_CAP)
     d["call_flow"]["termination"]["max_call_minutes"] = 10
     assert not _warned(cop, d, MARK_TINY_CAP)
+
+
+def test_lint_close_confirm_disabled(cop):
+    """Turning the misheard-goodbye guard off is a real risk — flag it.
+    Leaving it unset (the default, on) must stay silent."""
+    d = maya_shape()
+    assert not _warned(cop, d, MARK_NO_CLOSE_CONFIRM)
+    d["call_flow"]["termination"] = {"confirm_before_end": False}
+    assert _warned(cop, d, MARK_NO_CLOSE_CONFIRM)
+    d["call_flow"]["termination"]["confirm_before_end"] = True
+    assert not _warned(cop, d, MARK_NO_CLOSE_CONFIRM)
+
+
+def test_normalize_close_confirm_coerced_to_bool(cop):
+    notes: list[str] = []
+    d = maya_shape()
+    d["call_flow"]["termination"] = {"confirm_before_end": "no"}
+    out = cop._normalize_definition(d, notes)
+    assert out["call_flow"]["termination"]["confirm_before_end"] is True
+
+
+def test_system_prompt_teaches_close_confirm(cop):
+    """Copilot must know the confirm step exists platform-wide, so it never
+    writes it into prompt text or claims agents hang up instantly."""
+    p = cop._system_prompt()
+    assert "confirm_before_end" in p
+    assert "mishear" in p.lower()
 
 
 def test_normalize_termination_shapes(cop):

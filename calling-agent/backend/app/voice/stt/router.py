@@ -17,12 +17,17 @@ Key behaviours
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 import re
 import time
 import logging
 from collections import Counter
 from dataclasses import dataclass
+
+import httpx
+from openai import APITimeoutError
 
 from .base import STTProvider, STTResult  # noqa: F401 — re-exported for pipeline
 from .sarvam import SarvamSTT, SarvamRateLimitError
@@ -34,6 +39,30 @@ logger = logging.getLogger(__name__)
 
 MIN_TRANSCRIPT_LENGTH = 2
 MAX_RETRIES = 1
+# Hedged fallback (2026-08-03 Sarvam-hang incident). Healthy Sarvam answers
+# in 150-450ms; during the incident ~1-in-3 requests hung server-side while
+# the rest stayed fast. Once the primary has been silent this long, the
+# fallback provider starts IN PARALLEL and the first valid transcript wins —
+# a hung primary then costs hedge-delay + fallback latency (~2.5s) instead
+# of read-timeout + sequential fallback (4-10s). On the healthy path the
+# hedge never starts, so accuracy and spend are unchanged. 0 disables.
+STT_HEDGE_DELAY_S = float(os.environ.get("STT_HEDGE_DELAY_S", "1.0"))
+# Delayed parallel RETRY of the primary itself (2026-08-03): during the 08-03
+# Sarvam incident individual requests hung while an immediately-issued
+# duplicate succeeded in ~200ms — hangs are per-request, not per-service.
+# Racing a second primary attempt keeps the turn on the primary model's
+# transcript mid-incident instead of surrendering it to Whisper (whose text
+# is mishear-prone and never votes on language). Fires BEFORE the Whisper
+# hedge (0.6 < 1.0), so a rescued turn never involves Whisper. 0 disables.
+STT_PRIMARY_RETRY_HEDGE_S = float(
+    os.environ.get("STT_PRIMARY_RETRY_HEDGE_S", "0.6"))
+# When the hedge produces a valid transcript first, the primary gets this
+# much longer to land before the hedge takes the turn. A near-miss primary
+# (answering 100-300ms behind the hedge) then still decides the turn — its
+# transcript is more accurate, and its clean-empty verdict is the
+# anti-hallucination authority that discards Whisper noise-transcripts.
+# Against a genuine hang the grace expires and only adds 0.3s to the win.
+_HEDGE_PRIMARY_GRACE_S = 0.3
 # Threshold for the DERIVED confidence score (see _derive_confidence).
 # Sarvam's REST response has no confidence field, so for months every
 # transcript carried a fabricated 1.0 and this gate never fired once in
@@ -354,6 +383,12 @@ class STTRouter:
     * Sarvam raises a network/HTTP exception → try Whisper once.
     * Sarvam returns HTTP 429 → exponential backoff; route to Whisper during
       backoff window; reset on next successful Sarvam call.
+    * Sarvam silent past STT_HEDGE_DELAY_S → Whisper starts IN PARALLEL
+      (the hedge); a valid hedge transcript takes the turn once Sarvam has
+      also outlasted a short grace window. A Sarvam answer inside the grace
+      still decides the turn — including its clean-empty verdict, which
+      discards hedge text (anti-hallucination gate). A hedge that finishes
+      empty simply waits the primary out.
 
     This prevents the empty-transcript retry loop that exhausted both API
     quotas on every silent/noisy segment.
@@ -367,6 +402,7 @@ class STTRouter:
         max_retries: int = MAX_RETRIES,
         min_confidence: float = MIN_CONFIDENCE,
         stt_corrections: STTCorrections | None = None,
+        hedge_delay: float | None = None,
     ) -> None:
         self._primary = primary or SarvamSTT()
         self._fallback = fallback or OpenAIWhisperSTT()
@@ -374,6 +410,8 @@ class STTRouter:
         self._max_retries = max_retries
         self._min_confidence = min_confidence
         self._stt_corrections = stt_corrections
+        self._hedge_delay = (hedge_delay if hedge_delay is not None
+                             else STT_HEDGE_DELAY_S)
 
         # Rate-limit state (Sarvam HTTP 429 tracking)
         self._sarvam_rl_until: float = 0.0   # monotonic time when backoff expires
@@ -391,27 +429,13 @@ class STTRouter:
     # Public API
     # ------------------------------------------------------------------
 
-    def set_stream_language(self, code: str) -> None:
-        """A4a: forward a language pin to the streaming primary (no-op for
-        the plain HTTP provider — its language comes per request)."""
-        fn = getattr(self._primary, "set_language", None)
-        if callable(fn):
-            fn(code)
-
-    @property
-    def last_covered_seconds(self) -> float:
-        """H1: audio seconds the last streamed transcript actually covered
-        (0.0 for batch providers). A streamed finalize can legitimately span
-        several VAD chunks, so words-per-chunk plausibility must score
-        against this, not the local segment duration."""
-        return float(getattr(self._primary, "last_covered_seconds", 0.0) or 0.0)
-
     async def transcribe(
         self,
         audio_bytes: bytes,
         sample_rate: int = 16_000,
         language: str = "en",
         default_language: str | None = None,
+        fallback_hint: str | None = None,
     ) -> STTResult:
         """
         Transcribe one audio segment.
@@ -426,6 +450,14 @@ class STTRouter:
             transcript is rejected as unsupported-script. Ignored otherwise.
             The pipeline passes it from conversation state once a language has
             actually been established; None/"unknown" disables the retry.
+        fallback_hint : str | None
+            Establishment-aware Whisper hint from the pipeline. A language
+            code = hint Whisper with it (caller confirmed it); "" = force
+            auto-detect (conversation language is still just the agent's
+            default — an agent-default hint makes Whisper transliterate
+            Hindi callers into Latin junk, which then starves the script
+            evidence the language switcher needs). None = legacy resolution
+            below (direct callers/tests).
         """
         duration_ms = len(audio_bytes) / (sample_rate * 2) * 1000
         logger.info("[STT] Audio segment: %.0f ms, %d bytes", duration_ms, len(audio_bytes))
@@ -434,8 +466,11 @@ class STTRouter:
 
         # A4c: the Whisper fallback accepts an ISO-639 hint — the stabilized
         # conversation language stops "हाँजी?" coming back as ", angie?".
-        _fb_lang = self._resolve_script_retry_language(
-            language, default_language) or language
+        if fallback_hint is not None:
+            _fb_lang = fallback_hint or "unknown"
+        else:
+            _fb_lang = self._resolve_script_retry_language(
+                language, default_language) or language
 
         # ── Sarvam rate-limited: route directly to fallback ──────────────
         if now < self._sarvam_rl_until:
@@ -449,59 +484,191 @@ class STTRouter:
             )
             return STTResult(text=text, confidence=conf, source="fallback")
 
-        # ── Try primary (Sarvam) ─────────────────────────────────────────
+        # ── Try primary (Sarvam), hedged by the fallback ─────────────────
+        # Hedge race (see STT_HEDGE_DELAY_S): the primary runs as a task; if
+        # it stays silent past the hedge delay the fallback starts in
+        # parallel. A valid hedge transcript that lands while the primary is
+        # still hanging wins immediately. Every sequential-fallback branch
+        # below reuses the in-flight hedge instead of a fresh Whisper call.
+        primary_task = asyncio.create_task(self._primary_hedged(
+            audio_bytes, sample_rate, language))
+        hedge_task: asyncio.Task | None = None
+        hedge_result: tuple[str, float | None] | None = None
+
         try:
-            text, had_error, detected_lang, reject, conf = await self._try_provider(
-                self._primary, "primary", audio_bytes, sample_rate, language
-            )
-        except SarvamRateLimitError as exc:
-            # Apply exponential backoff; reset on the next successful call
-            self._apply_sarvam_backoff(exc)
-            text, _, _, _, conf = await self._try_provider(
-                self._fallback, "fallback", audio_bytes, sample_rate, _fb_lang
-            )
+            if self._hedge_delay > 0:
+                done, _ = await asyncio.wait(
+                    {primary_task}, timeout=self._hedge_delay)
+                if not done:
+                    logger.warning(
+                        "[STT] Primary silent for %.1fs — starting fallback "
+                        "hedge in parallel", self._hedge_delay)
+                    hedge_task = asyncio.create_task(self._try_provider(
+                        self._fallback, "hedge",
+                        audio_bytes, sample_rate, _fb_lang))
+                    done, _ = await asyncio.wait(
+                        {primary_task, hedge_task},
+                        return_when=asyncio.FIRST_COMPLETED)
+                    if hedge_task in done and not primary_task.done():
+                        hedge_result = self._hedge_result_of(hedge_task)
+                        if hedge_result[0]:
+                            # Grace: a primary landing within this window
+                            # still decides the turn (accuracy + the
+                            # clean-empty anti-hallucination verdict).
+                            done, _ = await asyncio.wait(
+                                {primary_task},
+                                timeout=_HEDGE_PRIMARY_GRACE_S)
+                            if not done:
+                                logger.info(
+                                    "[STT] Hedge won the race: %r "
+                                    "(primary still hanging — cancelled)",
+                                    hedge_result[0])
+                                return STTResult(text=hedge_result[0],
+                                                 confidence=hedge_result[1],
+                                                 source="fallback")
+                        else:
+                            # Hedge finished empty/errored — wait the
+                            # primary out.
+                            await asyncio.wait({primary_task})
+
+            try:
+                text, had_error, detected_lang, reject, conf = await primary_task
+            except SarvamRateLimitError as exc:
+                # Apply exponential backoff; reset on the next successful call
+                self._apply_sarvam_backoff(exc)
+                text, conf = await self._fallback_result(
+                    hedge_task, hedge_result, audio_bytes, sample_rate, _fb_lang)
+                return STTResult(text=text, confidence=conf, source="fallback")
+
+            if text:
+                # Successful Sarvam call → reset rate-limit strike counter
+                self._sarvam_rl_count = 0
+                logger.info("[STT] Primary succeeded: %r", text)
+                return STTResult(text=text, detected_language=detected_lang,
+                                 confidence=conf)
+
+            if not had_error:
+                # F16: Sarvam produced REAL text but in an unsupported script
+                # (e.g. genuine Hindi transcribed as Gurmukhi/pa-IN). The audio
+                # demonstrably contained speech — retry once with the language
+                # forced, then fall back to Whisper if that also fails.
+                if reject is not None and reject.reason == SCRIPT_REJECT_REASON:
+                    if hedge_task is not None:
+                        # A hedge is already in flight (the primary stalled
+                        # before answering): its transcript — Whisper WITH the
+                        # conversation-language hint — beats paying another
+                        # possibly-hanging Sarvam round-trip mid-incident.
+                        h_text, h_conf = await self._fallback_result(
+                            hedge_task, hedge_result,
+                            audio_bytes, sample_rate, _fb_lang)
+                        if h_text:
+                            logger.info(
+                                "[STT] Script-reject resolved by hedge: %r",
+                                h_text)
+                            return STTResult(text=h_text, confidence=h_conf,
+                                             source="fallback")
+                    return await self._recover_script_misdetection(
+                        reject, audio_bytes, sample_rate, language,
+                        default_language
+                    )
+
+                # Sarvam processed the audio cleanly but found no speech, or
+                # the transcript was noise/hallucination (any non-script
+                # rejection). Whisper would produce the same (empty or
+                # hallucinated) result — a still-running hedge is cancelled in
+                # the finally block and any parked hedge text is deliberately
+                # discarded (Sarvam's clean-empty is the anti-hallucination
+                # authority).
+                logger.info(
+                    "[STT] Primary returned no speech (clean empty) — "
+                    "skipping fallback"
+                )
+                return STTResult(text="")
+
+            # ── Primary had a genuine API/network error → fallback ───────
+            logger.info("[STT] Primary errored — routing to fallback provider")
+            text, conf = await self._fallback_result(
+                hedge_task, hedge_result, audio_bytes, sample_rate, _fb_lang)
+            if text:
+                logger.info("[STT] Fallback succeeded: %r", text)
+            else:
+                logger.warning(
+                    "[STT] Both providers failed — returning empty transcript")
             return STTResult(text=text, confidence=conf, source="fallback")
 
-        if text:
-            # Successful Sarvam call → reset rate-limit strike counter
-            self._sarvam_rl_count = 0
-            logger.info("[STT] Primary succeeded: %r", text)
-            return STTResult(text=text, detected_language=detected_lang,
-                             confidence=conf)
-
-        if not had_error:
-            # F16: Sarvam produced REAL text but in an unsupported script
-            # (e.g. genuine Hindi transcribed as Gurmukhi/pa-IN). The audio
-            # demonstrably contained speech — retry once with the language
-            # forced, then fall back to Whisper if that also fails.
-            if reject is not None and reject.reason == SCRIPT_REJECT_REASON:
-                return await self._recover_script_misdetection(
-                    reject, audio_bytes, sample_rate, language, default_language
-                )
-
-            # Sarvam processed the audio cleanly but found no speech, or the
-            # transcript was noise/hallucination (any non-script rejection).
-            # Whisper would produce the same (empty or hallucinated) result,
-            # so skip it entirely to avoid wasting quota.
-            logger.info(
-                "[STT] Primary returned no speech (clean empty) — skipping fallback"
-            )
-            return STTResult(text="")
-
-        # ── Primary had a genuine API/network error → try fallback ───────
-        logger.info("[STT] Primary errored — routing to fallback provider")
-        text, _, _, _, conf = await self._try_provider(
-            self._fallback, "fallback", audio_bytes, sample_rate, _fb_lang
-        )
-        if text:
-            logger.info("[STT] Fallback succeeded: %r", text)
-        else:
-            logger.warning("[STT] Both providers failed — returning empty transcript")
-        return STTResult(text=text, confidence=conf, source="fallback")
+        finally:
+            # Settle whatever is still outstanding: cancel losers, retrieve
+            # exceptions of finished-but-unconsumed tasks so asyncio never
+            # logs "exception was never retrieved".
+            for _t in (primary_task, hedge_task):
+                if _t is None:
+                    continue
+                if not _t.done():
+                    _t.cancel()
+                with contextlib.suppress(BaseException):
+                    await _t
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _primary_hedged(
+        self,
+        audio_bytes: bytes,
+        sample_rate: int,
+        language: str,
+    ) -> tuple[str, bool, str | None, _RejectedTranscript | None, float | None]:
+        """Primary attempt with a delayed parallel RETRY of the primary.
+
+        See STT_PRIMARY_RETRY_HEDGE_S. First leg to produce a usable
+        transcript OR a clean no-speech verdict decides; a leg that errors
+        waits the other leg out. Rate-limit errors only propagate when no
+        leg succeeds. From the caller's perspective this behaves exactly
+        like one _try_provider call.
+        """
+        t1 = asyncio.create_task(self._try_provider(
+            self._primary, "primary", audio_bytes, sample_rate, language))
+        if STT_PRIMARY_RETRY_HEDGE_S <= 0:
+            return await t1
+        done, _ = await asyncio.wait({t1}, timeout=STT_PRIMARY_RETRY_HEDGE_S)
+        if done:
+            return t1.result()
+        logger.warning(
+            "[STT] Primary silent for %.1fs — racing a second primary "
+            "attempt", STT_PRIMARY_RETRY_HEDGE_S)
+        t2 = asyncio.create_task(self._try_provider(
+            self._primary, "primary-race", audio_bytes, sample_rate, language))
+        pending: set[asyncio.Task] = {t1, t2}
+        last_result = None
+        last_error: BaseException | None = None
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    try:
+                        res = t.result()
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException as exc:
+                        last_error = exc
+                        continue
+                    last_result = res
+                    if res[0] or not res[1]:
+                        # Usable transcript, or the provider's clean
+                        # no-speech verdict (anti-hallucination authority).
+                        return res
+            if last_result is not None:
+                return last_result      # had_error leg — caller falls back
+            if last_error is not None:
+                raise last_error        # e.g. both legs rate-limited
+            return "", True, None, None, None
+        finally:
+            for t in (t1, t2):
+                if not t.done():
+                    t.cancel()
+                with contextlib.suppress(BaseException):
+                    await t
 
     def _apply_sarvam_backoff(self, exc: SarvamRateLimitError) -> None:
         """Record a 429 strike and open the exponential backoff window."""
@@ -518,6 +685,35 @@ class STTRouter:
             backoff,
             exc.retry_after,
         )
+
+    @staticmethod
+    def _hedge_result_of(task: "asyncio.Task") -> tuple[str, float | None]:
+        """(text, confidence) of a completed hedge task; errors become empty."""
+        try:
+            text, _, _, _, conf = task.result()
+            return text, conf
+        except BaseException as exc:  # CancelledError included — hedge is best-effort
+            logger.warning("[STT] Hedge fallback errored: %s", exc)
+            return "", None
+
+    async def _fallback_result(
+        self,
+        hedge_task: "asyncio.Task | None",
+        hedge_result: tuple[str, float | None] | None,
+        audio_bytes: bytes,
+        sample_rate: int,
+        language: str,
+    ) -> tuple[str, float | None]:
+        """Fallback transcript, reusing the in-flight hedge when one exists."""
+        if hedge_result is not None:
+            return hedge_result
+        if hedge_task is not None:
+            await asyncio.wait({hedge_task})
+            return self._hedge_result_of(hedge_task)
+        text, _, _, _, conf = await self._try_provider(
+            self._fallback, "fallback", audio_bytes, sample_rate, language
+        )
+        return text, conf
 
     @staticmethod
     def _resolve_script_retry_language(
@@ -722,8 +918,6 @@ class STTRouter:
                     confidence = self._derive_confidence(
                         processed, audio_bytes, sample_rate,
                         latency_ms, provider_conf,
-                        covered_seconds=float(getattr(
-                            provider, "last_covered_seconds", 0.0) or 0.0),
                     )
                     if confidence < self._min_confidence:
                         # Low-score turns are routed to a re-ask, not
@@ -757,6 +951,22 @@ class STTRouter:
             except SarvamRateLimitError:
                 raise
 
+            except (httpx.TimeoutException, APITimeoutError):
+                # A timeout means the provider is HUNG, not flaky (08-03
+                # incident pattern: individual requests stall server-side
+                # while parallel ones answer in 300ms). Retrying the hung
+                # provider burns another full read-timeout window while the
+                # caller waits in silence — route to the fallback provider
+                # immediately instead. APITimeoutError is the OpenAI SDK's
+                # wrapper for the same condition on the Whisper side.
+                logger.warning(
+                    "[STT] %s attempt %d/%d timed out — skipping remaining "
+                    "attempts, routing to fallback",
+                    label, attempt, self._max_retries + 1,
+                )
+                had_error = True
+                break
+
             except Exception as exc:
                 logger.warning(
                     "[STT] %s attempt %d/%d exception: %s",
@@ -779,7 +989,6 @@ class STTRouter:
         sample_rate: int,
         latency_ms: float,
         provider_confidence: float | None,
-        covered_seconds: float = 0.0,
     ) -> float:
         """Derived 0–1 confidence for a validated transcript.
 
@@ -797,19 +1006,12 @@ class STTRouter:
 
         A provider-reported confidence, when one ever exists, is the
         starting point instead of 1.0.
-
-        covered_seconds: how much audio the transcript ACTUALLY covers when
-        that exceeds the local segment — a streaming provider can return
-        text for speech the local pipeline dropped (barge-in stitch), and
-        scoring wps against the short local buffer falsely reads as
-        over-generation (observed live: 7 words / 464ms local → rejected).
         """
         score = (provider_confidence
                  if provider_confidence is not None else 1.0)
         words = len(text.split())
         duration_s = (len(audio_bytes) / (2.0 * sample_rate)
                       if sample_rate else 0.0)
-        duration_s = max(duration_s, covered_seconds)
         wps = words / duration_s if duration_s > 0.15 else 0.0
         if wps > 8.0:
             score *= 0.3

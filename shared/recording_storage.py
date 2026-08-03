@@ -16,9 +16,14 @@ GCS object when the local file is gone.
 Config (deploy/.pg_env — shared by lescall-runtime and lescall-dashboard):
     GCS_RECORDINGS_BUCKET=lescall-recordings     # empty → uploads disabled
     GCS_RECORDINGS_PREFIX=recordings
-    GOOGLE_APPLICATION_CREDENTIALS=/path/sa.json # or VM default credentials
     PUBLIC_BASE_URL=https://agent.lescall.com
     RECORDING_LOCAL_RETENTION_DAYS=3
+
+Google auth is the VM's attached service account, read from the metadata
+server — no key file, no user login, nothing that expires. Never set
+GOOGLE_APPLICATION_CREDENTIALS here: an explicit path outranks metadata ADC,
+which is how a stale user token silently stalled uploads for 17 days in July
+2026. See RUNBOOK §6b.
 
 CLI (catch-up sync + retention cleanup, cron/systemd-timer friendly):
     python -m shared.recording_storage --once

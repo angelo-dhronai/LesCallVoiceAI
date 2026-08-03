@@ -628,9 +628,16 @@ def check_gcs(state: State) -> bool:
     except Exception as exc:
         alert(state, "gcs-auth", "GCS access failing",
               f"{exc!r}\nRecording/log uploads are paused (local serving "
-              "still works). Likely fix: re-run gcloud auth "
-              "application-default login --impersonate-service-account="
-              "lescall-recsync@lescall.iam.gserviceaccount.com")
+              "still works, and nothing is deleted locally until it is "
+              "safely in the bucket). Auth is the VM's attached service "
+              "account via the metadata server — there is no key file and "
+              "no human session to renew, so this should NOT be a "
+              "re-login. Check, in order: (1) is "
+              "GOOGLE_APPLICATION_CREDENTIALS set anywhere (it overrides "
+              "metadata ADC — it must be unset), (2) does the attached SA "
+              "still hold roles/storage.objectAdmin on the bucket, (3) is "
+              "the instance still running with --scopes cloud-platform. "
+              "See RUNBOOK 6b.")
         return False
 
 

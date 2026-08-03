@@ -234,7 +234,7 @@ export function FollowupReview({ open, onClose }: Props) {
     && i.evidence.strength === 'inferred').length
 
   return (
-    <FullscreenModal open={open} onClose={onClose}
+    <FullscreenModal open={open} onClose={onClose} scope="shell"
       title="Review follow-up calls"
       headerExtra={
         <div className="flex items-center gap-3">

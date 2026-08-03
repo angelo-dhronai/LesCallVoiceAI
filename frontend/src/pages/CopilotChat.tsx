@@ -13,7 +13,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sh
 import { TryAgentDialog } from '../components/TryAgent'
 import { ActivateAgentModal, type ActivateTarget } from '../components/ActivateAgent'
 import {
-  Sparkles, SendHorizontal, RotateCcw, Check, X, ArrowDown,
+  Sparkles, SendHorizontal, RotateCcw, Check, X, ArrowDown, Info,
   Plus, Pencil, Radio, Bot, Trash2, MessagesSquare, SquarePen, Lightbulb,
   Paperclip, FileText, ClipboardList, Eye, EyeOff, PlayCircle, Volume2,
 } from 'lucide-react'
@@ -197,68 +197,64 @@ function CopilotAvatar() {
    The shared CopilotAction type doesn't model it, so widen locally. */
 type ActionWithAgent = CopilotAction & { agent?: string }
 
-function ActionChips({ actions }: { actions?: CopilotAction[] }) {
+function ActionChips({ actions, summary, agentLinks }: {
+  actions?: CopilotAction[]; summary?: string; agentLinks?: string[]
+}) {
   const [trying, setTrying] = useState<string | null>(null)
   const [activating, setActivating] = useState<ActivateTarget | null>(null)
-  // Failed chips carry the full refusal/error text but render one line —
-  // click toggles the full message so "Refused: the user has not…" is
-  // actually readable (a real support complaint, 2026-07-24).
-  const [expanded, setExpanded] = useState<Set<number>>(new Set())
   // The agent list is already loaded for the sidebar; it carries call_direction,
   // which decides whether activating binds the inbound or the outbound slot.
   const { data: agentsData } = useGet<{ agents?: { name: string; agent_name?: string; call_direction?: string }[] }>(
     ['agents'], '/agents')
   if (!actions?.length) return null
-  const agents = [...new Set(
+  // The server sends agent_links = agents that EXIST on disk (a draft still
+  // being interviewed is not tryable — dead "Try …" buttons, 2026-08-01).
+  // Deriving from raw actions is only a fallback for responses that predate
+  // the field.
+  const agents = agentLinks ?? [...new Set(
     (actions as ActionWithAgent[]).map((a) => (a.agent || '').trim()).filter(Boolean),
   )]
+  // One plain-English line replaces the old per-tool chip list — the raw
+  // tool names and error internals confused non-technical users (support
+  // complaint, 2026-08-01). The server writes the line; tool detail stays
+  // in `actions` for the quick-action buttons below.
+  const allOk = actions.every((a) => a.ok)
   return (
     <div className="mt-2">
-      <span className="eyebrow text-2xs">Actions taken</span>
-      <div className="mt-1 flex flex-wrap gap-1.5">
-        {actions.map((a, i) => (
-          <button
-            key={i}
-            type="button"
-            className="inline-flex max-w-full text-left"
-            title={a.ok ? a.tool : a.summary}
-            onClick={() => setExpanded((s) => {
-              const n = new Set(s)
-              n.has(i) ? n.delete(i) : n.add(i)
-              return n
-            })}
-          >
-            <Badge tone={a.ok ? 'mint' : 'rose'}>
-              {a.ok ? <Check size={11} /> : <X size={11} />}
-              <code className="font-mono text-2xs opacity-70">{a.tool}</code>
-              <span className={expanded.has(i)
-                ? 'whitespace-normal break-words'
-                : 'truncate'}>{a.summary}</span>
-            </Badge>
-          </button>
-        ))}
-      </div>
+      {summary && (
+        <p className="flex items-start gap-1.5 text-xs text-dim">
+          {allOk
+            ? <Check size={13} className="mt-px shrink-0 text-mint-500" />
+            : <Info size={13} className="mt-px shrink-0 text-amber-500" />}
+          <span>{summary}</span>
+        </p>
+      )}
       {/* Per-agent quick actions — the copilot just changed this agent, so the
           next thing you want is to hear it, not to go hunting for it. "Try it"
           runs a real engine turn in text before anyone dials the number. */}
       {agents.length > 0 && (
         <div className="mt-1.5 flex flex-wrap gap-1.5">
-          {agents.map((slug) => (
+          {agents.map((slug) => {
+            // Buttons say the agent's spoken name, not the internal slug —
+            // "Try Vishal", never "Try pramukh_agent".
+            const meta = (agentsData?.agents ?? []).find((x) => x.name === slug)
+            const disp = meta?.agent_name || slug
+            return (
             <span key={slug} className="inline-flex flex-wrap gap-1.5">
               <button type="button" onClick={() => setTrying(slug)}
                 className="inline-flex max-w-full rounded-full"
-                title={`Try ${slug} — one live engine turn, in text`}>
+                title={`Try ${disp} — one live engine turn, in text`}>
                 <Badge tone="mint">
-                  <PlayCircle size={11} /> <span className="truncate">Try {slug}</span>
+                  <PlayCircle size={11} /> <span className="truncate">Try {disp}</span>
                 </Badge>
               </button>
               <Link
                 to={`/build/agents/${slug}`}
                 className="inline-flex max-w-full rounded-full"
-                title={`Open ${slug} in the agent editor`}
+                title={`Open ${disp} in the agent editor`}
               >
                 <Badge tone="indigo">
-                  <Pencil size={11} /> <span className="truncate">Open {slug} in editor</span>
+                  <Pencil size={11} /> <span className="truncate">Open {disp} in editor</span>
                 </Badge>
               </Link>
               {/* Same modal the Agents panel uses — an agent is only real once
@@ -266,18 +262,18 @@ function ActionChips({ actions }: { actions?: CopilotAction[] }) {
                   navigation away. */}
               <button type="button"
                 onClick={() => {
-                  const a = (agentsData?.agents ?? []).find((x) => x.name === slug)
-                  setActivating({ slug, title: a?.agent_name || slug,
-                    direction: a?.call_direction })
+                  setActivating({ slug, title: disp,
+                    direction: meta?.call_direction })
                 }}
                 className="inline-flex max-w-full rounded-full"
-                title={`Put ${slug} on one of your numbers`}>
+                title={`Put ${disp} on one of your numbers`}>
                 <Badge tone="amber">
-                  <Radio size={11} /> <span className="truncate">Activate {slug}</span>
+                  <Radio size={11} /> <span className="truncate">Activate {disp}</span>
                 </Badge>
               </button>
             </span>
-          ))}
+            )
+          })}
         </div>
       )}
       <TryAgentDialog slug={trying ?? ''} open={!!trying}
@@ -384,7 +380,8 @@ function Bubble({ msg, onRetry }: { msg: ChatMsg; onRetry?: () => void }) {
           </div>
         )}
         <VoicePreviewRow samples={msg.voice_samples} />
-        <ActionChips actions={msg.actions} />
+        <ActionChips actions={msg.actions} summary={msg.actions_summary}
+          agentLinks={msg.agent_links} />
       </div>
     </div>
   )
@@ -757,7 +754,7 @@ export default function CopilotChat() {
         localStorage.setItem(SID_KEY, realSid)
         setSid(realSid)
       }
-      setMessages((m) => [...m, { role: 'assistant', content: res.reply, actions: res.actions, voice_samples: res.voice_samples }])
+      setMessages((m) => [...m, { role: 'assistant', content: res.reply, actions: res.actions, actions_summary: res.actions_summary, agent_links: res.agent_links, voice_samples: res.voice_samples }])
       setInterview(res.interview ?? null)
       setPendingChanges(res.pending_changes ?? [])
       if (res.agents_changed) refresh(['agents'])

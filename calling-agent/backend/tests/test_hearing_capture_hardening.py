@@ -7,11 +7,15 @@ dropped as "stale"), and the email capture armed five turns after the ask,
 fought the LLM for ownership, then discarded the confirmed address at
 call end. Full diagnosis: deploy/PLAN-call-hearing-and-capture-hardening.md.
 
-Covers Part H (hearing: covered-seconds plausibility, barge keep-audio,
-late-segment stash, continuation hold, हेलो allowlist, condensed watchdog
-replay) and Part C (ask-time arming, engine-owned readbacks, token-based
-bare confirm with read-back context, capture-scoped extraction hygiene,
-script-aware echo guard, answer-slot overwrite).
+Covers Part H (hearing: continuation hold, हेलो allowlist, condensed
+watchdog replay) and Part C (ask-time arming, engine-owned readbacks,
+token-based bare confirm with read-back context, capture-scoped extraction
+hygiene, script-aware echo guard, answer-slot overwrite).
+
+The streaming-only half of Part H (H1 covered-seconds plausibility, H2
+barge keep-audio, H3 late-segment stash, H4 consumed-episode empties) was
+removed on 2026-07-31 together with the WebSocket STT provider it
+mitigated — see RUNBOOK §24.
 """
 
 from __future__ import annotations
@@ -46,87 +50,30 @@ def email_router(**extra_slots):
 
 # ── H: hearing ──────────────────────────────────────────────────────────────
 
-def test_router_exposes_covered_seconds():
-    from app.voice.stt.router import STTRouter
-
-    class Streamy:
-        last_covered_seconds = 4.5
-
-        async def transcribe(self, *a, **k):  # pragma: no cover
-            raise AssertionError
-
-    class Batchy:
-        async def transcribe(self, *a, **k):  # pragma: no cover
-            raise AssertionError
-
-    assert STTRouter(primary=Streamy(),
-                     fallback=Batchy()).last_covered_seconds == 4.5
-    assert STTRouter(primary=Batchy(),
-                     fallback=Batchy()).last_covered_seconds == 0.0
-
-
-def test_barge_flush_keeps_stream_audio(monkeypatch):
-    """H2: the barge-in queue flush must not invalidate fed caller audio
-    (the generation bump discarded 'cleaning and helping…' live)."""
+def test_batch_flush_drains_queues_without_stream_hooks():
+    """The barge-in queue flush drains the three pipeline queues and bumps
+    the delivery epoch. H1-H4 (covered-seconds plausibility, barge
+    keep-audio, late-segment stash, consumed-episode empties) were
+    streaming-only mitigations and were removed with the streaming
+    provider on 2026-07-31 — this pins that the flush no longer reaches
+    for any stream handle."""
     import app.voice.pipeline as pl
 
-    calls = []
+    ns = types.SimpleNamespace(
+        _delivery_epoch=0,
+        _tts_queue=asyncio.Queue(),
+        _stt_queue=asyncio.Queue(),
+        _transcript_queue=asyncio.Queue(),
+    )
+    ns._tts_queue.put_nowait("stale")
+    ns._transcript_queue.put_nowait("stale")
+    ns._flush_pipeline_queues = types.MethodType(
+        pl.VoicePipeline._flush_pipeline_queues, ns)
 
-    def _mk():
-        ns = types.SimpleNamespace(
-            _delivery_epoch=0,
-            _tts_queue=asyncio.Queue(),
-            _stt_queue=asyncio.Queue(),
-            _transcript_queue=asyncio.Queue(),
-            _streaming_stt=types.SimpleNamespace(
-                reset_turn=lambda: calls.append(1)),
-        )
-        ns._flush_pipeline_queues = types.MethodType(
-            pl.VoicePipeline._flush_pipeline_queues, ns)
-        return ns
+    ns._flush_pipeline_queues()
 
-    _mk()._flush_pipeline_queues()
-    assert calls == []          # default: audio kept
-    monkeypatch.setattr(pl, "BARGE_KEEP_STREAM_AUDIO", False)
-    _mk()._flush_pipeline_queues()
-    assert calls == [1]         # legacy rollback path still works
-
-
-def test_late_segment_stash_serves_next_finalize():
-    """H3: a segment draining after its finalize is stashed, and the next
-    finalize returns it instantly instead of timing out empty."""
-    from app.voice.stt.sarvam_stream import SarvamStreamingSTT
-
-    s = SarvamStreamingSTT(api_key="test")
-    s._late_segment = (time.monotonic(), "अभी तो दिक्कत नहीं है")
-    s._fed_since_finalize = False
-    text, _ = asyncio.run(s._finalize())
-    assert text == "अभी तो दिक्कत नहीं है"
-    assert s._late_segment is None
-
-
-def test_late_segment_stash_expires():
-    from app.voice.stt.sarvam_stream import SarvamStreamingSTT
-
-    s = SarvamStreamingSTT(api_key="test")
-    s._late_segment = (time.monotonic() - 5.0, "stale text")
-    s._fed_since_finalize = False
-
-    async def _boom():
-        raise RuntimeError("no network in tests")
-    s._ensure_connected = _boom
-    with pytest.raises(RuntimeError):
-        asyncio.run(s._finalize())
-    assert s._late_segment is None   # expired stash consumed, not returned
-
-
-def test_reset_turn_clears_stash():
-    from app.voice.stt.sarvam_stream import SarvamStreamingSTT
-
-    s = SarvamStreamingSTT(api_key="test")
-    s._late_segment = (time.monotonic(), "dropped turn tail")
-    s.reset_turn()
-    assert s._late_segment is None
+    assert ns._delivery_epoch == 1
+    assert ns._tts_queue.empty() and ns._transcript_queue.empty()
 
 
 @pytest.mark.parametrize("text,held", [

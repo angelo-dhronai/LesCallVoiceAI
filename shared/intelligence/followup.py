@@ -261,6 +261,23 @@ def decide(call: dict[str, Any], judgment: dict[str, Any],
     }
 
 
+def _autocall_entitled(owner: str) -> bool:
+    """E8 — does this tenant's plan include automated follow-up calls?
+
+    Fails OPEN: a billing outage must not silently downgrade every follow-up
+    in the platform to manual, which would be an invisible loss of a paid
+    feature. E3 re-checks at dial time, where refusing is cheap and visible.
+    """
+    if not owner:
+        return False
+    try:
+        from shared.billing.entitlements import autocall_allowed
+        return autocall_allowed(owner)
+    except Exception as exc:
+        log.warning("[followup] autocall entitlement check unavailable: %r", exc)
+        return True
+
+
 def _agent_auto_execute(agent_slug: str | None) -> bool:
     """Whether this agent's follow-ups are auto-dialled.
 
@@ -440,8 +457,14 @@ async def stage_followup(call: dict[str, Any]) -> None:
         )
         # mode: 'auto' only when the agent's YAML opts in AND the decision is
         # an actionable yes — a human toggle on the row can override later.
+        # E8: and only when the tenant's PLAN includes automated follow-up
+        # calls. Staging a row as 'auto' on a plan without the capability would
+        # queue work the dialer must then refuse one row at a time; stamping it
+        # 'manual' up front is the honest state. E3 remains the safety net for
+        # rows staged before a downgrade.
         mode = ("auto" if row["decision"] == "yes"
-                and _agent_auto_execute(call.get("agent_slug")) else "manual")
+                and _agent_auto_execute(call.get("agent_slug"))
+                and _autocall_entitled(call.get("owner") or "") else "manual")
         db.execute(
             """INSERT INTO followups
                    (owner, call_id, contact_id, commitment_id, decision, confidence,

@@ -146,6 +146,17 @@ try:
 except Exception as _ab_exc:  # pragma: no cover - never take down the dashboard
     logging.getLogger("dashboard").error("Agent Builder API NOT mounted: %r", _ab_exc)
 
+# Agent sharing — a link that lets another account IMPORT an independent copy.
+# Separate router from the builder on purpose: the builder's tenancy dependency
+# 404s any agent the caller does not own, which is exactly who reads a share
+# link. See dashboard/agent_share_api.py.
+try:
+    from agent_share_api import router as agent_share_router
+    app.include_router(agent_share_router)
+    logging.getLogger("dashboard").info("Agent Share API mounted")
+except Exception as _sh_exc:  # pragma: no cover - never take down the dashboard
+    logging.getLogger("dashboard").error("Agent Share API NOT mounted: %r", _sh_exc)
+
 # Agent Copilot — conversational agent builder (ChatGPT-style dashboard homepage).
 # Interviews the user, then writes agents through the same Agent Builder plumbing.
 try:
@@ -165,8 +176,29 @@ try:
     # every route except /login, /auth/*, /static/* requires a session.
     _auth_module.install_login_gate(app)
     logging.getLogger("dashboard").info("Auth API + login gate mounted")
+except SystemExit:
+    raise
 except Exception as _auth_exc:  # pragma: no cover - never take down the dashboard
     logging.getLogger("dashboard").error("Auth API NOT mounted: %r", _auth_exc)
+
+# Fail-closed boot assertion (P-1). Deliberately OUTSIDE the try/except above:
+# "auth failed to mount" must not degrade to "auth is off". If the login wall
+# cannot be configured, this process must not serve traffic at all.
+import auth as _auth_assert  # noqa: E402
+_auth_assert.assert_auth_configured()
+
+# Billing / subscriptions (deploy/PLAN-razorpay-subscriptions.md). Mounted with
+# an explicit success line: the try/except pattern above is convenient for
+# optional surfaces but a billing router that vanishes silently means quotas
+# stop being enforceable while everything still looks healthy.
+try:
+    from billing_api import router as billing_router
+    app.include_router(billing_router)
+    logging.getLogger("dashboard").info("Billing API mounted")
+except Exception as _bill_exc:  # pragma: no cover
+    logging.getLogger("dashboard").error(
+        "BILLING API NOT MOUNTED (checkout, webhook and receipts are DOWN): %r",
+        _bill_exc, exc_info=True)
 
 # BYON telephony control plane (trunks/DIDs -> FreeSWITCH config + Kamailio
 # ACL), owner-scoped. See docs/MULTITENANT_BYON_PLAN.md §3b.
@@ -783,6 +815,52 @@ def _scan_recordings(limit: int = 500) -> list[dict]:
     return records
 
 
+_contact_name_cache: dict[str, tuple[float, dict]] = {}
+_CONTACT_NAME_TTL = 30.0
+
+
+def _contact_name_map(owner: str) -> dict:
+    """{significant digits -> saved contact name} for one tenant.
+
+    Keyed on the last 10 significant digits, the same key the contacts unique
+    index uses, so "+9198…", "098…" and "98…" all resolve to the same person.
+    Short-cached: this is called per list request, and a phone book changes far
+    more slowly than it is rendered.
+    """
+    now = time.monotonic()
+    hit = _contact_name_cache.get(owner)
+    if hit and (now - hit[0]) < _CONTACT_NAME_TTL:
+        return hit[1]
+    out: dict[str, str] = {}
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            for r in db.execute(
+                    "SELECT sig_digits, name FROM contacts "
+                    " WHERE owner=? AND name IS NOT NULL AND name <> ''",
+                    (owner,)).fetchall():
+                row = dict(r)
+                sig = (row.get("sig_digits") or "").strip()
+                if sig:
+                    out[sig] = row["name"]
+    except Exception as exc:
+        logger.warning("contact name map failed for %s: %r", owner, exc)
+    _contact_name_cache[owner] = (now, out)
+    return out
+
+
+def _name_for_phone(phone: str, names: dict) -> str:
+    """Saved contact name for a raw phone string, or '' when it is not in the
+    tenant's phone book."""
+    if not phone:
+        return ""
+    try:
+        from shared.phone import significant_digits
+        return names.get(significant_digits(phone) or "", "")
+    except Exception:
+        return ""
+
+
 def _is_recording_complete(folder: str) -> bool:
     """metadata.json is written exactly once, in CallAuditSession.close() —
     its presence is the signal a call is fully wrapped up and safe to read."""
@@ -1254,7 +1332,21 @@ async def runtime_output_stream(request: Request) -> StreamingResponse:
 
 @app.get("/api/health")
 async def health() -> JSONResponse:
-    return JSONResponse(_get_runtime_health())
+    payload = _get_runtime_health()
+    # Billing posture, for the sentinel. Two things worth alarming on:
+    #   * `enforcement` disagreeing between the api and runtime containers —
+    #     they read the same DB setting, so a mismatch means one of them is
+    #     wedged on a stale 30s cache or lost its DB.
+    #   * fail_open — how many owners are currently being admitted WITHOUT a
+    #     verifiable entitlement because the billing DB is erroring. Nonzero
+    #     for more than a moment means calls are going out unmetered.
+    try:
+        from shared.billing.entitlements import enforcement_enabled, fail_open_state
+        payload["billing"] = {"enforcement": enforcement_enabled(),
+                              "fail_open": fail_open_state()}
+    except Exception as exc:
+        payload["billing"] = {"error": repr(exc)[:120]}
+    return JSONResponse(payload)
 
 
 def _owner_call_stats(owner: str, start: datetime.date,
@@ -1333,10 +1425,24 @@ async def overview(request: Request, period: str = Query("today")) -> JSONRespon
         "answered": kpis["answered_calls"], "missed": kpis["missed_calls"], "failed": 0,
     }
 
-    quota = _load_minutes_quota()
-    total_minutes = quota.get("total_minutes")
-    remaining_minutes = (round(total_minutes - kpis["minutes_used"], 1)
-                          if total_minutes is not None else None)
+    # Minutes quota is now PER TENANT, from the entitlements row. The legacy
+    # settings(owner='') value was a single platform-global number shown
+    # identically to every tenant — meaningless once accounts have their own
+    # plans, and it disagreed with what the dial gate would actually enforce.
+    total_minutes = remaining_minutes = None
+    plan_code = None
+    try:
+        from shared.billing.entitlements import usage_summary
+        _ent = usage_summary(_ov_owner)
+        total_minutes = _ent.get("minutes_limit")
+        remaining_minutes = _ent.get("minutes_remaining")
+        plan_code = _ent.get("plan_code")
+    except Exception as exc:
+        logger.warning("overview entitlement view unavailable: %r", exc)
+        quota = _load_minutes_quota()
+        total_minutes = quota.get("total_minutes")
+        remaining_minutes = (round(total_minutes - kpis["minutes_used"], 1)
+                             if total_minutes is not None else None)
 
     # Call counts per window, owner-scoped. The old shape carried credit-log
     # cost estimates here too (est_stt_cost / tts_chars / …); those are
@@ -1354,7 +1460,9 @@ async def overview(request: Request, period: str = Query("today")) -> JSONRespon
         "runtime_status": _get_runtime_health()["overall"],
         "hourly_calls": [{"hour": h, "count": hourly[h]} for h in range(24)],
         "kpis": kpis,
-        "minutes_quota": {"total_minutes": total_minutes, "remaining_minutes": remaining_minutes},
+        "minutes_quota": {"total_minutes": total_minutes,
+                          "remaining_minutes": remaining_minutes,
+                          "plan_code": plan_code},
         "charts": {
             "calls_over_time": daily_calls,
             "call_type_distribution": call_type_distribution,
@@ -1363,13 +1471,35 @@ async def overview(request: Request, period: str = Query("today")) -> JSONRespon
     })
 
 
+# RETIRED (billing, 2026-07-31). This was a single platform-global number in
+# settings(owner=''), shown identically to every tenant and enforced nowhere.
+# Minute allowances are now per-tenant, come from the `entitlements` row, and
+# are set by the plan (or by the super-admin plane for Enterprise). Kept as
+# 410s rather than deleted so a stale cached SPA gets a clear answer instead
+# of a 404 that looks like a routing bug.
 @app.get("/api/minutes/quota")
-async def minutes_quota_get() -> JSONResponse:
-    return JSONResponse(_load_minutes_quota())
+async def minutes_quota_get(request: Request) -> JSONResponse:
+    try:
+        from shared.billing.entitlements import usage_summary
+        ent = usage_summary(_acting_owner(request))
+        return JSONResponse({"total_minutes": ent.get("minutes_limit"),
+                             "remaining_minutes": ent.get("minutes_remaining"),
+                             "plan_code": ent.get("plan_code"),
+                             "source": "entitlements"})
+    except Exception:
+        return JSONResponse(_load_minutes_quota())
 
 
 @app.post("/api/minutes/quota")
 async def minutes_quota_set(request: Request) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "code": "retired",
+         "reason": "Minute allowances come from your plan now. See Billing.",
+         "detail": "the platform-global minutes quota has been retired",
+         "upgrade": "/billing"}, status_code=410)
+
+
+async def _minutes_quota_set_legacy(request: Request) -> JSONResponse:
     body = await request.json()
     try:
         total = float(body.get("total_minutes"))
@@ -1395,10 +1525,27 @@ def _scope_live_state(state: dict, owner: str) -> dict:
     snapshot has no owner (legacy/pre-tagging) belongs to the founding admin."""
     import auth
     if auth.is_admin(owner):
-        return state
+        return {"updated_at": state.get("updated_at"),
+                "calls": _label_live_calls(list(state.get("calls") or []), owner)}
     calls = [c for c in (state.get("calls") or [])
              if (c.get("owner") or auth.DEFAULT_OWNER) == owner]
-    return {"updated_at": state.get("updated_at"), "calls": calls}
+    return {"updated_at": state.get("updated_at"),
+            "calls": _label_live_calls(calls, owner)}
+
+
+def _label_live_calls(calls: list, owner: str) -> list:
+    """Attach the saved phone-book name to each live call.
+
+    Note: on OUTBOUND legs the snapshot's caller_number is our own origination
+    number, not the customer's (the runtime publishes the channel caller id),
+    so those simply will not resolve and keep showing the number as before.
+    Inbound — where knowing who is on the line actually matters — resolves.
+    """
+    if not calls:
+        return calls
+    names = _contact_name_map(owner)
+    return [{**c, "contact_name": _name_for_phone(c.get("caller_number", ""), names)}
+            for c in calls]
 
 
 @app.get("/api/calls/active")
@@ -1495,44 +1642,109 @@ def _build_recording_phone_map() -> dict[str, str]:
     return result
 
 
+_ZERO_COST_FIELDS = {"stt_sarvam_seconds": 0.0, "stt_sarvam_billed_seconds": 0.0,
+                      "stt_sarvam_calls": 0, "stt_whisper_seconds": 0.0, "stt_whisper_calls": 0,
+                      "tts_chars": 0, "tts_calls": 0, "tts_cancelled_calls": 0,
+                      "est_stt_cost": 0.0, "est_tts_cost": 0.0, "est_total_cost": 0.0}
+
+
+def _as_iso(value) -> str:
+    """DB timestamps back as either datetime or str depending on driver/table —
+    normalise to the ISO-Z string the dashboard renders. Never raises."""
+    if not value:
+        return ""
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.timezone.utc)
+        return value.astimezone(datetime.timezone.utc).isoformat(
+            timespec="seconds").replace("+00:00", "Z")
+    s = str(value).strip()
+    if not s:
+        return ""
+    # "2026-08-01 10:15:00" (psycopg text form) -> ISO-Z
+    if " " in s and "T" not in s:
+        s = s.replace(" ", "T", 1)
+    if not s.endswith("Z") and "+" not in s[10:]:
+        s += "Z"
+    return s
+
+
 def _build_call_activity(start_date: datetime.date, end_date: datetime.date,
                          owner: str) -> list[dict]:
-    """Unified Call Activity feed for one tenant: pipeline calls (always
-    'answered') plus outbound dial attempts that never connected. Admins see
-    every call; a tenant sees only calls whose recording folder they own
-    (calls table) plus their own contacts' dial history."""
-    import auth
-    is_admin = auth.is_admin(owner)
-    owner_map = _call_owner_map()
-    events = _load_credit_range(start_date, end_date)
-    # Original per-call fields (stt/tts seconds & costs) are preserved as-is —
-    # the existing Call History table already renders them — with call_type/
-    # status/contact fields layered on top, additive only.
-    _ZERO_COST_FIELDS = {"stt_sarvam_seconds": 0.0, "stt_sarvam_billed_seconds": 0.0,
-                          "stt_sarvam_calls": 0, "stt_whisper_seconds": 0.0, "stt_whisper_calls": 0,
-                          "tts_chars": 0, "tts_calls": 0, "tts_cancelled_calls": 0,
-                          "est_stt_cost": 0.0, "est_tts_cost": 0.0, "est_total_cost": 0.0}
-    rows = []
-    phone_map = _build_recording_phone_map()
-    for c in _aggregate_calls(events):
-        # A tenant only sees pipeline calls whose recording folder they own.
-        if not is_admin and (owner_map.get(c.get("call_id", "")) or auth.DEFAULT_OWNER) != owner:
-            continue
-        link = _classify_direction(c.get("start_time", ""), owner=owner)
-        contact_name = link.get("name") or ""
-        contact_phone = link.get("phone") or ""
-        if not contact_phone and link["direction"] == "inbound":
-            contact_phone = phone_map.get(c.get("call_id", ""), "")
+    """Unified Call Activity feed for one tenant.
+
+    Sourced from the `calls` table — the authoritative per-call record, which
+    carries the REAL direction, phone, contact binding, duration and (since
+    answer_state) whether the callee actually spoke. Outbound attempts that
+    never connected have no `calls` row at all (the pipeline never ran), so
+    those still come from each contact's call_history.
+
+    The credit log is joined in only for the STT/TTS cost columns, keyed by
+    conn_id. It used to be the *primary* source, which is why this feed was
+    broken: every pipeline call was hardcoded "answered" and its direction was
+    guessed by timestamp-matching a dial record, defaulting to "inbound" on any
+    miss. Both filters were therefore close to meaningless.
+    """
+    import auth as _auth
+    from shared.db.database import get_db
+
+    # Cost sidecar: call_id here IS the bridge's conn_id.
+    costs = {c["call_id"]: c for c in _aggregate_calls(_load_credit_range(start_date, end_date))}
+
+    # Half-open upper bound so the whole of end_date is included regardless of
+    # the stored timestamp's time component.
+    range_start = start_date.isoformat()
+    range_end = (end_date + datetime.timedelta(days=1)).isoformat()
+
+    rows: list[dict] = []
+    seen_conn: set[str] = set()
+    try:
+        with get_db() as db:
+            records = [dict(r) for r in db.execute(
+                "SELECT c.conn_id, c.direction, c.phone, c.started_at, c.ended_at, "
+                "       c.duration_s, c.answer_state, c.contact_id, "
+                "       ct.name AS contact_name, ct.phone AS contact_phone "
+                "  FROM calls c "
+                "  LEFT JOIN contacts ct ON ct.id = c.contact_id "
+                " WHERE COALESCE(NULLIF(c.owner, ''), ?) = ? "
+                "   AND c.started_at >= ? AND c.started_at < ? "
+                " ORDER BY c.started_at DESC",
+                (_auth.DEFAULT_OWNER, owner, range_start, range_end)).fetchall()]
+    except Exception as exc:
+        logger.error("call activity: calls query failed: %r", exc)
+        records = []
+
+    for r in records:
+        conn_id = r.get("conn_id") or ""
+        if conn_id:
+            seen_conn.add(conn_id)
+        cost = costs.get(conn_id, {})
+        # A connected call is 'answered' unless the teardown detector decided
+        # nobody actually spoke. NULL (every pre-existing row) means the
+        # detector never ran — those stay 'answered' rather than guessing.
+        status = "empty_call" if (r.get("answer_state") or "") == "empty" else "answered"
         rows.append({
-            **c,
-            "call_type": link["direction"],
-            "contact_name": contact_name, "contact_phone": contact_phone,
-            "status": "answered",
+            "call_id": conn_id or None,
+            "start_time": _as_iso(r.get("started_at")),
+            "end_time": _as_iso(r.get("ended_at")) or _as_iso(r.get("started_at")),
+            "duration_seconds": round(float(r.get("duration_s") or 0.0), 1),
+            **{**_ZERO_COST_FIELDS,
+               **{k: v for k, v in cost.items()
+                  if k in _ZERO_COST_FIELDS}},
+            "call_type": (r.get("direction") or "inbound"),
+            "contact_id": r.get("contact_id"),
+            "contact_name": r.get("contact_name") or "",
+            "contact_phone": r.get("contact_phone") or r.get("phone") or "",
+            "status": status,
         })
+
+    # Dial attempts that never became a call: no_answer / busy / declined /
+    # failed. 'answered' entries are skipped — the `calls` row above is that
+    # call, and listing both would double-count it.
     for contact in _load_outbound(owner):
         for h in contact.get("call_history", []):
             if h.get("call_status") == "answered":
-                continue  # represented by its matched pipeline row above
+                continue
             if not _in_range(h.get("ts", ""), start_date, end_date):
                 continue
             rows.append({
@@ -1540,10 +1752,12 @@ def _build_call_activity(start_date: datetime.date, end_date: datetime.date,
                 "duration_seconds": 0.0,
                 **_ZERO_COST_FIELDS,
                 "call_type": "outbound",
+                "contact_id": contact.get("db_id"),
                 "contact_name": contact.get("name", ""), "contact_phone": contact.get("phone", ""),
                 "status": h.get("call_status", "failed"),
             })
-    rows.sort(key=lambda r: r["end_time"], reverse=True)
+
+    rows.sort(key=lambda r: r.get("end_time") or "", reverse=True)
     return rows
 
 
@@ -1583,13 +1797,22 @@ async def recordings_list(
     limit: int = Query(50, ge=1, le=200),
     search: str = Query(""),
 ) -> JSONResponse:
-    records = _filter_history(_scan_recordings(limit=2000), _acting_owner(request))
+    # E12 — recordings are a paid capability (every paid tier; not Free).
+    owner = _require_feature(request, "recordings")
+    records = _filter_history(_scan_recordings(limit=2000), owner)
+    # Label saved numbers with the name they are saved under, so the list reads
+    # as people rather than digits. Done BEFORE search so typing a contact's
+    # name finds their recordings too.
+    names = _contact_name_map(owner)
+    records = [{**r, "contact_name": _name_for_phone(r.get("caller", ""), names)}
+               for r in records]
     if search:
         s = search.lower()
         records = [r for r in records
                    if s in r.get("folder", "").lower()
-                   or s in r.get("call_id", "").lower()
-                   or s in r.get("caller", "").lower()]
+                   or s in (r.get("call_id") or "").lower()
+                   or s in r.get("caller", "").lower()
+                   or s in (r.get("contact_name") or "").lower()]
     media = _call_media_map()
     records = [{**r, **media.get(r.get("folder", ""), {})} for r in records]
     total = len(records)
@@ -1604,7 +1827,7 @@ async def recordings_list(
 async def recording_transcript(folder: str, request: Request) -> JSONResponse:
     if "/" in folder or ".." in folder:
         return JSONResponse({"error": "invalid folder"}, status_code=400)
-    if not _can_see_folder(folder, _acting_owner(request)):
+    if not _can_see_folder(folder, _require_feature(request, "transcripts")):
         return JSONResponse({"error": "not found"}, status_code=404)
     meta: dict = {}
     meta_path = RECORDINGS_DIR / folder / "metadata.json"
@@ -1929,7 +2152,8 @@ async def conversation_analytics(request: Request, folders: str = Query("")) -> 
 async def transcripts_search(request: Request, q: str = Query(..., min_length=1), limit: int = Query(50, ge=1, le=200)) -> JSONResponse:
     """Full-text search across transcript.txt files, plus caller/contact/call-id
     metadata. Owner-scoped: a tenant only searches calls whose folder they own."""
-    _ts_owner = _acting_owner(request)
+    # E12 — transcripts are Growth+.
+    _ts_owner = _require_feature(request, "transcripts")
     ql = q.lower()
     digits = "".join(ch for ch in q if ch.isdigit())
 
@@ -2012,7 +2236,9 @@ def _stream_recording(call_key: str, gcs_object: str | None, download: bool):
 async def recording_audio(folder: str, request: Request, download: int = Query(0)):
     if "/" in folder or ".." in folder:
         return JSONResponse({"error": "invalid folder"}, status_code=400)
-    if not _can_see_folder(folder, _acting_owner(request)):
+    # E12 — the audio itself, not just the list. Gating the index while
+    # leaving the stream open would be enforcement in name only.
+    if not _can_see_folder(folder, _require_feature(request, "recordings")):
         return JSONResponse({"error": "not found"}, status_code=404)
     return _stream_recording(folder, _gcs_object_for(folder), bool(download))
 
@@ -2131,9 +2357,30 @@ async def usage_minutes(request: Request) -> JSONResponse:
             unreconciled += 1
 
     recent = sorted(rows, key=lambda r: r.get("answered_at") or "", reverse=True)[:20]
+
+    # Entitlement view, from the SAME functions the dial gates read. If the
+    # meter here and a refusal at dial time ever disagree, the meter is lying
+    # to the user about why their call was blocked — so both come from
+    # usage_summary() rather than being computed twice.
+    entitlement: dict = {}
+    if not scope_all:
+        try:
+            from shared.billing.entitlements import usage_summary
+            entitlement = usage_summary(scope_owner)
+        except Exception as exc:
+            logger.warning("usage entitlement view unavailable: %r", exc)
+
     return JSONResponse({
         "owner": "all" if scope_all else scope_owner,
         "month": month_key,
+        "plan_code": entitlement.get("plan_code"),
+        "plan_name": entitlement.get("plan_name"),
+        "minutes_limit": entitlement.get("minutes_limit"),
+        "minutes_used_period": entitlement.get("minutes_used"),
+        "minutes_remaining": entitlement.get("minutes_remaining"),
+        "period_start": entitlement.get("period_start"),
+        "period_end": entitlement.get("period_end"),
+        "entitlement_status": entitlement.get("status"),
         "seconds_month": sum(month_secs),
         "minutes_month": display_minutes(month_secs),
         "calls_month": len(month_secs),
@@ -2907,6 +3154,8 @@ async def outbound_list(
     disposition: str = Query(None),
     q: str = Query(None),
     group: str = Query(None),
+    page: int = Query(1),
+    limit: int = Query(0),
 ) -> JSONResponse:
     contacts = _load_outbound(_acting_owner(request))
     if call_status and call_status != "all":
@@ -2926,7 +3175,14 @@ async def outbound_list(
     if q:
         ql = q.lower()
         contacts = [c for c in contacts if ql in c.get("phone", "") or ql in c.get("name", "").lower()]
-    return JSONResponse({"contacts": contacts, "total": len(contacts)})
+    # `total` is always the full filtered count — the page slice must never be
+    # what the caller counts by. Pagination is opt-in (limit>0) so callers that
+    # want the whole filtered list keep getting it.
+    total = len(contacts)
+    if limit and limit > 0:
+        start = max(0, (max(1, page) - 1) * limit)
+        contacts = contacts[start:start + limit]
+    return JSONResponse({"contacts": contacts, "total": total})
 
 
 @app.post("/api/outbound/contacts")
@@ -3644,6 +3900,19 @@ async def _dial_automation_entry(automation_id: str) -> None:
                 _src_agent = _row["agent_slug"]
     except Exception as exc:
         logger.warning("automation source-agent lookup failed: %r", exc)
+    # E4 — the automation callback is a real outbound call placed on the
+    # tenant's behalf, so it obeys the same quota as one they click.
+    _cb_decision = await asyncio.to_thread(
+        _billing_check_dial, _cb_owner, "automation")
+    if not _cb_decision.allowed:
+        _update_automation(automation_id,
+                           {"status": "failed",
+                            "call_outcome": f"not placed: {_cb_decision.reason}",
+                            "called_at": _now_iso()})
+        logger.info("FOLLOWUP_AUTOMATION %s skipped for %s: %s",
+                    automation_id, _cb_owner, _cb_decision.code)
+        return
+
     _dial_slug = _src_agent or _ident["agent_slug"]
     # WHY-YOU-ARE-CALLING-BACK context for the live agent prompt.
     _ctx_bits = [entry.get("call_aim") or "", entry.get("past_call_context") or ""]
@@ -3659,6 +3928,8 @@ async def _dial_automation_entry(automation_id: str) -> None:
     except Exception as exc:
         logger.error("automation dial %s error: %r", phone, exc)
         cs = "failed"
+    finally:
+        _billing_release(_cb_decision.reservation)
 
     _update_automation(automation_id,
                        {"status": "called", "call_outcome": cs,
@@ -3849,6 +4120,31 @@ async def _autodial_once() -> int:
                 detail="Refused: no human approval on file", permanent=False)
             continue
 
+        # E3 — automated follow-up calls are a paid capability (Growth+), and
+        # they still consume the tenant's minutes. Two separate questions:
+        #   * autocall_allowed  — is this tier even entitled to auto-dial?
+        #     Checked here as well as at staging (E8), because a row staged
+        #     while the tenant was on Growth must not keep dialling after a
+        #     downgrade.
+        #   * check_dial_allowed — do they have minutes left?
+        # Both are recorded as transient attempts so the row explains itself
+        # in the UI rather than silently never dialling.
+        _ac_ok = await asyncio.to_thread(autodial_billing_allowed, owner)
+        if not _ac_ok:
+            await asyncio.to_thread(
+                autodial.record_attempt, row["id"], ok=False,
+                detail="Automated follow-up calls are not included in this "
+                       "plan — upgrade to Growth to enable them.",
+                permanent=False)
+            continue
+        _ad_decision = await asyncio.to_thread(
+            _billing_check_dial, owner, "autodial")
+        if not _ad_decision.allowed:
+            await asyncio.to_thread(
+                autodial.record_attempt, row["id"], ok=False,
+                detail=_ad_decision.reason, permanent=False)
+            continue
+
         slug = ident["agent_slug"]
         # The agent on this call must open like someone who remembers the
         # last conversation: the follow-up reason (and the commitment being
@@ -3883,7 +4179,8 @@ async def _autodial_once() -> int:
         placed += 1
 
         async def _place(p=phone, s=slug, i=ident, o=owner,
-                         h=row.get("contact_handle"), fid=row["id"]):
+                         h=row.get("contact_handle"), fid=row["id"],
+                         res=_ad_decision.reservation):
             try:
                 out = await _fs_esl_exec(_fs_originate_cmd(
                     p, agent_slug=s, caller_id=i["caller_id"],
@@ -3892,6 +4189,8 @@ async def _autodial_once() -> int:
             except Exception as exc:
                 logger.error("autodial %s error: %r", p, exc)
                 cs = "failed"
+            finally:
+                _billing_release(res)
             if h:
                 _update_contact_after_call(h, cs, o)
             # Outcome loop: stamp the originate result. 'answered' stays
@@ -4174,6 +4473,29 @@ def _update_contact_after_call(contact_id: str, call_status: str, owner: str) ->
     _save_outbound(contacts, owner)
 
 
+def _require_feature(request: Request, feature: str) -> str:
+    """E12 — per-tier capability gate for the legacy (non-intel) endpoints.
+
+    Returns the owner so call sites can use it directly. Raises a 402
+    BillingRefusal when the plan does not include the capability.
+    """
+    owner = _acting_owner(request)
+    try:
+        from shared.billing.entitlements import feature_allowed
+        from shared.billing.errors import BillingRefusal, CODE_PLAN_REQUIRED
+    except Exception:
+        return owner
+    if not feature_allowed(owner, feature):
+        copy = {
+            "recordings": "Call recordings are included in every paid plan. "
+                          "Upgrade to listen back to your calls.",
+            "transcripts": "Call transcripts are included in Growth. Upgrade "
+                           "to search every conversation.",
+        }.get(feature, "This feature is not included in your plan.")
+        raise BillingRefusal(copy, CODE_PLAN_REQUIRED, feature=feature)
+    return owner
+
+
 def _acting_owner(request: Request) -> str:
     """Email placing this dial — used to pick the caller's OWN number/trunk."""
     try:
@@ -4182,6 +4504,68 @@ def _acting_owner(request: Request) -> str:
     except Exception:
         import auth
         return auth.DEFAULT_OWNER
+
+
+# ---------------------------------------------------------------------------
+# BILLING enforcement at the dial origins (plan §7, E1-E5).
+#
+# Gate rule: EVERY call site of _fs_esl_exec(_fs_originate_cmd(...)) must be
+# preceded by an entitlement check. There are six origins in this file plus
+# shared/sentinel.py's loopback probe (which is exempt — it is a synthetic
+# self-test marked billable=0 and rings no human).
+#
+# Admission RESERVES rather than reads: this endpoint returns immediately and
+# originates in a background task, so N parallel POSTs to N different contacts
+# would otherwise all pass the same "remaining >= 1" check in the same instant.
+# The reservation must be released when the call's ledger row closes — the
+# bridge does that at teardown; a crashed leg's reservation expires on its own.
+# ---------------------------------------------------------------------------
+
+def _billing_check_dial(owner: str, origin: str):
+    """Decision for one outbound origination. Never raises."""
+    try:
+        from shared.billing.entitlements import check_dial_allowed
+        return check_dial_allowed(owner, origin=origin)
+    except Exception as exc:
+        logger.error("BILLING dial check unavailable (%s): %r", origin, exc)
+        from shared.billing.errors import Decision
+        return Decision.ok(check="error")
+
+
+def _billing_release(reservation: str) -> None:
+    if not reservation:
+        return
+    try:
+        from shared.billing.entitlements import release_reservation
+        release_reservation(reservation)
+    except Exception as exc:
+        logger.warning("BILLING reservation release failed: %r", exc)
+
+
+def autodial_billing_allowed(owner: str) -> bool:
+    """Is this tenant's plan entitled to automated follow-up calls?
+
+    Kept as a thin wrapper so `shared/intelligence/autodial.py` stays a PURE
+    predicate module with no billing import — it is the piece that has to stay
+    trivially auditable after the 2026-07-29 incident.
+    """
+    try:
+        from shared.billing.entitlements import autocall_allowed
+        return autocall_allowed(owner)
+    except Exception as exc:
+        logger.error("BILLING autocall check unavailable: %r", exc)
+        return True
+
+
+def _billing_refusal_response(decision) -> JSONResponse:
+    """402 in BOTH dialects. `reason` is what the Outbound UI reads; `detail`
+    is what FastAPI clients read; `code` is what the SPA switches on. Never
+    carries duplicate:true — that is the 409 duplicate-dial shape, and
+    ?force=1 must not bypass billing."""
+    return JSONResponse(decision.detail | {
+        "ok": False, "reason": decision.reason, "detail": decision.reason,
+        "code": decision.code, "upgrade": "/billing",
+    }, status_code=402)
 
 
 @app.post("/api/outbound/dial/{contact_id}")
@@ -4225,9 +4609,17 @@ async def outbound_dial(contact_id: str, request: Request) -> JSONResponse:
                 "seconds_ago": int(_recent),
             }, status_code=409)
 
+    # E1 — after the duplicate guard (so a duplicate click does not burn a
+    # reservation) and before we resolve an identity or touch FreeSWITCH.
+    _decision = _billing_check_dial(dial_owner, "dial")
+    if not _decision.allowed:
+        logger.info("DIAL refused for %s: %s", dial_owner, _decision.code)
+        return _billing_refusal_response(_decision)
+
     try:
         ident = _outbound_identity(dial_owner)
     except OutboundIdentityError as exc:
+        _billing_release(_decision.reservation)
         return JSONResponse({"ok": False, "reason": str(exc), "detail": str(exc)},
                             status_code=400)
 
@@ -4244,6 +4636,11 @@ async def outbound_dial(contact_id: str, request: Request) -> JSONResponse:
         except Exception as e:
             logger.error("dial %s error: %r", phone, e)
             cs = "failed"
+        finally:
+            # A leg that never answered consumes no minutes, and one that did
+            # is accounted for by its own ledger row — either way the
+            # admission hold is done once the originate returns.
+            _billing_release(_decision.reservation)
         _update_contact_after_call(contact_id, cs, dial_owner)
         logger.info("DIAL %s from %s (%s) → %s", phone, ident["caller_id"],
                     ident["source"], cs)
@@ -4300,6 +4697,12 @@ async def number_test_call(number_id: int, request: Request) -> JSONResponse:
                                        "the test call rings YOUR phone."},
                             status_code=400)
 
+    # E5 — a test call is a real call on a real trunk with a real agent on the
+    # line, so it meters and it counts against quota exactly like any other.
+    _decision = _billing_check_dial(owner, "test")
+    if not _decision.allowed:
+        return _billing_refusal_response(_decision)
+
     caller = re.sub(r"[^\d]", "", row["number"])
     _record_dial(dest, f"test-call-{number_id}", "Test call (you)",
                  agent_slug=slug, owner=owner)
@@ -4313,6 +4716,8 @@ async def number_test_call(number_id: int, request: Request) -> JSONResponse:
         except Exception as e:
             logger.error("test-call %s error: %r", dest, e)
             cs = "failed"
+        finally:
+            _billing_release(_decision.reservation)
         logger.info("TEST-CALL %s from %s (agent=%s, owner=%s) → %s",
                     dest, caller, slug, owner, cs)
 
@@ -4476,6 +4881,42 @@ async def campaign_start(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "reason": str(exc), "detail": str(exc)},
                             status_code=400)
 
+    # E2 — the sixth dial origin, and the one that multiplies. A campaign is
+    # the only path that dials a LIST from one click, so an unchecked campaign
+    # is a quota bypass times N. Two gates:
+    #   * one admission check up front, so a tenant with no minutes cannot
+    #     start a run at all; and
+    #   * the audience is TRUNCATED to what the remaining balance can pay for,
+    #     so a 5,000-contact list on a 30-minute plan queues 30 calls, not
+    #     5,000 that fail one by one on the trunk.
+    _camp_decision = _billing_check_dial(camp_owner, "campaign")
+    if not _camp_decision.allowed:
+        return _billing_refusal_response(_camp_decision)
+    _billing_release(_camp_decision.reservation)   # the per-call gate reserves
+
+    _quota_capped = 0
+    try:
+        from shared.billing.entitlements import (
+            enforcement_enabled as _enf, get_entitlements as _get_ent,
+            minutes_used as _mins_used, period_bounds as _pbounds)
+        if _enf():
+            _ent = _get_ent(camp_owner)
+            if _ent.get("minutes_limit") is not None:
+                _remaining = max(0, int(_ent["minutes_limit"])
+                                 - _mins_used(camp_owner, *_pbounds(_ent)))
+                if len(to_call) > _remaining:
+                    _quota_capped = len(to_call) - _remaining
+                    to_call = to_call[:_remaining]
+    except Exception as exc:
+        logger.error("BILLING campaign sizing failed: %r", exc)
+
+    if not to_call:
+        return JSONResponse({
+            "ok": False, "code": "quota_minutes", "upgrade": "/billing",
+            "reason": "You have no minutes left this period, so no calls were "
+                      "queued. Add minutes or upgrade to run this campaign.",
+            "detail": "no minutes remaining"}, status_code=402)
+
     import uuid as _uuid
     cid = _uuid.uuid4().hex[:8]
     camp.update({
@@ -4527,6 +4968,21 @@ async def campaign_start(request: Request) -> JSONResponse:
                     camp["completed"] += 1
                     continue
 
+                # E2 (per call). Re-checked every iteration, not just at start:
+                # a long run burns minutes as it goes, and the whole point is
+                # that call 40 must not go out on a balance that ran dry at
+                # call 12.
+                _c_decision = await asyncio.to_thread(
+                    _billing_check_dial, camp_owner, "campaign")
+                if not _c_decision.allowed:
+                    remaining = camp["total"] - camp["completed"]
+                    camp["stopped"] = True
+                    camp["error"] = _c_decision.reason
+                    camp["error_code"] = _c_decision.code
+                    logger.info("CAMPAIGN [%s] halted on %s, %s undialled",
+                                cid, _c_decision.code, remaining)
+                    break
+
                 camp["current_phone"] = phone
                 camp["current_name"] = contact.get("name", "")
                 logger.info("CAMPAIGN [%s owner=%s] dialing %s (%s/%s)",
@@ -4545,6 +5001,8 @@ async def campaign_start(request: Request) -> JSONResponse:
                 except Exception as e:
                     logger.error("campaign dial %s error: %r", phone, e)
                     cs = "failed"
+                finally:
+                    _billing_release(_c_decision.reservation)
 
                 _update_contact_after_call(contact_id, cs, camp_owner)
                 key = cs if cs in camp else "failed"
@@ -4567,6 +5025,7 @@ async def campaign_start(request: Request) -> JSONResponse:
     _campaign_tasks[camp_owner] = asyncio.create_task(_run())
     return JSONResponse({"ok": True, "campaign_id": cid, "total": len(to_call),
                          "dnd_skipped": dnd_skipped, "capped": capped,
+                         "quota_capped": _quota_capped,
                          "max_calls": max_calls, "delay_seconds": delay_secs})
 
 

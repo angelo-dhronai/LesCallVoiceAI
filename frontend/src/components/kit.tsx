@@ -99,6 +99,32 @@ export function Pagination({
   )
 }
 
+/* ------------------------------------------------------------------ Contact label */
+
+/**
+ * A phone number, shown as the person it belongs to.
+ *
+ * Whenever a number is in the tenant's phone book, the saved NAME is the
+ * headline and the number sits underneath in small mono type. Unknown numbers
+ * stay the headline themselves — a lone "—" would hide the one identifying
+ * detail we do have. Use this anywhere a caller/callee is rendered so the app
+ * reads as people rather than digits.
+ */
+export function ContactLabel({ name, phone, className }: {
+  name?: string | null; phone?: string | null; className?: string
+}) {
+  const n = (name ?? '').trim()
+  const p = (phone ?? '').trim()
+  if (!n && !p) return <span className="text-dim">—</span>
+  if (!n) return <span className={cx('font-mono text-sm text-[var(--text)]', className)}>{p}</span>
+  return (
+    <div className={cx('min-w-0 leading-tight', className)}>
+      <div className="truncate font-medium text-[var(--text)]" title={n}>{n}</div>
+      {p && <div className="truncate font-mono text-2xs text-dim" title={p}>{p}</div>}
+    </div>
+  )
+}
+
 /* ------------------------------------------------------------------ Status badge */
 
 type Tone = 'mint' | 'indigo' | 'amber' | 'rose' | 'neutral'
@@ -110,6 +136,9 @@ const STATUS_TONE: Record<string, Tone> = {
   to_contact_later: 'amber', in_doubt: 'amber', inquiry: 'indigo', calling: 'indigo', dialing: 'indigo',
   failed: 'rose', declined: 'rose', rejected: 'rose', cancelled: 'rose', down: 'rose', dismissed: 'neutral',
   not_called: 'neutral', not_classified: 'neutral',
+  // Connected but nobody actually spoke (silence / noise / voicemail / instant
+  // hang-up). Amber, not mint: the leg answered, the conversation did not.
+  empty_call: 'amber',
   // call direction + runtime states
   inbound: 'indigo', outbound: 'mint', up: 'mint', live: 'mint', running: 'mint', error: 'rose', stopped: 'neutral',
   // priority

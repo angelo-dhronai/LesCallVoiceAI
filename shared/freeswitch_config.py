@@ -169,9 +169,27 @@ def render_acl(cidrs: list[str], kamailio_ip: str | None = None) -> str:
 
 
 def _fs_reload() -> dict:
-    """Run the reload commands via fs_cli; report per-command success."""
+    """Run the reload commands, preferring the event socket over `fs_cli`.
+
+    `fs_cli` is a FreeSWITCH binary and is NOT installed in the app containers —
+    the same gap that produced shared/fs_esl.py. Shelling out to it from the
+    api container raised FileNotFoundError for every command, so `reloaded`
+    came back False and a BYON apply reported `status: "error"` even when all
+    the XML had been written correctly.
+
+    Falls back to the subprocess for host-side callers (scripts, tests) that
+    have fs_cli but no ESL password in their environment.
+    """
     results = {}
     for cmd in RELOAD_COMMANDS:
+        try:
+            from shared.fs_esl import fs_api
+            body = fs_api(cmd, timeout=15)
+            results[cmd] = {"ok": not body.strip().startswith("-ERR"),
+                            "output": body.strip()[:500], "via": "esl"}
+            continue
+        except Exception as esl_exc:
+            esl_err = repr(esl_exc)
         try:
             proc = subprocess.run(
                 [FS_CLI, "-x", cmd], capture_output=True, text=True, timeout=15,
@@ -179,10 +197,34 @@ def _fs_reload() -> dict:
             results[cmd] = {
                 "ok": proc.returncode == 0,
                 "output": (proc.stdout or proc.stderr or "").strip()[:500],
+                "via": "fs_cli",
             }
         except Exception as exc:
-            results[cmd] = {"ok": False, "output": repr(exc)}
+            results[cmd] = {"ok": False, "via": "none",
+                            "output": f"esl: {esl_err} / fs_cli: {exc!r}"[:500]}
     return results
+
+
+def _write_shared(path, text: str) -> None:
+    """Write a generated config file and leave it GROUP-WRITABLE.
+
+    /etc/freeswitch/... is owned by `freeswitch` with group-write on the
+    directories, and the app container runs as uid 1000 in the freeswitch
+    group. Directory permission is enough to CREATE a file, but rewriting one
+    needs write permission on the FILE — and Python's default 0644 leaves the
+    group read-only. So the first apply succeeded and every re-apply of the
+    same trunk or DID failed with EACCES, including when a DID moved from one
+    tenant to another and its stale dialplan file was still owned by
+    freeswitch. Anything under this directory is regenerated from the database
+    on every apply, so a shared-writable mode is correct rather than lax.
+    """
+    path.write_text(text, encoding="utf-8")
+    try:
+        path.chmod(0o664)
+    except PermissionError:
+        # Someone else owns it; the write above already succeeded, and the
+        # next apply will still work as long as the mode is right.
+        pass
 
 
 def apply_config(
@@ -202,19 +244,19 @@ def apply_config(
 
     gw_path = base / "sip_profiles" / "external" / gateway_file_name(trunk)
     gw_path.parent.mkdir(parents=True, exist_ok=True)
-    gw_path.write_text(render_gateway(trunk), encoding="utf-8")
+    _write_shared(gw_path, render_gateway(trunk))
     written.append(str(gw_path))
 
     for number in numbers:
         dp_path = base / "dialplan" / "public" / dialplan_file_name(number)
         dp_path.parent.mkdir(parents=True, exist_ok=True)
-        dp_path.write_text(render_inbound_dialplan(number), encoding="utf-8")
+        _write_shared(dp_path, render_inbound_dialplan(number))
         written.append(str(dp_path))
 
     if all_provider_cidrs is not None:
         acl_path = base / "autoload_configs" / "acl.conf.xml"
         acl_path.parent.mkdir(parents=True, exist_ok=True)
-        acl_path.write_text(render_acl(all_provider_cidrs), encoding="utf-8")
+        _write_shared(acl_path, render_acl(all_provider_cidrs))
         written.append(str(acl_path))
 
     result: dict = {"written": written, "reloaded": False, "reload_results": {}}

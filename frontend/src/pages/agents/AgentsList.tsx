@@ -2,8 +2,8 @@ import { useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useGet, useRefresh } from '../../api/hooks/useApi'
 import { archiveAgent, createTwin, type AgentSummary, type AgentsList as AgentsListT } from '../../api/agents'
-import { Card, Button, Badge, EmptyState, LiveDot, Spinner, SkeletonBlock, cx } from '../../components/ui'
-import { PageHeader, AsyncState, Segmented } from '../../components/kit'
+import { Card, Button, Badge, EmptyState, IconButton, LiveDot, Spinner, SkeletonBlock, cx } from '../../components/ui'
+import { PageHeader, AsyncState } from '../../components/kit'
 import {
   ActivateAgentModal, slotFor, type ActivateTarget, type NumberRow,
 } from '../../components/ActivateAgent'
@@ -15,12 +15,12 @@ import {
 import {
   Plus, Radio, Pencil, Archive, Bot, Languages, GitBranch, CheckCircle2,
   PhoneIncoming, PhoneOutgoing, CalendarDays, Info,
-  MoreVertical, PlayCircle,
+  MoreVertical, MessageSquare, Share2,
 } from 'lucide-react'
-import IntentTester from './IntentTester'
 import { TryAgentDialog } from '../../components/TryAgent'
+import { ImportAgentModal, ShareAgentModal } from '../../components/ShareAgent'
+import { useUrlParam } from '../../lib/hooks'
 
-type Tab = 'agents' | 'intent'
 
 
 /* ------------------------------------------------------------------ page */
@@ -28,15 +28,30 @@ type Tab = 'agents' | 'intent'
 export default function AgentsList() {
   const { data, isLoading, error } = useGet<AgentsListT>(['agents'], '/agents', { refetchInterval: 15000 })
   const { data: numbersData } = useGet<{ numbers: NumberRow[] }>(['numbers'], '/numbers')
+  // Plan cap, so the New Agent button can say WHY it is unavailable instead of
+  // letting the user fill in a whole form and hit a 402 on submit.
+  const { data: billing } = useGet<{
+    agents_used: number | null; max_agent_families: number | null; enforcement: boolean
+  }>(['billing', 'summary'], '/billing/summary')
+  const atCap = !!billing?.enforcement
+    && billing.max_agent_families != null
+    && (billing.agents_used ?? 0) >= billing.max_agent_families
   const nav = useNavigate()
   const refresh = useRefresh()
   const toast = useToast()
   const confirm = useConfirm()
   const [busy, setBusy] = useState<string>('')
-  const [tab, setTab] = useState<Tab>('agents')
   const [activating, setActivating] = useState<ActivateTarget | null>(null)
   const [trying, setTrying] = useState<{ slug: string; direction: 'inbound' | 'outbound' } | null>(null)
   const [twinBusy, setTwinBusy] = useState<string>('')
+  // Sharing is FAMILY-level: one link carries both direction variants,
+  // because that is also how the plan cap counts them.
+  const [sharing, setSharing] = useState<{ slug: string; title: string } | null>(null)
+  // A share link lands here as ?import=<token>. Keeping it in the URL (rather
+  // than in component state) is what makes the link survive the login
+  // round-trip and a page refresh; clearing it on close stops a dismissed
+  // dialog from reappearing on every reload.
+  const [importToken, setImportToken] = useUrlParam('import')
 
   const addTwin = async (source: string, direction: 'inbound' | 'outbound') => {
     setTwinBusy(source)
@@ -110,15 +125,23 @@ export default function AgentsList() {
     <div className="space-y-6">
       <PageHeader
         title="Agents"
-        sub="Build voice agents, test their intent matching, and connect one to your phone number"
+        sub="Build voice agents, chat with them to check the flow, and connect one to your phone number"
         actions={
           <div className="flex flex-wrap items-center gap-2">
-            <Segmented<Tab>
-              value={tab}
-              onChange={setTab}
-              options={[{ value: 'agents', label: 'Agents' }, { value: 'intent', label: 'Intent tester' }]}
-            />
-            {tab === 'agents' && (
+            {atCap ? (
+              // Disabled WITH A REASON. A plain disabled button reads as a
+              // bug; naming the cap and the way out (archiving frees a slot)
+              // is the difference between "broken" and "understood".
+              <div className="flex items-center gap-2">
+                <Button variant="primary" disabled
+                        title={`Your plan includes ${billing?.max_agent_families} agents. Archive one to free a slot, or upgrade.`}>
+                  <Plus size={15} /> New Agent
+                </Button>
+                <Link to="/billing" className="text-xs font-semibold text-indigo-600 hover:underline dark:text-indigo-300">
+                  {billing?.agents_used}/{billing?.max_agent_families} used — upgrade
+                </Link>
+              </div>
+            ) : (
               <Link to="/build/agents/new">
                 <Button variant="primary"><Plus size={15} /> New Agent</Button>
               </Link>
@@ -127,9 +150,7 @@ export default function AgentsList() {
         }
       />
 
-      {tab === 'intent' ? (
-        <IntentTester />
-      ) : isLoading ? (
+      {isLoading ? (
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {[0, 1, 2].map((i) => <SkeletonBlock key={i} h={190} className="rounded-2xl" />)}
         </div>
@@ -139,7 +160,7 @@ export default function AgentsList() {
           <EmptyState
             icon={<Bot size={22} />}
             title="No agents yet"
-            hint="Agents are voice personas defined in YAML. Build one, try phrases against it in the Intent tester tab, then Activate it on one of your numbers."
+            hint="Agents are voice personas defined in YAML. Build one, chat with it to check the flow, then Activate it on one of your numbers."
             action={
               <Link to="/build/agents/new">
                 <Button variant="primary" size="sm"><Plus size={14} /> Create your first agent</Button>
@@ -170,10 +191,22 @@ export default function AgentsList() {
                     </div>
                     <div className="truncate text-xs text-dim">{a.company || '—'}</div>
                   </div>
-                  <code title={f.variants.map((v) => v.name).join(', ')} className="max-w-[45%] truncate rounded-md bg-[var(--surface-2)] px-2 py-0.5 font-mono text-2xs text-soft ring-1 ring-[var(--border)]">
-                    {f.key}
-                    {a.version && <span className="ml-1 text-2xs text-dim">v{a.version}</span>}
-                  </code>
+                  <div className="flex max-w-[52%] shrink-0 items-center gap-1">
+                    <code title={f.variants.map((v) => v.name).join(', ')} className="min-w-0 truncate rounded-md bg-[var(--surface-2)] px-2 py-0.5 font-mono text-2xs text-soft ring-1 ring-[var(--border)]">
+                      {f.key}
+                      {a.version && <span className="ml-1 text-2xs text-dim">v{a.version}</span>}
+                    </code>
+                    {/* One link per agent, covering every direction it has —
+                        so this sits on the card, not on a variant row. */}
+                    <IconButton
+                      label={`Share “${a.agent_name || f.key}” with another account`}
+                      disabled={f.variants.every((v) => !!v.error)}
+                      className="h-8 w-8"
+                      onClick={() => setSharing({ slug: f.key, title: a.agent_name || f.key })}
+                    >
+                      <Share2 size={14} />
+                    </IconButton>
+                  </div>
                 </div>
 
                 {brokenVariants.length > 0 && (
@@ -242,12 +275,12 @@ export default function AgentsList() {
                           </Button>
                         )}
                         <div className="ml-auto flex items-center gap-1">
-                          {/* Hear it before you dial it — one live engine turn in
-                              text. Disabled agents can't answer, so nothing to try. */}
+                          {/* Talk to it before you dial it — a typed call against
+                              the live engine. Broken agents can't answer. */}
                           <Button variant="ghost" size="sm" disabled={!!v.error}
-                            title={v.error ? 'Fix the agent error before testing' : `Try ${v.name} in text`}
+                            title={v.error ? 'Fix the agent error before chatting' : `Chat with ${v.name} as if it were a call`}
                             onClick={() => setTrying({ slug: v.name, direction: outbound ? 'outbound' : 'inbound' })}>
-                            <PlayCircle size={13} /> Try
+                            <MessageSquare size={13} /> Chat with agent
                           </Button>
                           <Link to={`/build/agents/${v.name}`}>
                             <Button variant="ghost" size="sm"><Pencil size={13} /> Edit</Button>
@@ -315,17 +348,15 @@ export default function AgentsList() {
       </AsyncState>
       )}
 
-      {tab === 'agents' && (
-        <div className="flex items-start gap-2 rounded-xl bg-indigo-500/10 px-4 py-3 ring-1 ring-indigo-500/20">
-          <Info size={14} className="mt-0.5 shrink-0 text-indigo-500" />
-          <p className="text-xs text-soft">
-            <span className="font-semibold">Activating</span> connects an agent to one of your phone
-            numbers — the inbound twin answers incoming calls on it, the outbound twin speaks on calls
-            placed from it. Manage your numbers in{' '}
-            <Link to="/telephony" className="font-semibold text-indigo-600 hover:underline dark:text-indigo-300">Numbers (BYON)</Link>.
-          </p>
-        </div>
-      )}
+      <div className="flex items-start gap-2 rounded-xl bg-indigo-500/10 px-4 py-3 ring-1 ring-indigo-500/20">
+        <Info size={14} className="mt-0.5 shrink-0 text-indigo-500" />
+        <p className="text-xs text-soft">
+          <span className="font-semibold">Activating</span> connects an agent to one of your phone
+          numbers — the inbound twin answers incoming calls on it, the outbound twin speaks on calls
+          placed from it. Manage your numbers in{' '}
+          <Link to="/telephony" className="font-semibold text-indigo-600 hover:underline dark:text-indigo-300">Numbers (BYON)</Link>.
+        </p>
+      </div>
 
       <ActivateAgentModal
         target={activating}
@@ -335,6 +366,19 @@ export default function AgentsList() {
 
       <TryAgentDialog slug={trying?.slug ?? ''} direction={trying?.direction}
         open={!!trying} onOpenChange={(v) => !v && setTrying(null)} />
+
+      <ShareAgentModal
+        slug={sharing?.slug ?? ''}
+        title={sharing?.title}
+        open={!!sharing}
+        onClose={() => setSharing(null)}
+      />
+
+      <ImportAgentModal
+        token={importToken}
+        open={!!importToken}
+        onClose={() => setImportToken('')}
+      />
     </div>
   )
 }

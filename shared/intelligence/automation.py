@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import re
 import subprocess
 from typing import Any
 
@@ -240,13 +241,33 @@ def _notify(owner: str, severity: str, title: str, body: str, link: str,
     return {"ok": True}
 
 
+# A tenant writes `to`/`subject` freely in the rule builder, and both used to
+# be concatenated straight into the message headers. A newline in either one
+# appends headers of the attacker's choosing (extra Bcc:, a forged From:), which
+# turns this VM into a relay for convincing "LesCall payment failed, re-enter
+# your card" mail sent from our own IP — precisely the mail billing is about to
+# start sending for real. Headers are single-line by definition: fold anything
+# that could break the line, and validate the address shape.
+_ADDR_RE = re.compile(r"^[^@\s;,<>\"]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24}$")
+
+
+def _header_value(raw: str, limit: int = 200) -> str:
+    """One header line: CR/LF/NUL stripped, collapsed, truncated."""
+    return re.sub(r"[\r\n\x00]+", " ", str(raw or "")).strip()[:limit]
+
+
 def _email(owner: str, params: dict, ctx: dict) -> dict:
-    to = params.get("to") or owner
-    subject = params.get("subject") or "LesCall automation alert"
+    to = _header_value(params.get("to") or owner, 254)
+    if not _ADDR_RE.match(to):
+        return {"ok": False, "detail": f"invalid recipient address: {to[:80]!r}"}
+    subject = _header_value(params.get("subject") or "LesCall automation alert")
     body = params.get("body") or json.dumps(ctx, ensure_ascii=False, indent=1)[:2000]
+    # The recipient is passed as an ARGV envelope address, not parsed out of the
+    # header block by `sendmail -t` — so even if a header somehow survived
+    # sanitisation it cannot redirect delivery.
     msg = f"To: {to}\nSubject: {subject}\n\n{body}\n"
     try:
-        proc = subprocess.run(["sendmail", "-t"], input=msg.encode(),
+        proc = subprocess.run(["sendmail", "-i", "--", to], input=msg.encode(),
                               timeout=20, capture_output=True)
         return {"ok": proc.returncode == 0,
                 "detail": (proc.stderr.decode()[:200] or "sent")}
@@ -256,15 +277,74 @@ def _email(owner: str, params: dict, ctx: dict) -> dict:
         return {"ok": False, "detail": repr(exc)[:200]}
 
 
+# The webhook URL is tenant-supplied and this code runs in a host-network
+# container, so an unvalidated POST reaches anything the VM can reach:
+# 127.0.0.1 (the super-admin plane, Postgres, the media WebSocket) and the GCP
+# metadata service at 169.254.169.254, which hands out VM service-account
+# tokens. The URL is therefore resolved to its IPs BEFORE the request and every
+# private/loopback/link-local destination is refused; redirects are disabled so
+# a public URL cannot bounce us to a private one on the second hop.
+_WEBHOOK_TIMEOUT_S = 15
+_WEBHOOK_MAX_BYTES = 64 * 1024
+
+
+def _public_ip(host: str) -> tuple[bool, str]:
+    """(allowed, detail) for a hostname — every resolved address must be a
+    global unicast address. Fails CLOSED on resolution failure."""
+    import ipaddress
+    import socket as _socket
+
+    try:
+        infos = _socket.getaddrinfo(host, None)
+    except Exception as exc:
+        return False, f"dns resolution failed: {exc!r}"
+    if not infos:
+        return False, "dns resolution returned no addresses"
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False, f"unparseable address {addr!r}"
+        if not ip.is_global or ip.is_multicast:
+            # covers loopback, RFC1918, link-local (incl. 169.254.169.254),
+            # unique-local v6, reserved, and CGNAT.
+            return False, f"refusing private/reserved destination {addr}"
+    return True, ""
+
+
 async def _webhook(params: dict, payload: dict) -> dict:
-    url = params.get("url")
+    from urllib.parse import urlsplit
+
+    url = str(params.get("url") or "")
     if not url:
         return {"ok": False, "detail": "not_configured: url missing"}
+    parts = urlsplit(url)
+    if parts.scheme != "https":
+        return {"ok": False, "detail": "webhook url must be https"}
+    if not parts.hostname:
+        return {"ok": False, "detail": "webhook url has no host"}
+    if parts.port is not None and parts.port not in (443,):
+        return {"ok": False, "detail": f"webhook port {parts.port} not allowed"}
+
+    import asyncio as _asyncio
+    allowed, detail = await _asyncio.to_thread(_public_ip, parts.hostname)
+    if not allowed:
+        log.warning("[automation] webhook blocked (%s): %s", detail, url[:200])
+        return {"ok": False, "detail": f"blocked: {detail}"}
+
     import httpx
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, json=payload)
-        return {"ok": resp.status_code < 300, "status": resp.status_code}
+    try:
+        async with httpx.AsyncClient(timeout=_WEBHOOK_TIMEOUT_S,
+                                     follow_redirects=False) as client:
+            resp = await client.post(url, json=payload)
+    except Exception as exc:
+        return {"ok": False, "detail": f"webhook failed: {exc!r}"[:200]}
+    if resp.status_code in (301, 302, 303, 307, 308):
+        return {"ok": False, "detail": "webhook redirected — refusing to follow"}
+    return {"ok": resp.status_code < 300, "status": resp.status_code,
+            "body": resp.text[:_WEBHOOK_MAX_BYTES] if resp.status_code >= 300 else ""}
 
 
 def _create_followup(owner: str, call_id: int | None, params: dict,

@@ -195,6 +195,10 @@ def test_rollback_cancels_slot_extractor():
 def test_closing_turn_commits_immediately():
     r = make_router()
     drive(r, "thank you bye")
+    # The close-confirm question (2026-07-31) is deliberately NOT committed —
+    # if "bye" was the front of a longer sentence, continuation-merge should
+    # still be able to roll it back. The confirmed close is the final turn.
+    drive(r, "yes")
     assert r.state.is_closing is True
     assert not r.has_pending_turn()
     assert r.rollback_pending_turn() is None

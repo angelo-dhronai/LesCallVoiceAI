@@ -31,6 +31,13 @@ export function AppShell({ children }: { children: ReactNode }) {
   // Navigating closes the mobile drawer.
   useEffect(() => { setMobileOpen(false) }, [pathname])
 
+  // Publish the sidebar state to <html> so shell-scoped overlays (the live
+  // transcript) can resolve --shell-nav-w in CSS and follow the sidebar when
+  // it collapses — they render in a portal on <body>, far outside this tree.
+  useEffect(() => {
+    document.documentElement.dataset.nav = collapsed ? 'collapsed' : 'expanded'
+  }, [collapsed])
+
   // Each panel opens at its top — an inherited scroll offset on a fresh page
   // reads as a broken load. Immediate (not smoothed): the content under the
   // scrollbar is already new, so easing would animate the wrong page.

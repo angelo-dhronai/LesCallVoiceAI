@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   BookUser, ChevronRight, FolderPlus, Folder, FolderOpen, Pencil, Plus,
@@ -87,7 +87,7 @@ export default function Contacts() {
   const groupSel: 'all' | 'none' | number =
     groupRaw === 'all' ? 'all' : groupRaw === 'none' ? 'none' : Number(groupRaw) || 'all'
   const setGroupSel = (v: 'all' | 'none' | number) => setGroupRaw(String(v))
-  const [search, setSearch] = useUrlParam('search')
+  const [search, setSearch] = useUrlParam('search', '')
   const [page, setPage] = useUrlNumber('page', 1)
   const debSearch = useDebounced(search, 300)
   const [editor, setEditor] = useState<EditorState | null>(null)
@@ -110,16 +110,25 @@ export default function Contacts() {
   const groups = groupsQ.data?.groups ?? []
 
   const groupParam = groupSel === 'all' ? 'all' : groupSel === 'none' ? 'none' : String(groupSel)
+  // Server-side pagination: the page is part of the cache key so React Query
+  // keeps each page separately (and `total` is the full filtered count, not
+  // the size of the slice we were handed).
   const contactsQ = useGet<ContactsResp>(
-    ['contacts-book', groupParam, debSearch],
-    `/outbound/contacts?group=${groupParam}&q=${encodeURIComponent(debSearch)}`,
+    ['contacts-book', groupParam, debSearch, page],
+    `/outbound/contacts?group=${groupParam}&q=${encodeURIComponent(debSearch || '')}&page=${page}&limit=${PAGE_SIZE}`,
   )
   const all = contactsQ.data?.contacts ?? []
-  const pages = Math.max(1, Math.ceil(all.length / PAGE_SIZE))
-  const rows = useMemo(
-    () => all.slice((Math.min(page, pages) - 1) * PAGE_SIZE, Math.min(page, pages) * PAGE_SIZE),
-    [all, page, pages],
-  )
+  const total = contactsQ.data?.total ?? 0
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const rows = all
+
+  // The server slices by the page we asked for, so a stale page number (bookmarked
+  // deep link, or deleting the last contacts on page 3) would render a blank page
+  // forever. Snap back the moment the real total says that page cannot exist.
+  useEffect(() => {
+    if (contactsQ.data && page > pages) setPage(pages)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contactsQ.data, page, pages])
 
   const groupName = (id?: number | null) => groups.find((g) => g.id === id)?.name
 
@@ -314,7 +323,7 @@ export default function Contacts() {
             <SearchInput value={search} onChange={setSearch} placeholder="Search name or number" className="w-full max-w-sm" />
             {contactsQ.isFetching && <Spinner className="h-4 w-4 shrink-0" />}
             <div className="ml-auto">
-              {all.length > 0 && <Badge tone="neutral">{all.length.toLocaleString('en-IN')} contact{all.length === 1 ? '' : 's'}</Badge>}
+              {total > 0 && <Badge tone="neutral">{total.toLocaleString('en-IN')} contact{total === 1 ? '' : 's'}</Badge>}
             </div>
           </div>
 
@@ -393,7 +402,7 @@ export default function Contacts() {
                     ))}
                   </tbody>
                 </Table>
-                <Pagination page={Math.min(page, pages)} pages={pages} total={all.length} onPage={setPage} />
+                <Pagination page={Math.min(page, pages)} pages={pages} total={total} onPage={setPage} />
               </>
             )}
           </AsyncState>

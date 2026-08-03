@@ -31,6 +31,7 @@ import os
 import secrets
 import sys
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -60,6 +61,12 @@ OAUTH_REDIRECT_URL = os.environ.get(
     "OAUTH_REDIRECT_URL", "http://localhost:8080/auth/callback")
 SESSION_COOKIE = "lescall_session"
 STATE_COOKIE = "lescall_oauth_state"
+# Where to land AFTER logging in. Every deep link into the SPA — a shared
+# agent, a linked call, a bookmarked contact — used to be discarded on the way
+# to Google and dropped the user on the homepage instead. Short-lived because
+# it is only meant to survive one consent round-trip.
+RETURN_COOKIE = "lescall_return_to"
+RETURN_TTL_S = 900
 SESSION_TTL_S = int(os.environ.get("LESCALL_SESSION_TTL_S", str(7 * 24 * 3600)))
 
 _SECRET_FILE = Path(__file__).parent / ".session_secret"
@@ -93,8 +100,102 @@ def oauth_enabled() -> bool:
     return bool(GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET)
 
 
+def assert_auth_configured() -> None:
+    """Fail the boot if the whole auth wall has silently evaporated.
+
+    `oauth_enabled()` is decided by env that arrives through a best-effort
+    dotenv load of calling-agent/.env wrapped in `try/except: pass`. Lose or
+    mistype that file and every check above degrades to single-tenant
+    fallback: no login page, no session requirement, and `current_owner()`
+    returning DEFAULT_OWNER — i.e. the entire API served to the internet as
+    the founder, whose entitlements are unlimited. That is a silent,
+    total failure, so production asserts instead of degrading.
+
+    Set LESCALL_REQUIRE_AUTH=false ONLY for local single-tenant development.
+    """
+    require = os.environ.get("LESCALL_REQUIRE_AUTH", "true").lower()
+    if require not in ("1", "true", "yes"):
+        logger.warning(
+            "LESCALL_REQUIRE_AUTH is disabled — the API is running WITHOUT a "
+            "login wall as %s. Never do this on a public host.", DEFAULT_OWNER)
+        return
+    if not oauth_enabled():
+        raise SystemExit(
+            "FATAL: LESCALL_REQUIRE_AUTH=true but no OAuth is configured — "
+            "GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET are unset, so the login "
+            "wall would be OFF and every request would act as the founding "
+            "tenant. Check that calling-agent/.env is present and readable, "
+            "or set LESCALL_REQUIRE_AUTH=false for local development.")
+    if not _oauth_fully_configured():
+        raise SystemExit(
+            "FATAL: OAuth is half-configured (only one of GOOGLE_CLIENT_ID / "
+            "GOOGLE_CLIENT_SECRET is set) — login cannot complete.")
+    logger.info("auth: login wall ACTIVE (multi-tenant, signups=%s)",
+                "OPEN" if "*" in allowed_emails() else
+                f"{len(allowed_emails())} allowlisted")
+
+
+def normalize_owner(email: str) -> str:
+    """The canonical tenant key.
+
+    `owner TEXT` is an email on every table in this system, including the
+    billing tables — so two spellings of one address are two tenants, and the
+    second gets a fresh quota, a fresh agent cap and a fresh Pilot claim.
+    Google returns the address as registered, which is NOT necessarily
+    lowercase, and `allowed_emails()` only ever lowercased for *comparison*.
+    Normalize at every boundary that mints or reads an identity.
+    """
+    return unicodedata.normalize("NFC", str(email or "").strip()).lower()
+
+
 def _oauth_fully_configured() -> bool:
     return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+
+
+# File extensions a browser fetches on its own (icons, manifests, fonts,
+# bundle chunks). Never a place a person navigated to.
+_ASSET_EXTENSIONS = frozenset({
+    "ico", "png", "jpg", "jpeg", "gif", "svg", "webp", "avif",
+    "css", "js", "map", "txt", "xml", "json", "webmanifest",
+    "woff", "woff2", "ttf", "otf",
+})
+
+
+def safe_return_path(raw: str | None) -> str:
+    """A post-login destination we are willing to redirect to, or "".
+
+    This value comes from a query string, i.e. from whoever wrote the link, so
+    it is an open-redirect vector: `?next=https://evil.example` or the
+    protocol-relative `?next=//evil.example` would send a freshly
+    authenticated user off-site with our login flow as the referrer. Only
+    same-origin ABSOLUTE PATHS pass, and the login surface itself is excluded
+    so a bounce cannot loop.
+    """
+    path = (raw or "").strip()
+    if not path or len(path) > 512:
+        return ""
+    if not path.startswith("/") or path.startswith("//") or path.startswith("/\\"):
+        return ""
+    if "\\" in path or "\n" in path or "\r" in path:
+        return ""
+    for blocked in ("/login", "/auth/"):
+        if path == blocked or path.startswith(blocked):
+            return ""
+    # Asset fetches bounce off the login wall too — the browser's automatic
+    # /favicon.ico probe on the login page most of all — and their `next`
+    # arrives one request AFTER the real navigation's, overwriting the stashed
+    # destination. Every fresh login then landed on /favicon.ico.
+    leaf = path.split("?", 1)[0].rsplit("/", 1)[-1]
+    if "." in leaf and leaf.rsplit(".", 1)[1].lower() in _ASSET_EXTENSIONS:
+        return ""
+    return path
+
+
+def _set_return_cookie(resp, path: str) -> None:
+    if not path:
+        return
+    resp.set_cookie(RETURN_COOKIE, path, max_age=RETURN_TTL_S, httponly=True,
+                    samesite="lax", secure=_cookie_secure())
 
 
 def _cookie_secure() -> bool:
@@ -135,7 +236,7 @@ def _sign(payload: bytes) -> str:
 
 def make_session_cookie(email: str, name: str = "", picture: str = "") -> str:
     payload = json.dumps({
-        "email": email, "name": name, "picture": picture,
+        "email": normalize_owner(email), "name": name, "picture": picture,
         "exp": int(time.time()) + SESSION_TTL_S,
     }, separators=(",", ":")).encode("utf-8")
     b64 = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
@@ -176,16 +277,19 @@ def current_owner(request: Request) -> str:
     required (401 otherwise).
     """
     if not oauth_enabled():
-        return DEFAULT_OWNER
+        return normalize_owner(DEFAULT_OWNER)
     session = read_session_cookie(request.cookies.get(SESSION_COOKIE))
     if not session:
         raise HTTPException(status_code=401, detail="login required")
-    return session["email"]
+    # Normalized here too, not only at mint time: sessions issued before this
+    # change carry the raw Google claim and stay valid for up to 7 days.
+    return normalize_owner(session["email"])
 
 
 def _upsert_user(email: str, name: str, google_sub: str, picture: str) -> None:
     """Record the login in the shared DB. Best-effort — login must not fail
     because the DB is momentarily unavailable."""
+    email = normalize_owner(email)
     try:
         from shared.db.database import get_db
         with get_db() as db:
@@ -199,6 +303,19 @@ def _upsert_user(email: str, name: str, google_sub: str, picture: str) -> None:
                 (name, picture, email))
     except Exception as exc:
         logger.warning("user upsert failed for %s: %r", email, exc)
+
+    # Give every new account an EXPLICIT entitlements row at first login.
+    #
+    # Without it a tenant's plan is implicit — it works (get_entitlements falls
+    # back to Free defaults), but the P6 discovery query starts returning rows
+    # again the moment signups reopen, and "no row" is indistinguishable from
+    # "row we forgot to create". Best-effort: a billing hiccup must never stop
+    # someone logging in.
+    try:
+        from shared.billing.entitlements import resolve_entitlements
+        resolve_entitlements(email, actor="signup")
+    except Exception as exc:
+        logger.warning("entitlement provisioning skipped for %s: %r", email, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -285,12 +402,16 @@ async def put_profile(request: Request):
 
 
 @router.get("/auth/login")
-def login():
+def login(request: Request, next: str = ""):
     if not _oauth_fully_configured():
         return JSONResponse(
             {"error": "OAuth not (fully) configured — set BOTH GOOGLE_CLIENT_ID "
                       "and GOOGLE_CLIENT_SECRET"},
             status_code=503)
+    # `next` may arrive here directly (a link straight to /auth/login) or have
+    # been stashed by /login one hop earlier; the explicit param wins.
+    destination = safe_return_path(next) or safe_return_path(
+        request.cookies.get(RETURN_COOKIE))
     state = secrets.token_urlsafe(24)
     params = urllib.parse.urlencode({
         "client_id": GOOGLE_CLIENT_ID,
@@ -303,6 +424,7 @@ def login():
     resp = RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
     resp.set_cookie(STATE_COOKIE, state, max_age=600, httponly=True, samesite="lax",
                     secure=_cookie_secure())
+    _set_return_cookie(resp, destination)
     return resp
 
 
@@ -351,7 +473,12 @@ def callback(request: Request, code: str = "", state: str = ""):
 
     _upsert_user(email, claims.get("name", ""), claims.get("sub", ""),
                  claims.get("picture", ""))
-    resp = RedirectResponse("/")
+    # Back to whatever they were trying to open before the login wall caught
+    # them — a share link's token lives in that path, so dropping it means the
+    # invitation silently evaporates on first use.
+    destination = safe_return_path(request.cookies.get(RETURN_COOKIE)) or "/"
+    resp = RedirectResponse(destination)
+    resp.delete_cookie(RETURN_COOKIE)
     resp.set_cookie(
         SESSION_COOKIE, make_session_cookie(email, claims.get("name", ""),
                                             claims.get("picture", "")),
@@ -375,16 +502,24 @@ def logout():
 
 
 @router.get("/login")
-def login_page(request: Request):
-    """The branded login page (static/login.html)."""
+def login_page(request: Request, next: str = ""):
+    """The branded login page (static/login.html).
+
+    `?next=` is the path the visitor was actually trying to open; nginx's
+    auth_request wall appends it when it bounces an unauthenticated SPA
+    navigation here. It is stashed in a short-lived cookie rather than
+    threaded through login.html, so the static page needs no knowledge of it.
+    """
+    destination = safe_return_path(next)
     if not oauth_enabled():
-        return RedirectResponse("/")  # single-tenant mode: no login wall
+        return RedirectResponse(destination or "/")  # single-tenant: no wall
     if read_session_cookie(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse("/")
+        return RedirectResponse(destination or "/")
     page = Path(__file__).parent / "static" / "login.html"
-    if page.exists():
-        return FileResponse(str(page), media_type="text/html")
-    return RedirectResponse("/auth/login")  # page missing — straight to Google
+    resp = (FileResponse(str(page), media_type="text/html") if page.exists()
+            else RedirectResponse("/auth/login"))  # page missing — go to Google
+    _set_return_cookie(resp, destination)
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +533,15 @@ def login_page(request: Request):
 _OPEN_PREFIXES = ("/auth/", "/login", "/static/", "/api/auth/me", "/favicon",
                   "/api/recordings/dl/")
 
+# Paths open to unauthenticated callers by EXACT match only. Prefix matching is
+# wrong for these: a prefix short-circuits both the session requirement and the
+# tenancy gate, so adding "/api/billing/webhook/razorpay" to _OPEN_PREFIXES
+# would silently un-authenticate any future sibling route whose path starts
+# with those characters (…/razorpay-test, …/razorpay2). The webhook
+# authenticates itself with an HMAC over the raw body — that signature IS its
+# credential — so exactly one path, compared with ==, is what it needs.
+_OPEN_EXACT = ("/api/billing/webhook/razorpay",)
+
 # API prefixes tenants may use — every handler under these performs its own
 # per-owner scoping. EVERYTHING ELSE under /api/ is DENIED for every session
 # (roles are flattened; there are no admins): the legacy stores (runtime
@@ -408,6 +552,11 @@ _OPEN_PREFIXES = ("/auth/", "/login", "/static/", "/api/auth/me", "/favicon",
 _TENANT_API_PREFIXES = (
     "/api/auth/",
     "/api/agents",       # owner-scoped in agent_builder_api
+    # Agent share links. NOT owner-scoped by slug — that is the point: a
+    # recipient reads an agent they do not own, keyed by an unguessable token.
+    # A session is still required (this list only bypasses the tenancy gate,
+    # never the login wall), and every route re-checks ownership itself.
+    "/api/share",
     "/api/copilot",      # owner-scoped agent creation chat
     "/api/trunks",
     "/api/numbers",
@@ -423,6 +572,10 @@ _TENANT_API_PREFIXES = (
     "/api/calls/active",
     "/api/calls/live-state",
     "/api/usage/minutes",   # billing view; owner-scoped inside the endpoint
+    # Subscriptions, checkout, receipts, top-ups. Every endpoint under it takes
+    # Depends(current_owner) and scopes by that owner; the Razorpay webhook is
+    # the one exception and is opened by EXACT match in _OPEN_EXACT above.
+    "/api/billing",
     "/api/analysis",
     "/api/analytics/conversation",
     # Homepage KPIs. Was deliberately absent — every figure came from the
@@ -437,6 +590,10 @@ _TENANT_API_PREFIXES = (
     # data, and every tenant legitimately needs to see whether the platform is
     # up. Returns only service running-flags + ports, no per-call info.
     "/api/health",
+    # TTS voice previews — platform-wide stock samples (canned line per Sarvam
+    # speaker), no tenant data. Session still required. Absent from this list
+    # 07-24→08-01, which made every "tap to hear" chip in the copilot 403.
+    "/api/voices",
 )
 
 
@@ -448,12 +605,19 @@ def install_login_gate(app) -> None:
     async def _login_gate(request: Request, call_next):
         if oauth_enabled():
             path = request.url.path
-            if not any(path.startswith(p) for p in _OPEN_PREFIXES):
+            if (path not in _OPEN_EXACT
+                    and not any(path.startswith(p) for p in _OPEN_PREFIXES)):
                 session = read_session_cookie(request.cookies.get(SESSION_COOKIE))
                 if not session:
                     accepts_html = "text/html" in (request.headers.get("accept") or "")
                     if not path.startswith("/api/") and (path == "/" or accepts_html):
-                        return RedirectResponse("/login")
+                        # Carry the destination across the login round-trip.
+                        target = path + (f"?{request.url.query}"
+                                         if request.url.query else "")
+                        dest = safe_return_path(target)
+                        return RedirectResponse(
+                            f"/login?next={urllib.parse.quote(dest, safe='')}"
+                            if dest else "/login")
                     return JSONResponse({"detail": "login required"}, status_code=401)
                 if (path.startswith("/api/")
                         and not any(path.startswith(p) for p in _TENANT_API_PREFIXES)):

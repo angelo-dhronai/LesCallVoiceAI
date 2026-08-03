@@ -19,6 +19,21 @@ cd /home/angelo/lescall
     done
 ) &
 
+# Billing sync + dunning: ALSO its own supervised process, for the same reason
+# as the intel worker. It makes N sequential Razorpay calls per pass, so
+# putting it in the tick loop below would make tick duration a function of the
+# payment provider's latency — and the sentinel restarts this container when
+# 'reconcile:' vanishes for 20 minutes. One slow afternoon at Razorpay would
+# then kill the intel worker mid-job and stop billing reconciliation.
+# Self-disables when the billing tables are absent (SQLite dev).
+(
+    while true; do
+        python -m shared.billing.sync || true
+        echo "WARN billing sync exited; restarting in 60s"
+        sleep 60
+    done
+) &
+
 TICK=300
 i=0
 echo "workers loop up (tick=${TICK}s)"

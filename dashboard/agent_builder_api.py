@@ -96,11 +96,88 @@ def _slug_owner(slug: str) -> str | None:
 def _claim_slug(slug: str, owner: str, display_name: str = "") -> None:
     from shared.db.database import get_db
     with get_db() as db:
+        # E7 backstop. The real gate is _assert_agent_quota() at the top of
+        # each create handler — this one runs inside the same transaction as
+        # the claim, under an advisory lock, because a bare count-then-write is
+        # TOCTOU: two concurrent creates on a cap of 1 both read 0 and both
+        # succeed.
+        _billing_claim_guard(db, owner, slug)
         db.execute(
             "INSERT INTO agents (slug, owner, display_name) VALUES (?,?,?) "
             "ON CONFLICT (slug) DO NOTHING", (slug, owner, display_name or None))
         db.execute("UPDATE agents SET owner=? WHERE slug=? AND owner IS NULL",
                    (owner, slug))
+
+
+def _billing_claim_guard(db, owner: str, slug: str) -> None:
+    """Serialise cap checking per owner and re-verify under the lock.
+
+    pg_advisory_xact_lock is released automatically when the transaction ends,
+    so a crashed request cannot leave a tenant permanently unable to create.
+    """
+    try:
+        from shared.billing.entitlements import (
+            agent_families_used, enforcement_enabled, get_entitlements)
+        from shared.billing.errors import BillingRefusal, CODE_CAP_AGENTS
+    except Exception:
+        return
+    if not enforcement_enabled():
+        return
+    try:
+        db.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (owner,))
+    except Exception:
+        pass  # sqlite dev fallback has no advisory locks
+    try:
+        ent = get_entitlements(owner)
+        cap = ent.get("max_agent_families")
+        if cap is None:
+            return
+        family = agent_family(slug)
+        existing = db.execute(
+            "SELECT 1 FROM agents WHERE owner=? AND archived_at IS NULL "
+            "AND (slug=? OR slug=? OR slug=?) LIMIT 1",
+            (owner, family, f"{family}-inbound", f"{family}-outbound")).fetchone()
+        if existing:
+            return  # the other half of a pair the tenant already owns
+        used = agent_families_used(owner)
+    except BillingRefusal:
+        raise
+    except Exception as exc:
+        logger.error("[builder] agent cap re-check failed for %s: %r", owner, exc)
+        return
+    if used >= int(cap):
+        raise BillingRefusal(
+            f"Your plan includes {cap} agent{'s' if int(cap) != 1 else ''} and "
+            f"you have {used}. Archive one to free a slot, or upgrade.",
+            CODE_CAP_AGENTS, agents_used=used, agents_limit=int(cap))
+
+
+def _billing_llm_gate(owner: str, surface: str) -> None:
+    """E9-E11. One daily budget across every LLM surface a tenant can drive.
+
+    Raises BillingRefusal (402) when the budget is spent; records the turn
+    otherwise. Never blocks on a billing outage — the check itself fails open.
+    """
+    try:
+        from shared.billing.entitlements import check_copilot_turn, record_copilot_turn
+    except Exception:
+        return
+    check_copilot_turn(owner).raise_for_http()
+    record_copilot_turn(owner, surface)
+
+
+def _assert_agent_quota(owner: str, family: str = "") -> None:
+    """E7 pre-check, BEFORE any filesystem write.
+
+    Putting the only check inside _claim_slug was not enough. write_agent_dir
+    wraps the claim in `except Exception` and re-raises a 500, so the SPA's 402
+    handling would never fire; the copilot turns it into a ValueError string;
+    and in the twin loop the inbound slug's row is already inserted when the
+    outbound one raises, so the rollback rmtree leaves an owned, folder-less
+    row that eats a cap slot forever and 404s on archive.
+    """
+    from shared.billing.entitlements import check_agent_create
+    check_agent_create(owner, family).raise_for_http()
 
 
 def _visible_slugs(owner: str) -> set[str] | None:
@@ -267,9 +344,33 @@ def adapt_direction(spec: dict, direction: str) -> dict:
     company = ((out.get("identity") or {}).get("company_name") or "").strip()
 
     # 1. Opening greeting — outbound speaks first and names the contact.
+    #    The engine opens outbound calls from outbound.opening_greeting when
+    #    it is set (response_bank.opening_greeting is the inbound/fallback
+    #    line), so the outbound opener is written to BOTH homes with the SAME
+    #    text — one audible truth, no shadowed field saying something else
+    #    (the 2026-08-01 Jethalal edit landed in a shadowed field). An
+    #    existing per-language outbound.opening_greeting is kept as-is; the
+    #    inbound twin gets the dormant outbound opener cleared for the same
+    #    reason.
     bank = out.setdefault("response_bank", {})
+    ob_cfg = out.setdefault("outbound", {})
     if isinstance(bank, dict):
-        bank["opening_greeting"] = _OUTBOUND_GREETING if outbound else _INBOUND_GREETING
+        if outbound:
+            existing_ob = {k: str(v) for k, v in
+                           ((ob_cfg.get("opening_greeting") or {})
+                            if isinstance(ob_cfg, dict) else {}).items()
+                           if str(v).strip()}
+            if existing_ob:  # keep the authored per-language opener; align fallback
+                bank["opening_greeting"] = (existing_ob.get("en")
+                                            or next(iter(existing_ob.values())))
+            else:
+                bank["opening_greeting"] = _OUTBOUND_GREETING
+                if isinstance(ob_cfg, dict):
+                    ob_cfg["opening_greeting"] = {"en": _OUTBOUND_GREETING}
+        else:
+            bank["opening_greeting"] = _INBOUND_GREETING
+            if isinstance(ob_cfg, dict):
+                ob_cfg["opening_greeting"] = {}
         # 4. Cold-call objections only make sense when WE placed the call.
         if outbound:
             if not (bank.get("objection_responses") or {}):
@@ -403,6 +504,14 @@ def write_agent_dir(name: str, spec: dict, owner: str) -> AgentDefinition:
     agent_registry.put(name, agent)
     try:
         _claim_slug(name, owner, agent.identity.agent_name)
+    except HTTPException:
+        # A billing refusal (402) or any other deliberate HTTP error must reach
+        # the client UNCHANGED. Folding it into the 500 below is what made the
+        # SPA render "could not register ownership: ..." instead of the upgrade
+        # panel, so the cap looked like a server bug to every user who hit it.
+        shutil.rmtree(target_dir, ignore_errors=True)
+        agent_registry.invalidate(name)
+        raise
     except Exception as exc:
         # Fail CLOSED: an unclaimed agent would be invisible/unusable for a
         # tenant and grabbable later — undo the create instead.
@@ -415,16 +524,46 @@ def write_agent_dir(name: str, spec: dict, owner: str) -> AgentDefinition:
     return agent
 
 
+def _unclaim_slug(slug: str, owner: str) -> None:
+    """Undo a claim during a failed multi-agent create.
+
+    Without this the twin rollback deletes the FOLDER but leaves the row, and
+    an owned row with no folder is the worst of both worlds: it consumes a cap
+    slot forever, it is invisible in the agents list, and DELETE returns 404
+    because the archive path checks the filesystem first.
+    """
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            db.execute("DELETE FROM agents WHERE slug=? AND owner=?", (slug, owner))
+    except Exception as exc:
+        logger.error("[builder] could not release slug %s: %r", slug, exc)
+
+
 def _assert_slug_free(name: str, owner: str) -> None:
     if (_AGENTS_DIR / name).exists():
         raise HTTPException(status_code=409,
                             detail=f"Agent '{name}' already exists — use PUT to update")
     # Never write into a slug the DB already assigns to another tenant (guards
     # the narrow orphaned-row case where the folder was removed but the owner
-    # row survived).
+    # row survived). An ARCHIVED row is claimable again — archiving frees the
+    # slot, and a tenant who archives 'sales' must be able to create 'sales'
+    # afresh rather than being blocked by their own deleted agent.
     existing = _slug_owner(name)
-    if existing and existing != owner and not _ctx_is_admin():
+    if existing and existing != owner and not _ctx_is_admin() \
+            and not _slug_archived(name):
         raise HTTPException(status_code=409, detail=f"Agent '{name}' already exists")
+
+
+def _slug_archived(slug: str) -> bool:
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            row = db.execute("SELECT archived_at FROM agents WHERE slug=?",
+                             (slug,)).fetchone()
+        return bool(row and row["archived_at"])
+    except Exception:
+        return False
 
 
 @router.post("/api/agents")
@@ -451,6 +590,7 @@ async def create_agent(request: Request) -> dict:
 
     if not make_twins:
         _assert_slug_free(name, owner)
+        _assert_agent_quota(owner, agent_family(name))
         agent = write_agent_dir(name, body, owner)
         logger.info("[builder] created agent '%s' (owner=%s)", name, owner)
         return {"status": "created", "name": name, "agent_id": agent.agent_id}
@@ -463,6 +603,9 @@ async def create_agent(request: Request) -> dict:
     slugs = {d: twin_slug(family, d) for d in DIRECTIONS}
     for slug in slugs.values():
         _assert_slug_free(slug, owner)
+    # E7 — before ANY filesystem write. A twin pair is ONE family against the
+    # cap, so this is checked once for the pair, not once per slug.
+    _assert_agent_quota(owner, family)
 
     created: list[str] = []
     try:
@@ -481,6 +624,9 @@ async def create_agent(request: Request) -> dict:
         for slug in created:
             shutil.rmtree(_AGENTS_DIR / slug, ignore_errors=True)
             agent_registry.invalidate(slug)
+            # Release the ownership row too. Deleting only the folder leaves an
+            # owned, folder-less row that consumes a plan slot forever.
+            _unclaim_slug(slug, owner)
         raise
 
     primary = slugs[primary_direction]
@@ -523,6 +669,9 @@ async def create_twin(name: str) -> dict:
             "error": "exists", "name": target,
             "message": f"'{target}' already exists — open it instead."})
     _assert_slug_free(target, owner)
+    # A twin completes an EXISTING family, so this normally passes even at cap
+    # — check_agent_create() returns ok when the family is already owned.
+    _assert_agent_quota(owner, family)
 
     import yaml as _yaml
     with src_path.open(encoding="utf-8") as fh:
@@ -585,6 +734,16 @@ async def archive_agent(name: str) -> dict:
         shutil.rmtree(dest)
     shutil.move(str(agent_dir), str(dest))
     agent_registry.invalidate(name)
+    # Stamp the index row so the plan cap stops counting it. The row is kept
+    # (not deleted) so history, call attribution and un-archive all still work
+    # — but every cap check and usage display filters archived_at IS NULL.
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            db.execute("UPDATE agents SET archived_at=CURRENT_TIMESTAMP "
+                       "WHERE slug=? AND archived_at IS NULL", (name,))
+    except Exception as exc:
+        logger.error("[builder] could not stamp archived_at for %s: %r", name, exc)
     # If the archived agent was active, clear the selection.
     if _read_active() == name:
         try:
@@ -765,6 +924,10 @@ async def extract_from_document(file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=422, detail=f"Text extraction failed: {exc}")
     if not extracted.strip():
         raise HTTPException(status_code=422, detail="No text could be extracted from this file")
+    # E11 — LLM extraction on a tenant-uploaded file. Unmetered today, and the
+    # model quota it draws on is SHARED with live calls, so an upload loop is a
+    # way to degrade other tenants' phone calls at no cost to yourself.
+    _billing_llm_gate(_ctx_owner(), "extract-document")
     from backend.app.documents.yaml_filler import extract_fields_from_text
     result = extract_fields_from_text(extracted)
     if result.get("status") == "error":
@@ -860,6 +1023,7 @@ async def extract_yaml_from_document(name: str, doc_id: str) -> dict:
     text = get_document_text(name, doc_id)
     if not text:
         raise HTTPException(status_code=404, detail="Document text not found")
+    _billing_llm_gate(_ctx_owner(), "extract-yaml")   # E11
     from backend.app.documents.yaml_filler import extract_fields_from_text
     result = extract_fields_from_text(text)
     result["agent_folder"] = name
@@ -927,66 +1091,6 @@ async def tts_voice_preview(speaker: str, model: str = "bulbul:v3", language: st
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
-
-# ── intent preview (no LLM) ─────────────────────────────────────────────────
-@router.post("/api/preview/intent")
-async def preview_intent(request: Request) -> dict:
-    """Pattern-match caller text against an agent's deterministic intent rules."""
-    body = await request.json()
-    text = body.get("text", "").strip()
-    language = body.get("language", "auto")
-
-    req_agent = (body.get("agent") or "").strip()
-    agent_name = req_agent or (_read_active() if _ctx_is_admin() else "")
-    if not agent_name:
-        # Default to one of the CALLER's own agents, never another tenant's.
-        visible = _visible_slugs(_ctx_owner())
-        yamls = [p for p in sorted(_AGENTS_DIR.glob("*/agent.yaml"))
-                 if visible is None or p.parent.name in visible]
-        if not yamls:
-            raise HTTPException(status_code=503, detail="No agents found — create one first")
-        agent_name = yamls[0].parent.name
-    # Owner boundary: this route has no {name} path param so the router
-    # dependency never ran _assert_slug_access — enforce it explicitly.
-    _assert_slug_access(agent_name, _ctx_owner())
-    try:
-        agent_def = agent_registry.get(agent_name, _AGENTS_DIR)
-    except Exception as exc:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found: {exc}")
-
-    kb = agent_def.knowledge_base
-    text_lower = text.lower()
-    matches: list[dict] = []
-    for pattern in kb.objection_patterns:
-        if pattern.lower() in text_lower:
-            matches.append({"intent": "objection", "pattern": pattern})
-    for pattern in kb.time_patterns:
-        if pattern.lower() in text_lower:
-            matches.append({"intent": "time_request", "pattern": pattern})
-    for alias in kb.location_aliases:
-        if alias.lower() in text_lower:
-            matches.append({"intent": "location_selection", "pattern": alias})
-    qa_hits: list[dict] = []
-    for field_name, signals in kb.qa_field_signals.items():
-        for sig in signals:
-            if sig.lower() in text_lower:
-                qa_hits.append({"field": field_name, "signal": sig})
-    top_intent = matches[0]["intent"] if matches else ("qa_signal" if qa_hits else "none")
-    return {
-        "text": text,
-        "language": language,
-        "intent": top_intent,
-        "matches": matches,
-        "qa_signals": qa_hits,
-        "agent_id": agent_def.agent_id,
-        "patterns_checked": {
-            "objection": len(kb.objection_patterns),
-            "time": len(kb.time_patterns),
-            "location": len(kb.location_aliases),
-            "qa_fields": len(kb.qa_field_signals),
-        },
-    }
 
 
 # ── activate (THE wire to telephony) ────────────────────────────────────────

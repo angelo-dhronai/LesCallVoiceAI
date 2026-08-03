@@ -44,6 +44,33 @@ logger = logging.getLogger("call_bridge")
 PLAYBACK_HOST = "127.0.0.1"
 PLAYBACK_PORT = 9004
 
+# --- "empty call" detection (calls.answer_state) ---------------------------
+# A connected call where no real conversation happened: the callee picked up
+# but stayed silent, only noise came through, an answering machine took it, or
+# it was over before it began. FreeSWITCH answers all of these identically, so
+# it is decided at teardown from what the caller actually said. Every threshold
+# is env-tunable because the right value is deployment-specific.
+#
+# Below EMPTY_CALL_MAX_SECONDS an answered call is treated as empty regardless
+# of content — an 8-second "call" is a pickup-and-hang-up, not a conversation.
+_EMPTY_CALL_MAX_SECONDS = float(os.environ.get("EMPTY_CALL_MAX_SECONDS", "10"))
+# Total caller characters (across <=2 turns) below which they effectively said
+# nothing — "hello?" and then silence.
+_EMPTY_CALL_MIN_CHARS = int(os.environ.get("EMPTY_CALL_MIN_CHARS", "15"))
+# A single caller utterance this long, with nothing responsive after it, has
+# the shape of a recorded announcement.
+_VOICEMAIL_MIN_CHARS = int(os.environ.get("VOICEMAIL_MIN_CHARS", "120"))
+# Announcement phrases across the languages this platform serves. Matched
+# case-insensitively as substrings of the caller side of the transcript.
+_VOICEMAIL_PHRASES = tuple(p.strip().lower() for p in os.environ.get(
+    "VOICEMAIL_PHRASES",
+    "leave a message|after the tone|after the beep|voice mail|voicemail|"
+    "not available right now|unable to take your call|is switched off|"
+    "record your message|please try again later|"
+    "आपका संदेश|संदेश रिकॉर्ड|उपलब्ध नहीं|स्विच ऑफ|बाद में प्रयास|"
+    "ઉપલબ્ધ નથી|સંદેશ"
+).split("|") if p.strip())
+
 # Agent-initiated graceful hangup (platform rule, all agents). The engine
 # arms ConversationRouter.hangup_pending only on caller-consented closes
 # (farewell exchange, close-permission confirm, wrong number, DND); the
@@ -57,6 +84,11 @@ AGENT_HANGUP_ENABLED = os.environ.get(
 AGENT_HANGUP_MIN_WAIT_S = float(os.environ.get("AGENT_HANGUP_MIN_WAIT_S", "3.0"))
 # Seconds of post-playback grace after the estimated wire-playback end.
 AGENT_HANGUP_GRACE_S = float(os.environ.get("AGENT_HANGUP_GRACE_S", "1.0"))
+# Ceiling on how long caller speech may hold the channel open after a hangup
+# was armed. The quiet-check below is what stops us cutting someone off
+# mid-sentence; this stops a stuck VAD/STT flag from holding a dead call open
+# forever.
+AGENT_HANGUP_MAX_WAIT_S = float(os.environ.get("AGENT_HANGUP_MAX_WAIT_S", "20.0"))
 
 # TTS synthesis/output sample rate. 8000 = Sarvam synthesizes at telephony
 # rate directly and TelephonySink skips the ffmpeg downsample entirely
@@ -131,10 +163,18 @@ def _resolve_active_agent_slug() -> str:
     """
     try:
         from shared.db.database import get_db
+        # Scoped to the FOUNDING tenant. `is_active` is a single global flag
+        # that every tenant's Activate button writes, so an unscoped
+        # "most recently activated" query returns whoever last pressed the
+        # button — currently one of four different accounts. This function is
+        # the last-resort fallback for the founding tenant's pre-tenancy
+        # numbers; it must never hand a call to an unrelated tenant's agent,
+        # speaking their company name and billing their minutes.
+        default_owner = os.environ.get("LESCALL_DEFAULT_OWNER", "tech@dhronai.com")
         with get_db() as db:
             row = db.execute(
-                "SELECT slug FROM agents WHERE is_active=1 "
-                "ORDER BY updated_at DESC LIMIT 1").fetchone()
+                "SELECT slug FROM agents WHERE is_active=1 AND owner=? "
+                "ORDER BY updated_at DESC LIMIT 1", (default_owner,)).fetchone()
         if row and _agent_yaml_exists(row["slug"] or ""):
             return row["slug"]
     except Exception as exc:
@@ -162,6 +202,99 @@ def _agent_yaml_exists(slug: str) -> bool:
     return bool(slug) and (AGENTS_DIR / slug / "agent.yaml").exists()
 
 
+# Sentinel slug: the DID is registered to a tenant but has no agent bound to
+# the direction being used. Not a real folder — _build_agent_stack maps it to
+# the neutral fallback persona. Exists so this case is DISTINCT from "agent
+# failed to load", which is a different incident with a different fix.
+UNROUTED_AGENT = "__unrouted__"
+
+
+def _did_owner(did: str) -> str:
+    """Tenant a registered DID belongs to. "" when unknown. Never raises.
+
+    Used to attribute a call whose DID resolved to no agent — the tenant is
+    known from the number even when the binding is missing, so their quota and
+    their ledger are still the right ones to use.
+    """
+    if not did:
+        return ""
+    try:
+        from shared.db.database import get_db
+        from shared.phone import significant_digits
+        sig = significant_digits(did)
+        if not sig:
+            return ""
+        with get_db() as db:
+            row = db.execute("SELECT owner FROM phone_numbers WHERE sig_digits=?",
+                             (sig,)).fetchone()
+        return (row["owner"] or "") if row else ""
+    except Exception:
+        return ""
+
+
+# When false, an unclaimed explicit slug is allowed through with a warning
+# instead of being refused. Exists purely so a fleet with unmigrated legacy
+# agents can turn the check off for one deploy; leave it on.
+STRICT_SLUG_OWNERSHIP = os.environ.get(
+    "LESCALL_STRICT_SLUG_OWNERSHIP", "true").lower() in ("1", "true", "yes")
+
+# What a refused caller HEARS. English only and deliberately vague about the
+# reason: the person on the phone is usually the tenant's customer, not the
+# tenant, and "this business has run out of prepaid minutes" is not their
+# problem to hear. The tenant learns the real reason in the dashboard.
+_REFUSAL_LINES = {
+    "quota_minutes": "I'm sorry, we're unable to take calls right now. "
+                     "Please try again a little later. Thank you for calling.",
+    "cap_concurrency": "I'm sorry, all our lines are busy at the moment. "
+                       "Please call back shortly. Thank you.",
+    "account_locked": "I'm sorry, this number is not accepting calls at the "
+                      "moment. Thank you for calling.",
+    "unattributed": "I'm sorry, we're unable to take this call right now. "
+                    "Thank you for calling.",
+    "default": "I'm sorry, we're unable to take calls right now. "
+               "Please try again later. Thank you for calling.",
+}
+
+
+def _explicit_slug_permitted(slug: str, did: str = "") -> bool:
+    """May this caller-supplied slug answer this call?
+
+    Two rules, both cheap:
+      1. the slug must be CLAIMED in the agents index (an unclaimed folder on
+         disk is not a tenant's agent — it is an unowned artifact);
+      2. if the dialed DID is registered to a tenant, the slug's owner must be
+         that same tenant — a DID may not be answered by another tenant's agent.
+
+    NEVER raises and fails OPEN on a DB error: routing must not become a new
+    way to drop live calls. The bind-to-loopback change (S2) is the wall; this
+    is the second lock, not the only one.
+    """
+    if not STRICT_SLUG_OWNERSHIP:
+        return True
+    try:
+        from shared.db.database import get_db
+        from shared.phone import significant_digits
+        with get_db() as db:
+            row = db.execute("SELECT owner FROM agents WHERE slug=?",
+                             (slug,)).fetchone()
+            slug_owner = (row["owner"] or "") if row else ""
+            if not slug_owner:
+                return False
+            sig = significant_digits(did) if did else ""
+            if not sig:
+                return True
+            did_row = db.execute(
+                "SELECT owner FROM phone_numbers WHERE sig_digits=?",
+                (sig,)).fetchone()
+            did_owner = (did_row["owner"] or "") if did_row else ""
+            # Unregistered DID: nothing to contradict the claim.
+            return (not did_owner) or did_owner == slug_owner
+    except Exception as exc:
+        logger.warning("[BRIDGE] slug ownership check unavailable (%r) — "
+                       "allowing %s", exc, slug)
+        return True
+
+
 def resolve_agent_slug(did: str = "", campaign_id: int | None = None,
                        agent_slug: str = "", dial_meta: dict | None = None,
                        direction: str = "inbound") -> str:
@@ -184,9 +317,21 @@ def resolve_agent_slug(did: str = "", campaign_id: int | None = None,
     call can never be dropped by routing.
     """
     if _agent_yaml_exists(agent_slug):
-        logger.info("[BRIDGE] agent %s resolved via explicit", agent_slug)
-        return agent_slug
-    if agent_slug:
+        # An explicit slug arrives as a media-path segment, so it is only as
+        # trustworthy as whoever opened the WebSocket. "The folder exists on
+        # disk" was the entire check — meaning anyone who reached :9001 could
+        # name ANY tenant's agent and run a full AI session billed to them.
+        # The slug must additionally be CLAIMED, and when the DID names a
+        # different tenant's number the two must agree.
+        if _explicit_slug_permitted(agent_slug, did):
+            logger.info("[BRIDGE] agent %s resolved via explicit", agent_slug)
+            return agent_slug
+        # Fall through to DID/campaign routing rather than dropping the call:
+        # a live caller must never hear dead air because of a routing dispute.
+        logger.error("[BRIDGE] explicit agent slug %r REFUSED (unclaimed or "
+                     "cross-tenant vs did=%s) — falling through to DID routing",
+                     agent_slug, did or "-")
+    elif agent_slug:
         logger.warning("[BRIDGE] explicit agent slug %r has no agent.yaml — falling through",
                        agent_slug)
     try:
@@ -220,6 +365,20 @@ def resolve_agent_slug(did: str = "", campaign_id: int | None = None,
                                 logger.info("[BRIDGE] agent %s resolved via did "
                                             "(direction=%s)", cand, direction)
                                 return cand
+                        # The DID is REGISTERED but has no usable agent bound.
+                        #
+                        # Falling through from here is a cross-tenant leak: the
+                        # legacy path below picks whichever agent happens to be
+                        # flagged is_active, which belongs to an arbitrary
+                        # tenant. A customer calling tenant A's number would be
+                        # answered by tenant B's agent, saying tenant B's
+                        # company name — and the minutes would bill to B.
+                        # Stop here and answer neutrally instead.
+                        logger.error(
+                            "[BRIDGE] DID %s is registered but has no agent bound "
+                            "(direction=%s) — answering with the NEUTRAL fallback "
+                            "rather than another tenant's agent", sig, direction)
+                        return UNROUTED_AGENT
     except Exception as exc:
         logger.warning("[BRIDGE] DB agent routing unavailable (%r) — legacy resolution", exc)
     if dial_meta and _agent_yaml_exists(dial_meta.get("agent_slug", "")):
@@ -418,7 +577,10 @@ def _resolve_call_routing(conn_id: str, caller_number: str = "", did: str = "",
     slug = resolve_agent_slug(did=routing_did, campaign_id=campaign_id,
                               agent_slug=agent_slug, dial_meta=routing_dial_meta,
                               direction=direction)
-    owner = _lookup_agent_owner(slug)
+    # An unrouted DID still belongs to somebody: attribute the call to the
+    # number's tenant so their quota and their ledger are the ones used, even
+    # though no agent of theirs answered it.
+    owner = _lookup_agent_owner(slug) or _did_owner(routing_did or did)
 
     # Returning-caller memory: still inside the routing worker thread, so the
     # greeting path never pays for it. The customer's number is the caller id
@@ -457,16 +619,31 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
         direction=direction)
     agent_def = None
     agent_health = "ok"
-    try:
-        agent_def = agent_registry.get(slug)
-    except Exception as exc:
-        # NEVER fall back to another tenant's agent (the old path answered as
-        # Pramukh's Vishal Patel). Substitute the built-in neutral fallback:
-        # generic persona, no brand, apologizes and asks to call back.
-        logger.error("[%s] [BRIDGE] agent load FAILED for '%s': %r — "
-                     "answering with NEUTRAL_FALLBACK_AGENT",
-                     conn_id, slug, exc)
-        agent_health = "load_failed"
+    if slug == UNROUTED_AGENT:
+        # Registered DID with no agent bound. Answer politely as nobody in
+        # particular rather than as some other tenant's brand.
+        logger.error("[%s] [BRIDGE] no agent bound to this number — answering "
+                     "with NEUTRAL_FALLBACK_AGENT", conn_id)
+        agent_health = "unrouted"
+        try:
+            from backend.app.agent_definition.fallback_agent import (
+                get_neutral_fallback_agent)
+            agent_def = get_neutral_fallback_agent()
+        except Exception as exc:
+            logger.error("[%s] neutral fallback unavailable: %r", conn_id, exc)
+        slug = UNROUTED_AGENT
+    else:
+        try:
+            agent_def = agent_registry.get(slug)
+        except Exception as exc:
+            # NEVER fall back to another tenant's agent (the old path answered
+            # as Pramukh's Vishal Patel). Substitute the built-in neutral
+            # fallback: generic persona, no brand, apologizes and asks to call
+            # back.
+            logger.error("[%s] [BRIDGE] agent load FAILED for '%s': %r — "
+                         "answering with NEUTRAL_FALLBACK_AGENT",
+                         conn_id, slug, exc)
+            agent_health = "load_failed"
 
     # F6 call-start preflight (PROMPT_PREFLIGHT, default ON): render every
     # stage × language prompt on THROWAWAY routers before the greeting. A
@@ -512,16 +689,11 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
 
     call_id_provider = lambda: conn_id  # noqa: E731 - tiny provider closure
     corrections = agent_def.knowledge_base.stt_corrections if agent_def else None
-    if os.environ.get("ENABLE_STREAMING_STT", "false").lower() == "true":
-        # Streaming STT: saaras:v3 over WebSocket, fed live by the
-        # pipeline's VAD layer (see pipeline.ENABLE_STREAMING_STT).
-        # call_id_provider gives it TrackingSarvamSTT-parity credit
-        # metering (local buffer duration == fed audio duration).
-        # Self-downgrades to batch HTTP on any stream failure.
-        from backend.app.voice.stt.sarvam_stream import SarvamStreamingSTT
-        stt_primary = SarvamStreamingSTT(call_id_provider=call_id_provider)
-    else:
-        stt_primary = TrackingSarvamSTT(call_id_provider=call_id_provider)
+    # Batch STT: multipart WAV POST to api.sarvam.ai/speech-to-text per
+    # finalized VAD segment. The WebSocket streaming provider that briefly
+    # sat in front of this was removed 2026-07-31 (owner request) — this is
+    # the only STT primary again.
+    stt_primary = TrackingSarvamSTT(call_id_provider=call_id_provider)
     stt = STTRouter(
         primary=stt_primary,
         fallback=TrackingWhisperSTT(call_id_provider=call_id_provider),
@@ -700,10 +872,25 @@ class TelephonySession:
         routing = await asyncio.to_thread(
             _resolve_call_routing, conn_id, caller_number, did,
             campaign_id, agent_slug)
-        return cls(conn_id, sample_rate, caller_number=caller_number,
-                   skip_greeting=skip_greeting, did=did,
-                   campaign_id=campaign_id, agent_slug=agent_slug,
-                   routing=routing)
+        session = cls(conn_id, sample_rate, caller_number=caller_number,
+                      skip_greeting=skip_greeting, did=did,
+                      campaign_id=campaign_id, agent_slug=agent_slug,
+                      routing=routing)
+        # E6 — billing admission, off the event loop, BEFORE the greeting gate
+        # opens. A refused call is answered politely and hung up rather than
+        # dropped silently: a caller who hears nothing redials, which costs us
+        # another leg and them their patience.
+        decision = await asyncio.to_thread(session.check_billing_admission)
+        if not decision.allowed:
+            session.billing_refusal = _REFUSAL_LINES.get(
+                decision.code, _REFUSAL_LINES["default"])
+            # Suppress the agent's own greeting: the pipeline reads these two
+            # flags when its task starts, and that has not happened yet
+            # (start() creates it). Setting skip_greeting on the SESSION would
+            # do nothing — the pipeline was already constructed above.
+            session.pipeline._skip_greeting = True
+            session.pipeline._greeting_done = True
+        return session
 
     async def start(self):
         """Starts the AI pipeline and the playback injection loop."""
@@ -728,6 +915,23 @@ class TelephonySession:
         except Exception as exc:
             logger.warning("[%s] could not capture call_key: %r", self.conn_id, exc)
         logger.info(f"[{self.conn_id}] Session started (Phase 14) call_key=%s", self.call_key)
+
+        # E6 refusal: say one line through the normal TTS path, then arm the
+        # existing agent-hangup drain so the channel drops only after the
+        # sentence has actually reached the wire. Reusing hangup_pending means
+        # this shares every guard the consented-close path already has.
+        refusal = getattr(self, "billing_refusal", "")
+        if refusal:
+            try:
+                self.pipeline._queue_watchdog_line(refusal, time.monotonic())
+                conv = getattr(self.pipeline, "conversation", None)
+                if conv is not None:
+                    conv.hangup_pending = True
+                logger.warning("[%s] BILLING refusal spoken; ending call",
+                               self.conn_id)
+            except Exception as exc:
+                logger.error("[%s] BILLING refusal delivery failed: %r",
+                             self.conn_id, exc)
 
         # BILLING: open this call's usage-ledger row and start the 15s
         # heartbeat. Metering must never affect call handling — every touch
@@ -851,6 +1055,18 @@ class TelephonySession:
             logger.error("[%s] METERING close failed (reconciler will "
                          "recover): %r", self.conn_id, exc)
 
+        # Release the admission hold now that the ledger row is closed and the
+        # real seconds are recorded. A crashed teardown leaks the hold only
+        # until it expires, never permanently.
+        _decision = getattr(self, "_billing_decision", None)
+        if _decision is not None and getattr(_decision, "reservation", ""):
+            try:
+                from shared.billing.entitlements import release_reservation
+                await asyncio.to_thread(release_reservation, _decision.reservation)
+            except Exception as exc:
+                logger.warning("[%s] BILLING reservation release failed: %r",
+                               self.conn_id, exc)
+
         # Owner-tagged calls row for the multi-tenant dashboard (plan §2).
         # Off the event loop: a contended sqlite write (busy_timeout 5s) must
         # never stall audio for other live calls sharing this loop.
@@ -921,8 +1137,22 @@ class TelephonySession:
     # ------------------------------------------------------------------
 
     def _metering_owner(self) -> str:
-        return self.owner or os.environ.get("LESCALL_DEFAULT_OWNER",
-                                            "tech@dhronai.com")
+        """The tenant this call is billed to, or "" if it cannot be attributed.
+
+        There is deliberately NO fallback to LESCALL_DEFAULT_OWNER any more.
+        That fallback and `_resolve_call_routing`'s owner="" disagreed, and the
+        disagreement was exploitable: a call naming a slug with no agents row
+        checked its quota against the empty-string tenant (whose usage never
+        accumulates) and billed its minutes to the founding account (which is
+        unlimited). Naming an unclaimed slug was a self-serve free-minutes
+        switch. An unattributable call is now refused, not defaulted —
+        see billing_owner() in shared/billing/entitlements.py.
+        """
+        try:
+            from shared.billing.entitlements import billing_owner
+            return billing_owner({"owner": self.owner})
+        except Exception:
+            return (self.owner or "").strip().lower()
 
     def _metering_open(self):
         from shared.usage_metering import open_call
@@ -930,9 +1160,54 @@ class TelephonySession:
         dial = getattr(self, "_dial", None)
         if self.direction == "outbound" and dial and dial.get("phone"):
             phone = dial["phone"]
-        open_call(self.conn_id, self._metering_owner(),
+        owner = self._metering_owner()
+        decision = getattr(self, "_billing_decision", None)
+        # An unattributed call is metered but NOT billable: it must leave a
+        # trace (so the volume is visible and recoverable) without landing
+        # minutes in someone else's account.
+        billable = bool(owner)
+        open_call(self.conn_id, owner or "unattributed",
                   agent_slug=self.agent_slug, direction=self.direction,
-                  phone=phone or None)
+                  phone=phone or None, billable=billable)
+        # Stamp HOW this call was admitted, so fail-open minutes stay
+        # identifiable after the fact instead of being indistinguishable from
+        # properly admitted usage.
+        check = getattr(decision, "check", "ok") if decision else (
+            "ok" if billable else "unattributed")
+        try:
+            from shared.db.database import get_db
+            with get_db() as db:
+                db.execute("UPDATE usage_ledger SET entitlement_check=? "
+                           "WHERE conn_id=?", (check, self.conn_id))
+        except Exception as exc:
+            logger.warning("[%s] METERING entitlement stamp failed: %r",
+                           self.conn_id, exc)
+
+    def check_billing_admission(self) -> object:
+        """E6. Decide whether this call may proceed, and reserve for it.
+
+        Called from the session factory BEFORE the greeting fires. Returns a
+        Decision; the caller answers with the neutral refusal prompt and hangs
+        up when it denies. Never raises — a live call must not drop because
+        the billing DB hiccupped, which is why the fail-open inside
+        check_dial_allowed is bounded rather than blind.
+        """
+        try:
+            from shared.billing.entitlements import check_dial_allowed
+            decision = check_dial_allowed(
+                self._metering_owner(),
+                origin=("inbound" if self.direction == "inbound" else "outbound"),
+                ref=self.conn_id)
+        except Exception as exc:
+            logger.error("[%s] BILLING admission check unavailable: %r",
+                         self.conn_id, exc)
+            from shared.billing.errors import Decision
+            decision = Decision.ok(check="error")
+        self._billing_decision = decision
+        if not decision.allowed:
+            logger.warning("[%s] BILLING refused call for owner=%r: %s",
+                           self.conn_id, self.owner, decision.code)
+        return decision
 
     async def _metering_beat_loop(self):
         from shared.usage_metering import heartbeat
@@ -984,6 +1259,64 @@ class TelephonySession:
         except Exception as exc:
             logger.warning("[%s] collected-data snapshot failed: %r", self.conn_id, exc)
         return transcript, summary, collected, recording_path
+
+    def _compute_answer_state(self, duration_s: float):
+        """Did a real conversation happen on this connected call?
+
+        FreeSWITCH reports the same "+OK / answered" whether a person picked up
+        and talked, picked up and said nothing, or an answering machine took
+        the call — the dial result cannot tell them apart. This looks at what
+        the caller actually contributed and returns
+        ``('empty' | 'answered', reason)``.
+
+        Returns ``(None, None)`` if anything goes wrong: an unclassified call
+        must read as a normal answered call, never as a false 'empty'.
+        Never raises — it runs inside call teardown.
+        """
+        try:
+            turns = list(getattr(self, "transcript_tail", None) or [])
+            caller_raw = [str(t.get("text") or "").strip() for t in turns
+                          if str(t.get("speaker") or "").strip().lower().startswith("caller")]
+            caller_raw = [t for t in caller_raw if t]
+
+            # (1) The callee never produced a single transcript.
+            if not caller_raw:
+                return "empty", "no_caller_speech"
+
+            # (2) Everything they produced was noise/filler. The STT router
+            # already rejects most of this upstream, so this is a second pass
+            # for anything that slipped through as a "valid" transcript.
+            try:
+                from backend.app.voice.stt.router import validate_transcript
+                meaningful = [t for t in caller_raw if validate_transcript(t)]
+            except Exception:
+                meaningful = caller_raw
+            if not meaningful:
+                return "empty", "caller_noise_only"
+
+            # (2b) Only an acknowledgement — "hello?" and then nothing. Two
+            # turns or fewer, and barely any content across all of them.
+            if len(meaningful) <= 2 and sum(len(t) for t in meaningful) < _EMPTY_CALL_MIN_CHARS:
+                return "empty", "caller_silent"
+
+            # (3) Voicemail / recorded greeting. Either a known announcement
+            # phrase, or the shape of one: a single long uninterrupted
+            # utterance and nothing responsive afterwards. Heuristic — a
+            # talkative human opening looks the same, so it is checked last.
+            low = " ".join(meaningful).lower()
+            if any(p in low for p in _VOICEMAIL_PHRASES):
+                return "empty", "voicemail_phrase"
+            if len(meaningful) == 1 and len(meaningful[0]) >= _VOICEMAIL_MIN_CHARS:
+                return "empty", "voicemail_suspected"
+
+            # (4) Answered, but over before a conversation could happen.
+            if duration_s and duration_s < _EMPTY_CALL_MAX_SECONDS:
+                return "empty", "too_short"
+
+            return "answered", None
+        except Exception as exc:
+            logger.warning("[%s] answer-state detection failed: %r", self.conn_id, exc)
+            return None, None
 
     def _compute_outcome(self):
         """Deterministic call outcome (plan §4.6) — ONLY when the agent
@@ -1111,6 +1444,11 @@ class TelephonySession:
         call_key = self.call_key
         transcript, summary, collected, recording_path = self._collect_call_media(call_key)
         outcome, outcome_kind = self._compute_outcome()
+        answer_state, answer_reason = self._compute_answer_state(
+            round(ended - started, 1))
+        if answer_state == "empty":
+            logger.info("[%s] answer_state=empty reason=%s duration=%.1fs",
+                        self.conn_id, answer_reason, ended - started)
 
         # Public download link: a fresh 256-bit random token per call. On a
         # reconnect upsert the FIRST segment's token wins (COALESCE on the
@@ -1150,8 +1488,9 @@ class TelephonySession:
                 "transcript, summary, collected_data, recording_path, "
                 "download_token, recording_url, contact_id, outcome, outcome_kind, "
                 "agent_revision, agent_sha, agent_health, "
-                "llm_models_used, llm_fallback_turns, placed_by) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "llm_models_used, llm_fallback_turns, placed_by, "
+                "answer_state, answer_state_reason) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT (conn_id) DO UPDATE SET "
                 "call_key=COALESCE(excluded.call_key, calls.call_key), "
                 "ended_at=excluded.ended_at, "
@@ -1172,7 +1511,16 @@ class TelephonySession:
                 "agent_health=COALESCE(calls.agent_health, excluded.agent_health), "
                 "llm_models_used=COALESCE(calls.llm_models_used, excluded.llm_models_used), "
                 "llm_fallback_turns=COALESCE(calls.llm_fallback_turns, excluded.llm_fallback_turns), "
-                "placed_by=COALESCE(calls.placed_by, excluded.placed_by)",
+                "placed_by=COALESCE(calls.placed_by, excluded.placed_by), "
+                # A reconnect splits one conversation across two segments; the
+                # segment that heard real speech decides. Only let 'empty'
+                # stand if the existing row is also empty/unset.
+                "answer_state=CASE WHEN excluded.answer_state='answered' "
+                "                  OR calls.answer_state IS NULL "
+                "             THEN excluded.answer_state ELSE calls.answer_state END, "
+                "answer_state_reason=CASE WHEN excluded.answer_state='answered' "
+                "                    THEN NULL ELSE COALESCE(calls.answer_state_reason, "
+                "                                            excluded.answer_state_reason) END",
                 (self.conn_id, call_key, self.direction, self.agent_slug, self.campaign_id,
                  phone or None, significant_digits(phone) or None,
                  lang or None, _iso(started), _iso(ended), round(ended - started, 1),
@@ -1182,8 +1530,24 @@ class TelephonySession:
                  int(getattr(self, "agent_revision", 0) or 0),
                  str(getattr(self, "agent_sha", "") or "") or None,
                  str(getattr(self, "agent_health", "") or "") or None,
-                 llm_models_used, llm_fallback_turns, placed_by),
+                 llm_models_used, llm_fallback_turns, placed_by,
+                 answer_state, answer_reason),
             )
+
+            # Mirror an empty call onto the phone-book row so the Outbound
+            # status filter can find these contacts. Only overwrites the
+            # dial-time result ('answered' / never called) — a status the user
+            # or a later real conversation set is left alone.
+            if answer_state == "empty" and contact_id:
+                try:
+                    db.execute(
+                        "UPDATE contacts SET call_status='empty_call' "
+                        " WHERE id=? AND COALESCE(call_status,'') "
+                        "       IN ('answered', 'not_called', '')",
+                        (contact_id,))
+                except Exception as exc:
+                    logger.warning("[%s] contact empty_call mark failed: %r",
+                                   self.conn_id, exc)
 
         # Turn-level traces (0012) — deliberately a SEPARATE transaction:
         # a missing call_turns table (sqlite dev fallback, un-migrated PG)
@@ -1394,7 +1758,9 @@ class TelephonySession:
           + grace) — the farewell line is never cut mid-sentence,
         - hangup_pending has been armed for AGENT_HANGUP_MIN_WAIT_S, so a
           farewell still inside TTS synthesis (queue momentarily empty, no
-          flush yet) can't be mistaken for drained audio.
+          flush yet) can't be mistaken for drained audio,
+        - the pipeline is quiet — the caller is not speaking and no transcript
+          is in flight (bounded by AGENT_HANGUP_MAX_WAIT_S).
         """
         if not AGENT_HANGUP_ENABLED or self._hangup_sent:
             return
@@ -1415,6 +1781,28 @@ class TelephonySession:
         busy_until = float(getattr(self.sink, "playback_busy_until", 0.0) or 0.0)
         if now < busy_until + AGENT_HANGUP_GRACE_S:
             return
+        # The engine only cancels a pending hangup once a FINALIZED transcript
+        # reaches process_stream. A caller who starts speaking during the drain
+        # window is still inside VAD/STT at that moment, so the cancel has not
+        # happened yet and the channel would drop on top of them — observed
+        # live 2026-07-31, where the caller answered "anything else?" with "can
+        # you take my email address?" and was cut off 2.6s into it. Waiting for
+        # the pipeline to go quiet closes that race. A HARD close (max-duration
+        # cap) skips the check by design: caller speech does not defer it.
+        if not getattr(conv, "_hangup_hard", False):
+            quiet = getattr(self.pipeline, "_pipeline_quiet", None)
+            if callable(quiet):
+                try:
+                    speaking = not quiet(now)
+                except Exception:
+                    speaking = False
+                if speaking:
+                    if now - self._hangup_armed_ts < AGENT_HANGUP_MAX_WAIT_S:
+                        return
+                    logger.warning(
+                        "[%s] [HANGUP_FORCED] pipeline never went quiet in "
+                        "%.0fs — ending anyway", self.conn_id,
+                        AGENT_HANGUP_MAX_WAIT_S)
         self._hangup_sent = True
         logger.info("[%s] [HANGUP_REQUEST] farewell drained — ending call",
                     self.conn_id)

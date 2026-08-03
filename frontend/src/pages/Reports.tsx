@@ -108,13 +108,14 @@ export default function Reports() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  function download(rep: Report) {
-    const blob = new Blob([rep.document ?? ''], { type: 'text/markdown' })
+  /** Both exports are built server-side — a watermarked .docx and a formatted
+   *  .xlsx cannot be produced from a Blob in the browser. Same-origin link, so
+   *  the session cookie authenticates the download. */
+  function download(rep: Report, fmt: 'docx' | 'xlsx') {
     const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = `${rep.title.replace(/\W+/g, '-').toLowerCase()}.md`
+    a.href = `/api/intel/reports/${rep.id}/export.${fmt}`
+    a.rel = 'noopener'
     a.click()
-    URL.revokeObjectURL(a.href)
   }
 
   async function remove(rep: Report) {
@@ -208,12 +209,17 @@ export default function Reports() {
         )}
       </Card>
 
-      <FullscreenModal open={!!open} onClose={() => setOpen(null)}
+      <FullscreenModal open={!!open} onClose={() => setOpen(null)} scope="shell"
         title={open?.title}
         headerExtra={open ? (
-          <Button variant="ghost" size="sm" onClick={() => download(open)}>
-            <Download size={13} /> Download .md
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={() => download(open, 'docx')}>
+              <Download size={13} /> Word (.docx)
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => download(open, 'xlsx')}>
+              <Download size={13} /> Analysis (.xlsx)
+            </Button>
+          </div>
         ) : undefined}>
         <div className="report-doc mx-auto max-w-3xl px-1 py-2"
           dangerouslySetInnerHTML={{ __html: html }} />

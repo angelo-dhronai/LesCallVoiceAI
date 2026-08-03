@@ -40,6 +40,33 @@ RTP_PORT_RANGE = os.environ.get("PUBLIC_RTP_RANGE", "16384-32768")
 router = APIRouter()
 
 
+def paid_owner(owner: str = Depends(current_owner)) -> str:
+    """Tenant boundary PLUS the paid-plan gate for BYON setup.
+
+    Signups are open to any Google account, and this is the one surface that
+    puts a SIP trunk and a DID on our carrier edge — so registering telephony
+    is a paid capability. Free accounts can sign up, build an agent and explore
+    the dashboard; connecting a real number needs a plan.
+
+    Applied to MUTATIONS only. The GET endpoints stay open on purpose: the SPA
+    renders the panel in a locked state with an upgrade prompt, and a 402 on
+    the list call would give it nothing to render but an error — which reads as
+    a broken page rather than a plan boundary.
+
+    Note this gate does NOT consult `enforcement_enabled()`. That switch stages
+    quota rollout for existing tenants; this protects the trunk from strangers
+    who signed up today, and must be live the moment signups reopen.
+    """
+    from shared.billing.entitlements import telephony_allowed
+    from shared.billing.errors import BillingRefusal, CODE_PLAN_REQUIRED
+    if not telephony_allowed(owner):
+        raise BillingRefusal(
+            "Connecting your own phone number is available on paid plans. "
+            "Start with Pilot to run real calls on your own number.",
+            CODE_PLAN_REQUIRED, feature="telephony")
+    return owner
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -166,7 +193,7 @@ def list_trunks(owner: str = Depends(current_owner)):
 
 
 @router.post("/api/trunks")
-async def create_trunk(request: Request, owner: str = Depends(current_owner)):
+async def create_trunk(request: Request, owner: str = Depends(paid_owner)):
     body = await _body(request)
     name = str(body.get("name") or "").strip()
     sip_domain = str(body.get("sip_domain") or "").strip()
@@ -208,8 +235,65 @@ async def create_trunk(request: Request, owner: str = Depends(current_owner)):
     return {"id": trunk_id, "name": full_name, "kamailio_acl": acl}
 
 
+@router.patch("/api/trunks/{trunk_id}")
+async def update_trunk(trunk_id: int, request: Request,
+                       owner: str = Depends(paid_owner)):
+    """Edit a trunk in place: SIP domain, credentials, caller ID, provider IPs.
+
+    Previously the only way to correct any of these was delete-and-recreate,
+    which also drops the trunk's DIDs (FK) and their agent bindings. That is a
+    harsh penalty for a typo, and for the common real case: a carrier trunk
+    registered against the wrong Zentrunk domain, or one that turns out to need
+    SIP credentials rather than IP auth.
+
+    `name` is deliberately NOT editable — it is the FreeSWITCH gateway name and
+    its config filename, so renaming would orphan the old XML and change the
+    gateway every live DID points at. Delete and recreate for that.
+
+    Sets config_status back to 'pending': the DB now disagrees with what is on
+    disk in /etc/freeswitch until Apply runs again.
+    """
+    body = await _body(request)
+    editable = {
+        "sip_domain": str, "proxy": str, "username": str, "password": str,
+        "caller_id": str, "provider_ips": str, "transport": str, "provider": str,
+    }
+    fields: dict = {}
+    for key, cast in editable.items():
+        if key in body:
+            fields[key] = cast(body.get(key) or "")
+    if "register" in body:
+        fields["register"] = 1 if body.get("register") else 0
+    if not fields:
+        raise HTTPException(status_code=400, detail="nothing to update")
+
+    if "sip_domain" in fields and not fields["sip_domain"].strip():
+        raise HTTPException(status_code=400, detail="sip_domain cannot be empty")
+    if "provider_ips" in fields:
+        _validate_provider_ips(fields["provider_ips"])
+    # An empty password in the body means "leave it alone", not "clear it" —
+    # the GET masks it as "***", so a round-tripped form would otherwise wipe
+    # the credential every time someone edited an unrelated field.
+    if fields.get("password") in ("", "***"):
+        fields.pop("password", None)
+
+    with get_db() as db:
+        _trunk_or_404(db, trunk_id, owner)
+        sets = ", ".join(f"{k}=?" for k in fields)
+        db.execute(f"UPDATE trunks SET {sets}, config_status='pending' WHERE id=? AND owner=?",
+                   (*fields.values(), trunk_id, owner))
+        db.execute("UPDATE phone_numbers SET config_status='pending' "
+                   "WHERE trunk_id=? AND owner=?", (trunk_id, owner))
+        acl = kamailio_acl.sync_carrier_acl(_all_provider_cidrs(db))
+        row = dict(_trunk_or_404(db, trunk_id, owner))
+    row["password"] = "***" if row.get("password") else ""
+    logger.info("trunk %s updated by %s: %s", trunk_id, owner, sorted(fields))
+    return {"status": "updated", "trunk": row, "kamailio_acl": acl,
+            "hint": "press Apply to write the new config to FreeSWITCH"}
+
+
 @router.delete("/api/trunks/{trunk_id}")
-def delete_trunk(trunk_id: int, owner: str = Depends(current_owner)):
+def delete_trunk(trunk_id: int, owner: str = Depends(paid_owner)):
     with get_db() as db:
         _trunk_or_404(db, trunk_id, owner)
         n = db.execute("SELECT COUNT(*) AS n FROM phone_numbers WHERE trunk_id=?",
@@ -225,7 +309,7 @@ def delete_trunk(trunk_id: int, owner: str = Depends(current_owner)):
 
 
 @router.post("/api/trunks/{trunk_id}/apply")
-def apply_trunk(trunk_id: int, owner: str = Depends(current_owner)):
+def apply_trunk(trunk_id: int, owner: str = Depends(paid_owner)):
     """Generate + write FreeSWITCH config for this trunk and its DIDs, reload
     FS, and re-sync the Kamailio carrier ACL."""
     with get_db() as db:
@@ -295,7 +379,7 @@ def list_numbers(owner: str = Depends(current_owner)):
 
 
 @router.post("/api/numbers")
-async def create_number(request: Request, owner: str = Depends(current_owner)):
+async def create_number(request: Request, owner: str = Depends(paid_owner)):
     body = await _body(request)
     number = str(body.get("number") or "").strip()
     sig = significant_digits(number)
@@ -339,7 +423,7 @@ async def create_number(request: Request, owner: str = Depends(current_owner)):
 
 @router.patch("/api/numbers/{number_id}")
 async def update_number(number_id: int, request: Request,
-                        owner: str = Depends(current_owner)):
+                        owner: str = Depends(paid_owner)):
     """Rebind a DID (agent / direction / label). Routing changes take effect on
     the NEXT call — the bridge reads phone_numbers per call."""
     body = await _body(request)
@@ -374,7 +458,7 @@ async def update_number(number_id: int, request: Request,
 
 
 @router.delete("/api/numbers/{number_id}")
-def delete_number(number_id: int, owner: str = Depends(current_owner)):
+def delete_number(number_id: int, owner: str = Depends(paid_owner)):
     with get_db() as db:
         row = db.execute("SELECT * FROM phone_numbers WHERE id=? AND owner=?",
                          (number_id, owner)).fetchone()

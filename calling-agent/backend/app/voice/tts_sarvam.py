@@ -38,7 +38,19 @@ VALID_MODELS = ("bulbul:v2", "bulbul:v3-beta", "bulbul:v3")
 DEFAULT_MODEL = "bulbul:v3"
 DEFAULT_SPEAKER = "shubh"
 DEFAULT_SAMPLE_RATE = 16_000
-STREAM_TIMEOUT = 10.0
+# STREAM_TIMEOUT is httpx's read timeout: max wait for the FIRST byte and
+# max gap BETWEEN chunks — not total stream duration. Healthy first chunk
+# is ~350ms; cut 10.0 → 3.5 (2026-08-03) because a hung stream-open made
+# callers sit through 10s+ of dead air after answering (the retry then
+# succeeded in ~0.5s). A 3.5s inter-chunk gap still never fires on a
+# healthy stream, which delivers continuously once started.
+# The FIRST attempt gets an even tighter 2.0s cap: during the 08-03 incident
+# hangs were per-request (~1-in-3) and a fresh connection almost always
+# answered fast, so failing over sooner directly shrinks greeting dead air
+# (2.0 + retry ≈ 2.7s worst case). Later attempts keep the roomier cap to
+# avoid burning the whole retry budget against a genuinely slow API.
+STREAM_TIMEOUT = 3.5
+STREAM_TIMEOUT_FIRST_ATTEMPT = 2.0
 CONNECT_TIMEOUT = 5.0
 CHUNK_READ_SIZE = 4096
 
@@ -254,6 +266,9 @@ class SarvamTTS(StreamingTTS):
         # Canned-audio cache capture (see speak_cached)
         self._capture_buf: bytearray | None = None
         self._last_speak_clean = False
+        # Set when a mid-stream stall truncated the utterance — such audio
+        # must never be cached (it would replay truncated forever).
+        self._stream_truncated = False
 
         if not self._api_key:
             logger.warning("[TTS:Sarvam] SARVAM_API_KEY not set — calls will fail")
@@ -441,8 +456,12 @@ class SarvamTTS(StreamingTTS):
                     chunk_count, flushed_parts or 1,
                 )
             # _reset() clears _cancelled — preserve completion state for
-            # speak_cached's cache-write decision.
-            self._last_speak_clean = not self._cancelled and chunk_count > 0
+            # speak_cached's cache-write decision. A truncated stream is
+            # never clean: caching it would replay the cut-off audio on
+            # every future hit.
+            self._last_speak_clean = (not self._cancelled
+                                      and chunk_count > 0
+                                      and not self._stream_truncated)
             self._reset()
 
     # ------------------------------------------------------------------
@@ -586,6 +605,13 @@ class SarvamTTS(StreamingTTS):
         # Budget covers both connection retries AND hot-swapping through the
         # backup key pool when a key returns 402 (out of credits).
         max_retries = 8
+        # Once any audio from this utterance has reached the sink, a retry
+        # would re-stream the utterance FROM THE START — the caller hears the
+        # sentence twice (the double-speak class of bug). Truncating the tail
+        # is the lesser evil, so mid-stream failures after first audio return
+        # instead of retrying.
+        yielded_any = False
+        self._stream_truncated = False
         for attempt in range(max_retries):
             if self._cancelled:
                 return
@@ -603,6 +629,11 @@ class SarvamTTS(StreamingTTS):
                         "Content-Type": "application/json",
                     },
                     json=payload,
+                    timeout=httpx.Timeout(
+                        STREAM_TIMEOUT_FIRST_ATTEMPT if attempt == 0
+                        else STREAM_TIMEOUT,
+                        connect=CONNECT_TIMEOUT,
+                    ),
                 ) as response:
                     if response.status_code == 402:
                         body = await response.aread()
@@ -641,6 +672,7 @@ class SarvamTTS(StreamingTTS):
                         if first_chunk:
                             first_chunk = False
                             self._check_stream_rate(raw_chunk)
+                        yielded_any = True
                         yield TTSChunk(
                             audio=raw_chunk,
                             text_segment=text,
@@ -656,6 +688,12 @@ class SarvamTTS(StreamingTTS):
                 # Force new client on next attempt — timeout may mean the
                 # connection is in a bad state (partially sent request).
                 self._reset_client()
+                if yielded_any:
+                    logger.error("[TTS:Sarvam] Mid-stream stall after audio was "
+                                 "delivered — dropping remainder of %r to avoid "
+                                 "double-speak", text[:50])
+                    self._stream_truncated = True
+                    return
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
                 # Stale or dropped connection — always reset so the retry
                 # opens a fresh TLS socket.  ConnectError was previously
@@ -665,6 +703,12 @@ class SarvamTTS(StreamingTTS):
                 logger.warning("[TTS:Sarvam] Stale/dropped connection (attempt %d/%d): %s — resetting client",
                                attempt + 1, max_retries, exc)
                 self._reset_client()
+                if yielded_any:
+                    logger.error("[TTS:Sarvam] Connection dropped after audio was "
+                                 "delivered — dropping remainder of %r to avoid "
+                                 "double-speak", text[:50])
+                    self._stream_truncated = True
+                    return
             except Exception:
                 logger.exception("[TTS:Sarvam] Stream error (attempt %d/%d)",
                                  attempt + 1, max_retries)

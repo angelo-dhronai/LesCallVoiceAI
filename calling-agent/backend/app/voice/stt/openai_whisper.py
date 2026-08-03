@@ -16,7 +16,11 @@ from .base import STTProvider, STTResult, pcm_to_wav
 
 logger = logging.getLogger(__name__)
 
-WHISPER_TIMEOUT = 15.0
+# Whisper is the LAST-RESORT provider: by the time it runs the caller has
+# already waited through Sarvam's read timeout. Observed healthy latency is
+# ~1.5s; 8s bounds the worst-case turn without giving up on slow successes.
+# (Was 15.0 — tightened 2026-08-03 during the Sarvam-hang incident.)
+WHISPER_TIMEOUT = 8.0
 
 
 class OpenAIWhisperSTT(STTProvider):

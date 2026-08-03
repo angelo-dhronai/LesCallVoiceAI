@@ -57,17 +57,23 @@ def drive(router: ConversationRouter, text: str) -> str:
 
 
 def test_caller_goodbye_arms_hangup():
+    """Two turns now: the goodbye is confirmed before the hangup arms
+    (close-confirm gate, 2026-07-31)."""
     r = make_router()
     drive(r, "okay thank you, goodbye")
+    assert r.hangup_pending is False       # confirmation asked, not closed
+    drive(r, "yes")
     assert r.state.is_closing is True
     assert r.hangup_pending is True
 
 
 def test_close_permission_confirm_arms_hangup():
-    """Agent asked 'anything else?' → caller 'no, that's all' → close."""
+    """Agent asked 'anything else?' → caller 'no, that's all' → confirm → close."""
     r = make_router()
     r.last_agent_response = "Great! Is there anything else I can help you with?"
     drive(r, "no that's all")
+    assert r.hangup_pending is False
+    drive(r, "yes please")
     assert r.state.is_closing is True
     assert r.hangup_pending is True
 
@@ -76,6 +82,8 @@ def test_close_permission_confirm_hinglish():
     r = make_router()
     r.last_agent_response = "Theek hai! Aur kuch madad chahiye aapko?"
     drive(r, "nahi bas")
+    assert r.hangup_pending is False
+    drive(r, "haan ji")
     assert r.hangup_pending is True
 
 
@@ -99,6 +107,7 @@ def test_caller_speaking_again_cancels_hangup():
     """'Wait, one more thing' after the goodbye must be answered, not cut."""
     r = make_router()
     drive(r, "okay bye")
+    drive(r, "yes")                        # confirm the close
     assert r.hangup_pending is True
     drive(r, "wait actually one more question about the location")
     assert r.hangup_pending is False

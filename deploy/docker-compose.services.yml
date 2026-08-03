@@ -22,15 +22,40 @@ services:
     container_name: lescall-api
     network_mode: host
     user: "1000:1000"
+    # freeswitch group: "Apply" on a BYON trunk writes the generated gateway
+    # and dialplan XML into /etc/freeswitch/{sip_profiles/external,dialplan/public},
+    # which are freeswitch:freeswitch drwxrwxr-x. Without this the whole BYON
+    # flow ends in a 500 at the final step — trunk and number save fine, then
+    # apply cannot write. (uid 1000 is already a member on the host.)
+    group_add: ["994"]
     working_dir: /home/angelo/lescall/dashboard
     command: ["python", "server.py"]
-    env_file: [.pg_env]
+    # Secrets live OUTSIDE the repo (/etc/lescall, root 0600) because the repo
+    # is bind-mounted into every container as uid 1000 — see
+    # deploy/etc-lescall-env.template. `required: false` so a host that has not
+    # created them yet still boots: the billing layer degrades honestly.
+    env_file:
+      - .pg_env
+      - path: /etc/lescall/telephony.env
+        required: false
+      - path: /etc/lescall/billing.env
+        required: false
     environment:
-      GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
+      # Google auth comes from the VM metadata server (attached service
+      # account lescall-recsync, cloud-platform scope) — no key file, no
+      # human session, tokens auto-refresh forever. Do NOT reintroduce
+      # GOOGLE_APPLICATION_CREDENTIALS: an explicit path takes PRECEDENCE
+      # over metadata ADC, so a stale file there silently defeats the
+      # attached SA. That is exactly what rotted 2026-07-14 → 07-31
+      # (expired user ADC, 270 recordings stranded local-only).
       GOOGLE_CLOUD_PROJECT: lescall
     volumes:
       - /home/angelo/lescall:/home/angelo/lescall
-      - /home/angelo/.config/gcloud:/gcloud:ro
+      # BYON trunk "Apply" generates FreeSWITCH gateway + dialplan XML here and
+      # then reloads FS over ESL. The directory does not exist inside the
+      # container without this mount, so the write failed with EACCES at the
+      # container root and every apply returned 500.
+      - /etc/freeswitch:/etc/freeswitch
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/login"]
@@ -55,9 +80,20 @@ services:
     group_add: ["994"]
     working_dir: /home/angelo/lescall
     command: ["bash", "deploy/runtime_entry.sh"]
-    env_file: [.pg_env]
+    # Telephony secrets only. The runtime container handles live calls and must
+    # NEVER see payment credentials — billing.env is deliberately absent here.
+    env_file:
+      - .pg_env
+      - path: /etc/lescall/telephony.env
+        required: false
     environment:
-      GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
+      # Google auth comes from the VM metadata server (attached service
+      # account lescall-recsync, cloud-platform scope) — no key file, no
+      # human session, tokens auto-refresh forever. Do NOT reintroduce
+      # GOOGLE_APPLICATION_CREDENTIALS: an explicit path takes PRECEDENCE
+      # over metadata ADC, so a stale file there silently defeats the
+      # attached SA. That is exactly what rotted 2026-07-14 → 07-31
+      # (expired user ADC, 270 recordings stranded local-only).
       GOOGLE_CLOUD_PROJECT: lescall
       TELEPHONY_MODE: "true"
       # ── Continuation-merge canary (2026-07-23, RUNBOOK §11) ──────────────
@@ -69,17 +105,20 @@ services:
       # exactly pre-canary (10 rollback tests + no-filler-replay pin green).
       ENABLE_CONTINUATION_MERGE: "true"
       HARD_FLUSH_SILENCE_FRAMES: "20"
-      # ── Streaming STT + native tool calling LIVE (2026-07-29) ────────────
-      # Streaming: saaras:v3 WS fed during speech — transcription overlaps
-      # the caller talking, finalize at the endpoint is one flush round-trip
-      # (~300-800ms measured) instead of the full batch POST. Self-downgrades
-      # to batch on any stream failure; credit-metered at parity.
-      # Tools: gated execution on the main LLM call (record/book/callback/
-      # dnd/end_call as validated proposals; stages still advance only in
-      # code). ROLLBACK: delete these two lines and `docker compose up -d
-      # runtime` — streaming returns to batch, tools return to the per-agent
-      # YAML default (shadow). Verify: grep [STT:Stream] and [TOOLS].
-      ENABLE_STREAMING_STT: "true"
+      # ── WebSocket streaming STT: REMOVED 2026-07-31 (owner request) ──────
+      # ENABLE_STREAMING_STT lived here from 2026-07-29. The flag is gone
+      # because the provider itself is gone — stt/sarvam_stream.py and
+      # stt/sarvam_ws.py were deleted and the bridge now always builds
+      # TrackingSarvamSTT (batch multipart POST to
+      # api.sarvam.ai/speech-to-text). Setting the variable here does
+      # NOTHING; nothing reads it. Re-introducing streaming means restoring
+      # the provider from git history, not adding a line back. RUNBOOK §24.
+      #
+      # ── Native LLM tool calling LIVE (2026-07-29) — deliberately KEPT ────
+      # Independent of STT. Gated execution on the main LLM call (record/
+      # book/callback/dnd/end_call as validated proposals; stages still
+      # advance only in code). ROLLBACK: delete this line and `up -d runtime`
+      # — tools return to the per-agent YAML default (shadow). Verify: [TOOLS].
       LLM_TOOLS_MODE: "on"
       # ── VAD stack LIVE (2026-07-30, PLAN-vad-stack.md) ───────────────────
       # WebRTC pre-filter → FSMN-VAD model (vendored onnx) + semantic
@@ -90,7 +129,6 @@ services:
       VAD_ENGINE: "fsmn"
     volumes:
       - /home/angelo/lescall:/home/angelo/lescall
-      - /home/angelo/.config/gcloud:/gcloud:ro
       - /tmp/esl_recordings:/tmp/esl_recordings
       # TTS playback WAVs: the bridge writes them, socket_server passes the
       # path to FreeSWITCH on the HOST — must be the same directory or every
@@ -117,17 +155,62 @@ services:
     group_add: ["994"]   # freeswitch — read CDR csv for billing reconciliation
     working_dir: /home/angelo/lescall
     command: ["bash", "deploy/workers_entry.sh"]
-    env_file: [.pg_env]
+    # Workers run the billing sync/dunning pass, so they need Razorpay creds.
+    env_file:
+      - .pg_env
+      - path: /etc/lescall/telephony.env
+        required: false
+      - path: /etc/lescall/billing.env
+        required: false
     environment:
-      GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
+      # Google auth comes from the VM metadata server (attached service
+      # account lescall-recsync, cloud-platform scope) — no key file, no
+      # human session, tokens auto-refresh forever. Do NOT reintroduce
+      # GOOGLE_APPLICATION_CREDENTIALS: an explicit path takes PRECEDENCE
+      # over metadata ADC, so a stale file there silently defeats the
+      # attached SA. That is exactly what rotted 2026-07-14 → 07-31
+      # (expired user ADC, 270 recordings stranded local-only).
       GOOGLE_CLOUD_PROJECT: lescall
     volumes:
       - /home/angelo/lescall:/home/angelo/lescall
-      - /home/angelo/.config/gcloud:/gcloud:ro
       - /var/log/freeswitch/cdr-csv:/var/log/freeswitch/cdr-csv:ro
       # FS record_session staging: recsync catch-up copies full two-party
       # recordings from here; cleanup_local prunes stragglers (needs rw).
       - /tmp/esl_recordings:/tmp/esl_recordings
+    restart: unless-stopped
+    logging: *log
+
+  # Super-admin plane (plan §8). Deliberately NOT reachable from the internet:
+  # no nginx vhost, no DNS record, no firewall opening. Primary interface is a
+  # UNIX domain socket, which an HTTP-URL SSRF cannot address at all; an
+  # optional 127.0.0.1 TCP bind can be enabled in /etc/lescall/admin.env for
+  # convenience. Reach it with:
+  #     ssh -L 8090:127.0.0.1:8090 angelo@35.207.225.237
+  # The app refuses to start without a >=32-char ADMIN_TOKEN, and refuses to
+  # bind anything that is not the socket or loopback.
+  admin:
+    image: lescall-app:latest
+    build: { context: .., dockerfile: deploy/Dockerfile.app }
+    container_name: lescall-admin
+    network_mode: host
+    user: "1000:1000"
+    working_dir: /home/angelo/lescall/dashboard
+    command: ["python", "admin_app.py"]
+    env_file:
+      - .pg_env
+      - path: /etc/lescall/admin.env
+        required: false
+      - path: /etc/lescall/billing.env
+        required: false
+    environment:
+      # Small pool: Postgres is max_connections=30 and shared with api,
+      # runtime and workers. The admin plane is a single operator.
+      LESCALL_ADMIN_SOCKET: /run/lescall-admin/lescall-admin.sock
+    volumes:
+      - /home/angelo/lescall:/home/angelo/lescall
+      # Socket directory, created by the operator:
+      #   sudo install -d -m 0770 -o angelo -g angelo /run/lescall-admin
+      - /run/lescall-admin:/run/lescall-admin
     restart: unless-stopped
     logging: *log
 

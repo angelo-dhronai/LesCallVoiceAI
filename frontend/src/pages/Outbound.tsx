@@ -11,7 +11,8 @@ import {
   Input, Select, Field, Segmented, AsyncState,
 } from '../components/kit'
 import { StatCard } from '../components/StatCard'
-import { useDebounced, useUrlParam } from '../lib/hooks'
+import { useDebounced, useUrlParam, useUrlPatch } from '../lib/hooks'
+import { CONTACT_STATUS_FILTER } from '../lib/callStatus'
 import { num } from '../lib/format'
 
 type Stats = {
@@ -57,25 +58,6 @@ const DISPOSITION_OPTS = [
   { value: 'to_contact_later', label: 'To contact later' },
   { value: 'rejected', label: 'Rejected' },
 ]
-
-const CALL_STATUS_FILTER = [
-  { value: 'all', label: 'All' },
-  { value: 'not_called', label: 'Not called' },
-  { value: 'answered', label: 'Answered' },
-  { value: 'no_answer', label: 'No answer' },
-  { value: 'declined', label: 'Declined' },
-  { value: 'busy', label: 'Busy' },
-] as const
-
-const DISPOSITION_FILTER = [
-  { value: 'all', label: 'All' },
-  { value: 'interested', label: 'Interested' },
-  { value: 'site_visit_booked', label: 'Site visit' },
-  { value: 'inquiry', label: 'Inquiry' },
-  { value: 'in_doubt', label: 'In doubt' },
-  { value: 'to_contact_later', label: 'Later' },
-  { value: 'rejected', label: 'Rejected' },
-] as const
 
 const CAMPAIGN_WHO = [
   { value: 'not_called', label: 'Not called' },
@@ -126,8 +108,9 @@ export default function Outbound() {
 
   // filters — mirrored into the URL so refresh/back/share keep the view
   const [cs, setCs] = useUrlParam('cs', 'all')
-  const [dp, setDp] = useUrlParam('dp', 'all')
   const [q, setQ] = useUrlParam('q')
+  // urlPatch, not patch: `patch` in this file is the HTTP PATCH helper.
+  const urlPatch = useUrlPatch()
   const dq = useDebounced(q, 300)
 
   // add contacts form
@@ -162,8 +145,8 @@ export default function Outbound() {
   const statsQ = useGet<StatsResp>(['outbound-stats'], '/outbound/stats',
     { refetchInterval: campRunning ? 5000 : undefined })
   const contactsQ = useGet<ContactsResp>(
-    ['outbound-contacts', cs, dp, dq],
-    `/outbound/contacts?call_status=${cs}&disposition=${dp}&q=${encodeURIComponent(dq)}`,
+    ['outbound-contacts', cs, dq],
+    `/outbound/contacts?call_status=${cs}&q=${encodeURIComponent(dq)}`,
     { refetchInterval: campRunning ? 5000 : undefined },
   )
 
@@ -171,7 +154,7 @@ export default function Outbound() {
   const disp = statsQ.data?.dispositions ?? {}
   const contacts = Array.isArray(contactsQ.data?.contacts) ? contactsQ.data!.contacts! : []
 
-  const hasFilters = cs !== 'all' || dp !== 'all' || dq.trim() !== ''
+  const hasFilters = cs !== 'all' || dq.trim() !== ''
 
   const audienceCounts: Record<string, number | undefined> = {
     not_called: stats.not_called,
@@ -582,8 +565,16 @@ export default function Outbound() {
       {/* 4. Contacts table (filters live inside the card) */}
       <Card className="p-5">
         <div className="mb-4 flex flex-wrap items-center gap-3">
-          <Segmented options={CALL_STATUS_FILTER.map((o) => ({ value: o.value, label: o.label }))} value={cs} onChange={setCs} />
-          <Segmented options={DISPOSITION_FILTER.map((o) => ({ value: o.value, label: o.label }))} value={dp} onChange={setDp} />
+          {/* One status filter. The separate lead-disposition pill row is gone:
+              disposition stays editable per row and is still summarised in the
+              "Lead dispositions" card above. */}
+          <div className="max-w-full overflow-x-auto [scrollbar-width:none]">
+            <Segmented
+              options={CONTACT_STATUS_FILTER.map((o) => ({ value: o.value, label: o.label }))}
+              value={cs}
+              onChange={setCs}
+            />
+          </div>
           <div className="relative">
             <SearchInput value={q} onChange={setQ} placeholder="Search phone or name…" className="w-56" />
             {searching && <Spinner className="absolute right-3 top-1/2 -translate-y-1/2" />}
@@ -604,7 +595,7 @@ export default function Outbound() {
                 title="No contacts match these filters"
                 hint="Try a different status, disposition or search term."
                 action={
-                  <Button variant="ghost" onClick={() => { setCs('all'); setDp('all'); setQ('') }}>
+                  <Button variant="ghost" onClick={() => urlPatch({ cs: null, q: null })}>
                     Reset filters
                   </Button>
                 }

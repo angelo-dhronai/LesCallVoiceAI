@@ -18,6 +18,31 @@ logger = logging.getLogger(__name__)
 
 SARVAM_API_URL = "https://api.sarvam.ai/speech-to-text"
 SARVAM_TIMEOUT = 10.0
+# Per-phase caps inside the blanket timeout (2026-08-03). A healthy Sarvam
+# turn is ~200-300ms median / <1s p95, but during the 08-03 morning incident
+# individual requests hung to the full 10s blanket (turns of 10.3-21.8s,
+# STT queue overflow dropped live caller speech). Tight connect/read caps
+# make a hung request fail fast enough that the router's retry — on a fresh
+# connection — still lands inside a salvageable turn.
+# Read cap tightened 5.0 → 2.5 later on 08-03: the hangs kept recurring all
+# morning and the observed healthy distribution (150-450ms, one 2.4s
+# outlier) leaves 2.5s ample; the rare slow-success now goes to Whisper
+# instead of stalling the serial STT worker for 5s.
+SARVAM_CONNECT_TIMEOUT_S = float(os.environ.get("SARVAM_CONNECT_TIMEOUT_S", "3.0"))
+SARVAM_READ_TIMEOUT_S = float(os.environ.get("SARVAM_READ_TIMEOUT_S", "2.5"))
+
+# Production model is saarika:v2.5 — owner decision 2026-08-03 after a brief
+# saaras:v3 experiment (switched 08-01, reverted twice at owner request).
+# The 08-03 "saarika got slow" episode was NOT the model config: requests
+# were byte-identical to the pre-experiment shape; the cause was Sarvam-side
+# request hangs amplified by the old blanket 10s timeout (see the timeout
+# caps below). Keep for reference: saaras:v3 mode=codemix keeps English in
+# Latin script under a hi-IN pin ("2 BHK flat", not "दो बीएच के फ्लैट") at
+# latency parity — re-test via SARVAM_STT_MODEL/SARVAM_STT_MODE env only,
+# and only with the owner's sign-off.
+# "mode" is a saaras-only parameter — never sent for saarika models.
+SARVAM_STT_MODEL = os.environ.get("SARVAM_STT_MODEL", "saarika:v2.5").strip()
+SARVAM_STT_MODE = os.environ.get("SARVAM_STT_MODE", "codemix").strip()
 
 # Shared per-process HTTP client: STT instances are created per call, but the
 # warmup flag is per-process — without sharing, every call after the first
@@ -33,7 +58,11 @@ _shared_client: httpx.AsyncClient | None = None
 
 def _make_client(timeout: float) -> httpx.AsyncClient:
     return httpx.AsyncClient(
-        timeout=timeout,
+        timeout=httpx.Timeout(
+            timeout,
+            connect=SARVAM_CONNECT_TIMEOUT_S,
+            read=SARVAM_READ_TIMEOUT_S,
+        ),
         limits=httpx.Limits(
             max_keepalive_connections=5,
             keepalive_expiry=SARVAM_KEEPALIVE_EXPIRY_S if SARVAM_HTTP_SHARED else 60,
@@ -71,12 +100,14 @@ class SarvamSTT(STTProvider):
         api_key: str | None = None,
         api_url: str = SARVAM_API_URL,
         timeout: float = SARVAM_TIMEOUT,
-        model: str = "saarika:v2.5",
+        model: str | None = None,
+        mode: str | None = None,
     ) -> None:
         self._api_key = api_key or os.environ.get("SARVAM_API_KEY", "")
         self._api_url = api_url
         self._timeout = timeout
-        self._model = model
+        self._model = model or SARVAM_STT_MODEL
+        self._mode = mode if mode is not None else SARVAM_STT_MODE
         # Per-call dynamic normalizer — adapts gain + noise-gating to THIS
         # caller/line across the call. Falls back to raw audio on any error.
         from .audio_norm import DynamicNormalizer
@@ -125,7 +156,7 @@ class SarvamSTT(STTProvider):
         else:
             audio_bytes = normalize_pcm_audio(audio_bytes)
         wav_data = pcm_to_wav(audio_bytes, sample_rate=sample_rate)
-        duration_ms = len(audio_bytes) // (sample_rate * 2) * 1000
+        duration_ms = len(audio_bytes) * 1000 // (sample_rate * 2)
         logger.info(
             "[STT:Sarvam] Sending %d bytes (%.0fms) lang=%s",
             len(wav_data), duration_ms, language,
@@ -149,18 +180,28 @@ class SarvamSTT(STTProvider):
 
         client = self._get_client()
 
+        form: dict[str, str] = {
+            "language_code": lang_code,
+            "model": self._model,
+        }
+        if self._mode and self._model.startswith("saaras"):
+            form["mode"] = self._mode
+
         try:
             response = await client.post(
                 self._api_url,
                 headers={"api-subscription-key": self._api_key},
-                data={
-                    "language_code": lang_code,
-                    "model": self._model,
-                },
+                data=form,
                 files={"file": ("audio.wav", wav_data, "audio/wav")},
             )
         except httpx.TimeoutException as exc:
-            logger.warning("[STT:Sarvam] Request timed out: %s", exc)
+            # A hang usually means a silently-dead pooled connection or a
+            # wedged server-side worker — drop the client so the router's
+            # retry opens a fresh connection instead of reusing the socket.
+            logger.warning(
+                "[STT:Sarvam] Request timed out: %s — resetting client for retry", exc
+            )
+            await self.close()
             raise
         except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError) as exc:
             # Stale or closed connection — discard the client so the next
@@ -201,17 +242,21 @@ class SarvamSTT(STTProvider):
 
         data = response.json()
         transcript = data.get("transcript", "").strip()
-        # saarika's REST response carries no confidence field — report None
-        # rather than a fabricated 1.0 (which kept the router's
+        # The REST response carries no transcript-confidence field — report
+        # None rather than a fabricated 1.0 (which kept the router's
         # MIN_CONFIDENCE gate from ever firing). If Sarvam ever ships one,
-        # it flows through automatically.
+        # it flows through automatically. (saaras:v3 DOES return
+        # language_probability, but only on auto-detect — we pin the
+        # language, so detection is skipped and it comes back null.)
         _conf_raw = data.get("confidence")
         confidence = float(_conf_raw) if _conf_raw is not None else None
         detected_lang = data.get("language_code") or None
-        logger.info("[STT:Sarvam] Transcript: %r (confidence=%s, lang=%s)",
+        _lang_prob = data.get("language_probability")
+        logger.info("[STT:Sarvam] Transcript: %r (confidence=%s, lang=%s%s)",
                     transcript,
                     "n/a" if confidence is None else f"{confidence:.2f}",
-                    detected_lang)
+                    detected_lang,
+                    "" if _lang_prob is None else f" p={_lang_prob:.2f}")
         return STTResult(text=transcript, confidence=confidence, detected_language=detected_lang)
 
     async def warmup(self) -> None:

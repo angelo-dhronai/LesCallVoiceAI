@@ -44,7 +44,61 @@ from shared.intelligence import search as intel_search  # noqa: E402
 from shared.intelligence.embed import parse_turns  # noqa: E402
 from shared.intelligence.memory import digest_for_contact  # noqa: E402
 
-router = APIRouter(prefix="/api/intel")
+def require_feature(feature: str):
+    """E12 — a per-tier capability gate, enforced AT THE API.
+
+    Hiding a nav item is decoration, not enforcement: the endpoints stay
+    reachable with a session and a URL. These dependencies are what actually
+    separates the tiers.
+
+    Note what is NOT gated: post-call PROCESSING still runs for every tenant
+    on every call. It feeds follow-ups and platform analytics, and it means an
+    upgrade retroactively reveals the customer's own history instead of
+    leaving a hole for the months they were on a cheaper plan.
+    """
+    def _dep(request: Request, owner: str = Depends(current_owner)) -> str:
+        if any(request.url.path.startswith(p) for p in _CROSS_TIER_PATHS):
+            return owner
+        try:
+            from shared.billing.entitlements import feature_allowed
+            from shared.billing.errors import BillingRefusal, CODE_PLAN_REQUIRED
+        except Exception:
+            return owner
+        if not feature_allowed(owner, feature):
+            raise BillingRefusal(
+                _FEATURE_COPY.get(feature, "This feature is not included in "
+                                            "your plan."),
+                CODE_PLAN_REQUIRED, feature=feature)
+        return owner
+    return _dep
+
+
+# Endpoints under /api/intel that every tier must keep, regardless of plan.
+# The notification bell is the obvious one and it is not optional: billing
+# itself delivers "payment failed" and "trial ending" through it, so gating it
+# behind the Intelligence tier would silence exactly the messages a
+# non-Intelligence tenant most needs to see.
+_CROSS_TIER_PATHS = (
+    "/api/intel/notifications",
+)
+
+
+_FEATURE_COPY = {
+    "intelligence": "The Intelligence dashboard is included in Growth. "
+                    "Upgrade to see what is happening inside your calls.",
+    "transcripts": "Call transcripts are included in Growth. Upgrade to "
+                   "search every conversation.",
+    "summaries": "AI call summaries are included in Growth.",
+    "conversation_analytics": "Conversation analytics are included in Growth.",
+    "advanced_analytics": "Advanced analytics are included in Growth.",
+    "recordings": "Call recordings are included in every paid plan.",
+    "autocall": "Automated follow-up calls are included in Growth.",
+}
+
+# `intelligence` gates the whole prefix — it is the Intelligence dashboard.
+# Individual routes below add narrower flags on top where the tiers differ.
+router = APIRouter(prefix="/api/intel",
+                   dependencies=[Depends(require_feature("intelligence"))])
 
 _PAGE_LIMIT = 50
 
@@ -1008,6 +1062,64 @@ def report_get(rid: int, owner: str = Depends(current_owner)):
     return rep
 
 
+def _report_export_payload(rid: int, owner: str):
+    """Shared loader for both export formats: the report row plus every call it
+    covers, already joined to the intelligence layer and to its commitments."""
+    from shared.intelligence import report_export as rx
+
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM reports WHERE id=? AND owner=? AND deleted_at IS NULL",
+            (rid, owner)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="report not found")
+        rep = dict(row)
+        rows = rx.load_report_rows(db, rep, owner)
+        commitments = rx.load_commitments(
+            db, owner, [r["id"] for r in rows if r.get("id") is not None])
+    rows = rx._prepare(rows, commitments)
+    return rep, rows
+
+
+@router.get("/reports/{rid}/export.docx")
+def report_export_docx(rid: int, owner: str = Depends(current_owner)):
+    """The report as a branded Word document (LesCall watermark on every page)."""
+    from fastapi.responses import Response
+    from shared.intelligence import report_export as rx
+
+    rep, rows = _report_export_payload(rid, owner)
+    try:
+        blob = rx.build_docx(rep, rows, owner)
+    except Exception as exc:
+        logger.exception("docx export failed for report %s", rid)
+        raise HTTPException(status_code=500, detail=f"docx export failed: {exc}")
+    name = rx.safe_filename(rep.get("title"), "docx")
+    return Response(
+        content=blob,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@router.get("/reports/{rid}/export.xlsx")
+def report_export_xlsx(rid: int, owner: str = Depends(current_owner)):
+    """Per-call analysis workbook: every call, hot leads, the ones needing a
+    human, and every outstanding promise — typed and filterable."""
+    from fastapi.responses import Response
+    from shared.intelligence import report_export as rx
+
+    rep, rows = _report_export_payload(rid, owner)
+    try:
+        blob = rx.build_xlsx(rep, rows, owner)
+    except Exception as exc:
+        logger.exception("xlsx export failed for report %s", rid)
+        raise HTTPException(status_code=500, detail=f"xlsx export failed: {exc}")
+    name = rx.safe_filename(rep.get("title"), "xlsx")
+    return Response(
+        content=blob,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
 @router.delete("/reports/{rid}")
 def report_delete(rid: int, owner: str = Depends(current_owner)):
     with get_db() as db:
@@ -1649,7 +1761,8 @@ def _pct(part: float | None, whole: float | None) -> float | None:
     return round((part or 0) / whole * 100, 1)
 
 
-@router.get("/analytics/conversation")
+@router.get("/analytics/conversation",
+            dependencies=[Depends(require_feature("conversation_analytics"))])
 def conversation_analytics(owner: str = Depends(current_owner),
                            days: int = Query(30, ge=1, le=365),
                            agent: str = ""):

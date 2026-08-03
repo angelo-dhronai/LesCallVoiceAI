@@ -42,6 +42,12 @@ export type VoiceSample = { speaker: string; gender: string; url: string }
 export type ChatResponse = {
   reply: string
   actions: CopilotAction[]
+  /** Plain-English one-liner of what the turn did — what the UI shows
+      instead of per-tool chips. */
+  actions_summary?: string
+  /** Agents touched this turn that exist on disk — the only slugs the UI
+      may offer Try/Open/Activate for (a mid-interview draft is not tryable). */
+  agent_links?: string[]
   agents_changed: boolean
   session?: SessionSummary
   interview?: InterviewProgress
@@ -53,6 +59,8 @@ export type TranscriptMsg = {
   role: 'user' | 'assistant'
   content: string
   actions?: CopilotAction[]
+  actions_summary?: string
+  agent_links?: string[]
   voice_samples?: VoiceSample[]
 }
 

@@ -6,7 +6,7 @@
  * lifetime stats, owner-managed sharing (grants).
  * Backed by /api/intel/contacts/{id}(/timeline|/calls|/grants).
  */
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   BrainCircuit, CalendarClock, Handshake, History, ListTodo,
@@ -118,6 +118,15 @@ export default function ContactHub() {
   const [grantAccess, setGrantAccess] = useState<'read' | 'edit'>('read')
   const [granting, setGranting] = useState(false)
 
+  // Navigating contact → contact reuses this component: without a reset the
+  // previous person's "load older" pages and kind filter carry over into the
+  // new one's timeline.
+  useEffect(() => {
+    setKinds('')
+    setOlder([])
+    setMoreCursor(undefined)
+  }, [id])
+
   const d = hubQ.data
   const events = useMemo(() => {
     const first = timelineQ.data?.items ?? []
@@ -201,14 +210,14 @@ export default function ContactHub() {
   }
 
   const mem = d?.memory ?? {}
-  const trend = d?.scores.trend ?? []
-  const latest = d?.scores.latest
+  const trend = d?.scores?.trend ?? []
+  const latest = d?.scores?.latest
   const supersededCount = useMemo(() =>
     ['preferences', 'promises', 'objections'].reduce((n, k) =>
       n + ((mem as any)[k] ?? []).filter((f: any) => f.status && f.status !== 'active').length, 0),
     [mem])
   const rec = d?.recommendations ?? {}
-  const outcomeMix = d?.stats.outcome_mix ?? {}
+  const outcomeMix = d?.stats?.outcome_mix ?? {}
   const grants = d?.grants ?? []
 
   const timelineEvents: TimelineEvent[] = events.map((e) => ({
@@ -528,10 +537,10 @@ export default function ContactHub() {
             <Card className="p-5">
               <SectionHead title="Lifetime" />
               <div className="grid grid-cols-2 gap-3">
-                <StatTile label="calls" value={d?.stats.calls ?? 0} />
-                <StatTile label="talk time" value={dur(d?.stats.talk_seconds ?? 0)} />
-                <StatTile label="calls · 30 days" value={d?.stats.calls_30d ?? 0} />
-                <StatTile label="first contact" value={d?.stats.first_call_at?.slice(0, 10) ?? '—'} />
+                <StatTile label="calls" value={d?.stats?.calls ?? 0} />
+                <StatTile label="talk time" value={dur(d?.stats?.talk_seconds ?? 0)} />
+                <StatTile label="calls · 30 days" value={d?.stats?.calls_30d ?? 0} />
+                <StatTile label="first contact" value={d?.stats?.first_call_at?.slice(0, 10) ?? '—'} />
               </div>
               {Object.keys(outcomeMix).length > 0 && (
                 <div className="mt-3">

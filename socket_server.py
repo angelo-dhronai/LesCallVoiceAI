@@ -315,8 +315,12 @@ import struct
 import wave
 import contextlib
 
-HOST = "0.0.0.0"
-PORT = 9000
+# Loopback by default: this socket IS the FreeSWITCH ESL controller, and
+# FreeSWITCH runs on this host. Binding 0.0.0.0 exposed the call-control plane
+# to anyone who could reach the VM on 9000. Override only if FreeSWITCH moves
+# off-box (and then firewall it).
+HOST = os.environ.get("LESCALL_SOCKET_HOST", "127.0.0.1")
+PORT = int(os.environ.get("LESCALL_SOCKET_PORT", "9000"))
 
 # ESL frame-end marker. Two LFs, no CR.
 END = b"\n\n"

@@ -86,6 +86,7 @@ def test_builtin_hangup_phrase_closes():
     """'main phone rakhta hoon' is an unambiguous 'I'm hanging up now'."""
     r = make_router()
     drive(r, "acha theek hai main phone rakhta hoon")
+    drive(r, "haan")                        # close-confirm gate (2026-07-31)
     assert r.state.is_closing is True
     assert r.hangup_pending is True
 
@@ -93,6 +94,7 @@ def test_builtin_hangup_phrase_closes():
 def test_configured_farewell_pattern_closes():
     r = make_router(termination={"farewell_patterns": ["chalo rakhte hain"]})
     drive(r, "ok ji chalo rakhte hain")
+    drive(r, "haan")
     assert r.hangup_pending is True
 
 
@@ -107,6 +109,7 @@ def test_thanks_confirms_close_permission():
     r = make_router()
     r.last_agent_response = "Is there anything else I can help you with?"
     drive(r, "thank you so much")
+    drive(r, "yes")
     assert r.hangup_pending is True
 
 
@@ -154,8 +157,9 @@ def test_marker_stripped_but_ignored_when_disabled():
 
 def test_llm_end_call_signal_closes_after_stream():
     """The consume loop arms the platform hangup once the stream that
-    carried [END_CALL] finishes — and the token never reaches TTS."""
-    r = make_router()
+    carried [END_CALL] finishes — and the token never reaches TTS.
+    confirm_before_end off here: the gated path has its own tests below."""
+    r = make_router(termination={"confirm_before_end": False})
     text = r._strip_end_call_marker("It was lovely speaking with you. Goodbye! [END_CALL]")
     assert r._llm_end_call_seen is True
 
@@ -340,3 +344,166 @@ def test_closure_block_without_llm_end_call():
     r = make_router(termination={"llm_end_call": False})
     joined = "\n".join(pb.call_closure_block(r._def, "en"))
     assert "[END_CALL]" not in joined
+
+
+# ── close-confirmation gate (2026-07-31) ────────────────────────────────────
+# Live regression: STT heard "okay, by the way..." as "okay bye", the engine
+# closed instantly, and the channel dropped while the caller was still
+# talking. Every speech-triggered close now asks once before hanging up.
+
+def test_misheard_goodbye_asks_instead_of_closing():
+    r = make_router()
+    out = drive(r, "okay bye")
+    assert r.hangup_pending is False
+    assert r.state.is_closing is False
+    assert r._close_confirm_pending is True
+    assert "end the call" in out.lower()    # "Alright then, shall I end the call here?"
+
+
+def test_confirmed_goodbye_closes():
+    r = make_router()
+    drive(r, "okay bye")
+    out = drive(r, "yes")
+    assert r.hangup_pending is True
+    assert r.state.is_closing is True
+    assert r._close_confirm_pending is False
+    # Owner-specified platform thank-you, not the agent's closing speech —
+    # a goodbye may already have been spoken on the confirming turn.
+    assert "thank you for talking" in out.lower()
+
+
+def test_denied_close_keeps_the_call_alive():
+    """'no, I didn't say that' must resume the conversation, not end it."""
+    r = make_router()
+    drive(r, "okay bye")
+    drive(r, "no no")
+    assert r.hangup_pending is False
+    assert r.state.is_closing is False
+    assert r._close_confirm_pending is False
+
+
+def test_content_answer_to_the_confirm_is_not_a_yes():
+    """The exact live turn: the caller answered with a request, not a
+    goodbye — it must be handled as conversation."""
+    r = make_router()
+    drive(r, "okay bye")
+    drive(r, "can you take my email address?")
+    assert r.hangup_pending is False
+    assert r._close_confirm_pending is False
+
+
+def test_affirmation_inside_a_longer_sentence_is_not_a_yes():
+    r = make_router()
+    drive(r, "okay bye")
+    drive(r, "yes but first can you tell me the price of the two bhk")
+    assert r.hangup_pending is False
+
+
+def test_confirm_gate_is_capped_so_a_real_goodbye_still_ends():
+    """A caller who keeps saying bye is never trapped in a confirm loop."""
+    r = make_router()
+    for _ in range(r._CLOSE_CONFIRM_MAX):
+        drive(r, "okay bye")
+        drive(r, "actually one more thing about the location")
+    drive(r, "okay bye")
+    assert r.hangup_pending is True     # cap spent — closes directly
+
+
+def test_confirm_gate_can_be_disabled_per_agent():
+    r = make_router(termination={"confirm_before_end": False})
+    drive(r, "okay bye")
+    assert r.hangup_pending is True
+
+
+def test_confirm_question_follows_the_call_language():
+    r = make_router()
+    r.state.language = "hi"
+    out = drive(r, "theek hai bye")
+    assert r.hangup_pending is False
+    assert "कॉल कट" in out    # "ठीक है, तो फिर मैं कॉल कट कर दूँ?"
+    out2 = drive(r, "haan")
+    assert r.hangup_pending is True
+    assert "धन्यवाद" in out2  # "बात करने के लिए धन्यवाद, आपका दिन शुभ हो।"
+
+
+def test_end_call_marker_on_a_question_is_ignored():
+    """The live bug: the model stapled [END_CALL] onto 'is there anything
+    else I can help you with today?' and the call was cut as the caller
+    answered. A turn that asks something is not a goodbye."""
+    r = make_router()
+    text = r._strip_end_call_marker(
+        "I understand. Is there anything else I can help you with today? [END_CALL]")
+    assert r._llm_end_call_seen is True
+
+    async def _run():
+        q: asyncio.Queue = asyncio.Queue()
+        q.put_nowait(text)
+        q.put_nowait(None)
+        out = []
+        async for res in r._consume_llm_with_filler(q, asyncio.Event(), "question"):
+            out.append(res.text)
+        return out
+
+    out = asyncio.run(_run())
+    assert r.hangup_pending is False
+    assert r._close_confirm_pending is False    # not even a confirm — no close
+    assert all("END_CALL" not in t for t in out)
+
+
+def test_llm_goodbye_is_confirmed_before_closing():
+    r = make_router()
+    text = r._strip_end_call_marker("It was lovely speaking with you. Goodbye! [END_CALL]")
+
+    async def _run():
+        q: asyncio.Queue = asyncio.Queue()
+        q.put_nowait(text)
+        q.put_nowait(None)
+        out = []
+        async for res in r._consume_llm_with_filler(q, asyncio.Event(), "farewell"):
+            out.append(res.text)
+        return out
+
+    out = asyncio.run(_run())
+    joined = " ".join(out)
+    assert r.hangup_pending is False
+    assert r._close_confirm_pending is True
+    assert "end the call" in joined.lower()
+    final = drive(r, "yes")
+    assert r.hangup_pending is True
+    assert "thank you for talking" in final.lower()
+
+
+def test_dnd_still_closes_immediately():
+    """Compliance closes are NOT gated — re-asking someone who said 'stop
+    calling me' is worse than the mishearing risk."""
+    r = make_router(guardrails={"compliance": {"dnd_phrases": ["stop calling me"]}})
+    r.state.stage = "S2"
+    drive(r, "please stop calling me")
+    assert r.hangup_pending is True
+    assert r._close_confirm_pending is False
+
+
+def test_silence_hangup_still_closes_immediately():
+    """Nobody is on the line to answer a confirmation question."""
+    r = make_router()
+    assert r.generate_silence_goodbye()
+    assert r.hangup_pending is True
+    assert r._close_confirm_pending is False
+
+
+def test_max_duration_close_still_hard():
+    r = make_router(termination={"max_call_minutes": 5})
+    assert r.generate_timeout_goodbye()
+    assert r.hangup_pending is True
+    assert r._hangup_hard is True
+    assert r._close_confirm_pending is False
+
+
+def test_closure_block_mentions_the_platform_confirm():
+    r = make_router()
+    joined = "\n".join(pb.call_closure_block(r._def, "en"))
+    assert "asks the caller a question" in joined
+    assert "mishear" in joined.lower()
+    # The platform speaks the final thank-you after the confirm, so the LLM
+    # is told to keep its own goodbye to one sentence (double-farewell fix).
+    assert "ONE short sentence" in joined

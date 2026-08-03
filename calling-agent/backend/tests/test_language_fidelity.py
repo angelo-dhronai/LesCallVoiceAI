@@ -237,7 +237,8 @@ def test_flush_pipeline_queues_bumps_epoch():
         _tts_queue=asyncio.Queue(),
         _stt_queue=asyncio.Queue(),
         _transcript_queue=asyncio.Queue(),
-        _streaming_stt=None,
+        _stt_ready_queue=asyncio.Queue(),
+        _stt_inflight=0,
     )
     ns._flush_pipeline_queues = types.MethodType(
         VoicePipeline._flush_pipeline_queues, ns)

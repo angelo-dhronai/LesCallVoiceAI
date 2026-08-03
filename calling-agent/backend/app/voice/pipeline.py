@@ -41,16 +41,6 @@ logger = logging.getLogger(__name__)
 # ENV-based control for barge-in and telephony defaults
 ENABLE_BARGE_IN = os.environ.get("ENABLE_BARGE_IN", "true").lower() == "true"
 
-# Streaming STT canary (default OFF): when the STT router's primary is a
-# SarvamStreamingSTT (installed by the bridge under the same flag), speech
-# frames are ALSO fed to Sarvam's WebSocket while the caller talks, so the
-# transcript is near-ready when the endpoint fires instead of paying the
-# full batch round-trip afterwards. The local buffer and every batch-path
-# safety net stay in place — the stream self-downgrades to batch on any
-# failure.
-ENABLE_STREAMING_STT = (
-    os.environ.get("ENABLE_STREAMING_STT", "false").lower() == "true")
-
 # VAD engine (deploy/PLAN-vad-stack.md): "energy" = legacy threshold VAD,
 # "fsmn" = WebRTC pre-filter → FSMN-VAD model stack + EndpointController +
 # audio-event classifier + shadow session state machine. Rollback is this
@@ -118,8 +108,16 @@ class Response:
 
 
 QUEUE_SIZE_AUDIO = 40
-QUEUE_SIZE_STT = 3
+# Raised 3 → 6 (2026-08-03): during a slow-Sarvam stretch the queue filled
+# behind an in-flight request and NEW caller speech was dropped ("STT queue
+# full"). Late segments are recoverable (the stale-drop and merge layers
+# sort them out); lost audio is not.
+QUEUE_SIZE_STT = 6
 QUEUE_SIZE_TRANSCRIPT = 3
+# How many segments beyond the one being processed may transcribe AHEAD in
+# parallel (the STT submitter/worker split). 1 → up to ~3 provider requests
+# in flight worst-case. Transcripts are still DELIVERED strictly in order.
+STT_PREFETCH_AHEAD = max(1, int(os.environ.get("STT_PREFETCH_AHEAD", "1")))
 # Raised from 3 to 8: streamed LLM responses produce multiple sentence-level
 # chunks in quick succession. A queue of 3 caused drops when the TTS layer was
 # busy playing an earlier chunk while new ones arrived.
@@ -220,6 +218,15 @@ POST_RESPONSE_MERGE_MS = 800.0
 ENABLE_CONTINUATION_MERGE = os.environ.get(
     "ENABLE_CONTINUATION_MERGE", "false").lower() == "true"
 CONTINUATION_WINDOW_MS = float(os.environ.get("CONTINUATION_WINDOW_MS", "2000"))
+# Owner request 2026-08-03: slow/paused callers resume well past 2s and were
+# getting a second, separate answer. Gaps in (CONTINUATION_WINDOW_MS,
+# CONTINUATION_LONG_WINDOW_MS] also merge — but ONLY while the superseded
+# reply is still undelivered (LLM generating, queued for TTS, currently
+# playing, or barged into). After a reply has fully played, a caller
+# utterance past the base window is a genuine new turn (their answer to the
+# agent's question), never a continuation.
+CONTINUATION_LONG_WINDOW_MS = float(
+    os.environ.get("CONTINUATION_LONG_WINDOW_MS", "6000"))
 # Relaxed hearing during the bounded post-endpoint window: barge-in energy
 # factor (vs the normal 2.0× echo-reject threshold) and sustained-frame
 # requirements. Outside the window today's constants apply unchanged.
@@ -227,7 +234,8 @@ CONTINUATION_BARGE_FACTOR = float(os.environ.get("CONTINUATION_BARGE_FACTOR", "1
 CONTINUATION_BARGE_FRAMES = int(os.environ.get("CONTINUATION_BARGE_FRAMES", "5"))
 CONTINUATION_ECHO_EXIT_FRAMES = int(os.environ.get("CONTINUATION_ECHO_EXIT_FRAMES", "4"))
 # Cap on consecutive rollback-merges per chain (background-noise guard).
-CONTINUATION_MAX_MERGES = int(os.environ.get("CONTINUATION_MAX_MERGES", "3"))
+# 3 → 5 (2026-08-03): long fragmented monologues hit the cap mid-thought.
+CONTINUATION_MAX_MERGES = int(os.environ.get("CONTINUATION_MAX_MERGES", "5"))
 
 # ── Connect window (repeated-"hello" loop counter) ──────────────────────────
 # In the first CONNECT_WINDOW_S of a call the caller's patience is ~2s and a
@@ -285,13 +293,6 @@ STT_LANG_PIN_TURNS = int(os.environ.get("STT_LANG_PIN_TURNS", "2"))
 CAPTURE_MODE = os.environ.get("CAPTURE_MODE", "true").lower() == "true"
 CAPTURE_MERGE_WINDOW_MS = float(os.environ.get(
     "CAPTURE_MERGE_WINDOW_MS", "2000"))
-# H2 (2026-07-31): the barge-in queue flush used to reset_turn() the
-# streaming STT, discarding echo-gate-vetted caller audio fed before the
-# barge threshold tripped (live: "cleaning and helping…" and a spelled
-# email fragment both vanished this way). The interrupting speech IS the
-# next turn — keep it. false = legacy discard.
-BARGE_KEEP_STREAM_AUDIO = os.environ.get(
-    "BARGE_KEEP_STREAM_AUDIO", "true").lower() == "true"
 # H5 (2026-07-31): a transcript ending in a continuation word ("हम बेसिकली
 # जो।") must not take the idle-skip fast path — hold the merge window so
 # the caller's resumed speech joins the same turn instead of racing the LLM.
@@ -457,6 +458,12 @@ class VoicePipeline:
         self._stt_queue: asyncio.Queue[AudioSegment] = asyncio.Queue(maxsize=QUEUE_SIZE_STT)
         self._transcript_queue: asyncio.Queue[Transcript] = asyncio.Queue(maxsize=QUEUE_SIZE_TRANSCRIPT)
         self._tts_queue: asyncio.Queue[Response] = asyncio.Queue(maxsize=QUEUE_SIZE_TTS)
+        # STT prefetch hand-off: (segment, transcribe_task, submit_ts) tuples.
+        # The submitter STARTS transcriptions as segments arrive (bounded by
+        # the queue size); the worker consumes them strictly in order, so one
+        # slow provider request no longer serializes the segments behind it.
+        self._stt_ready_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=STT_PREFETCH_AHEAD)
 
         # State
         self._running = False
@@ -475,6 +482,17 @@ class VoicePipeline:
         self._stt_lang_pin: str | None = None      # BCP-47 or None (=unknown)
         self._stt_lang_last: str | None = None
         self._stt_lang_stable: int = 0
+        # Whisper-hint gate (2026-08-03): the conversation language starts as
+        # the AGENT's default — hinting Whisper with it before the CALLER has
+        # confirmed a language makes Whisper transliterate/translate (Hindi
+        # speech under an 'en' hint comes back as Latin junk), which then
+        # starves the script-based language evidence: the call sticks in the
+        # wrong language. Until established, the fallback runs auto-detect.
+        self._lang_initial: str | None = None
+        self._lang_caller_established: bool = False
+        # Lazily probed: does self.stt.transcribe accept fallback_hint?
+        # (Router does; bare providers and older test mocks may not.)
+        self._stt_accepts_hint: bool | None = None
         # Live "is the caller currently speaking" flag — read-only signal for
         # external monitoring (dashboard live-call snapshot); never consulted
         # by any pipeline control-flow branch.
@@ -489,9 +507,6 @@ class VoicePipeline:
         # table by the bridge at teardown. Capped so a marathon call can't
         # grow memory unbounded.
         self.turn_traces: list[dict] = []
-        # Set in start() when ENABLE_STREAMING_STT and the router's primary
-        # supports live feeding (SarvamStreamingSTT).
-        self._streaming_stt = None
         # Turn accumulator: tracks full caller text across segments within one
         # turn. Preserved when barge-in fires so the next STT fragment is merged
         # with prior context. Cleared when TTS completes a clean (non-barge-in)
@@ -539,12 +554,6 @@ class VoicePipeline:
         # pipeline plays the agent's graceful-close phrase and stops queuing
         # more fallbacks — preventing an infinite "sorry I couldn't hear you" loop.
         self._stt_consecutive_fallbacks: int = 0
-        # H4: when a streamed finalize consumed a whole speech episode, the
-        # NEXT VAD chunk's finalize legitimately comes back empty — that
-        # empty must not count as "unrecognized speech" (live: it queued a
-        # "couldn't hear you" while the caller had been perfectly heard).
-        self._last_accept_ts: float = 0.0
-        self._last_accept_overcovered: bool = False
         # Dead-air repair state (see _silence_watchdog): last time the VAD saw
         # caller speech, consecutive reprompts without a real caller turn, and
         # when the last reprompt fired.
@@ -622,15 +631,6 @@ class VoicePipeline:
         # (guarded by class-level _warmup_done_flag inside each provider).
         warmup_coros = []
         primary_stt = getattr(self.stt, "_primary", None)
-        # Streaming STT: the bridge installs SarvamStreamingSTT as the
-        # router's primary under ENABLE_STREAMING_STT; the VAD layer feeds
-        # it live speech frames whenever this handle is non-None.
-        self._streaming_stt = (
-            primary_stt
-            if ENABLE_STREAMING_STT and hasattr(primary_stt, "feed_nowait")
-            else None)
-        if self._streaming_stt is not None:
-            logger.info("[PIPELINE] Streaming STT ACTIVE (ENABLE_STREAMING_STT)")
         if primary_stt is not None and hasattr(primary_stt, "warmup"):
             if not getattr(primary_stt.__class__, "_warmup_done_flag", False):
                 logger.info("[WARMUP] STT primary warmup queued")
@@ -670,6 +670,7 @@ class VoicePipeline:
 
         self._tasks = [
             asyncio.create_task(self._audio_vad_layer(), name="audio_vad"),
+            asyncio.create_task(self._stt_submitter(), name="stt_submitter"),
             asyncio.create_task(self._stt_worker(), name="stt_worker"),
             asyncio.create_task(self._conversation_layer(), name="conversation"),
             asyncio.create_task(self._tts_layer(), name="tts"),
@@ -735,12 +736,6 @@ class VoicePipeline:
                 self.vad.close()
             except Exception:
                 pass
-        if self._streaming_stt is not None:
-            try:
-                await self._streaming_stt.close()
-            except Exception:
-                pass
-            self._streaming_stt = None
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -1084,14 +1079,10 @@ class VoicePipeline:
                     for pre_frame in self._pre_speech_buffer:
                         self._audio_buffer.extend(pre_frame)
                         self._speech_duration_ms += 20.0
-                        if self._streaming_stt is not None:
-                            self._streaming_stt.feed_nowait(pre_frame)
                     self._pre_speech_buffer.clear()
             self._turn.mark_speech()
             self._audio_buffer.extend(frame)
             self._speech_duration_ms += 20.0
-            if self._streaming_stt is not None:
-                self._streaming_stt.feed_nowait(frame)
             if self._session is not None:
                 # Monologue-length tick (outbound IVR/voicemail heuristics).
                 self._session.on_speech_run(self._speech_duration_ms)
@@ -1099,17 +1090,13 @@ class VoicePipeline:
             if len(self._audio_buffer) > MAX_BUFFER_BYTES:
                 del self._audio_buffer[:len(self._audio_buffer) - MAX_BUFFER_BYTES]
 
-            # Streaming STT emits finalized SEGMENT transcripts mid-turn
-            # (no word partials exist on saaras) — when real words are
-            # available the TurnManager sees them instead of proxy tokens,
-            # so its sentence-end heuristic can actually match.
-            stream_text = (self._streaming_stt.turn_text
-                           if self._streaming_stt is not None else "")
-            if stream_text:
-                self._turn.update_text(stream_text)
-            else:
-                proxy_words = max(1, int(self._speech_duration_ms / 300))
-                self._turn.update_text(" ".join(["x"] * proxy_words))
+            # No mid-turn transcript exists on the batch path — the POST only
+            # happens after the endpoint fires. Feed the TurnManager proxy
+            # tokens so its length heuristics still advance; its sentence-end
+            # heuristic cannot match on proxies, which is the pre-streaming
+            # behaviour.
+            proxy_words = max(1, int(self._speech_duration_ms / 300))
+            self._turn.update_text(" ".join(["x"] * proxy_words))
         else:
             if self._prev_speech:
                 logger.info("[VAD] Speech end (%.0fms)", self._speech_duration_ms)
@@ -1131,12 +1118,15 @@ class VoicePipeline:
             and self._speech_duration_ms >= self._min_speech_ms(time.monotonic())
         ):
             if self._endpointer is not None:
+                # No live transcript on the batch path, so the endpointer
+                # decides on acoustics alone (its "default" profile). Its
+                # semantic hold/fast-complete profiles need mid-turn text,
+                # which only a streaming provider could supply.
                 _flush_due = self._endpointer.should_flush(
                     self._silence_frames,
                     self._speech_duration_ms,
-                    (self._streaming_stt.turn_text
-                     if self._streaming_stt is not None else ""),
-                    self._streaming_stt is not None,
+                    "",
+                    False,
                 )
             else:
                 _flush_due = self._silence_frames >= HARD_FLUSH_SILENCE_FRAMES
@@ -1163,10 +1153,6 @@ class VoicePipeline:
                 self._audio_buffer.clear()
                 self._speech_duration_ms = 0.0
                 self._turn.flush()
-                if self._streaming_stt is not None:
-                    # The fed audio was dropped locally — invalidate any
-                    # segment the server may still emit for it.
-                    self._streaming_stt.reset_turn()
                 return
 
             _now_flush = time.monotonic()
@@ -1255,27 +1241,30 @@ class VoicePipeline:
                     drained += 1
                 except asyncio.QueueEmpty:
                     break
+        # Prefetched transcriptions belong to flushed audio — cancel them and
+        # release their inflight slots (the worker never sees these pairs).
+        while not self._stt_ready_queue.empty():
+            try:
+                _, _task, _ = self._stt_ready_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            _task.cancel()
+            self._stt_inflight -= 1
+            drained += 1
         if drained:
             logger.info("[BARGE-IN] Drained %d items from pipeline queues", drained)
-        if self._streaming_stt is not None and not BARGE_KEEP_STREAM_AUDIO:
-            # Legacy behavior: invalidate everything fed to the stream. This
-            # also discarded the caller's own interrupting speech (fed before
-            # the barge threshold tripped), so it is off by default — the
-            # superseded turn's segments were already consumed by its own
-            # finalize, which bumps the generation itself.
-            self._streaming_stt.reset_turn()
 
     # -----------------------------------------------------------------------
     # Layer 2: STT Worker
     # -----------------------------------------------------------------------
 
     def _update_stt_lang_pin(self) -> None:
-        """A4a: pin the streaming STT once the conversation language has been
+        """A4a: pin the STT language once the conversation language has been
         stable for STT_LANG_PIN_TURNS accepted transcripts; release the pin
         the moment conversation state moves off it (explicit request or
         evidence switch flips state → one auto-detect turn → re-pin). The
-        reconnect itself happens inside the stream client at the next turn
-        boundary — never mid-turn."""
+        pin is read in _stt_worker and passed as the batch request's
+        language_code."""
         if not STT_LANG_PIN or self.conversation is None:
             return
         cur = getattr(getattr(self.conversation, "state", None),
@@ -1287,25 +1276,25 @@ class VoicePipeline:
         else:
             self._stt_lang_last = cur
             self._stt_lang_stable = 1
-        setter = getattr(self.stt, "set_stream_language", None)
         mapped = {"en": "en-IN", "hi": "hi-IN", "gu": "gu-IN"}[cur]
         if self._stt_lang_pin and self._stt_lang_pin != mapped:
             self._stt_lang_pin = None
-            if callable(setter):
-                setter("unknown")
             logger.info("[STT] Language pin released (state now %s)", cur)
         elif (self._stt_lang_pin is None
                 and self._stt_lang_stable >= STT_LANG_PIN_TURNS):
             self._stt_lang_pin = mapped
-            if callable(setter):
-                setter(mapped)
             logger.info("[STT] Language pinned to %s (stable %d turns)",
                         mapped, self._stt_lang_stable)
 
-    async def _stt_worker(self) -> None:
+    async def _stt_submitter(self) -> None:
         """
-        Consumes AudioSegments, transcribes via STT router.
-        Runs independently — never blocks the audio layer.
+        Layer 2a: pulls audio segments and STARTS each transcription
+        immediately (bounded look-ahead, STT_PREFETCH_AHEAD), so one slow
+        provider round-trip no longer serializes the segments behind it —
+        the 08-03 slow-Sarvam stretch turned 2.5s requests into 8-20s queue
+        tails and dropped segments. The worker consumes the (segment, task)
+        pairs strictly IN ORDER: validation, language mirror, merge and
+        engine semantics stay exactly sequential.
         """
         while self._running:
             try:
@@ -1409,10 +1398,70 @@ class VoicePipeline:
                     _conv_state = getattr(self.conversation, "state", None)
                     if _conv_state is not None:
                         _retry_lang = getattr(_conv_state, "language", None) or None
-                stt_result = await self.stt.transcribe(
+                # Whisper hint (2026-08-03): only once the CALLER has
+                # established the language — "" (auto-detect) before that.
+                # See _lang_caller_established in __init__ for the trap this
+                # avoids (agent-default hints transliterate Hindi to Latin).
+                _fb_hint = ""
+                if _retry_lang:
+                    if self._lang_initial is None:
+                        self._lang_initial = _retry_lang
+                    if (self._lang_caller_established
+                            or _retry_lang != self._lang_initial):
+                        self._lang_caller_established = True
+                        _fb_hint = _retry_lang
+                if self._stt_accepts_hint is None:
+                    import inspect
+                    try:
+                        self._stt_accepts_hint = ("fallback_hint" in
+                            inspect.signature(self.stt.transcribe).parameters)
+                    except (TypeError, ValueError):
+                        self._stt_accepts_hint = False
+                _hint_kw = ({"fallback_hint": _fb_hint}
+                            if self._stt_accepts_hint else {})
+                _stt_task = asyncio.create_task(self.stt.transcribe(
                     segment.audio, sample_rate=SAMPLE_RATE, language=_stt_lang,
-                    default_language=_retry_lang,
+                    default_language=_retry_lang, **_hint_kw,
+                ))
+            except Exception:
+                logger.exception("[STT] Submit failed")
+                self._stt_inflight -= 1
+                continue
+            try:
+                await self._stt_ready_queue.put(
+                    (segment, _stt_task, latency_start))
+            except asyncio.CancelledError:
+                _stt_task.cancel()
+                self._stt_inflight -= 1
+                break
+
+        logger.info("[STT] Submitter stopped")
+
+    async def _stt_worker(self) -> None:
+        """
+        Consumes prefetched (segment, transcription-task) pairs IN ORDER and
+        runs every post-transcription step (validation, mirror, enqueue).
+        The companion _stt_submitter overlaps the provider round-trips.
+        """
+        while self._running:
+            try:
+                segment, _stt_task, latency_start = await asyncio.wait_for(
+                    self._stt_ready_queue.get(), timeout=1.0
                 )
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+            try:
+                try:
+                    stt_result = await _stt_task
+                except asyncio.CancelledError:
+                    if _stt_task.cancelled():
+                        # Segment flushed (barge-in/shutdown) — skip it; the
+                        # worker itself is not being cancelled.
+                        continue
+                    raise
                 transcript_text = stt_result.text
                 stt_latency = (time.monotonic() - latency_start) * 1000
 
@@ -1448,14 +1497,11 @@ class VoicePipeline:
                 # A transcript with far more words than the audio can contain is a
                 # hallucination (STT filling silence with fluent-sounding text).
                 # Threshold: 250 ms/word (4 wps) with a floor of 4 words for short segments.
-                # H1: a streamed finalize spans the whole speech EPISODE
-                # (server-stitched across VAD chunks), so score against the
-                # audio it actually covered — the local chunk alone rejected
-                # real answers as hallucination (14 words / 1440ms, live).
+                # On the batch path a transcript covers exactly the segment it
+                # was POSTed for, so the segment duration IS the audio it can
+                # legitimately account for.
                 if transcript_text and transcript_text.strip():
-                    _covered_ms = getattr(self.stt, "last_covered_seconds",
-                                          0.0) * 1000.0
-                    _effective_ms = max(segment.duration_ms, _covered_ms)
+                    _effective_ms = segment.duration_ms
                     _word_count = len(transcript_text.split())
                     _max_plausible = max(4, int(_effective_ms / 250))
                     if _word_count > _max_plausible * 2:
@@ -1510,17 +1556,7 @@ class VoicePipeline:
                     #   3. not _tts_playing   — agent is not currently speaking
                     #   4. _vad_mute_until elapsed — not inside echo-cooldown window
                     if segment.duration_ms >= _STT_FALLBACK_MIN_SPEECH_MS:
-                        if (self._last_accept_overcovered
-                                and time.monotonic() - self._last_accept_ts < 3.0):
-                            # H4: previous streamed transcript covered this
-                            # chunk's audio too — nothing was missed.
-                            logger.info(
-                                "[STT] Empty finalize (%.0fms) right after an "
-                                "over-covered streamed transcript — episode "
-                                "already consumed, skipping",
-                                segment.duration_ms,
-                            )
-                        elif not self._greeting_done:
+                        if not self._greeting_done:
                             logger.info(
                                 "[STT] Skipping fallback — greeting not yet complete "
                                 "(startup/warmup audio, %.0fms)", segment.duration_ms,
@@ -1608,13 +1644,6 @@ class VoicePipeline:
                     continue
 
                 self._stt_consecutive_fallbacks = 0  # successful transcript — reset failure streak
-                # H4 bookkeeping: remember whether this transcript covered
-                # more audio than its own VAD chunk (streamed episode).
-                self._last_accept_ts = time.monotonic()
-                self._last_accept_overcovered = (
-                    getattr(self.stt, "last_covered_seconds", 0.0) * 1000.0
-                    > segment.duration_ms + 500.0
-                )
                 # Deferred language mirror: the transcript survived every
                 # rejection guard — apply Sarvam's detection only if it is
                 # plausible for this text (script/markers agree; a lone
@@ -1631,6 +1660,9 @@ class VoicePipeline:
                 if _pending_mirror and self.conversation:
                     if self.conversation.stt_mirror_consistent(
                             _pending_mirror, transcript_text):
+                        # A consistent caller transcript confirmed a language
+                        # — the Whisper hint may follow it from now on.
+                        self._lang_caller_established = True
                         logger.info(
                             "[STT] Language auto-detected by Sarvam: %s → %s (guarded)",
                             stt_result.detected_language, _pending_mirror)
@@ -2184,11 +2216,25 @@ class VoicePipeline:
                     gap_ms = (
                         transcript.speech_start_ts - self._turn_txn_speech_end
                     ) * 1000.0
+                    # Long-pause merges (gap > base window) are allowed only
+                    # while the superseded reply has NOT been fully delivered:
+                    # still generating, queued, playing, or cut by a barge-in.
+                    # Evaluated BEFORE the cut below mutates any of these.
+                    _reply_undelivered = (
+                        (self._current_generation_task is not None
+                         and not self._current_generation_task.done())
+                        or not self._tts_queue.empty()
+                        or self._tts_playing
+                        or self._barge_in_occurred
+                    )
                     if (
                         not _hello_turn
                         and transcript.speech_start_ts > 0.0
                         and self._turn_txn_speech_end > 0.0
-                        and 0.0 <= gap_ms <= CONTINUATION_WINDOW_MS
+                        and 0.0 <= gap_ms
+                        and (gap_ms <= CONTINUATION_WINDOW_MS
+                             or (_reply_undelivered
+                                 and gap_ms <= CONTINUATION_LONG_WINDOW_MS))
                         and self._merge_chain_count < CONTINUATION_MAX_MERGES
                     ):
                         # Cut the agent's superseded reply wherever it is:

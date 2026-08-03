@@ -6,7 +6,9 @@ a real-audio-driven stand-in that tracks actual speech duration — no
 fake phrases, no canned text. It exists solely to give the TurnManager
 word-count signals proportional to real speech timing.
 
-Replace with SarvamStreamingSTT (or any provider) by subclassing.
+Subclass to add a real streaming provider. Nothing implements it today —
+the live STT path is the batch STTRouter in `stt/` (the WebSocket provider
+that once sat here was removed 2026-07-31, RUNBOOK §24).
 """
 
 from __future__ import annotations

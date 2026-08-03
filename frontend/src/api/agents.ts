@@ -64,15 +64,6 @@ export type Booking = {
 
 export type CalendarSlot = { day: string; time: string }
 
-export type IntentResult = {
-  text: string
-  intent: string
-  matches: { intent: string; pattern: string }[]
-  qa_signals: { field: string; signal: string }[]
-  agent_id: string
-  patterns_checked: Record<string, number>
-}
-
 /* ───────────────────────── reads ───────────────────────── */
 export const listAgents = () => api<AgentsList>('/agents')
 export const getAgent = (name: string) => api<any>(`/agents/${name}`)
@@ -186,9 +177,6 @@ export const listBookings = (name: string) =>
   api<{ bookings: Booking[] }>(`/agents/${name}/bookings`)
 export const deleteBooking = (name: string, index: number) =>
   del(`/agents/${name}/bookings/${index}`)
-
-export const previewIntent = (text: string, agent?: string, language = 'auto') =>
-  post<IntentResult>('/preview/intent', { text, agent, language })
 
 export const ttsPreviewUrl = (speaker: string, model: string, language: string, pace?: number) =>
   `/api/tts/preview?speaker=${encodeURIComponent(speaker)}&model=${encodeURIComponent(

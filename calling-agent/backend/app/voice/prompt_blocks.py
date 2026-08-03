@@ -843,6 +843,7 @@ def call_closure_block(agent_def: AgentDefinition, lang: str = "en") -> list[str
     """
     term = getattr(agent_def.call_flow, "termination", None) or {}
     llm_end = bool(term.get("llm_end_call", True))
+    confirm_end = bool(term.get("confirm_before_end", True))
     conds = [str(c).strip() for c in (term.get("end_conditions") or [])
              if str(c).strip()]
 
@@ -889,6 +890,21 @@ def call_closure_block(agent_def: AgentDefinition, lang: str = "en") -> list[str
         lines.append(
             "✗ NEVER write [END_CALL] on any turn that is not a goodbye — "
             "the call ends right after your words when you use it")
+        lines.append(
+            "✗ NEVER write [END_CALL] on a turn that asks the caller a "
+            "question (including 'is there anything else I can help you "
+            "with?') — a question means the conversation is still open, and "
+            "the platform ignores the token there")
+    if confirm_end:
+        lines.append(
+            "✓ If the caller's goodbye might have been misheard, the platform "
+            "asks them to confirm before hanging up and handles that exchange "
+            "itself — never ask 'are you sure you want to end the call?' "
+            "yourself, and never repeat a goodbye you have already said")
+        lines.append(
+            "✓ Keep your goodbye to ONE short sentence — after the caller "
+            "confirms, the platform speaks the final thank-you line itself, "
+            "so a long farewell speech from you gets doubled")
     if conds:
         lines.append("━━ END-CALL RULES (set by the business — follow exactly) ━━")
         lines.extend(f"▸ {c}" for c in conds)

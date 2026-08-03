@@ -47,8 +47,15 @@ TARGET_SR = int(os.environ.get("TELEPHONY_TARGET_SR", "16000"))
 PHASE15_DEBUG_DIR = "/tmp/phase15_audio_debug"
 DEBUG_CAPTURE_SECONDS = 5
 
-HOST_DEFAULT = "0.0.0.0"
-PORT_DEFAULT = 9001
+# Loopback by default. FreeSWITCH and every app container are on this host
+# (containers use network_mode: host), so 0.0.0.0 bought nothing and exposed an
+# UNAUTHENTICATED media endpoint: whoever reached 9001 could open a session
+# naming any agent slug that exists on disk and run full AI calls billed to that
+# slug's tenant — Sarvam + LLM spend on our account, quota on theirs, bypassing
+# every billing gate in this codebase. Override with LESCALL_WS_HOST only if
+# FreeSWITCH genuinely moves off-box, and put a firewall in front of it.
+HOST_DEFAULT = os.environ.get("LESCALL_WS_HOST", "127.0.0.1")
+PORT_DEFAULT = int(os.environ.get("LESCALL_WS_PORT", "9001"))
 
 DEFAULT_SAMPLE_RATE_HZ = 8000
 DEFAULT_BYTES_PER_SAMPLE = 2
@@ -1045,13 +1052,13 @@ def main():
 
     p.add_argument(
         "--host",
-        default="0.0.0.0",
+        default=HOST_DEFAULT,
     )
 
     p.add_argument(
         "--port",
         type=int,
-        default=9001,
+        default=PORT_DEFAULT,
     )
 
     p.add_argument(

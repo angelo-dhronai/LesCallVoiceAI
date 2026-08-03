@@ -339,6 +339,11 @@ class CallFlowConfig:
     #   llm_end_call: bool (default True) — the LLM may end the call by
     #     appending [END_CALL] after its goodbye line; the engine strips the
     #     token and arms the platform hangup.
+    #   confirm_before_end: bool (default True) — before acting on a heard
+    #     goodbye (caller farewell or the LLM's own end-call signal) the
+    #     agent asks one confirmation question and only hangs up if the
+    #     caller says yes. Guards against a misheard "bye". Does not apply
+    #     to DND / wrong-number / silence hangup / max_call_minutes.
     #   end_conditions: [str] — plain-English business rules rendered into
     #     the system prompt as ━━ END-CALL RULES ━━ ("once the visit is
     #     booked and confirmed, wrap up", "if the caller is abusive, end").

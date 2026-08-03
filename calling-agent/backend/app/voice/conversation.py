@@ -492,6 +492,15 @@ _GUJARATI_PATTERNS = [
 LANG_EVIDENCE_SWITCH = os.environ.get(
     "LANG_EVIDENCE_SWITCH", "true").lower() == "true"
 
+# Indic script characters (Devanagari + Gujarati) are UNFAKEABLE language
+# evidence: no provider hallucinates Devanagari on English speech. A
+# fallback/recovered transcript that carries them may vote in the evidence
+# switcher — without this, a hedge-heavy stretch (Whisper winning most
+# turns with Latin text, which never votes) starves the switcher and the
+# call sticks in the agent's default language (2026-08-03 live incident:
+# Hindi caller answered in English for 90 seconds).
+_INDIC_EVIDENCE_RE = re.compile("[\u0900-\u097F\u0A80-\u0AFF]")
+
 # English *function* words are the only Latin tokens that vote en — a name
 # ("alvin anthony") or brand string must never read as an English switch.
 # Deliberately absent: to/me/in/us/do/he/may (all common romanized-Hindi
@@ -966,6 +975,14 @@ class ConversationRouter:
         # its goodbye (call_flow.termination.llm_end_call, default on). The
         # token itself is stripped before TTS ever sees it.
         self._llm_end_call_seen: bool = False
+        # Close-confirmation gate (platform rule, all agents —
+        # call_flow.termination.confirm_before_end, default on). A misheard
+        # "bye" used to close the call outright; now every speech-triggered
+        # close asks one short confirmation question first and only arms
+        # hangup_pending after the caller says yes. Counted so a caller who
+        # really is leaving is never trapped in a confirm loop.
+        self._close_confirm_pending: bool = False
+        self._close_confirm_count: int = 0
         # Native tool calling (deploy/PLAN-llm-tool-calling.md). Mode is
         # per-agent llm_config.enable_tools with the LLM_TOOLS_MODE env kill
         # switch; proposals are accumulated by _call_llm_stream and executed
@@ -1659,9 +1676,13 @@ class ConversationRouter:
             # call Gujarati; the name "alvin anthony" turned it English).
             # Explicit requests (intent=language_switch, handled below) stay
             # instant for all pairs and are the only path that sets a lock.
-            if self._turn_stt_source in ("fallback", "primary-script-retry"):
-                # Tier 0: recovered transcripts are mishear-prone (', angie?'
-                # from "हाँजी") — they never vote on language.
+            if (self._turn_stt_source in ("fallback", "primary-script-retry")
+                    and not _INDIC_EVIDENCE_RE.search(text)):
+                # Tier 0: recovered LATIN transcripts are mishear-prone
+                # (', angie?' from "हाँजी") — they never vote on language.
+                # But Indic script inside a recovered transcript is unfakeable
+                # evidence (see _INDIC_EVIDENCE_RE) and votes normally,
+                # keeping the switcher alive through hedge-heavy stretches.
                 logger.info("[LANG] Turn doesn't vote (stt_source=%s)",
                             self._turn_stt_source)
             elif self._capture_slot is not None or self._name_pending:
@@ -1915,6 +1936,30 @@ class ConversationRouter:
                 yield EngineResult(text=resp, is_shortcut=True, intent="repeat")
                 return
 
+        # --- Close-confirmation answer (platform rule, all agents) ---
+        # Our previous turn asked "should I end the call here, or did I just
+        # mishear that?". A clear yes closes; ANYTHING else drops the gate and
+        # falls through, so the turn is answered as normal conversation.
+        if self._close_confirm_pending:
+            self._close_confirm_pending = False
+            if self._is_close_confirm_yes(text):
+                _cancel_llm()
+                logger.info("[HANGUP] close confirmed by caller — closing")
+                self.state.is_closing = True
+                self.commit_pending_turn()  # closing turn — never rolled back
+                # Short platform thank-you, NOT the agent's closing speech —
+                # the goodbye (LLM or canned) may already have been spoken on
+                # the turn that asked for this confirmation.
+                resp = self._close_confirmed_line()
+                self.memory.add_assistant(resp, language=self.state.language)
+                self._store_last_response(resp)
+                self.state.stage = STAGE_CLOSING
+                self.hangup_pending = True
+                yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
+                return
+            logger.info("[HANGUP] close-confirm answered %r — not a goodbye, "
+                        "conversation continues", text[:40])
+
         # --- Farewell at any stage ---
         # Platform rule (all agents): the close-permission confirm counts as a
         # farewell — our previous turn asked "anything else I can help with?"
@@ -1936,6 +1981,14 @@ class ConversationRouter:
                 self.memory.add_assistant(_cc_ask, language=self.state.language)
                 self._store_last_response(_cc_ask)
                 yield EngineResult(text=_cc_ask, is_shortcut=True, intent="objection")
+                return
+            # Confirm before ending: a goodbye we may have misheard costs one
+            # question to check and a whole call to get wrong.
+            _confirm = self._maybe_close_confirm("caller farewell")
+            if _confirm is not None:
+                self.memory.add_assistant(_confirm, language=self.state.language)
+                self._store_last_response(_confirm)
+                yield EngineResult(text=_confirm, is_shortcut=True, intent="farewell")
                 return
             self.state.is_closing = True
             # Closing turns are final: the bridge may hang up right after the
@@ -3572,22 +3625,37 @@ class ConversationRouter:
         # after this still cancels at the top of process_stream.
         if self._llm_end_call_seen:
             self._llm_end_call_seen = False
-            self.state.is_closing = True
-            self.commit_pending_turn()  # closing turn — never rolled back
-            self.state.stage = STAGE_CLOSING
-            self.hangup_pending = True
-            logger.info("[HANGUP] LLM end-call signal — closing after goodbye")
-            if not full_parts:
-                # Marker arrived with no speakable goodbye — never end on
-                # dead silence; play the configured closing line.
-                resp = self._lang_response(
-                    self._def.response_bank.closing_responses,
-                    lang=self._closing_language()) or self._localized(
-                    "closing",
-                    "Thank you for your time! Have a great day!",
-                    lang=self._closing_language())
-                full_parts.append(resp)
-                yield EngineResult(text=resp, is_shortcut=False, intent="farewell")
+            _said = " ".join(full_parts).strip()
+            # The model sometimes staples the token onto an OPEN QUESTION
+            # ("...Is there anything else I can help you with today?
+            # [END_CALL]") — observed live 2026-07-31, where it cut the caller
+            # off as they answered. A turn that asks the caller something is
+            # by definition not a goodbye, so the marker is a mistake: drop it
+            # and let the conversation continue.
+            if _said.endswith("?"):
+                logger.info("[HANGUP] [END_CALL] ignored — turn ends in a "
+                            "question, not a goodbye: %r", _said[-60:])
+            elif (_confirm := self._maybe_close_confirm("llm end-call signal")):
+                full_parts.append(_confirm)
+                yield EngineResult(text=_confirm, is_shortcut=True,
+                                   intent="farewell")
+            else:
+                self.state.is_closing = True
+                self.commit_pending_turn()  # closing turn — never rolled back
+                self.state.stage = STAGE_CLOSING
+                self.hangup_pending = True
+                logger.info("[HANGUP] LLM end-call signal — closing after goodbye")
+                if not full_parts:
+                    # Marker arrived with no speakable goodbye — never end on
+                    # dead silence; play the configured closing line.
+                    resp = self._lang_response(
+                        self._def.response_bank.closing_responses,
+                        lang=self._closing_language()) or self._localized(
+                        "closing",
+                        "Thank you for your time! Have a great day!",
+                        lang=self._closing_language())
+                    full_parts.append(resp)
+                    yield EngineResult(text=resp, is_shortcut=False, intent="farewell")
 
         if full_parts:
             full_text = " ".join(full_parts)
@@ -4514,6 +4582,106 @@ class ConversationRouter:
         """call_flow.termination with a safe empty default."""
         cfg = getattr(self._def.call_flow, "termination", None)
         return cfg if isinstance(cfg, dict) else {}
+
+    # ── Close-confirmation gate (platform rule, all agents) ─────────────
+    # Speech is the least reliable input we have: on 2026-07-31 a live caller
+    # saying "okay, by the way..." was transcribed "okay bye", the engine
+    # closed instantly and the channel dropped while they were still talking.
+    # Every speech-triggered close now asks ONE short question first and only
+    # ends the call after the caller says yes. Deliberately NOT applied to
+    # closes that are not a hearing judgement: DND / wrong-number (compliance
+    # — re-asking someone who said "stop calling me" is worse than the risk),
+    # silence hangup (nobody is there to answer) and the max-duration hard cap
+    # (the platform is ending the call regardless).
+    _CLOSE_CONFIRM_MAX = 2
+    # Owner-specified copy (2026-08-01): short and casual — "okay then, shall
+    # I cut the call?" — not a wordy "did I mishear?" apology. First-person
+    # subjunctive (कर दूँ / કરી દઉં) on purpose: it is gender-neutral, agent
+    # voices vary per language (same doctrine as _INTRO_LINES).
+    _CLOSE_CONFIRM_Q = {
+        "en": "Alright then, shall I end the call here?",
+        "hi": "ठीक है, तो फिर मैं कॉल कट कर दूँ?",
+        "gu": "સારું, તો પછી હું કૉલ કટ કરી દઉં?",
+    }
+    # Spoken after the caller confirms, right before the platform hangs up.
+    _CLOSE_CONFIRMED = {
+        "en": "Thank you for talking with me — have a wonderful day!",
+        "hi": "बात करने के लिए धन्यवाद, आपका दिन शुभ हो।",
+        "gu": "વાત કરવા બદલ આભાર, તમારો દિવસ શુભ રહે.",
+    }
+
+    def _close_confirm_question(self) -> str:
+        """The one confirmation line, per language. response_bank
+        localized_responses['close_confirm'] overrides it per agent."""
+        lang = self._closing_language()
+        return self._localized(
+            "close_confirm",
+            self._CLOSE_CONFIRM_Q.get((lang or "en")[:2],
+                                      self._CLOSE_CONFIRM_Q["en"]),
+            lang=lang)
+
+    def _close_confirmed_line(self) -> str:
+        """The thank-you spoken after a confirmed close, per language.
+        Platform copy for every agent (owner-specified); response_bank
+        localized_responses['close_confirmed'] overrides it per agent. The
+        agent's closing_responses are deliberately NOT used here — they are
+        full farewell speeches, and one may already have been spoken on the
+        turn that triggered the confirmation."""
+        lang = self._closing_language()
+        return self._localized(
+            "close_confirmed",
+            self._CLOSE_CONFIRMED.get((lang or "en")[:2],
+                                      self._CLOSE_CONFIRMED["en"]),
+            lang=lang)
+
+    def _maybe_close_confirm(self, reason: str) -> str | None:
+        """Return the confirmation question when a close should be checked
+        with the caller first, or None when it may proceed immediately."""
+        if not bool(self._termination_cfg().get("confirm_before_end", True)):
+            return None
+        if self._close_confirm_count >= self._CLOSE_CONFIRM_MAX:
+            logger.info("[HANGUP] close-confirm cap spent — closing directly "
+                        "(%s)", reason)
+            return None
+        self._close_confirm_pending = True
+        self._close_confirm_count += 1
+        logger.info("[HANGUP] close-confirm asked (%s) — hangup deferred "
+                    "until the caller confirms", reason)
+        return self._close_confirm_question()
+
+    def _is_close_confirm_yes(self, text: str) -> bool:
+        """True only when the caller clearly agreed to end the call.
+
+        Biased hard toward "keep the call alive": anything with content in it
+        ("can you take my email address?") answers the question with a no by
+        simply not being a yes, which is the safe direction to be wrong in."""
+        t = (text or "").strip()
+        if not t:
+            return False
+        _negated = re.search(
+            r"\b(no|not|don'?t|do not|nahi+n?|nhi|na|mat|ના|નહીં|नहीं|ना|मत)\b",
+            t, re.IGNORECASE)
+        if _all_tokens_in(t, _NEG_TOKENS):
+            return False
+        # "yes, end it" / "haan rakh do" / "you can cut the call"
+        if re.search(r"\b(end|cut|hang ?up|disconnect|khatam|khatm|band|"
+                     r"rakh (?:do|de|dijiye)|puru kar|खत्म|बंद|रख|પૂરું|ખતમ)\b",
+                     t, re.IGNORECASE) and not _negated:
+            return True
+        if self._contains_farewell(t):
+            return True
+        # A bare all-affirmation turn ("yes", "haan ji", "ठीक है") is a yes.
+        if _all_tokens_in(t, _AFFIRM_TOKENS):
+            return True
+        # ...as is a short turn that OPENS with one and adds nothing but
+        # politeness ("yes please", "haan ji bilkul"). The length bar is what
+        # keeps "yes but can you tell me the price first" out — those words
+        # inside a real sentence are not an answer to this question.
+        if "?" in t or _negated:
+            return False
+        toks = [w.strip(".,!;:।॥\"'") for w in t.lower().split()]
+        toks = [w for w in toks if w]
+        return bool(toks) and toks[0] in _AFFIRM_TOKENS and len(toks) <= 4
 
     def _connect_cfg(self) -> dict:
         """call_flow.connect with a safe empty default."""

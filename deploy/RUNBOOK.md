@@ -271,32 +271,170 @@ Pieces:
   zero `allUsers` grants; downloads always go through the tokenized endpoint).
 - SA `lescall-recsync@lescall.iam.gserviceaccount.com` with
   `roles/storage.objectAdmin` scoped to the bucket only.
-- **Credentials = impersonated ADC, no key file.** The org policy
-  `iam.disableServiceAccountKeyCreation` blocks JSON *and* HMAC keys, so auth
-  is `~/.config/gcloud/application_default_credentials.json` created via
-  `gcloud auth application-default login --impersonate-service-account=
-  lescall-recsync@lescall.iam.gserviceaccount.com` (alwynantonyben@ holds
-  `roles/iam.serviceAccountTokenCreator` on the SA). All three units run as
-  User=angelo and pick it up automatically.
 - Backlog of 21 recordings uploaded; GCS-fallback streaming verified on the
   public link after local deletion.
 
-CAVEAT: the ADC rides on alwynantonyben@'s Google session. If org session
-control expires it, uploads pause (timer retries; local serving unaffected)
-until the login command above is re-run.
-**This fired 2026-07-14** (`RefreshError: Reauthentication is needed` on
-every sync since; ~220 calls local-only, log shipping stuck on the same
-credential, Sentinel alerting hourly). Verified 2026-07-29: no working
-write-capable Google credential exists on the VM at all — the attached
-default compute SA has `devstorage.read_only` scope, and scope/SA changes
-both require the VM to be STOPPED. So the re-login below is the only
-unblock short of the durable fix. Durable fix: attach the
-`lescall-recsync` SA to the VM (`gcloud compute instances set-service-account
-lescall-agent --zone asia-south1-c --service-account lescall-recsync@lescall.
-iam.gserviceaccount.com --scopes cloud-platform`, VM must be STOPPED —
-~2 min downtime; external IP `agent` 35.207.225.237 is a reserved static
-address, so the Plivo trunk ACL survives the restart). Afterwards the
-metadata server supplies tokens and the ADC file can be deleted.
+### Auth: attached service account, NOT a login (durable fix, 2026-07-31)
+
+**Doctrine: a production VM must never authenticate as a human.** The first
+build used impersonated ADC — `gcloud auth application-default login
+--impersonate-service-account=lescall-recsync@…` — because the org policy
+`iam.disableServiceAccountKeyCreation` blocks JSON *and* HMAC key files. That
+credential rides on alwynantonyben@'s Google session, so org session control
+expired it on **2026-07-14** and every sync since died with `RefreshError:
+Reauthentication is needed`. By 07-31: 270 of 311 calls local-only, log
+shipping dead on the same credential, and the 41 calls that *had* uploaded
+were unservable — retention had deleted their local copies and the GCS
+fallback needs the same dead token. Re-running the login is a 90-day snooze
+on the same outage, not a fix.
+
+The durable answer is the third option GCE gives you, between "key file"
+(blocked) and "human session" (expires): **attach the SA to the instance and
+let the metadata server mint tokens.** No key material exists, nothing to
+rotate, nothing to renew — tokens refresh for the life of the VM.
+
+Both the SA and its scopes are boot-time properties, so this needs the
+instance **STOPPED** (~2-3 min of inbound-call downtime — schedule it). The
+external IP `agent` 35.207.225.237 is a *reserved static* address and
+survives the stop, so the Plivo trunk ACL needs no change.
+
+Run from Cloud Shell or any authed admin machine — deliberately NOT from the
+VM, which is the whole point:
+
+```bash
+SA=lescall-recsync@lescall.iam.gserviceaccount.com
+
+# 1. Roles the metadata SA must carry. objectAdmin on lescall-recordings is
+#    already granted; the other three replace what the default compute SA
+#    was doing (log shipping + the Cloud Ops agent, which is enabled here —
+#    forget these and ops-agent telemetry goes dark at the same moment).
+gcloud storage buckets add-iam-policy-binding gs://lescall-logs \
+  --member="serviceAccount:$SA" --role=roles/storage.objectAdmin
+gcloud projects add-iam-policy-binding lescall \
+  --member="serviceAccount:$SA" --role=roles/logging.logWriter
+gcloud projects add-iam-policy-binding lescall \
+  --member="serviceAccount:$SA" --role=roles/monitoring.metricWriter
+
+# 2. Swap the SA (VM must be stopped for this API call to be accepted).
+gcloud compute instances stop  lescall-agent --zone asia-south1-c
+gcloud compute instances set-service-account lescall-agent \
+  --zone asia-south1-c --service-account "$SA" --scopes cloud-platform
+gcloud compute instances start lescall-agent --zone asia-south1-c
+```
+
+`--scopes cloud-platform` is required, not cosmetic: legacy scopes cap IAM,
+and the default compute SA sat at `devstorage.read_only`, which silently
+downgrades every write no matter what roles you grant.
+
+### The two credential-precedence traps (both bite AFTER the stop/start)
+
+`google.auth.default()` resolves in a fixed order and metadata is **last**:
+`GOOGLE_APPLICATION_CREDENTIALS` → `~/.config/gcloud/application_default_
+credentials.json` → metadata server. So attaching the SA changes nothing on
+its own if either of the first two still resolves. There are two distinct
+consumers and each is blocked by a different one:
+
+**Containers** are blocked by the env var — and `restart: unless-stopped`
+does NOT re-read the compose file. On VM boot Docker restarts the *existing*
+container objects with the environment baked in at creation time (verified
+2026-07-31: all three still carried the dead `GOOGLE_APPLICATION_CREDENTIALS`
+from their July create dates). The compose edit only lands when the
+containers are **recreated**:
+
+```bash
+docker compose -f deploy/docker-compose.services.yml up -d   # recreates api/runtime/workers
+```
+
+**Host processes** (`lescall-sentinel.service`, `lescall-recsync.timer`) set
+no env var, so they fall through to the well-known ADC path and keep using
+the stale user token until the file is gone:
+
+```bash
+rm -f ~/.config/gcloud/application_default_credentials.json
+```
+
+Do the `rm` **after** container-side GCS is verified, not before — while the
+file still exists, `git checkout deploy/docker-compose.services.yml && docker
+compose up -d` is a complete app-layer rollback with no VM stop.
+
+### Cutover order
+
+1. `gcloud compute instances stop / set-service-account / start` (above).
+2. On the VM: `docker compose -f deploy/docker-compose.services.yml up -d`.
+3. Verify metadata identity + a real GCS round-trip (below).
+4. `rm -f ~/.config/gcloud/application_default_credentials.json`.
+5. Confirm host-side too: `journalctl -u lescall-sentinel -n 30` shows no
+   `gcs-auth` alert on the next hourly check.
+
+### Verify
+
+```bash
+# 1. identity — must be lescall-recsync@, NOT 927969746216-compute@
+curl -H Metadata-Flavor:Google \
+  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email
+# 2. scopes — must include cloud-platform
+curl -H Metadata-Flavor:Google \
+  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/scopes
+# 3. no stale env survived the recreate — must print (unset)
+docker exec lescall-workers printenv GOOGLE_APPLICATION_CREDENTIALS || echo "(unset)"
+# 4. WRITE round-trip (read alone proves nothing — read_only scope was the bug)
+docker exec lescall-workers python -c "
+from google.cloud import storage
+b = storage.Client().bucket('lescall-recordings')
+b.blob('.healthcheck').upload_from_string('ok'); b.blob('.healthcheck').delete()
+print('GCS write OK')"
+# 5. drain the backlog (~270 calls), then confirm the DB stamps moved
+docker exec lescall-workers python -m shared.recording_storage --once
+docker exec lescall-pg psql -U lescall -d lescall -c \
+  "SELECT count(*) total, count(gcs_uploaded_at) uploaded, max(gcs_uploaded_at) FROM calls;"
+```
+
+Step 4 is the one that matters: a `list_blobs` read succeeds under
+`devstorage.read_only` too, so only a write proves the scope change took.
+
+Watch disk during the drain — `recordings/` is ~1.5 GB. Nothing was lost in
+the 17-day outage because `cleanup_local` only prunes what is confirmed in
+the bucket.
+
+### Rollback
+
+The cutover cannot destroy recordings: local WAVs are deleted only after a
+successful upload is stamped, so the worst case is uploads stay broken
+exactly as they are today.
+
+- **App layer (no VM stop, seconds):** `git checkout
+  deploy/docker-compose.services.yml deploy/.pg_env && docker compose -f
+  deploy/docker-compose.services.yml up -d` — restores the env var and the
+  gcloud mount. Only works while the ADC file still exists, which is why the
+  `rm` is step 4 and not step 2.
+- **Full SA revert (needs another stop, ~3 min):** re-attach the default
+  compute SA with its original scope set, captured 2026-07-31 before the
+  cutover:
+
+```bash
+gcloud compute instances stop lescall-agent --zone asia-south1-c
+gcloud compute instances set-service-account lescall-agent \
+  --zone asia-south1-c \
+  --service-account 927969746216-compute@developer.gserviceaccount.com \
+  --scopes=https://www.googleapis.com/auth/devstorage.read_only,\
+https://www.googleapis.com/auth/logging.write,\
+https://www.googleapis.com/auth/monitoring.write,\
+https://www.googleapis.com/auth/service.management.readonly,\
+https://www.googleapis.com/auth/servicecontrol,\
+https://www.googleapis.com/auth/trace.append
+gcloud compute instances start lescall-agent --zone asia-south1-c
+```
+
+- **If calls break rather than recordings** (the SA swap touches nothing in
+  the telephony path, but): `bash phase14_runtime/check_runtime.sh`, then
+  `docker compose -f deploy/docker-compose.services.yml restart runtime`.
+  FreeSWITCH/Kamailio are on the host and unaffected by the container
+  recreate; the static IP survives the stop so the Plivo ACL is unchanged.
+
+NOTE: `lescall-recsync.timer` on the host is still enabled and duplicates the
+containerized recsync pass every 15 min. Harmless (uploads are idempotent),
+but disable it once the container pass is confirmed working:
+`sudo systemctl disable --now lescall-recsync.timer`.
 
 ## 7. Verification checklist (plan §6)
 
@@ -1151,3 +1289,889 @@ call's exact ASR); full suite 800 green. On a live call grep for:
 multi-chunk streamed turns. Note: `opening handshake failed` every 20s in
 ws_audio_receiver.log is the docker healthcheck probing :9001 — cosmetic,
 not the Sarvam stream.
+
+## 22. Close-confirmation gate — platform-wide (2026-07-31)
+
+**The call that caused it** (`a0f9a6ae`, 07:16 UTC, ws_audio_receiver.log).
+Two independent defects, one after the other:
+
+1. `07:16:14` STT merged segments #21 "Okay" + #22 "Bye" into `okay bye` —
+   the caller was actually mid-sentence ("...don't mind giving it sir"
+   arrived 1.3s later as #23). The deterministic farewell branch fired
+   instantly: **"Thank you for your time."** + `hangup_pending`.
+2. The caller kept talking, so the engine cancelled that hangup correctly at
+   `07:16:18`. But the LLM's reply to the next turn — *"I understand… **Is
+   there anything else I can help you with today?**"* — carried `[END_CALL]`.
+   The engine trusted the marker on a turn that was an **open question**, and
+   at `07:16:28` the bridge cut the line while the caller was answering it
+   ("Can you take my email address?", segment #24 at `07:16:25`).
+
+That is the "mysterious mid-conversation cut": nothing mysterious, the agent
+was told to end and the caller's answer was still inside STT when it did.
+
+**Fix — three layers, all default-on for every agent, no YAML edit needed:**
+
+- **Confirm before ending** (`call_flow.termination.confirm_before_end`,
+  default **true**). Every *speech-triggered* close now asks one question
+  first — owner-specified copy since 2026-08-01: hi "ठीक है, तो फिर मैं कॉल
+  कट कर दूँ?", en "Alright then, shall I end the call here?", gu equivalent
+  (first-person subjunctive = gender-neutral; override per agent via
+  `response_bank.localized_responses.close_confirm`) — and arms
+  `hangup_pending` only on a clear yes. The confirmed close then speaks the
+  short platform thank-you — hi "बात करने के लिए धन्यवाद, आपका दिन शुभ हो।"
+  (`localized_responses.close_confirmed` overrides) — NOT the agent's
+  `closing_responses`, because the goodbye may already have been spoken on
+  the turn that triggered the confirmation; the closure prompt band also
+  tells the LLM to keep its pre-`[END_CALL]` goodbye to ONE short sentence
+  so farewells don't stack. `_is_close_confirm_yes` is biased
+  toward keeping the call alive: a bare affirmation, a short affirmation-led
+  turn (≤4 tokens), a farewell word or an explicit "end/cut/रख" wins; a
+  negation, a question, or **anything with content in it** drops the gate and
+  the turn is answered as normal conversation. Capped at
+  `_CLOSE_CONFIRM_MAX = 2` asks per call so a caller who really is leaving is
+  never trapped in a loop.
+- **`[END_CALL]` on a question is ignored.** A turn whose text ends in `?` is
+  by definition not a goodbye; the marker is dropped and logged
+  (`[HANGUP] [END_CALL] ignored — turn ends in a question`). The prompt band
+  gained a matching `✗ NEVER write [END_CALL] on a turn that asks the caller
+  a question` rule.
+- **The bridge waits for silence.** `_maybe_agent_hangup` now also requires
+  `pipeline._pipeline_quiet(now)` — the engine only cancels a pending hangup
+  when a *finalized* transcript reaches `process_stream`, so a caller who
+  starts speaking during the drain window had not cancelled it yet. Bounded
+  by `AGENT_HANGUP_MAX_WAIT_S` (20s, then `[HANGUP_FORCED]`) so a stuck
+  VAD/STT flag cannot hold a dead call open. A **hard** close (max-duration
+  cap) skips the check by design.
+
+**Deliberately NOT gated** — these are not hearing judgements, and asking
+again would be worse than the risk: DND / "stop calling me" and wrong-number
+(compliance), silence hangup (nobody is there to answer), and
+`max_call_minutes` (the platform is ending the call regardless).
+
+**Copilot.** `confirm_before_end` documented in the schema block and the
+ENDING CALLS doctrine; `_normalize_definition` coerces it to bool; a new
+`_quality_warnings` lint fires when it is set false. New agents inherit the
+gate with no configuration.
+
+**Rollback.** Per-agent: `termination: {confirm_before_end: false}` restores
+instant closes. Platform: `ENABLE_AGENT_HANGUP=false` still kills all
+agent-initiated hangups; `AGENT_HANGUP_MAX_WAIT_S=0` disables the new quiet
+wait alone.
+
+### Verification
+
+Tests: `test_call_termination.py` (+14, including a replay of both live
+defects), `test_agent_hangup.py` + `test_continuation_merge.py` updated to
+drive the two-turn exchange, `test_copilot_quality_lints.py` (+3), 90 golden
+prompts regenerated for the two new closure-band lines; full suite **817
+green**. On a live call grep ws_audio_receiver.log for
+`[HANGUP] close-confirm asked`, `[HANGUP] close confirmed by caller`,
+`[HANGUP] close-confirm answered … not a goodbye`, and
+`[HANGUP] [END_CALL] ignored`.
+
+## 23. FreeSWITCH event-socket credential (2026-07-31) — OUTAGE FIX
+
+**The outage.** From 08:19 UTC (container recreate after the 08:03 reboot)
+until 11:00 UTC, **every outbound call failed** — manual dial, campaigns,
+follow-up automations, autodial, number test-call and the nightly loopback
+probe. The dashboard returned `{"ok": true, "status": "dialing"}` and then
+logged `DIAL <phone> from <did> (own-number) → failed`; FreeSWITCH's log
+showed nothing at all, because no originate ever reached it.
+
+Cause: the ESL hardening was applied to **code only**. `shared/fs_esl.py`
+dropped the `ClueCon` default (`PASSWORD = os.environ.get("FS_ESL_PASSWORD",
+"")`) and now rejects unset / vendor-default / <16-char values, but
+`/etc/lescall/` had never been created on the host and
+`/etc/freeswitch/autoload_configs/event_socket.conf.xml` still said
+`password="ClueCon"`. `fs_api` raised before opening the socket,
+`_fs_esl_exec` turned that into `-ERR esl transport failure: …`, and
+`_parse_fs_result` read it as `failed`.
+
+**The password lives in exactly two places and they must be rotated
+together** — that is the whole point of the loud failure:
+
+1. `/etc/lescall/telephony.env` → `FS_ESL_PASSWORD=` (root, 0600)
+2. `/etc/freeswitch/autoload_configs/event_socket.conf.xml` → `password=`
+
+```bash
+PW=$(openssl rand -hex 32)
+sudo install -d -m 0750 -o root -g root /etc/lescall
+printf 'FS_ESL_PASSWORD=%s\n' "$PW" \
+  | sudo install -m 0600 -o root -g root /dev/stdin /etc/lescall/telephony.env
+sudo cp -a /etc/freeswitch/autoload_configs/event_socket.conf.xml{,.bak-$(date +%Y%m%d)}
+sudo sed -i "s|name=\"password\" value=\"[^\"]*\"|name=\"password\" value=\"$PW\"|" \
+  /etc/freeswitch/autoload_configs/event_socket.conf.xml
+sudo systemctl restart freeswitch            # check `show channels count` first
+sudo docker compose -f deploy/docker-compose.services.yml up -d
+sudo systemctl restart lescall-sentinel
+```
+
+**`docker compose` must now be run with `sudo`.** The `env_file:` is read by
+the **compose CLI as the invoking user**, not by the daemon as root — so a
+plain `docker compose up -d` as `angelo` dies with
+`open /etc/lescall/telephony.env: permission denied`. Keeping the file
+root-0600 is deliberate (the repo is bind-mounted into every container as uid
+1000, so anything under it is readable by the live-call runtime); running
+compose as root is the price. Do **not** relax the file mode instead.
+
+**Never pass `--remove-orphans`.** `lescall-pg` belongs to
+`docker-compose.postgres.yml` and compose reports it as an orphan of the
+`deploy` project. `--remove-orphans` deletes the database container.
+
+**The host sentinel needs the secret too.** It runs as `User=angelo` under
+systemd with only `.pg_env`, so `loopback_probe` (`shared/sentinel.py`)
+could not originate. Fixed with a drop-in — systemd reads `EnvironmentFile`
+as root *before* dropping privileges, so the secret stays root-only:
+`/etc/systemd/system/lescall-sentinel.service.d/10-telephony-env.conf`.
+
+**Consumers of 8021** (all host or `network_mode: host`): `dashboard/server.py`
+(`_fs_esl_exec`), `shared/sentinel.py` (`loopback_probe`). `socket_server.py`
+is **outbound** ESL — FreeSWITCH dials *out* to port 9000 from the dialplan,
+so it never authenticates. That is why inbound calls kept working throughout
+the outage while every outbound one failed.
+
+### Verification
+
+```bash
+docker exec lescall-api python -c "import sys;sys.path.insert(0,'/home/angelo/lescall');\
+from shared.fs_esl import fs_api;print(fs_api('status',10))"
+calling-agent/venv/bin/python -m shared.sentinel --probe
+```
+The probe originates from each DID **to itself** (caller ID = the same DID,
+`&park()`, legs killed afterwards) — it rings no human and is marked
+`billable=0`. Expect `"ok"` per DID. Confirmed 2026-07-31 11:01 UTC:
+`918065953160` ok, `912264231897` ok — answered + audio played.
+
+**Still open**: `deploy/freeswitch-event_socket.conf.xml` (the hardened
+template) also moves the bind from `::` to `127.0.0.1` and applies
+`loopback.auto` ACL. Only the password was rotated in this fix; installing
+the full template is a separate, FS-restarting change.
+
+## 24. WebSocket streaming STT REMOVED — back to batch (2026-07-31)
+
+Owner request. The saaras:v3 WebSocket provider that ran in front of the
+batch STT since 2026-07-29 is **gone from the code**, not just switched off.
+The live STT path is the batch multipart POST to
+`api.sarvam.ai/speech-to-text` per finalized VAD segment — exactly what ran
+before the streaming canary.
+
+**Two steps, both done:**
+
+1. `ENABLE_STREAMING_STT: "true"` removed from `deploy/docker-compose.services.yml`
+   (runtime service) and `sudo docker compose … up -d runtime`.
+2. The code deleted, so the flag no longer exists at all.
+
+**Deleted**: `app/voice/stt/sarvam_stream.py` (476 lines, the live provider)
+and `app/voice/stt/sarvam_ws.py` (216 lines, an earlier attempt that nothing
+imported).
+
+**Rewired**:
+- `conversation_call_bridge.py` — the `if ENABLE_STREAMING_STT` branch is
+  gone; the router's primary is always `TrackingSarvamSTT`.
+- `pipeline.py` — `ENABLE_STREAMING_STT`, `BARGE_KEEP_STREAM_AUDIO` and the
+  `_streaming_stt` handle removed, along with every feed/finalize site: the
+  two `feed_nowait` calls in the VAD loop, the mid-turn `turn_text` feed to
+  the TurnManager (proxy tokens again), the `reset_turn()` calls on
+  too-short-discard and barge-in flush, and the `close()` in `stop()`.
+- `stt/router.py` — `last_covered_seconds` and `set_stream_language`
+  removed; `_derive_confidence` lost its `covered_seconds` parameter.
+
+**Part H of §21 partly went with it.** H1 (covered-seconds plausibility), H2
+(barge keep-audio), H3 (late-segment stash) and H4 (consumed-episode
+empties) were mitigations for streaming-specific failure modes — a finalize
+spanning several VAD chunks, segments draining after their finalize. On the
+batch path a transcript covers exactly the segment it was POSTed for, so
+those conditions cannot arise and the code was dead weight, not protection.
+**H5 (continuation hold) and all of Part C (capture) are untouched.**
+
+**Deliberately kept**: `LLM_TOOLS_MODE: "on"` (independent of STT),
+`VAD_ENGINE: "fsmn"`, `ENABLE_CONTINUATION_MERGE`, the STT language pin
+(`_update_stt_lang_pin` feeds `_stt_lang` on the batch request — it was
+never streaming-only), and `endpointer.py` itself. The endpointer now always
+receives `("", False)` and so decides on acoustics alone; its semantic
+hold/fast-complete profiles need mid-turn text that only a streaming
+provider could supply.
+
+**Cost of the rollback**: the ~300-800ms overlap saving is gone. Every turn
+now pays the full batch POST after the endpoint fires.
+
+**To re-introduce streaming**, restore the provider from git history
+(`git log -- calling-agent/backend/app/voice/stt/sarvam_stream.py`) — it is
+no longer a flag flip.
+
+### Verification
+
+Full backend suite **812 green** (was 817: 5 streaming tests and 3
+`covered_seconds` tests removed, 3 replacements added). In the live
+container:
+
+```bash
+docker exec lescall-runtime python -c "import sys;\
+sys.path.insert(0,'/home/angelo/lescall/calling-agent');\
+import backend.app.voice.stt.sarvam_stream"   # → ModuleNotFoundError
+```
+On the next live call, `[STT:Stream]` and `[PIPELINE] Streaming STT ACTIVE`
+must be absent from ws_audio_receiver.log; STT latency per turn returns to
+the batch profile.
+
+## 25. Billing, plans & subscriptions (2026-07-31) — SHIPPED, ENFORCEMENT OFF
+
+Implements `deploy/PLAN-razorpay-subscriptions.md`. Everything below is in the
+repo and inert: **no Razorpay account exists yet**, and the enforcement switch
+is `false`, so the platform behaves exactly as it did before. Turning it on is
+one DB flag (§25.6).
+
+### 25.1 What shipped
+
+| Piece | Where |
+|---|---|
+| Schema | `shared/db/migrations/0013_billing.sql` (+ `.down.sql`) — 10 tables |
+| Boot ALTERs | `agents.archived_at`, `usage_ledger.entitlement_check` in `shared/db/database.py` |
+| Entitlements | `shared/billing/entitlements.py` — the ONLY thing the hot path reads |
+| Gateway | `shared/billing/razorpay_client.py` — inert and honest when unconfigured |
+| Checkout/recovery | `shared/billing/service.py` |
+| Webhooks | `shared/billing/webhooks.py` |
+| Receipts (GST) | `shared/billing/receipts.py` |
+| Sync + dunning | `shared/billing/sync.py`, own supervised process in `workers_entry.sh` |
+| Tenant API | `dashboard/billing_api.py` → `/api/billing/*` |
+| Admin plane | `dashboard/admin_app.py`, compose service `admin` |
+| SPA | `frontend/src/pages/Billing.tsx`, `Receipt.tsx`, `api/billing.ts` |
+| Tests | `tests/test_billing_core.py` (35, pure), `tests/test_billing_lifecycle.py` (29, PG) |
+
+### 25.2 The plans (from the published pricing page, 2026-07-31)
+
+Prices are **GST-EXCLUSIVE**; `plans.price_paise` stores the base and the
+gateway is charged `base × 1.18`.
+
+| | Free | Pilot | Basic | Growth | Enterprise |
+|---|---|---|---|---|---|
+| Price ex-GST | 0 | ₹2,999 once | ₹14,999/mo | ₹49,999/mo | custom |
+| Charged | 0 | ₹3,538.82 | ₹17,698.82 | ₹58,998.82 | — |
+| Minutes | 30/mo | 500 / 7 days | 3,000/mo | 8,000/mo | custom |
+| Agents | 1 | 3 | 10 | 25 | unlimited |
+| Recordings | ✗ | ✓ | ✓ | ✓ | ✓ |
+| AI summaries | ✗ | ✓ | ✗ | ✓ | ✓ |
+| Transcripts | ✗ | ✗ | ✗ | ✓ | ✓ |
+| Conversation analytics | ✗ | ✗ | ✗ | ✓ | ✓ |
+| Automated follow-ups | ✗ | ✗ | ✗ | ✓ | ✓ |
+| Additional minutes | ✗ | ✗ | ✗ | ✗ | ✗ |
+
+> ⚠ **Both monthly tiers are above the RBI AFA ceiling.** AFA-free e-mandate
+> auto-debit stops at **₹15,000 per transaction, GST included**. Basic charges
+> ₹17,699 and Growth ₹58,999, so a **card or UPI-Autopay mandate will demand a
+> customer approval every single month** on both. The plan document assumed
+> only Growth was affected — it is both.
+>
+> Mitigation, already wired: `/api/billing/plans` returns `afa_free:false` for
+> these tiers, the plan card says so, and checkout offers **eMandate/eNACH**
+> first (no per-debit AFA up to ₹99,999). Enable eMandate on the Razorpay
+> account before selling either tier, or the dunning path
+> (`pending → halted → grace → Free`) becomes the normal monthly experience.
+
+**Additional minutes are NOT sold** (owner decision, 2026-08-01). Exhausting
+the allowance offers exactly one route: upgrade. Every plan is seeded
+`topup_allowed=0`, so `/api/billing/topup` refuses for everyone and the SPA
+renders no purchase control. The Orders rail behind it is built and tested —
+re-enabling is a data change (`UPDATE plans SET topup_allowed=1,
+topup_pack_minutes=…, topup_rate_paise=…`), not a migration.
+
+> The published pricing page still advertises "Additional Usage ₹8/minute"
+> (Basic) and "₹6/minute" (Growth). Those two lines should come off the page,
+> or it promises something the product deliberately does not do.
+
+Agent caps are the plan document's D2 defaults — the pricing page states no
+numbers. Change them in `plans` and re-run `resolve_entitlements`; no code
+change is needed.
+
+### 25.3 Setting up Razorpay (when the account exists)
+
+1. KYC-verified account → enable **Subscriptions** → Account Settings → GST
+   details → enable cards, **UPI Autopay** and **eMandate/eNACH**.
+2. Test keys into `/etc/lescall/billing.env` (see
+   `deploy/etc-lescall-env.template`), then
+   `sudo docker compose -f deploy/docker-compose.services.yml up -d`
+   (**`up -d`, not `restart`** — env_file is only re-read on recreate).
+3. Create the two recurring gateway Plans:
+   ```bash
+   docker exec -w /home/angelo/lescall lescall-api \
+     python -m shared.billing.plans_bootstrap          # dry run first
+   docker exec -w /home/angelo/lescall lescall-api \
+     python -m shared.billing.plans_bootstrap --apply
+   ```
+   **Razorpay Plans are immutable forever.** A price change means a new plan id
+   and re-authorising every subscriber's mandate. Pilot and top-ups need no
+   Plan — they are Orders created per purchase, so their price can change freely.
+4. Webhook → `https://agent.lescall.com/api/billing/webhook/razorpay`, with its
+   **own secret** (≠ API secret, and different again in live). Subscribe to:
+   all `subscription.*`, `order.paid`, `payment.captured`, `payment.failed`,
+   `refund.processed`, `invoice.paid`.
+5. Install the nginx rate limit + 256k body cap for that location
+   (`deploy/nginx-agent.lescall.conf`), then `sudo nginx -t && sudo systemctl reload nginx`.
+
+### 25.4 GST invoicing
+
+Ours is the **tax invoice**; Razorpay's auto-invoice is only a payment receipt
+(no customer GSTIN, no SAC, no CGST/SGST split). Set `PLATFORM_GSTIN`,
+`PLATFORM_LEGAL_NAME`, `PLATFORM_ADDRESS`, `PLATFORM_STATE_CODE` in
+`/etc/lescall/billing.env` — `/api/billing/health` reports `invoicing_ready`
+and names the missing field.
+
+- Numbering is a consecutive per-FY series (`LC-26-27-00001`), allocated with
+  `SELECT … FOR UPDATE` **inside the payment transaction**, and only when the
+  payments INSERT actually inserted — so a webhook retry cannot burn a number.
+- Credit notes (`LCCN-…`) are issued automatically on a full refund. An issued
+  invoice is never deleted.
+- The customer's details are **snapshotted onto the payment row at issue**, so
+  editing a billing profile later cannot rewrite an invoice already issued.
+- GSTIN is validated server-side including the mod-36 check digit, and the
+  place of supply is **derived from it** — never accepted as a separate field.
+
+### 25.5 When a payment goes wrong
+
+Every case below is handled; this is where to look when a customer asks.
+
+| Symptom | What happens | Where |
+|---|---|---|
+| "I paid, nothing happened" | tenant presses **I paid but nothing happened** on `/billing` → polls the gateway → recovers | `POST /api/billing/reconcile` |
+| Customer closed the tab after paying | webhook opens the window anyway | `webhooks._settle_order` |
+| Webhook lost / not configured | sync recovery pass every 15 min | `sync.pass_recover_payments` |
+| Card declined | attempt `failed` + notification; plan untouched | `webhooks._on_payment_failed` |
+| Renewal fails | `pending → halted → 72h grace → Free`, and the gateway sub is **cancelled** so they can subscribe again | `sync.pass_grace_expiry` |
+| Paid twice | idempotent on `razorpay_payment_id`; one receipt only | `service.record_payment` |
+| Amount ≠ plan price | quarantined, nothing granted, alarm | `webhooks._record_subscription_charge` |
+| Webhook replayed | deduped on `event_id`, one effect | `webhooks.ingest` |
+| Webhook for an unknown id | recorded + alarmed, never granted | `webhooks._unknown` |
+| Refund | payment flipped, credit note, minutes recomputed | `webhooks._on_refund` |
+| Handler crashed | event left unprocessed, replayed from the stored raw payload | `sync.reprocess_stuck_events` |
+
+Operator views: `GET /admin/api/billing-events?unprocessed_only=1`,
+`GET /admin/api/tenants/{owner}` (subscriptions + payments + **attempts**), and
+`POST /admin/api/tenants/{owner}/reconcile`.
+
+Every checkout attempt — including the ones that never become money — is a row
+in `payment_attempts` with `failure_step` / `failure_code` / `failure_reason`.
+That table, not `payments`, is what answers "why did their card fail".
+
+### 25.5b Rollout record — what actually happened (2026-08-01)
+
+Deployed P0–P5 live. **Enforcement is OFF**; flipping it is §25.6.
+
+Three things bit during the rollout; all are fixed, and all are worth knowing:
+
+1. **The 0013 staff seed did not survive.** It wrote
+   `entitlements.plan_code='enterprise'` with no `overrides`, and
+   `resolve_entitlements()` rebuilds the row wholesale from the
+   `subscriptions` history — these accounts have no subscription, so the first
+   resolve correctly reset all three staff tenants to Free. Fixed by
+   **migration 0014**, which writes the grant as an `overrides` JSON (the
+   supported mechanism, and what the admin plane uses) and additionally gives
+   every other pre-existing account an explicit Free row. Verified stable
+   across repeated re-resolution.
+   *Rule: to grant a plan without a gateway subscription, write `overrides`.
+   A bare `plan_code` is derived state and will be overwritten.*
+
+2. **`/run/lescall-admin` is tmpfs** — it vanishes on reboot and the admin
+   container then crash-loops on `PermissionError`. Made persistent with
+   `/etc/tmpfiles.d/lescall-admin.conf`.
+
+3. **A test fixture had written `billing_enforce` into the PRODUCTION settings
+   table** (found stamped `by: "pytest restore"`). Cause: `enforcement_on` and
+   `_use_test_db` were both autouse and function-scoped, so pytest was free to
+   run the former first, while `LESCALL_DB_URL` still pointed at production.
+   Fixed by making `enforcement_on` take `_use_test_db` as an explicit
+   dependency. Any future billing fixture that writes MUST do the same.
+
+Verified live after deploy: all six containers healthy · billing endpoints 401
+without a session · `…/webhook/razorpay` 503 (no secret) while
+`…/webhook/razorpay-test` is 401, proving `_OPEN_EXACT` · checkout answers a
+clean 503 rather than crashing · every pre-existing surface still 200 ·
+9000/9001 bound to 127.0.0.1 · admin reachable only over the UNIX socket
+(TCP refused) · **loopback call probe OK on both DIDs, answered + audio**, and
+those calls metered with `entitlement_check='ok'` and released their
+reservations.
+
+### 25.5c Open signups + the telephony gate (2026-08-01)
+
+`LESCALL_ALLOWED_EMAILS=*` — any verified Google account may register again.
+
+What a brand-new account gets: **Free** (30 min/month, 1 agent) and **no
+telephony**. They can build and test an agent in the dashboard; they cannot
+register a SIP trunk or attach a DID. Connecting a real number starts at Pilot.
+
+Migration **0015** adds `plans.telephony_enabled` / `entitlements.telephony`
+(Free 0, Pilot/Basic/Growth/Enterprise 1) and grandfathers anyone who already
+owned a trunk or number — via `overrides`, so it survives re-resolution.
+
+Enforced by `telephony_api.paid_owner`, applied to the six MUTATING endpoints:
+
+| Gated (402) | Open (200) |
+|---|---|
+| `POST /api/trunks` · `DELETE /api/trunks/{id}` · `POST /api/trunks/{id}/apply` | `GET /api/trunks` |
+| `POST /api/numbers` · `PATCH /api/numbers/{id}` · `DELETE /api/numbers/{id}` | `GET /api/numbers` · `GET /api/trunks/{id}/instructions` · `GET /api/telephony/server-info` |
+
+Reads stay open so the SPA can render a locked panel that shows what the plan
+unlocks (`TelephonyLocked` in `frontend/src/pages/Telephony.tsx`); a 402 on the
+list call would leave it nothing to draw but an error.
+
+> **This gate deliberately ignores `enforcement_enabled()`.** That switch stages
+> quota rollout for tenants who already have plans. This one keeps strangers off
+> the carrier edge and has to bite the moment signups reopen. Everything else in
+> §25.9 still no-ops while enforcement is off.
+
+Every account now also gets an **explicit** entitlements row at first login
+(`auth._upsert_user` → `resolve_entitlements`), so the P6 discovery query keeps
+returning zero.
+
+⚠ **With enforcement still OFF, a new signup gets unlimited agents and
+unlimited Copilot turns.** The Copilot's model quota is shared with live calls,
+so that is the remaining exposure from open signups — see §25.6.
+
+### 25.5d BYON in containers — three gaps found live (2026-08-01)
+
+A tenant's trunk "Apply" 500'd. The trunk and number saved fine; only the final
+step failed. Three independent containerization gaps, all now fixed:
+
+1. **`/etc/freeswitch` was not mounted into `lescall-api`.** Apply writes the
+   generated gateway/dialplan XML there. Fixed: bind mount + `group_add: ["994"]`
+   (the dirs are `freeswitch:freeswitch drwxrwxr-x`).
+2. **`_fs_reload()` shelled out to `fs_cli`**, which is not installed in the app
+   containers — the same gap `shared/fs_esl.py` exists for. Every reload raised
+   FileNotFoundError, so `reloaded` was False and apply reported
+   `status: "error"` even with the XML written. Now uses the event socket,
+   falling back to `fs_cli` for host-side callers.
+3. **Generated files were written 0644**, so only the tenant who first claimed a
+   DID could ever re-apply it. When a DID moves between tenants the old
+   `ai_inbound_<did>.xml` is still owned by `freeswitch` and cannot be
+   overwritten. Now written 0664 via `freeswitch_config._write_shared()`.
+
+**Then the call itself failed with SIP 403** — carrier-side, not ours. The
+diagnostic that pins it down: a 403 with **no preceding 407/401** means the
+carrier rejected the SOURCE, not the credentials. On Plivo Zentrunk that is the
+**termination** side: the trunk needs an IP ACL containing this server's egress
+IP (`35.207.225.237/32`). Origination (`<ip>:5080`) is a separate setting and
+configuring only that gives working inbound and 403 on every outbound.
+
+Also added: **`PATCH /api/trunks/{id}`**. Previously a trunk could only be
+created, applied or deleted, so fixing a wrong SIP domain or adding credentials
+meant delete-and-recreate — which drops the DIDs and their agent bindings.
+`name` stays immutable (it is the FreeSWITCH gateway name and filename), and a
+masked `***` password is ignored rather than wiping the stored credential.
+
+### 25.5e DID routing isolation — cross-tenant leak (2026-08-01)
+
+`agents.is_active` is a SINGLE GLOBAL FLAG that every tenant's Activate button
+writes. Four tenants had activated agents. Two paths could therefore hand a
+call to the wrong tenant:
+
+* a **registered DID with no agent bound** fell through to the global "active
+  agent" lookup — so a customer calling tenant A's number would have been
+  answered by tenant B's agent, speaking B's company name, billed to B;
+* the last-resort lookup itself ordered by `updated_at DESC` across all owners.
+
+Fixed in `conversation_call_bridge.py`:
+
+* a registered-but-unbound DID now returns the `UNROUTED_AGENT` sentinel, which
+  `_build_agent_stack` maps to the neutral fallback persona
+  (`agent_health='unrouted'`), and `_did_owner()` still attributes the call to
+  the number's tenant so quota and ledger land correctly;
+* `_resolve_active_agent_slug()` is scoped to `LESCALL_DEFAULT_OWNER` — it
+  exists for the founding tenant's pre-tenancy numbers and must never select
+  another tenant's agent.
+
+Pinned by `tests/test_did_routing_isolation.py`. That file imports the bridge
+**inside a fixture**: a module-scope import pulls in the audio stack, whose
+threads segfault the interpreter at shutdown (tests pass, then exit 139).
+
+### 25.5f Manual invoices — money collected outside the gateway (2026-08-01)
+
+Cash, NEFT/RTGS, cheque, or an account put on credit. `shared/billing/invoices.py`
++ the admin console at `/admin/tenant/<email>` → **Issue an invoice**.
+
+Owner-approved design decisions:
+
+| Decision | Choice |
+|---|---|
+| Unpaid ("yet to be paid") | **Activates the plan immediately**, balance shows as outstanding |
+| GST numbering | Unpaid invoices take a **real number** in the `LC-<fy>-NNNNN` series on issue; cancelled by credit note, never deleted |
+| Amount | Pre-filled from the plan, **editable** (negotiated + Enterprise deals) |
+| Partial payments | Not in v1 — issue two invoices for a 50/50 split |
+
+Rules the module enforces, each for a reason:
+
+* The invoice number comes from the **issue date's** financial year, not
+  today's. Back-dating across a FY boundary is refused outright — it would
+  insert a number into a series that has already been filed.
+* Future-dated invoices are refused.
+* The plan grant is written into `overrides`, never as a bare `plan_code` —
+  entitlements are derived state and a bare plan_code does not survive the next
+  `resolve_entitlements()` (see 0014).
+* `payments.razorpay_payment_id` is UNIQUE and is the gateway idempotency key,
+  so a manual invoice gets a synthetic `manual-<hex>` value rather than NULL
+  (a nullable UNIQUE column admits unlimited NULLs).
+* The invoice line names the **plan actually sold**, captured in the snapshot
+  at issue — it previously said "Enterprise" for every manual invoice.
+
+Operator flow: **Issue** → (if on credit) **Mark paid** with method + UTR/cheque
+ref → or **Void**, which allocates an `LCCN-<fy>-NNNNN` credit note and requires
+a reason. `/admin/invoices` is the collections view (unpaid, oldest first,
+overdue flagged).
+
+Tenant side: the same invoice appears in their **Billing → Payment history**
+with `paid` / `payment due` / `cancelled`, an outstanding-balance banner, and
+the printable GST invoice at `/billing/receipt/<id>`.
+
+Migration **0016** adds `issued_at`, `due_date`, `paid_at`, `payment_reference`,
+`created_by`, `voided_at`, `void_reason`, and extends `payments.status` with
+`due` and `void`.
+
+> ⚠ **Invoicing is BLOCKED until the supplier identity is set.** `issue()`
+> refuses while `PLATFORM_GSTIN` / `PLATFORM_LEGAL_NAME` / `PLATFORM_ADDRESS` /
+> `PLATFORM_STATE_CODE` are blank in `/etc/lescall/billing.env`, naming the
+> missing field. A document with no GSTIN or place of supply is not a tax
+> invoice — it burns a number out of the GST series for something the customer
+> cannot claim credit against and we cannot file.
+>
+> That guard was added after the fact: three test invoices (₹58,998 · ₹14,160 ·
+> ₹58,998) reached a live tenant's Billing page during this feature's own
+> testing. They were hard-deleted and `receipt_counters` reset to 0 for FY
+> 26-27, so the first REAL invoice is `LC-26-27-00001`. Hard delete rather than
+> the usual credit-note reversal was correct **only** because the platform
+> GSTIN had never been configured: nothing had been filed, so no series
+> existed to protect, and voiding would have left the customer looking at three
+> invoices plus three credit notes for money they never paid. Once a real
+> invoice exists, the rule is absolute — cancel with a credit note, never
+> delete.
+
+### 25.5g Admin console — operations surfaces (2026-08-01)
+
+`dashboard/admin_ops.py`. Everything below previously needed SSH, `psql` or
+`docker ps`. Ten pages total; nav across the top.
+
+| Page | Answers |
+|---|---|
+| `/admin` | tenants — search, plan, status, minutes, agents, calls, telephony |
+| `/admin/tenant/<email>` | everything about one account + plan/lock/invoice controls |
+| `/admin/health` | is the platform up — listeners, live calls, freshness, disk, billing integrity |
+| `/admin/keys` | **Sarvam key pool** — the highest-impact number on the platform |
+| `/admin/calls` | cross-tenant call browser with billing attribution |
+| `/admin/agents` | every agent, owner, orphans, legacy active flag |
+| `/admin/audit` | who did what, including admin reads |
+| `/admin/invoices` | outstanding balances, oldest first |
+| `/admin/payments` | all money in |
+| `/admin/events` | gateway webhook events, stuck ones flagged |
+
+**Why the key pool page matters most.** Sarvam supplies STT and TTS for every
+call. When the pool is exhausted, *every tenant's calls go silent* — and since
+roles were flattened, `/api/sarvam/*` is 403 for every session, so there was no
+UI for it anywhere. Current state: 13 usable, 11 already exhausted. Rotation is
+automatic on HTTP 429; the page exists to top the pool up BEFORE that runs dry.
+
+Two traps that bit while building it, both worth remembering:
+
+* `api_key_pool.json` is `{"pool": [...]}`, not a bare list, and has THREE
+  other consumers — `sarvam_key_watchdog.py`, `key_rotator.py` (in the live
+  call path) and `server.py`. The admin page therefore calls
+  `server._load_api_key_pool` / `_save_api_key_pool` rather than writing the
+  file itself; a bare-list write would have silently broken rotation.
+* `sarvam_dead_keys.json` wraps its list under `"dead"`. Reading the wrapper as
+  the list reported **1** exhausted key when there were **11** — a number an
+  operator would have acted on.
+
+**The admin plane deliberately gets no new credentials.** It reads ports by
+connecting to them, live state from the repo mount, and everything else from
+the database. It does NOT take `FS_ESL_PASSWORD`: it can already change plans
+and issue invoices, and adding "can originate calls" to a leaked `ADMIN_TOKEN`
+buys only a channel count that port 8021 plus recent call activity already
+imply.
+
+### 25.6 Turning enforcement on (P6)
+
+**Run the discovery query first.** Every pre-existing tenant must already have
+an entitlements row, or they drop to Free (30 min, 1 agent) and block instantly:
+
+```sql
+SELECT DISTINCT owner FROM (
+  SELECT email AS owner FROM users UNION SELECT owner FROM agents
+  UNION SELECT owner FROM usage_ledger UNION SELECT owner FROM calls) t
+WHERE owner <> '' AND owner NOT IN (SELECT owner FROM entitlements);
+-- MUST return zero rows.
+```
+
+Migration 0013 seeds `tech@`, `angelo@` and `alwynantonyben@dhronai.com` as
+Enterprise/unlimited. Anyone else must be granted a plan from the admin plane
+first.
+
+```bash
+# apply the schema (additive; enforcement still off)
+docker exec -w /home/angelo/lescall lescall-workers python -m shared.db.migrate --status
+docker exec -w /home/angelo/lescall lescall-workers python -m shared.db.migrate
+
+# flip enforcement (admin plane, audited, reason mandatory)
+curl --unix-socket /run/lescall-admin/lescall-admin.sock \
+  -X POST http://local/admin/api/enforcement \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"enabled": true, "reason": "P6 enforcement go-live, owner approved"}'
+```
+
+Verify it reached **all four** services — the runtime container reads the same
+DB setting but caches it for 30s, and inbound enforcement lives there:
+
+```bash
+curl -s localhost:8080/api/health | jq .billing
+```
+
+`billing.fail_open` must stay empty. A non-empty value means calls are being
+admitted without a verifiable entitlement because the billing DB is erroring.
+
+**Rollback** is the same call with `"enabled": false`.
+
+### 25.7 Sync worker
+
+Own supervised process inside `lescall-workers` (never the 5-minute tick — N
+sequential gateway calls would make tick duration a function of Razorpay's
+latency, and the sentinel restarts the container when `reconcile:` vanishes for
+20 minutes).
+
+```bash
+docker logs lescall-workers 2>&1 | grep 'billing sync'
+docker exec -w /home/angelo/lescall lescall-workers python -m shared.billing.sync --once
+```
+
+Alarms are logged as `[BILLING-ALARM]` — the sentinel and GCS log shipping
+already watch that stream. They are deliberately not bell-only.
+
+### 25.8 Admin plane
+
+See `deploy/etc-lescall-env.template`. Refuses to start without a ≥32-char
+`ADMIN_TOKEN` and refuses any bind that is not the UNIX socket or loopback.
+No nginx vhost, no DNS, no firewall opening.
+
+It binds BOTH interfaces: the UNIX socket always, plus loopback TCP when
+`ADMIN_TCP_ENABLED=true`. The socket is the security-relevant one (an HTTP-URL
+SSRF cannot address a UNIX socket at all); the TCP port exists only so a
+browser at the far end of an SSH tunnel can render the page.
+
+```bash
+sudo install -d -m 0770 -o angelo -g angelo /run/lescall-admin   # + tmpfiles.d
+sudo docker compose -f deploy/docker-compose.services.yml up -d admin
+```
+
+**From the VM (scripts, no browser) — the socket:**
+
+```bash
+TOK=$(sudo grep -oP '(?<=^ADMIN_TOKEN=).*' /etc/lescall/admin.env)
+curl --unix-socket /run/lescall-admin/lescall-admin.sock \
+     http://local/admin/api/health -H "Authorization: Bearer $TOK"
+```
+
+**From your laptop (browser) — SSH tunnel:**
+
+```bash
+ssh -L 8090:127.0.0.1:8090 angelo@35.207.225.237      # keep this open
+```
+then open <http://127.0.0.1:8090/admin>, paste the token into the sign-in form.
+
+The form POSTs the token in the request BODY (never a query string, so it stays
+out of access logs, shell history and Referer) and sets an 8-hour HttpOnly,
+SameSite=strict cookie containing a **hash** of the token — so a stolen cookie
+cannot be replayed as an API bearer token, and rotating `ADMIN_TOKEN`
+invalidates every session for free.
+
+**The cookie authorizes GET only.** Every mutation still requires the
+`Authorization: Bearer` header, which is what keeps CSRF structurally
+impossible: while the tunnel is open, any page the operator visits could POST
+to 127.0.0.1:8090, but it cannot set that header. The HTML UI is read-only by
+design, so it loses nothing; changes go through `curl` against `/admin/api/*`.
+
+Turn the TCP bind off again with `ADMIN_TCP_ENABLED=false` + `up -d admin`;
+the socket keeps working.
+
+Reads are audited as well as writes: if the token leaks, reads are what an
+attacker uses first. Every mutation needs a `reason` of ≥10 characters, and
+`pilot-reset` additionally needs `confirm_owner` equal to the path owner so a
+body-less SSRF POST cannot trigger it.
+
+### 25.9 Enforcement points
+
+`E1` manual dial · `E2` campaign (start **and** per contact) · `E3` autodialer ·
+`E4` automation callback · `E5` number test call · `E6` inbound bridge ·
+`E7` agent creation · `E8` autocall staging · `E9` copilot chat ·
+`E10` copilot try-agent · `E11` document extraction · `E12` per-tier feature
+flags at the API.
+
+The grep gate — every `_fs_esl_exec(_fs_originate_cmd(...))` site must be
+preceded by a check:
+
+```bash
+python3 - <<'PY'
+src = open('dashboard/server.py').read().split('\n')
+for i, l in enumerate(src):
+    if '_fs_originate_cmd(' in l and 'fs_esl_exec' in l and not l.strip().startswith('#'):
+        assert '_billing_check_dial' in '\n'.join(src[max(0,i-60):i]), f'UNGATED line {i+1}'
+print('grep gate OK')
+PY
+```
+
+`shared/sentinel.py`'s loopback probe is exempt by design: it is a synthetic
+self-test marked `billable=0` that rings no human.
+
+---
+
+## 26. Share an agent by link — IMPORT makes an independent copy (2026-08-01)
+
+A tenant hands someone a URL; the recipient signs in and imports a **copy** of
+that agent into their own account. The two records are unrelated from the
+moment of import: separate slug, separate `agent_id`, separate revision
+history, separate owner. Editing one never changes the other, and archiving
+one never touches the other.
+
+### 26.1 Surfaces
+
+| Where | What |
+|---|---|
+| Build → Agents card | Share icon (top-right of the card) → link dialog |
+| `https://agent.lescall.com/s/<token>` | the link that gets sent |
+| `/build/agents?import=<token>` | where the link lands; opens the import popup |
+| `dashboard/agent_share_api.py` | `/api/share` (create/read) · `/api/share/{token}` (preview, revoke) · `/api/share/{token}/import` |
+| `frontend/src/components/ShareAgent.tsx` | both dialogs |
+| migration `0017_agent_share` | `agent_shares`, `agent_share_imports` |
+
+### 26.2 The unit is the FAMILY
+
+One link carries every direction variant the agent has (`x-inbound` +
+`x-outbound`), because the plan cap counts families and the card in the UI is
+a family. One import therefore consumes exactly one agent slot.
+
+### 26.3 "The same agent cannot be shared by two users"
+
+Three facts, no extra column:
+
+1. `agents.slug` is globally UNIQUE and each row carries exactly one `owner`.
+2. `POST /api/share` verifies every slug in the family is owned by the caller.
+3. `idx_agent_shares_live` — `UNIQUE (owner, family) WHERE revoked_at IS NULL`
+   — allows one live link per agent. Pressing Share twice returns the SAME
+   token rather than minting a second, separately-revocable link.
+
+An import mints a brand-new family, so two accounts never point at one row.
+
+### 26.4 What travels, and what deliberately does not
+
+Travels: `agent.yaml` (behaviour, personality, stages, knowledge base) and
+`documents/` including the `.npy` embeddings — otherwise the copy references
+knowledge it does not have and reads as broken.
+
+Does **not** travel:
+* `routing.yaml` — the sharer's DID binding. Copying it would point the
+  importer's new agent at someone else's phone number.
+* `bookings.json` — the sharer's live appointments, i.e. their customers.
+* `revision` / `updated_at` / `updated_by` — a copy claiming "revision 47,
+  updated_by someone@else.com" makes the importer's first edit look like a
+  rollback.
+* `is_active` — imported rows are forced to 0. `agents.is_active` DEFAULTS to
+  1 and `conversation_call_bridge` picks the most recently updated `is_active`
+  row per owner for calls that match no DID binding, so without this, importing
+  an agent to look at it would silently take over answering that account's
+  unbound calls.
+
+`agent_id` is **reminted** (`<new-slug>-v1`, uniqueness-checked against every
+`agent.yaml` on disk). `documents/store.get_folder_by_agent_id()` resolves a
+document folder by scanning for the FIRST matching `agent_id`, so two agents
+sharing an id means one tenant's RAG lookups can land in another tenant's
+documents.
+
+### 26.5 Refusals the recipient sees
+
+| Situation | Result |
+|---|---|
+| At the plan agent cap | popup still renders the agent, Import replaced by **See plans** (402 `cap_agents` on the API) |
+| Own link | 409 "this is your own agent" |
+| Already imported (copy still live) | 409 + a link to their copy |
+| Revoked / expired | 410, with which one it was |
+| Source archived or deleted | 410 |
+| >20 imports in 24h | 429 (abuse ceiling, `LESCALL_MAX_IMPORTS_PER_DAY`) |
+
+Cap and already-imported are reported in the preview BODY (`can_import:false`
++ `reason`) rather than as HTTP errors, because the popup has to render the
+agent's details alongside the explanation.
+
+### 26.6 Atomicity
+
+`agent_share_imports` has `UNIQUE (share_id, importer)` and the row is
+**reserved before any folder is written**. That is what makes a double-clicked
+Import button, a reloaded tab and two browser windows converge on one copy
+instead of three. Any failure mid-import rolls back every folder, every
+ownership row and the reservation together — half an imported twin pair is
+worse than none, because a number could bind to the survivor and run the wrong
+direction's prompts. Re-importing is allowed once the earlier copy has been
+archived or deleted (the stale row is dropped inside the same transaction).
+
+### 26.7 Deep links now survive login — platform-wide
+
+A share link's entire payload is the token in its URL, and the nginx
+`auth_request` wall used to throw the path away:
+`error_page 401 → @lescall_login → return 302 /login`. Everyone landed on the
+homepage after signing in and the invitation silently evaporated.
+
+Three coordinated changes:
+
+* `deploy/nginx-agent.lescall.conf` → `return 302 /login?next=$request_uri;`
+* `auth.safe_return_path()` — accepts same-origin ABSOLUTE PATHS only. `//host`,
+  `https://host`, backslashes, `/login*` and `/auth/*` are rejected, so `next`
+  cannot be turned into an open redirect.
+* `/login` stashes it in the short-lived httponly `lescall_return_to` cookie;
+  `/auth/callback` redirects there instead of `/`.
+
+Share links are `/s/<token>` — one path segment, no query string — precisely
+because stock nginx has no URL-encoder, so a destination carrying its own `&`
+would be truncated in `$request_uri`.
+
+**Installing the nginx change** (root):
+
+```bash
+sudo cp deploy/nginx-agent.lescall.conf /etc/nginx/sites-enabled/agent.lescall
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Without it, share links still work for anyone already signed in; a logged-out
+recipient lands on the dashboard homepage and has to re-open the link.
+
+### 26.8 Deploy
+
+```bash
+set -a; . deploy/.pg_env; set +a
+./calling-agent/venv/bin/python -m shared.db.migrate --status   # 0017 should show pending
+./calling-agent/venv/bin/python -m shared.db.migrate            # apply it
+sudo docker restart lescall-api               # picks up the new router
+docker compose -f deploy/docker-compose.services.yml up -d --build spa
+```
+
+Deployed 2026-08-01. Two traps hit on the way, recorded so they are not hit twice:
+
+* The backend is the **`lescall-api` container** (bind-mounted, host network,
+  port 8080). The old `lescall-dashboard` **systemd unit is disabled and must
+  stay stopped** — starting it spawns a second `server.py` that loses the race
+  for port 8080 and crash-loops under systemd's restart policy until stopped.
+* `deploy/nginx-agent.lescall.conf` ends with a `default_server` 444 catch-all.
+  `/etc/nginx/sites-enabled/lescall` (the legacy proxy-everything vhost)
+  **claimed `default_server`**, so installing the file verbatim fails `nginx -t`
+  with a duplicate default server. Resolution (2026-08-01, owner-approved): the
+  vhost was installed with the catch-all block stripped, then the catch-all was
+  installed separately as `/etc/nginx/sites-enabled/000-lescall-default` and the
+  legacy vhost removed (backup: `/etc/nginx/lescall.legacy-vhost.bak-20260801`).
+  Bare-IP / stale-DNS requests on :80 now get the connection closed with no
+  response; only `Host: agent.lescall.com` is served. Note the 444 block covers
+  **port 80 only** — on 443 the agent.lescall server is the sole listener and
+  therefore still answers any SNI/Host with its own cert (pre-existing).
+
+Until 0017 is applied every `/api/share` route answers **503 "Agent sharing is
+not enabled on this server yet"** rather than a 500 about a missing relation.
+
+### 26.9 Tests
+
+`calling-agent/backend/tests/test_agent_share.py` (34). Pure tier covers the
+slug/agent_id/spec algebra and the open-redirect guard; the DB tier runs the
+full create → preview → import path against `lescall_test` with `agents/`
+redirected at a tmp tree. The load-bearing ones: independence after import,
+`is_active` stays 0, routing/bookings excluded, double-import, re-import after
+archive, revoked/expired/deleted-source, name-collision walk, cap refusal, and
+"a failed import leaves nothing behind".

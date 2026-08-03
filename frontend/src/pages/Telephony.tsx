@@ -110,6 +110,66 @@ const EMPTY_TRUNK = {
   caller_id: '', provider_ips: '',
 }
 
+/**
+ * What a Free account sees in place of the BYON setup flow.
+ *
+ * Deliberately shows the real shape of the thing being unlocked — carrier
+ * trunk, your own DID, your agent answering it — rather than a bare
+ * "upgrade required". Someone deciding whether to pay should be able to see
+ * what they get.
+ */
+function TelephonyLocked() {
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        title="Telephony"
+        sub="Bring Your Own Number — connect your carrier and point a number at your agent"
+      />
+      <Card className="p-6">
+        <div className="flex items-start gap-4">
+          <div className="rounded-2xl bg-[var(--surface-2)] p-3">
+            <PlugZap size={22} className="text-dim" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h2 className="text-lg font-semibold">Connect your own number on a paid plan</h2>
+            <p className="mt-1 max-w-2xl text-sm text-soft">
+              Your account can build and test agents right now. To put one on a
+              real phone line — your carrier, your number, your caller ID —
+              you&rsquo;ll need a plan. Pilot is the usual starting point: seven
+              days and 500 minutes to run real conversations with your own
+              customers.
+            </p>
+
+            <ul className="mt-4 space-y-1.5 text-sm text-soft">
+              {[
+                'Register your SIP trunk (Plivo, Twilio, or any SIP carrier)',
+                'Point one of your own numbers at an agent you built',
+                'Inbound and outbound, English and Hindi',
+                'A test call to your own phone before you go live',
+              ].map((t) => (
+                <li key={t} className="flex items-start gap-2">
+                  <CheckCircle2 size={15} className="mt-0.5 shrink-0 text-emerald-500" />
+                  <span>{t}</span>
+                </li>
+              ))}
+            </ul>
+
+            <div className="mt-5 flex flex-wrap gap-2">
+              <Link to="/billing"><Button variant="primary">See plans</Button></Link>
+              <Link to="/build/agents"><Button variant="ghost">Build an agent first</Button></Link>
+            </div>
+            <p className="mt-4 text-xs text-dim">
+              Already on a paid plan and still seeing this? Reload the page, or
+              contact us and we&rsquo;ll sort it out.
+            </p>
+          </div>
+        </div>
+      </Card>
+    </div>
+  )
+}
+
+
 export default function Telephony() {
   const toast = useToast()
   const refresh = useRefresh()
@@ -120,6 +180,15 @@ export default function Telephony() {
   // Same source Settings edits — shows where "Test call" actually rings.
   const profileQ = useGet<Profile>(['profile'], '/auth/profile')
   const testPhone = profileQ.data?.phone ? `+${profileQ.data.phone}` : ''
+  // Paid-plan gate. The server refuses the mutations regardless (402); this
+  // just avoids walking someone through a five-field carrier form that is
+  // going to be rejected at the end.
+  const billingQ = useGet<{ features?: { telephony?: boolean } }>(
+    ['billing', 'summary'], '/billing/summary')
+  // Undefined while loading, or if /billing is unavailable — default to
+  // allowing, so a billing outage never hides a working panel from a paying
+  // customer. The server is the authority either way.
+  const telephonyAllowed = billingQ.data?.features?.telephony !== false
 
   const [connectForm, setConnectForm] = useState({ ...EMPTY_CONNECT })
   const [showCreds, setShowCreds] = useState(false)
@@ -292,6 +361,13 @@ export default function Telephony() {
     else next.add(id)
     return next
   })
+
+  // Connecting a real number is a paid capability. The panel stays VISIBLE and
+  // readable — a Free user should be able to see exactly what they would be
+  // setting up — but every control that would write is replaced by an upgrade
+  // path. Hiding the page instead would make the product look like it cannot
+  // do this at all.
+  if (!telephonyAllowed) return <TelephonyLocked />
 
   return (
     <div className="space-y-6">

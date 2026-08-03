@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import {
   Search, Bell, Timer, HelpCircle, Sun, Moon, PanelLeft, Menu, CornerDownLeft,
   CheckCircle2, XCircle, Keyboard, MessageCircle, CheckCheck,
@@ -74,7 +74,15 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
   const navigate = useNavigate()
   const pages = usePages()
   const refresh = useRefresh()
-  const minutes = useGet<{ minutes_month?: number }>(['usage-minutes'], '/usage/minutes', { refetchInterval: 60000 })
+  // `/usage/minutes` now also carries the tenant's entitlement view, from the
+  // same numbers the dial gates enforce — so the pill shows used / limit
+  // rather than a bare running total that says nothing about what is left.
+  const minutes = useGet<{
+    minutes_month?: number
+    minutes_used_period?: number | null
+    minutes_limit?: number | null
+    minutes_remaining?: number | null
+  }>(['usage-minutes'], '/usage/minutes', { refetchInterval: 60000 })
   const notifs = useGet<{ items: Notif[]; unread: number }>(
     ['intel', 'notifications'], '/intel/notifications?limit=20', { refetchInterval: 30000 })
   const [now, setNow] = useState(clockTime())
@@ -198,18 +206,45 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
         </div>
 
         <div className="ml-auto flex items-center gap-1.5">
-          {/* Live call-minutes usage (owner-scoped) */}
-          <span
-            title="Call minutes used this month"
-            aria-label="Call minutes used this month"
-            className="flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-soft ring-1 ring-[var(--border)]"
-          >
-            <Timer size={13} className="text-dim" />
-            <span className="tabular-nums">
-              {minutes.data?.minutes_month != null ? `${num(minutes.data.minutes_month)} min` : '— min'}
-            </span>
-            <span className="hidden text-dim sm:inline">this month</span>
-          </span>
+          {/* Call-minutes usage against the plan allowance (owner-scoped).
+              Amber at 80%, rose at 100% — the same thresholds the Billing page
+              and the Overview chip use, so the whole app agrees about when a
+              tenant is close to being blocked. Links to /billing because that
+              is the only place the number can be acted on. */}
+          {(() => {
+            const used = minutes.data?.minutes_used_period ?? minutes.data?.minutes_month ?? null
+            const limit = minutes.data?.minutes_limit ?? null
+            const pct = limit != null && limit > 0 && used != null ? used / limit : 0
+            const tone = limit == null ? '' : pct >= 1
+              ? 'text-rose-600 ring-rose-300 dark:text-rose-300 dark:ring-rose-900'
+              : pct >= 0.8
+                ? 'text-amber-600 ring-amber-300 dark:text-amber-300 dark:ring-amber-900'
+                : ''
+            const label = limit == null
+              ? `Call minutes used${used != null ? `: ${num(used)}` : ''}`
+              : `${num(used ?? 0)} of ${num(limit)} minutes used this period`
+            return (
+              <Link
+                to="/billing"
+                title={label}
+                aria-label={label}
+                className={cx(
+                  'flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-soft ring-1 ring-[var(--border)] hover:bg-[var(--surface)]',
+                  tone,
+                )}
+              >
+                <Timer size={13} className={tone ? '' : 'text-dim'} />
+                <span className="tabular-nums">
+                  {used == null ? '— min'
+                    : limit == null ? `${num(used)} min`
+                    : `${num(used)}/${num(limit)}`}
+                </span>
+                <span className="hidden text-dim sm:inline">
+                  {limit == null ? 'this month' : 'min'}
+                </span>
+              </Link>
+            )
+          })()}
           <span className="hidden px-1.5 text-xs font-medium tabular-nums text-dim md:block" title="Live clock">{now}</span>
 
           {/* Notification center — real intelligence notifications + service health */}

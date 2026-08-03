@@ -7,9 +7,10 @@ import { useGet, useRefresh } from '../api/hooks/useApi'
 import { Badge, Button, Card, EmptyState, IconButton, Spinner, cx } from '../components/ui'
 import {
   PageHeader, Table, THead, TH, TR, TD, Pagination,
-  StatusBadge, SearchInput, Segmented, AsyncState,
+  StatusBadge, SearchInput, Segmented, AsyncState, ContactLabel,
 } from '../components/kit'
-import { useDebounced, useUrlNumber, useUrlParam } from '../lib/hooks'
+import { useDebounced, useUrlNumber, useUrlParam, useUrlPatch } from '../lib/hooks'
+import { CALL_STATUS_FILTER } from '../lib/callStatus'
 import { inr, dur, num } from '../lib/format'
 
 type Call = {
@@ -86,7 +87,11 @@ export default function Activity() {
   // Debounced so we fire one request per pause, not one per keystroke.
   const debouncedSearch = useDebounced(search, 300)
 
-  const reset = (fn: () => void) => { fn(); setPage(1) }
+  // Filter + page reset must be ONE navigation. Written as two calls
+  // (setDays/setCallType/setStatus then setPage) the page reset recomputed the
+  // URL from pre-update state and threw the filter change away — which is why
+  // clicking these pills appeared to do nothing at all.
+  const patch = useUrlPatch()
 
   const path =
     `/calls/history?page=${page}&limit=50` +
@@ -109,9 +114,10 @@ export default function Activity() {
   const refreshing = isFetching && !showSkeleton
 
   const filtersActive = !!search || callType !== 'all' || status !== 'all' || days !== 7
-  const clearFilters = () => {
-    setSearch(''); setCallType('all'); setStatus('all'); setDays(7); setPage(1)
-  }
+  // Five setters in one tick had the same clobber problem — only the last
+  // survived, so "Reset filters" left most filters exactly where they were.
+  const clearFilters = () =>
+    patch({ q: null, type: null, status: null, days: null, page: null })
 
   const copyId = (id: string) => {
     navigator.clipboard.writeText(id).then(() => {
@@ -167,7 +173,7 @@ export default function Activity() {
         <div className="mb-4 flex flex-wrap items-center gap-3">
           <SearchInput
             value={search}
-            onChange={(v) => reset(() => setSearch(v))}
+            onChange={(v) => patch({ q: v, page: null })}
             placeholder="Search call id or contact"
             className="min-w-[220px] flex-1"
           />
@@ -181,7 +187,7 @@ export default function Activity() {
                 { value: '90', label: '90 days' },
               ]}
               value={String(days)}
-              onChange={(v) => reset(() => setDays(Number(v)))}
+              onChange={(v) => patch({ days: v, page: null })}
             />
           </div>
           <Segmented
@@ -191,20 +197,15 @@ export default function Activity() {
               { value: 'outbound', label: 'Outbound' },
             ]}
             value={callType}
-            onChange={(v) => reset(() => setCallType(v))}
+            onChange={(v) => patch({ type: v === 'all' ? null : v, page: null })}
           />
-          <Segmented
-            options={[
-              { value: 'all', label: 'All status' },
-              { value: 'answered', label: 'Answered' },
-              { value: 'no_answer', label: 'No answer' },
-              { value: 'busy', label: 'Busy' },
-              { value: 'declined', label: 'Declined' },
-              { value: 'failed', label: 'Failed' },
-            ]}
-            value={status}
-            onChange={(v) => reset(() => setStatus(v))}
-          />
+          <div className="max-w-full overflow-x-auto [scrollbar-width:none]">
+            <Segmented
+              options={CALL_STATUS_FILTER.map((o) => ({ value: o.value, label: o.label }))}
+              value={status}
+              onChange={(v) => patch({ status: v === 'all' ? null : v, page: null })}
+            />
+          </div>
         </div>
 
         {!showSkeleton && !error && (
@@ -265,10 +266,7 @@ export default function Activity() {
                             <TD className="whitespace-nowrap text-[var(--text)]" title={fmtWhen(c?.start_time)}>
                               {fmtTime(c?.start_time)}
                             </TD>
-                            <TD>
-                              <div className="font-semibold text-[var(--text)]">{c?.contact_name ?? 'Unknown'}</div>
-                              {c?.contact_phone && <div className="text-xs text-dim">{c.contact_phone}</div>}
-                            </TD>
+                            <TD><ContactLabel name={c?.contact_name} phone={c?.contact_phone} /></TD>
                             <TD>
                               {c?.call_type
                                 ? (

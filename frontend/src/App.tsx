@@ -1,8 +1,23 @@
 import { lazy, Suspense } from 'react'
-import { Routes, Route, Navigate } from 'react-router-dom'
+import { Routes, Route, Navigate, useParams } from 'react-router-dom'
 import { AppShell } from './layout/AppShell'
 import Overview from './pages/Overview'
 import Placeholder from './pages/Placeholder'
+
+/**
+ * Landing spot for a shared-agent link: /s/<token> → the Agents panel with the
+ * import popup open.
+ *
+ * A single path segment with no query string is deliberate. The nginx login
+ * wall bounces unauthenticated visitors through /login?next=$request_uri, and
+ * stock nginx cannot URL-encode that value — so a destination carrying its own
+ * `&` would be truncated. `/s/<token>` has nothing to truncate, which is what
+ * makes a share link survive being opened by someone who is not logged in yet.
+ */
+function ShareLanding() {
+  const { token = '' } = useParams()
+  return <Navigate to={`/build/agents?import=${encodeURIComponent(token)}`} replace />
+}
 
 /* Only the homepage ships in the entry chunk; every other panel is fetched on
    first navigation. One 740 kB bundle meant a cold visitor downloaded the agent
@@ -22,6 +37,11 @@ const Contacts = lazy(() => import('./pages/Contacts'))
 const ContactHub = lazy(() => import('./pages/ContactHub'))
 const Telephony = lazy(() => import('./pages/Telephony'))
 const Settings = lazy(() => import('./pages/Settings'))
+// Lazy like every other route: the billing page pulls in the plan grid, the
+// invoice view and (on demand) Razorpay's checkout.js — none of which belong
+// in the entry bundle for a user who never opens it.
+const Billing = lazy(() => import('./pages/Billing'))
+const Receipt = lazy(() => import('./pages/Receipt'))
 const AgentsList = lazy(() => import('./pages/agents/AgentsList'))
 const CreateAgent = lazy(() => import('./pages/agents/CreateAgent'))
 const EditAgent = lazy(() => import('./pages/agents/EditAgent'))
@@ -72,14 +92,22 @@ export default function App() {
           <Route path="/telephony" element={<Telephony />} />
           {/* Account settings — profile details (test-call destination phone) */}
           <Route path="/settings" element={<Settings />} />
-          {/* Build — one Agents panel: list + New Agent + Intent tester (tab) */}
+          {/* Plan, minutes, invoices (deploy/PLAN-razorpay-subscriptions.md) */}
+          <Route path="/billing" element={<Billing />} />
+          <Route path="/billing/receipt/:paymentId" element={<Receipt />} />
+          {/* Build — one Agents panel: list + New Agent. Each card chats with
+              its agent through the live engine (the Intent tester it replaced
+              was removed 2026-08-01). */}
           <Route path="/build/agents" element={<AgentsList />} />
           <Route path="/build/agents/new" element={<CreateAgent />} />
           <Route path="/build/agents/:name" element={<EditAgent />} />
-          {/* Intent preview folded into the Agents panel's "Intent tester" tab */}
+          {/* Intent tester is gone; keep the redirect so old links/bookmarks
+              land on the Agents panel instead of a 404. */}
           <Route path="/build/intent" element={<Navigate to="/build/agents" replace />} />
           {/* Old read-only Agent Settings is superseded by the editable builder */}
           <Route path="/agent-settings" element={<Navigate to="/build/agents" replace />} />
+          {/* Shared agent link — see ShareLanding above */}
+          <Route path="/s/:token" element={<ShareLanding />} />
           <Route path="*" element={<Placeholder title="Not Found" sub="That route does not exist." />} />
         </Routes>
       </Suspense>

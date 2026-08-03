@@ -1,9 +1,10 @@
-"""Derived STT confidence: the wps hallucination guard must score against
-the audio the transcript actually covers, not just the local segment.
-Regression for the live barge-in-stitch rejection (2026-07-29): streaming
-STT returned 7 words for a 464ms local buffer (the rest of the speech was
-server-side, dropped locally by the barge-in flush) → 15 wps → falsely
-rejected as over-generation, and the booking turn never reached the LLM."""
+"""Derived STT confidence: the words-per-second hallucination guard.
+
+On the batch path a transcript covers exactly the segment it was POSTed
+for, so the local buffer IS the audio it can account for. The
+`covered_seconds` escape hatch that let a stream-stitched transcript score
+against server-side audio was removed with the WebSocket STT provider on
+2026-07-31 (RUNBOOK §24)."""
 
 from app.voice.stt.router import STTRouter
 
@@ -17,20 +18,13 @@ def _audio(sec: float) -> bytes:
 TEXT = "शाम चार बजे साइट विजिट बुक कीजिए"  # 7 words
 
 
-def test_short_local_buffer_alone_reads_as_overgeneration():
+def test_impossible_word_rate_scores_low():
+    # 7 words in 464ms is 15 wps — no human says that; score it down.
     score = STTRouter._derive_confidence(TEXT, _audio(0.46), SR, 800, None)
-    assert score < 0.4  # the pre-fix behavior: would be rejected
+    assert score < 0.4
 
 
-def test_covered_seconds_rescues_barge_in_stitch():
-    score = STTRouter._derive_confidence(
-        TEXT, _audio(0.46), SR, 800, None, covered_seconds=4.0)
-    assert score >= 0.9  # 7 words over 4s of real speech is normal
-
-
-def test_covered_seconds_never_shrinks_duration():
-    # covered smaller than the local buffer must not inflate wps.
-    plain = STTRouter._derive_confidence(TEXT, _audio(3.0), SR, 800, None)
-    with_small = STTRouter._derive_confidence(
-        TEXT, _audio(3.0), SR, 800, None, covered_seconds=0.2)
-    assert with_small == plain
+def test_normal_word_rate_scores_high():
+    # The same 7 words over 4s of audio is ordinary speech.
+    score = STTRouter._derive_confidence(TEXT, _audio(4.0), SR, 800, None)
+    assert score >= 0.9

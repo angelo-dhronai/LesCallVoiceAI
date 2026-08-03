@@ -112,6 +112,16 @@ class FsmnVadStack:
         # the earliest hops of the call.
         self._q: queue.Queue = queue.Queue(maxsize=64)
         self._q_drop_logged = False
+        # Concurrency instrumentation (roadmap #3): dropped hops corrupt
+        # endpointing SILENTLY — count everything, and above the depth
+        # threshold flip this call to visible energy-VAD degradation
+        # instead of invisible model starvation.
+        self.hops_in = 0
+        self.hops_dropped = 0
+        self.hop_lat_ms: list[float] = []   # rolling, capped 512
+        self.deadline_misses = 0            # hop latency > HOP_MS
+        self.degraded = False
+        self._degrade_depth = int(os.environ.get("VAD_DEGRADE_DEPTH", "32"))
         self._worker = threading.Thread(
             target=self._worker_loop, name="fsmn-vad", daemon=True)
         self._worker.start()
@@ -161,9 +171,9 @@ class FsmnVadStack:
             # Re-opening: model cache restarts, replay recent context so
             # the onset isn't scored cold.
             self._gate_open = True
-            self._submit(("reset", b""))
+            self._submit(("reset", b"", 0.0))
             for hop in self._hop_ring:
-                self._submit(("hop", hop))
+                self._submit(("hop", hop, time.monotonic()))
         elif not want_open and self._gate_open:
             self._gate_open = False
 
@@ -176,11 +186,29 @@ class FsmnVadStack:
             if len(self._hop_ring) > 3:
                 self._hop_ring.pop(0)
             if self._gate_open:
-                self._submit(("hop", hop))
+                self.hops_in += 1
+                self._submit(("hop", hop, time.monotonic()))
 
+        if self.degraded:
+            # Visible fallback: energy decision, model verdict ignored.
+            return self._last_energy > self._minimum_threshold
         return self._speech_open
 
     # ── extras consumed by endpointer / classifier / diagnostics ─────
+
+    def stats(self) -> dict:
+        """Concurrency health snapshot (callsim harvest + live diagnostics)."""
+        lats = sorted(self.hop_lat_ms)
+        return {
+            "hops_in": self.hops_in,
+            "hops_dropped": self.hops_dropped,
+            "queue_depth": self._q.qsize(),
+            "hop_lat_p50_ms": round(lats[len(lats) // 2], 1) if lats else None,
+            "hop_lat_p99_ms": round(lats[int(len(lats) * 0.99)], 1)
+            if lats else None,
+            "deadline_misses": self.deadline_misses,
+            "degraded": self.degraded,
+        }
 
     def pop_events(self) -> list[tuple[str, float]]:
         with self._events_lock:
@@ -200,10 +228,19 @@ class FsmnVadStack:
     # ── worker ───────────────────────────────────────────────────────
 
     def _submit(self, item) -> None:
+        depth = self._q.qsize()
+        if depth >= self._degrade_depth and not self.degraded:
+            # Degrade, don't drop: energy-based speech decisions are worse
+            # but VISIBLE; silent hop loss corrupts endpointing untraceably.
+            self.degraded = True
+            logger.warning("[VAD-STACK] DEGRADED to energy VAD "
+                           "(queue depth %d ≥ %d — CPU starved)",
+                           depth, self._degrade_depth)
         try:
             self._q.put_nowait(item)
             self._q_drop_logged = False
         except queue.Full:
+            self.hops_dropped += 1
             if not self._q_drop_logged:
                 self._q_drop_logged = True
                 logger.warning("[VAD-STACK] worker queue full — dropping "
@@ -223,12 +260,26 @@ class FsmnVadStack:
         param: dict = {"in_cache": []}
         logger.info("[VAD-STACK] FSMN worker ready")
         while True:
-            kind, payload = self._q.get()
+            item = self._q.get()
+            kind, payload = item[0], item[1]
+            enq_t = item[2] if len(item) > 2 else 0.0
             if kind == "stop":
                 return
             if kind == "reset":
                 param = {"in_cache": []}
                 continue
+            if enq_t > 0.0:
+                lat = (time.monotonic() - enq_t) * 1000.0
+                self.hop_lat_ms.append(lat)
+                if len(self.hop_lat_ms) > 512:
+                    del self.hop_lat_ms[:256]
+                if lat > HOP_MS:
+                    self.deadline_misses += 1
+                # Recovery: queue drained back to healthy → un-degrade.
+                if self.degraded and self._q.qsize() < self._degrade_depth // 4:
+                    self.degraded = False
+                    logger.info("[VAD-STACK] recovered from degraded mode "
+                                "(queue drained)")
             audio = np.frombuffer(payload, dtype=np.int16).astype(np.float32)
             self._stream_ms += 1000.0 * len(audio) / self.sample_rate
             try:
@@ -252,6 +303,8 @@ class FsmnVadStack:
                         self._push_event("speech_start", float(beg))
                         self._push_event("speech_end", float(end))
                         self._speech_open = False
+            if self.hops_in and self.hops_in % 300 == 0:
+                logger.info("[VAD-STACK] health %s", self.stats())
             if self._classifier is not None:
                 try:
                     self._classifier.update(

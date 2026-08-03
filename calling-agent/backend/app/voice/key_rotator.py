@@ -93,6 +93,9 @@ def _load_pool() -> list[str]:
 def _save_pool(pool: list[str]) -> None:
     try:
         _POOL_FILE.write_text(json.dumps({"pool": pool}, indent=2), encoding="utf-8")
+        # Live API keys — never leave them world-readable (see the same guard
+        # in sarvam_key_watchdog._write_json).
+        os.chmod(_POOL_FILE, 0o600)
     except Exception as exc:
         logger.warning("[KEY-ROTATOR] Could not save pool: %s", exc)
 
@@ -105,5 +108,6 @@ def _update_env(new_key: str) -> None:
         else:
             text = text.rstrip("\n") + f"\nSARVAM_API_KEY={new_key}\n"
         _ENV_FILE.write_text(text, encoding="utf-8")
+        os.chmod(_ENV_FILE, 0o600)
     except Exception as exc:
         logger.warning("[KEY-ROTATOR] Could not update .env: %s", exc)

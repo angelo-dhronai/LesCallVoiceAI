@@ -84,9 +84,14 @@ def _read_json(path: Path, default):
 
 
 def _write_json(path: Path, data) -> None:
+    """Atomic write, owner-only. These files hold LIVE API keys — a default
+    0644 would republish them to every local account on each rotation, silently
+    undoing the hardening. Mode is set on the temp file BEFORE the rename so
+    the key is never world-readable, not even for the instant in between."""
     try:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.chmod(tmp, 0o600)
         tmp.replace(path)
     except Exception as exc:
         log.warning("could not write %s: %s", path.name, exc)
@@ -134,6 +139,11 @@ def write_active(key: str) -> None:
         else:
             text = text.rstrip("\n") + f"\nSARVAM_API_KEY={key}\n"
         ENV_FILE.write_text(text, encoding="utf-8")
+        # .env holds nine live credentials (Sarvam, OpenAI, Gemini, Google
+        # OAuth, the session-signing secret …). write_text preserves the mode
+        # of an existing file, but re-assert it so a file recreated by any
+        # path is never left world-readable.
+        os.chmod(ENV_FILE, 0o600)
     except Exception as exc:
         log.error("could not write active key to .env: %s", exc)
 

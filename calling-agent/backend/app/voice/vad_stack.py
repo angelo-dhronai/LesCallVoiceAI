@@ -58,6 +58,36 @@ _DEFAULT_MODEL_DIR = os.path.join(
     os.path.dirname(__file__), "..", "..", "..", "..",
     "data", "models", "fsmn_vad")
 
+# ── Shared warm model (roadmap #3) ───────────────────────────────────────
+# Fsmn_vad_online keeps ALL per-stream state in the caller's param_dict
+# (in_cache / frontend / vad_scorer — verified in funasr_onnx.vad_bin);
+# the object itself is just the ORT session + config. Loading it ONCE and
+# sharing across per-call workers removes the per-call construction lag
+# (ONNX session init; first call after boot also paid the funasr import).
+# _INFER_LOCK serializes the ~1.6ms forward passes — deliberate on the
+# 2-core box (owner doctrine: batch, don't parallelize).
+_MODEL_LOCK = threading.Lock()
+_INFER_LOCK = threading.Lock()
+_SHARED_MODEL = None
+_SHARED_MODEL_DIR = None
+
+
+def preload_model(model_dir: str | None = None):
+    """Load (once) and return the shared FSMN model. Called from boot
+    warmup so the first call of the process pays nothing."""
+    global _SHARED_MODEL, _SHARED_MODEL_DIR
+    mdir = os.path.abspath(model_dir or os.environ.get(
+        "FSMN_VAD_MODEL_DIR", _DEFAULT_MODEL_DIR))
+    with _MODEL_LOCK:
+        if _SHARED_MODEL is None or _SHARED_MODEL_DIR != mdir:
+            from funasr_onnx import Fsmn_vad_online
+            _SHARED_MODEL = Fsmn_vad_online(
+                mdir, quantize=False, intra_op_num_threads=1,
+                max_end_sil=FSMN_MAX_END_SIL_MS)
+            _SHARED_MODEL_DIR = mdir
+            logger.info("[VAD-STACK] shared FSMN model loaded (%s)", mdir)
+    return _SHARED_MODEL
+
 
 class FsmnVadStack:
     """WebRTC pre-filter → FSMN-VAD primary, VoiceActivityDetector-compatible."""
@@ -248,10 +278,7 @@ class FsmnVadStack:
 
     def _worker_loop(self) -> None:
         try:
-            from funasr_onnx import Fsmn_vad_online
-            model = Fsmn_vad_online(
-                self._model_dir, quantize=False, intra_op_num_threads=1,
-                max_end_sil=FSMN_MAX_END_SIL_MS)
+            model = preload_model(self._model_dir)
         except Exception:
             logger.exception("[VAD-STACK] FSMN model load failed — "
                              "stack is dead, pipeline should use energy")
@@ -283,7 +310,8 @@ class FsmnVadStack:
             audio = np.frombuffer(payload, dtype=np.int16).astype(np.float32)
             self._stream_ms += 1000.0 * len(audio) / self.sample_rate
             try:
-                segs = model(audio, param_dict=param, is_final=False)
+                with _INFER_LOCK:
+                    segs = model(audio, param_dict=param, is_final=False)
             except Exception as exc:
                 logger.warning("[VAD-STACK] inference failed: %r — "
                                "resetting cache", exc)

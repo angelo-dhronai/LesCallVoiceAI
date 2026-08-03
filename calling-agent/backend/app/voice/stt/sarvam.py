@@ -173,10 +173,15 @@ class SarvamSTT(STTProvider):
         else:
             lang_code = f"{language}-IN"
 
-        # Re-read the live key so a rotation (ours or the watchdog's) applies
-        # on the next segment without a restart.
-        from ..key_rotator import current_key as _current_key
-        self._api_key = _current_key()
+        # Per-call leased key when the bridge attached a provider (concurrent
+        # calls stop sharing one key's rate limits); else the live process-
+        # wide key, re-read so any rotation applies without a restart.
+        _provider = getattr(self, "key_provider", None)
+        if _provider is not None:
+            self._api_key = _provider()
+        else:
+            from ..key_rotator import current_key as _current_key
+            self._api_key = _current_key()
 
         client = self._get_client()
 
@@ -218,6 +223,8 @@ class SarvamSTT(STTProvider):
                 "Attempting auto-rotation from key pool."
             )
             from ..key_rotator import rotate as _rotate_key
+            from ..key_rotator import mark_exhausted as _mark_exhausted
+            _mark_exhausted(self._api_key)   # leased key: stop leasing it
             new_key = _rotate_key()
             if new_key:
                 self._api_key = new_key

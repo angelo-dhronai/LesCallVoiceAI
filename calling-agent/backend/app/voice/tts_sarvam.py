@@ -669,7 +669,9 @@ class SarvamTTS(StreamingTTS):
 
             # Always use the live key so a rotation (ours or the watchdog's)
             # is picked up on the very next attempt without a restart.
-            self._api_key = current_key()
+            _provider = getattr(self, "key_provider", None)
+            self._api_key = _provider() if _provider is not None \
+                else current_key()
             client = self._get_client()
             try:
                 async with client.stream(
@@ -693,6 +695,9 @@ class SarvamTTS(StreamingTTS):
                             body[:200],
                         )
                         from .key_rotator import rotate as _rotate_key
+                        from .key_rotator import (
+                            mark_exhausted as _mark_exhausted)
+                        _mark_exhausted(self._api_key)
                         new_key = _rotate_key()
                         if new_key:
                             self._api_key = new_key

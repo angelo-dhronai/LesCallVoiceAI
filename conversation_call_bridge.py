@@ -694,6 +694,18 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
     # sat in front of this was removed 2026-07-31 (owner request) — this is
     # the only STT primary again.
     stt_primary = TrackingSarvamSTT(call_id_provider=call_id_provider)
+    # Per-call key lease (owner directive 2026-08-03): concurrent calls stop
+    # sharing one Sarvam key's rate limits. One lease serves this call's STT
+    # AND TTS; it re-leases only after a 402. SARVAM_PER_CALL_KEYS=false
+    # restores the process-wide key.
+    try:
+        from backend.app.voice.key_rotator import per_call_key_provider
+        _key_provider = per_call_key_provider(conn_id)
+        stt_primary.key_provider = _key_provider
+    except Exception as exc:
+        _key_provider = None
+        logger.warning("[%s] per-call key lease unavailable: %r",
+                       conn_id, exc)
     stt = STTRouter(
         primary=stt_primary,
         fallback=TrackingWhisperSTT(call_id_provider=call_id_provider),
@@ -713,6 +725,8 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
         pace=tts_pace,
         sample_rate=TTS_OUTPUT_SR,
     )
+    if _key_provider is not None:
+        tts.key_provider = _key_provider
     # Seed the session language from the agent's own default — without this
     # every call opened in the hardcoded "hi" and English agents greeted with
     # a hi-IN accent (PLAN-tts-accent-consistency.md P0).

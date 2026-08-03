@@ -988,6 +988,16 @@ async def _boot_warmup():
             await ConversationRouter(
                 agent_def=get_neutral_fallback_agent()).warmup()
 
+        # Preload the shared FSMN VAD model so no call ever pays the
+        # construction lag (roadmap #3 warm-model).
+        if os.environ.get("VAD_ENGINE", "").strip().lower() == "fsmn":
+            try:
+                from backend.app.voice.vad_stack import preload_model
+                await asyncio.to_thread(preload_model)
+            except Exception as exc:
+                log.warning("[BOOT-WARMUP] FSMN preload failed "
+                            "(per-call load remains): %r", exc)
+
         stt = SarvamSTT()
         # Throwaway sink: SarvamTTS's default LocalSpeakerSink may probe an
         # audio device that headless servers lack.

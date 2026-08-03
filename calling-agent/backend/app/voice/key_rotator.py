@@ -56,6 +56,59 @@ def pool_size() -> int:
     return len(_load_pool())
 
 
+# ── Per-call key leasing (2026-08-03, owner directive) ──────────────────
+# Concurrent calls used to share the single active key — and its rate
+# limits (429 stutter under load). Each call now leases a key round-robin
+# across [active + backup pool] and keeps it until it 402s, then re-leases.
+# The pool file stays untouched (leases don't pop keys); rotate() and the
+# watchdog keep their exact semantics. Kill switch: SARVAM_PER_CALL_KEYS.
+PER_CALL_KEYS = os.environ.get(
+    "SARVAM_PER_CALL_KEYS", "true").lower() == "true"
+_lease_idx = 0
+_exhausted: set[str] = set()
+
+
+def lease_key(conn_id: str = "") -> str:
+    global _lease_idx
+    with _lock:
+        candidates = [current_key()] + [k for k in _load_pool() if k]
+        seen: list[str] = []
+        for k in candidates:
+            if k and k not in _exhausted and k not in seen:
+                seen.append(k)
+        if not seen:
+            return current_key()
+        key = seen[_lease_idx % len(seen)]
+        _lease_idx += 1
+        logger.info("[KEY-LEASE] %s → %s…%s (%d usable)",
+                    conn_id or "-", key[:8], key[-4:], len(seen))
+        return key
+
+
+def mark_exhausted(key: str) -> None:
+    """402 on a leased key: stop leasing it. The active key is handled by
+    rotate() (promotion from pool), never blacklisted here."""
+    with _lock:
+        if key and key != get_active_key():
+            _exhausted.add(key)
+            logger.warning("[KEY-LEASE] key %s…%s marked exhausted",
+                           key[:8], key[-4:])
+
+
+def per_call_key_provider(conn_id: str = ""):
+    """Stable per-call key: leased once, re-leased only after a 402.
+    Falls back to process-wide current_key() when leasing is disabled."""
+    if not PER_CALL_KEYS:
+        return current_key
+    state = {"key": lease_key(conn_id)}
+
+    def _get() -> str:
+        if not state["key"] or state["key"] in _exhausted:
+            state["key"] = lease_key(conn_id)
+        return state["key"] or current_key()
+    return _get
+
+
 def rotate() -> str | None:
     """
     Promote the first key from the backup pool to active.

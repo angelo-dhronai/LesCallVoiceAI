@@ -1405,6 +1405,25 @@ class ConversationRouter:
         logger.info("[HANGUP] max-call-duration reached — hard close")
         return text
 
+    def arm_dead_media_close(self) -> None:
+        """Media-layer close: the caller's audio channel has flatlined, so
+        there is nobody to say goodbye to and every TTS chunk sent into it is
+        pure waste. Unlike every other close this speaks NO line — a farewell
+        into a dead socket is precisely the behaviour it replaces (call
+        02819104 re-asked twice and delivered a full farewell across 53s to a
+        channel that had been dead since second 64).
+
+        HARD close: caller speech cannot cancel it, because by definition none
+        is arriving. Called by the pipeline's silence watchdog."""
+        self.state.is_closing = True
+        self.commit_pending_turn()
+        self.state.stage = STAGE_CLOSING
+        self.state_mgr.extra_flags["dead_media_close"] = True
+        self.call_outcome = self.call_outcome or "dead_media"
+        self.hangup_pending = True
+        self._hangup_hard = True
+        logger.info("[HANGUP] dead media — hard close, no farewell spoken")
+
     def _callback_opening(self) -> str | None:
         """Opening line for a platform-scheduled follow-up call: warmly
         reference the earlier conversation and the caller's own callback

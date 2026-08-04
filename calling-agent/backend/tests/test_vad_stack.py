@@ -61,6 +61,55 @@ def test_fsmn_stack_detects_real_speech_and_is_cheap():
     assert stack.threshold > 0 and stack._minimum_rms_floor > 0
 
 
+@pytest.mark.skipif(not os.path.isdir(MODEL), reason="model not vendored")
+def test_model_is_fed_normalised_audio_and_classifier_is_not():
+    """THE 2026-08-04 root cause. funasr's WavFrontendOnline multiplies its
+    input by (1 << 15) before kaldi fbank and its own loader is librosa.load,
+    so the model is calibrated on [-1, 1]. The worker fed it raw int16 —
+    32768x hot — from the day the stack went live (2026-07-30) until this was
+    found, which is why FSMN flagged silence as speech on 28% of segments in
+    call 5aaee2cd.
+
+    The classifier riding the same worker must NOT be normalised: its DTMF
+    Goertzel bank and AEC_RMS_FLOOR=60 are absolute int16 thresholds.
+    """
+    import app.voice.vad_stack as vs
+
+    seen = {"model": [], "clf": []}
+
+    class _CaptureModel:
+        def __call__(self, audio, param_dict=None, is_final=False):
+            seen["model"].append(float(np.max(np.abs(audio))) if len(audio) else 0.0)
+            return None
+
+    class _CaptureClf:
+        def update(self, hop, speech_open, at_ms):
+            seen["clf"].append(float(np.max(np.abs(hop))) if len(hop) else 0.0)
+
+    real_preload = vs.preload_model
+    vs.preload_model = lambda *a, **k: _CaptureModel()
+    try:
+        stack = vs.FsmnVadStack(event_sink=_CaptureClf())
+        # Full-scale int16 speech: the harshest case for a scaling error.
+        loud = (np.ones(SR // 5, dtype=np.int16) * 20000).tobytes()
+        frame = SR * 2 // 50
+        for i in range(0, len(loud) - frame + 1, frame):
+            stack.is_speech(loud[i:i + frame])
+        deadline = time.monotonic() + 5.0
+        while not seen["model"] and time.monotonic() < deadline:
+            time.sleep(0.02)
+        stack.close()
+    finally:
+        vs.preload_model = real_preload
+
+    assert seen["model"], "worker never invoked the model"
+    assert max(seen["model"]) <= 1.0, (
+        f"model got peak {max(seen['model'])} — must be normalised to [-1, 1]")
+    assert seen["clf"], "classifier never invoked"
+    assert max(seen["clf"]) > 1000.0, (
+        f"classifier got peak {max(seen['clf'])} — must stay int16-scaled")
+
+
 # ── audio-event classifier (synthetic signals) ───────────────────────
 
 def _run(clf, sig, fsmn=False, at0=0.0):

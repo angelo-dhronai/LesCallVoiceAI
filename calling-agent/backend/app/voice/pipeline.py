@@ -132,6 +132,48 @@ MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_SPEECH_SECONDS
 # valid single-word answers that must reach STT. 300ms is enough audio to
 # distinguish real speech from a click/breath without missing short replies.
 MIN_SPEECH_MS = 300.0
+# ── Real-speech floor (2026-08-04 VAD audit) ──────────────────────────────
+# MIN_SPEECH_MS above is measured on the PADDED buffer: the 400ms pre-speech
+# ring and the 200ms hysteresis hold are both counted into _speech_duration_ms
+# because both are prepended/appended to the segment. One single 20ms frame of
+# model-confirmed speech therefore scored ~620ms and cleared the 300ms floor —
+# the gate was arithmetically incapable of rejecting anything. In the
+# 2026-08-04 audit calls 9 of 23 (39%) live STT submissions carried no caller
+# speech at all, and an 80ms blip padded to 980ms came back as "₹1 lakh." in a
+# sales call about budget.
+#
+# This floor is measured on raw_speech frames ONLY — the model's own verdict,
+# with no amplitude term — so the "a quiet caller is a model problem, not a
+# loudness problem" doctrine of vad_stack.py still holds.
+MIN_REAL_SPEECH_MS = float(os.environ.get("MIN_REAL_SPEECH_MS", "200"))
+# Connect window keeps a lower bar for the same reason CONNECT_MIN_SPEECH_MS
+# exists: a clipped opening "hello" must still reach STT.
+CONNECT_MIN_REAL_SPEECH_MS = float(
+    os.environ.get("CONNECT_MIN_REAL_SPEECH_MS", "120"))
+# Companion guard for the case the ms floor alone cannot see: FSMN reporting
+# speech in a buffer that carries no signal. In the 2026-08-04 replay a 760ms
+# segment at RMS 15 was credited with exactly 200ms of "speech", cleared the
+# floor, and cost a paid Sarvam call that returned "".
+#
+# This is a RATIO against the caller's own line noise, never an absolute level
+# — a quiet caller is still far above their own floor, so vad_stack.py's "a
+# quiet caller is a model problem, not a loudness problem" doctrine holds. It
+# fails open: with too little ambient measured to form an estimate, the segment
+# passes.
+#
+# The threshold is deliberately far below real speech. A first attempt at 2.0×
+# rejected a genuine caller utterance ("d v h k", 800ms of model-confirmed
+# speech) that measured 1.8× in the callsim replay, while other real speech in
+# the SAME call measured 2.0-8.4× — i.e. 2.0 sat inside the real-speech
+# distribution. Deafness costs far more than a wasted STT call, so this now
+# asserts only that speech rose ABOVE the ambient at all.
+MIN_SPEECH_SNR = float(os.environ.get("MIN_SPEECH_SNR", "1.2"))
+SNR_MIN_NOISE_FRAMES = int(os.environ.get("SNR_MIN_NOISE_FRAMES", "10"))
+# ...and it polices SHORT segments only. Hallucination risk concentrates in
+# brief blips (the 80ms "₹1 lakh."), and that is also where a false drop costs
+# least. Anything with this much model-confirmed speech is taken on the model's
+# word regardless of level — the "d v h k" class is never energy-judged again.
+SNR_ENFORCE_BELOW_MS = float(os.environ.get("SNR_ENFORCE_BELOW_MS", "600"))
 # (removed 2026-07-23: BARGE_IN_COOLDOWN_MS was dead — the live guard is
 # BARGE_IN_MIN_ELAPSED_MS below; audits kept grabbing the wrong knob)
 # 5 sustained frames (100ms) before barge-in fires. 3 frames (60ms) was
@@ -195,6 +237,18 @@ SHADOW_ECHO_TEXT_RATIO = float(os.environ.get("SHADOW_ECHO_TEXT_RATIO", "0.75"))
 # real caller speech rather than echo. Echo is short-lived (1-3 frames);
 # a human speaking produces sustained energy well above this threshold.
 ECHO_EARLY_EXIT_FRAMES = int(os.environ.get("ECHO_EARLY_EXIT_FRAMES", "5"))
+# ...and those frames must actually be LOUD (2026-08-04 VAD audit). The exit
+# used to count bare raw_speech, i.e. the FSMN verdict — but vad_stack.py's own
+# contract says the model "happily classifies our own TTS echo as speech" and
+# names frame energy as the ONLY echo discriminator in the stack. The exit
+# therefore ran on the one signal that cannot tell echo from caller: in the
+# audit calls it broke out of a 5.4s echo window on 4 frames and shipped a
+# 700ms segment at RMS 8 (digital silence) to Sarvam. Frames that are speech to
+# the model but sit below this energy bar no longer open the gate.
+# Expressed as a multiple of vad.threshold (260 on the fsmn engine); real
+# caller speech in the audit calls measured 737-3655 RMS, echo measured 8-89.
+ECHO_EXIT_ENERGY_FACTOR = float(
+    os.environ.get("ECHO_EXIT_ENERGY_FACTOR", "1.0"))
 
 # Greeting-window softening: the caller's post-greeting "hello" is the most
 # predictable sustained-speech event of the call, so while the greeting is the
@@ -231,6 +285,24 @@ TRANSCRIPT_MERGE_WINDOW_MS = float(os.environ.get("TRANSCRIPT_MERGE_WINDOW_MS", 
 # queued, nothing in STT, caller silent) — removes a fixed ~550ms per turn.
 TRANSCRIPT_MERGE_SKIP_WHEN_IDLE = os.environ.get(
     "TRANSCRIPT_MERGE_SKIP_WHEN_IDLE", "true").lower() == "true"
+# ...but never fast-path a FRAGMENT (2026-08-04 VAD audit). The idle test is a
+# point-in-time sample of _prev_speech, and FSMN confirms speech 100-300ms
+# AFTER true onset — so a caller who has already resumed still reads as idle.
+# In call 02819104 the window was skipped at 06:23:58.896, FSMN reported the
+# resumed speech 196ms later, and CONT-MERGE merged 'area.' + 'stanley.' 1.3s
+# after the LLM call for 'area.' alone had already been dispatched: the caller
+# got two separate answers to one sentence.
+# Timing alone cannot separate "finished" from "mid-pause" (both land ~240ms
+# after speech end), but WORD COUNT can: every split fragment observed in the
+# audit calls was 1-3 words ('area.', 'stanley.', 'yes.', 'a normal.'), and no
+# full sentence was ever the head of a split. So short transcripts pay the
+# merge wait and long ones keep the zero-latency fast path.
+MERGE_NO_FASTPATH_MAX_WORDS = int(
+    os.environ.get("MERGE_NO_FASTPATH_MAX_WORDS", "3"))
+# ...and only while the caller's silence is still shorter than the model's
+# confirm lag; past this they really have stopped.
+MERGE_NO_FASTPATH_QUIET_MS = float(
+    os.environ.get("MERGE_NO_FASTPATH_QUIET_MS", "700"))
 
 # Post-response continuation window (ms). If TTS completed cleanly and a short
 # fragment (≤ 4 words) arrives within this window, it is likely a trailing
@@ -433,6 +505,24 @@ SILENCE_HANGUP_ENABLED = os.environ.get(
     "true" if TELEPHONY_MODE else "false").lower() == "true"
 SILENCE_HANGUP_GRACE_S = float(os.environ.get("SILENCE_HANGUP_GRACE_S", "10.0"))
 
+# ── Dead media detection (2026-08-04, call 02819104) ────────────────────────
+# A live telephone leg always dithers: µ-law silence decodes to 0, ±8, ±16, ±24
+# — never to one repeated value. A stream that flatlines to a SINGLE constant
+# sample is a dead media path, not a quiet caller, and the two need opposite
+# responses: re-ask a quiet caller, close on a dead line.
+#
+# In call 02819104 every sample from second 64 to the end was exactly -1, for
+# 61 of the call's 125 seconds. -1 is not even reachable from a µ-law decode,
+# and the line floor before the cut was ±8, so the carrier leg went flat
+# upstream of us. VAD correctly reported no speech — but nothing distinguished
+# it from silence, so the agent re-asked twice and delivered a farewell into a
+# dead socket over the next 53 seconds, billing TTS the whole way.
+DEAD_MEDIA_ENABLED = os.environ.get(
+    "DEAD_MEDIA_ENABLED", "true" if TELEPHONY_MODE else "false").lower() == "true"
+# Long enough that a codec hiccup or a brief comfort-noise gap can't trip it,
+# short enough to save the 53s of wasted spend.
+DEAD_MEDIA_S = float(os.environ.get("DEAD_MEDIA_S", "5.0"))
+
 
 class VoicePipeline:
     """
@@ -618,12 +708,27 @@ class VoicePipeline:
         # hangup (re-armed if the caller comes back) and the max-duration
         # close (never re-armed — it's a hard cap), plus the call-age anchor.
         self._silence_hangup_fired: bool = False
+        # Dead-media latch: when the caller channel flatlined, and whether the
+        # close already fired. Re-arms if real audio comes back.
+        self._dead_media_since: float = 0.0
+        self._dead_media_fired: bool = False
         self._maxdur_fired: bool = False
         self._call_start_ts: float = time.monotonic()
 
         # VAD + buffering state
         self._audio_buffer = bytearray()
         self._speech_duration_ms = 0.0
+        # Model-confirmed speech inside the buffer, EXCLUDING the pre-speech
+        # ring and the hysteresis hold that _speech_duration_ms counts. This is
+        # what MIN_REAL_SPEECH_MS gates on — see the constant for why the
+        # padded number could never reject a segment.
+        self._raw_speech_ms = 0.0
+        # Rolling per-segment energy split, for the SNR guard (see
+        # MIN_SPEECH_SNR). Speech frames vs the caller's own ambient.
+        self._speech_energy_sum = 0.0
+        self._speech_energy_n = 0
+        self._noise_energy_sum = 0.0
+        self._noise_energy_n = 0
         self._prev_speech = False
         self._speech_frame_streak = 0
         # Tracks whether the previously-started TTS utterance was a filler, so
@@ -636,6 +741,7 @@ class VoicePipeline:
         self._silence_frames = 0       # debounce: frames since last speech
         self._pre_speech_buffer: list[bytes] = []  # look-back to recover onset clip
         self._echo_gate_speech_frames: int = 0    # sustained frames during echo cooldown
+        self._echo_preserve_logged: bool = False  # once-per-window log latch
         # Playback shadow capture (fleet-audit defect #1) — see constants.
         self._shadow_frames: list[bytes] = []
         self._shadow_speech_ms: float = 0.0
@@ -651,6 +757,12 @@ class VoicePipeline:
         self._vad_speech_frames: int = 0
         self._segments_created: int = 0
         self._segments_sent_to_stt: int = 0
+        # Segments the real-speech floor rejected — paid STT calls not made.
+        self._segments_dropped_no_speech: int = 0
+        # Tail of the previous fragment of the turn in progress, for the
+        # endpointer's semantic profiles (see _endpoint_hint_text).
+        self._last_fragment_text: str = ""
+        self._last_fragment_ts: float = 0.0
 
         # Phase 17: Hysteresis tuning
         self._speech_onset_min_frames =  SPEECH_ONSET_MIN_FRAMES
@@ -852,9 +964,11 @@ class VoicePipeline:
         finally:
             logger.info(
                 "[AUDIO] Layer stopped: frames=%d vad_seen=%d vad_speech=%d "
-                "segments_created=%d segments_sent_to_stt=%d",
+                "segments_created=%d segments_sent_to_stt=%d "
+                "dropped_no_real_speech=%d",
                 self._frame_count, self._vad_frames_seen, self._vad_speech_frames,
                 self._segments_created, self._segments_sent_to_stt,
+                self._segments_dropped_no_speech,
             )
 
     @property
@@ -882,6 +996,13 @@ class VoicePipeline:
         # first ~600ms of speech after the user enables mic is silently
         # consumed by the calibration window. is_speech() returns False during
         # calibration, so this never triggers downstream processing.
+        # Media liveness runs BEFORE the mic gate and before every early
+        # return below: in the live incident the channel died while the agent
+        # was mid-playback, which is exactly when the rest of this method
+        # short-circuits.
+        if DEAD_MEDIA_ENABLED:
+            self._track_media_liveness(frame)
+
         if not self._mic_enabled:
             if not self.vad.calibrated:
                 self.vad.is_speech(frame)
@@ -1038,11 +1159,13 @@ class VoicePipeline:
                 # the reset, then reattach the playback-era shadow after it.
                 _pre_barge_audio = bytes(self._audio_buffer)
                 _pre_barge_ms = self._speech_duration_ms
+                _pre_barge_real_ms = self._raw_speech_ms
                 _pre_barge_start = self._cur_speech_start_ts
                 self._reset_vad_state()
                 if _pre_barge_ms >= 200.0:
                     self._audio_buffer.extend(_pre_barge_audio)
                     self._speech_duration_ms = _pre_barge_ms
+                    self._raw_speech_ms = _pre_barge_real_ms
                     self._cur_speech_start_ts = _pre_barge_start
                     self._prev_speech = True
                     logger.info(
@@ -1082,7 +1205,13 @@ class VoicePipeline:
         # During this window audio is likely TTS residue. Discard it unless
         # sustained real speech is detected, in which case exit early.
         if time.monotonic() < self._vad_mute_until:
-            if raw_speech:
+            # raw_speech ALONE cannot open this gate. vad_stack.py's contract:
+            # the model classifies our own TTS echo as speech, and frame energy
+            # is the only echo discriminator in the stack — so counting the
+            # model verdict here was counting the one signal that cannot tell
+            # the agent from the caller. Require both.
+            _echo_exit_floor = self.vad.threshold * ECHO_EXIT_ENERGY_FACTOR
+            if raw_speech and self.vad.last_energy >= _echo_exit_floor:
                 self._echo_gate_speech_frames = getattr(self, '_echo_gate_speech_frames', 0) + 1
             else:
                 self._echo_gate_speech_frames = 0
@@ -1102,8 +1231,10 @@ class VoicePipeline:
                 # not echo. Exit the mute window early and let speech through.
                 logger.info(
                     "[ECHO-GATE] Early exit: %d sustained speech frames detected "
-                    "(%.0fms cooldown remaining) — treating as real caller speech",
+                    "(energy=%.0f ≥ %.0f, %.0fms cooldown remaining) — "
+                    "treating as real caller speech",
                     self._echo_gate_speech_frames,
+                    self.vad.last_energy, _echo_exit_floor,
                     (self._vad_mute_until - time.monotonic()) * 1000,
                 )
                 self._vad_mute_until = 0.0
@@ -1120,10 +1251,15 @@ class VoicePipeline:
                     # after the gate.
                     if (self._speech_duration_ms >= 300.0
                             or self._shadow_seeded):
-                        logger.info(
-                            "[ECHO-GATE] Preserving %.0fms pre-TTS caller "
-                            "segment through cooldown",
-                            self._speech_duration_ms)
+                        # Once per cooldown window, not once per 20ms frame:
+                        # this line alone was 222 of the 1298 log lines in an
+                        # 86-second call.
+                        if not self._echo_preserve_logged:
+                            self._echo_preserve_logged = True
+                            logger.info(
+                                "[ECHO-GATE] Preserving %.0fms pre-TTS caller "
+                                "segment through cooldown",
+                                self._speech_duration_ms)
                     else:
                         logger.debug(
                             "[ECHO-GATE] Discarding %d bytes of post-TTS audio "
@@ -1134,6 +1270,8 @@ class VoicePipeline:
                         )
                         self._audio_buffer.clear()
                         self._speech_duration_ms = 0.0
+                        self._raw_speech_ms = 0.0
+                        self._reset_segment_energy()
                         self._segment_has_shadow = False
                         self._turn.flush()
                 self._prev_speech = False
@@ -1146,9 +1284,18 @@ class VoicePipeline:
             self._speech_onset_frames += 1
             self._silence_frames = 0
             self._last_voice_activity = time.monotonic()
+            # Model-confirmed speech, counted here and ONLY here so it is
+            # independent of both padding sources: the onset debounce (which
+            # suppresses `speech` for the first frame) and the hysteresis hold
+            # (which keeps `speech` true through 200ms of trailing silence).
+            self._raw_speech_ms += 20.0
+            self._speech_energy_sum += self.vad.last_energy
+            self._speech_energy_n += 1
         else:
             self._silence_frames += 1
             self._speech_onset_frames = 0
+            self._noise_energy_sum += self.vad.last_energy
+            self._noise_energy_n += 1
             # Look-back ring so onset clip is recoverable. Energy engine:
             # 2 frames (decision is instant). FSMN engine: 20 frames
             # (400ms) — the model confirms speech ~100-300ms after true
@@ -1225,14 +1372,25 @@ class VoicePipeline:
             and self._speech_duration_ms >= self._min_speech_ms(time.monotonic())
         ):
             if self._endpointer is not None:
-                # No live transcript on the batch path, so the endpointer
-                # decides on acoustics alone (its "default" profile). Its
-                # semantic hold/fast-complete profiles need mid-turn text,
-                # which only a streaming provider could supply.
+                # The batch path has no transcript for the utterance in
+                # progress, so this used to pass "" — which made
+                # EndpointController structurally incapable of ever leaving its
+                # "default" profile (both hold and fast_complete are gated on
+                # `if text:`). Every [ENDPOINT] line in production read
+                # profile=default, and _DIGIT_TAIL — the rule written so budget
+                # and phone-number dictation isn't chopped between bursts — had
+                # never once executed on a live call.
+                #
+                # What IS available is the text of the PREVIOUS fragment of this
+                # same turn: during a continuation chain ("one lakh" ⟶ pause ⟶
+                # "twenty thousand") the head has already come back from STT
+                # before this endpoint decision runs. Its tail is exactly the
+                # signal the profiles want. Outside the continuation window
+                # there is no chain and "" is still the honest answer.
                 _flush_due = self._endpointer.should_flush(
                     self._silence_frames,
                     self._speech_duration_ms,
-                    "",
+                    self._endpoint_hint_text(),
                     False,
                 )
             else:
@@ -1252,13 +1410,40 @@ class VoicePipeline:
                 len(self._audio_buffer),
             )
 
-            if self._speech_duration_ms < self._min_speech_ms(time.monotonic()):
-                logger.debug(
-                    "[TURN] Too short (%.0fms) — discarding",
-                    self._speech_duration_ms
+            _now_gate = time.monotonic()
+            _too_short = self._speech_duration_ms < self._min_speech_ms(_now_gate)
+            # The floor that actually bites: padded duration clears 300ms on a
+            # single speech frame, real speech does not. Everything below this
+            # is a click, a breath, or residual echo — shipping it costs a paid
+            # Sarvam call, a turn of latency, and (worse) a hallucinated
+            # transcript the LLM then answers.
+            _no_speech = self._raw_speech_ms < self._min_real_speech_ms(_now_gate)
+            _snr = self._segment_snr()
+            # Fails open twice over: _segment_snr() returns None when too
+            # little ambient was measured to judge, and a segment carrying
+            # substantial speech is never judged on energy at all.
+            _dead_line = (
+                _snr is not None
+                and self._raw_speech_ms < SNR_ENFORCE_BELOW_MS
+                and _snr < MIN_SPEECH_SNR)
+            if _too_short or _no_speech or _dead_line:
+                logger.info(
+                    "[TURN] Discarded: padded=%.0fms real_speech=%.0fms "
+                    "snr=%s (floors %.0f/%.0f/%.1f) — %s",
+                    self._speech_duration_ms, self._raw_speech_ms,
+                    f"{_snr:.1f}x" if _snr is not None else "n/a",
+                    self._min_speech_ms(_now_gate),
+                    self._min_real_speech_ms(_now_gate), MIN_SPEECH_SNR,
+                    "too short" if _too_short
+                    else ("no real speech" if _no_speech
+                          else "no signal above line noise"),
                 )
+                if not _too_short:
+                    self._segments_dropped_no_speech += 1
                 self._audio_buffer.clear()
                 self._speech_duration_ms = 0.0
+                self._raw_speech_ms = 0.0
+                self._reset_segment_energy()
                 self._segment_has_shadow = False
                 self._shadow_seeded = False
                 self._turn.flush()
@@ -1287,8 +1472,11 @@ class VoicePipeline:
                     _speech_end_ts + CONTINUATION_WINDOW_MS / 1000.0
                 )
 
+            _real_ms = self._raw_speech_ms
             self._audio_buffer.clear()
             self._speech_duration_ms = 0.0
+            self._raw_speech_ms = 0.0
+            self._reset_segment_energy()
 
             self._turn.flush()
 
@@ -1297,8 +1485,11 @@ class VoicePipeline:
                 self._segments_sent_to_stt += 1
 
                 logger.info(
-                    "[TURN] Enqueued audio segment (%.0fms)",
-                    segment.duration_ms
+                    "[TURN] Enqueued audio segment (%.0fms, %.0fms real speech "
+                    "= %.0f%%, snr=%s)",
+                    segment.duration_ms, _real_ms,
+                    100.0 * _real_ms / max(segment.duration_ms, 1.0),
+                    f"{_snr:.1f}x" if _snr is not None else "n/a",
                 )
 
             except asyncio.QueueFull:
@@ -1307,6 +1498,8 @@ class VoicePipeline:
     def _reset_vad_state(self) -> None:
         self._audio_buffer.clear()
         self._speech_duration_ms = 0.0
+        self._raw_speech_ms = 0.0
+        self._reset_segment_energy()
         self._prev_speech = False
         self._speech_onset_frames = 0
         self._silence_frames = 0
@@ -1364,6 +1557,9 @@ class VoicePipeline:
         self._audio_buffer.extend(b"".join(self._shadow_frames))
         added_ms = len(self._shadow_frames) * 20.0
         self._speech_duration_ms += added_ms
+        # Only the energetic portion of the ring counts as real speech — the
+        # rest are the quiet gap frames the ring keeps for contiguity.
+        self._raw_speech_ms += self._shadow_speech_ms
         # True onset is the shadow's first frame when that is earlier than
         # whatever anchor the normal path just computed.
         if self._shadow_started_ts > 0.0 and (
@@ -1913,6 +2109,12 @@ class VoicePipeline:
                     stt_source=getattr(stt_result, "source", "primary"),
                 )
 
+                # Feeds the endpointer's semantic profiles on the NEXT endpoint
+                # decision, so a turn split mid-dictation ("one lakh" ⟶ pause)
+                # holds instead of flushing on acoustics alone.
+                self._last_fragment_text = transcript.text
+                self._last_fragment_ts = transcript.timestamp
+
                 try:
                     self._transcript_queue.put_nowait(transcript)
                 except asyncio.QueueFull:
@@ -1991,6 +2193,85 @@ class VoicePipeline:
         if now - self._call_start_ts < CONNECT_WINDOW_S:
             return min(CONNECT_MIN_SPEECH_MS, MIN_SPEECH_MS)
         return MIN_SPEECH_MS
+
+    def _track_media_liveness(self, frame: bytes) -> None:
+        """Flag a caller channel that has flatlined to one constant sample.
+
+        Zero variance is the discriminator, not level: a quiet caller still
+        carries dither, a dead stream does not. See DEAD_MEDIA_ENABLED."""
+        a = np.frombuffer(frame, dtype=np.int16)
+        if a.size and int(a.max()) == int(a.min()):
+            if self._dead_media_since == 0.0:
+                self._dead_media_since = time.monotonic()
+            return
+        if self._dead_media_since > 0.0:
+            flat_s = time.monotonic() - self._dead_media_since
+            if flat_s >= 1.0:
+                logger.info("[MEDIA] caller channel recovered after %.1fs flat",
+                            flat_s)
+        self._dead_media_since = 0.0
+        self._dead_media_fired = False
+
+    def _dead_media_due(self, now: float) -> bool:
+        """The caller channel has been flat long enough to call it dead."""
+        if not DEAD_MEDIA_ENABLED or self._dead_media_fired:
+            return False
+        if self._dead_media_since <= 0.0:
+            return False
+        if now - self._dead_media_since < DEAD_MEDIA_S:
+            return False
+        conv = self.conversation
+        if conv is None or not hasattr(conv, "arm_dead_media_close"):
+            return False
+        if getattr(conv, "hangup_pending", False):
+            return False  # a close is already draining
+        return True
+
+    def _segment_snr(self) -> float | None:
+        """Mean energy of the segment's speech frames over the caller's own
+        ambient. None when too little ambient was measured to judge — the
+        caller then always gets the benefit of the doubt."""
+        if (self._noise_energy_n < SNR_MIN_NOISE_FRAMES
+                or self._speech_energy_n <= 0):
+            return None
+        noise = self._noise_energy_sum / self._noise_energy_n
+        speech = self._speech_energy_sum / self._speech_energy_n
+        if noise <= 0.0:
+            # Digitally silent ambient: any real speech is infinitely above it,
+            # but so is a stuck-at-1 dead line — fall back to "is there
+            # anything at all here", the one place an absolute is unavoidable.
+            return float("inf") if speech >= 2.0 else 0.0
+        return speech / noise
+
+    def _reset_segment_energy(self) -> None:
+        self._speech_energy_sum = 0.0
+        self._speech_energy_n = 0
+        self._noise_energy_sum = 0.0
+        self._noise_energy_n = 0
+
+    def _min_real_speech_ms(self, now: float) -> float:
+        """Model-confirmed speech a segment must carry to be worth a paid STT
+        call. Same connect-window relaxation as _min_speech_ms."""
+        if now - self._call_start_ts < CONNECT_WINDOW_S:
+            return min(CONNECT_MIN_REAL_SPEECH_MS, MIN_REAL_SPEECH_MS)
+        return MIN_REAL_SPEECH_MS
+
+    def _endpoint_hint_text(self) -> str:
+        """Text the EndpointController may reason over for the utterance
+        currently in progress.
+
+        Only the previous fragment of the SAME turn qualifies: within the
+        continuation window its tail predicts whether more is coming
+        (dangling conjunction, digit burst mid-dictation). Past that window it
+        belongs to a finished turn and would make the endpointer hold on a
+        stale signal, so return "" and let it decide on acoustics.
+        """
+        if not self._last_fragment_text:
+            return ""
+        window_s = CONTINUATION_WINDOW_MS / 1000.0
+        if time.monotonic() - self._last_fragment_ts > window_s:
+            return ""
+        return self._last_fragment_text
 
     def _resolve_tts_language(self, response: "Response", text: str) -> tuple[str, str]:
         """(language, source) the TTS speaks this utterance in. A language
@@ -2127,6 +2408,21 @@ class VoicePipeline:
             try:
                 await asyncio.sleep(0.5)
                 now = time.monotonic()
+
+                # Dead media outranks everything: with the channel flat there
+                # is nobody to re-ask and nobody to say goodbye to, so the
+                # repair cycle below would only bill TTS into a dead socket.
+                if self._dead_media_due(now):
+                    self._dead_media_fired = True
+                    logger.warning(
+                        "[HANGUP] dead media — caller channel flat (constant "
+                        "sample) for %.1fs; closing without further TTS",
+                        now - self._dead_media_since)
+                    try:
+                        self.conversation.arm_dead_media_close()
+                    except Exception:
+                        logger.exception("[HANGUP] dead-media close failed")
+                    continue
 
                 # Hard duration cap — checked first: it outranks repair.
                 if self._max_duration_due(now):
@@ -2300,10 +2596,21 @@ class VoicePipeline:
             if _dangling:
                 merge_wait_s = max(merge_wait_s,
                                    MERGE_HOLD_CONTINUATION_MS / 1000.0)
+            # A short transcript that arrived while the caller has only just
+            # gone quiet is the head of a split, not a finished turn. The idle
+            # test below cannot see this: _prev_speech is a point-in-time
+            # sample and FSMN confirms resumed speech 100-300ms late, so the
+            # caller is already talking when we sample "idle". Word count is
+            # the signal that survives the lag — see MERGE_NO_FASTPATH_MAX_WORDS.
+            _quiet_ms = (time.monotonic() - self._last_voice_activity) * 1000.0
+            _fragment = (
+                len(transcript.text.split()) <= MERGE_NO_FASTPATH_MAX_WORDS
+                and _quiet_ms < MERGE_NO_FASTPATH_QUIET_MS)
             if (
                 TRANSCRIPT_MERGE_SKIP_WHEN_IDLE
                 and not _capture_active
                 and not _dangling
+                and not _fragment
                 and self._transcript_queue.empty()
                 and self._stt_queue.empty()
                 and self._stt_inflight == 0
@@ -2315,6 +2622,11 @@ class VoicePipeline:
                 logger.info(
                     "[ENGINE] Merge window held %.0fms (dangling ending %r)",
                     merge_wait_s * 1000.0, transcript.text[-24:])
+            elif _fragment:
+                logger.info(
+                    "[ENGINE] Merge window held %.0fms (fragment %r, caller "
+                    "quiet only %.0fms — split likely)",
+                    merge_wait_s * 1000.0, transcript.text[:24], _quiet_ms)
             elif merge_wait_s > 0.0:
                 logger.info(
                     "[ENGINE] Merge window %.0fms%s (queued=%d stt_q=%d inflight=%d speaking=%s)",
@@ -2616,6 +2928,13 @@ class VoicePipeline:
                 sink = getattr(self.tts, "_sink", None)
                 if sink is not None and hasattr(sink, "flush"):
                     sink.turn_speech_end_ts = transcript.speech_end_ts
+
+            # The turn (merged or not) is now the engine's. Its text must not
+            # leak into the NEXT utterance's endpoint decision — a prior turn
+            # ending in digits would otherwise hold the following turn open for
+            # the _HOLD residual on a signal that no longer applies.
+            self._last_fragment_text = ""
+            self._last_fragment_ts = 0.0
 
             # Turn-level trace record. The numbers were always computed —
             # they just died as log lines. Enriched below as the LLM stages
@@ -3131,6 +3450,7 @@ class VoicePipeline:
                     else:
                         mute_s = TTS_ECHO_COOLDOWN_MS / 1000.0
                     self._vad_mute_until = now + mute_s
+                    self._echo_preserve_logged = False
 
                 # Shadow disposition at utterance end (fleet defect #1):
                 # a substantial ring = the caller spoke a whole utterance

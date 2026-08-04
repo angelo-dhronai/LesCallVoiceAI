@@ -307,7 +307,23 @@ class FsmnVadStack:
                     self.degraded = False
                     logger.info("[VAD-STACK] recovered from degraded mode "
                                 "(queue drained)")
-            audio = np.frombuffer(payload, dtype=np.int16).astype(np.float32)
+            # /32768 is LOAD-BEARING (2026-08-04). funasr's WavFrontendOnline
+            # multiplies its input by (1 << 15) before handing it to kaldi
+            # fbank (utils/frontend.py), and its own loader is
+            # librosa.load() — i.e. the model is trained and calibrated on
+            # waveforms in [-1, 1]. Feeding raw int16 made every frame 32768x
+            # hot, shifting every log-mel bin by a constant ~2*ln(32768) and
+            # putting the model permanently outside its calibration. It still
+            # half-worked, which is why this survived since the stack went
+            # live on 2026-07-30: measured on call 5aaee2cd it flagged 25
+            # speech segments of which 7 (28%) were silence (audio RMS < 100);
+            # at the correct scale, 20 segments of which 2 (10%).
+            # The classifier below keeps the int16 scale — its DTMF/tone
+            # Goertzel bank and AEC_RMS_FLOOR=60 are absolute int16 thresholds,
+            # so handing it the normalized copy would read every hop as
+            # SILENCE. Two scales, two consumers, deliberately.
+            pcm16 = np.frombuffer(payload, dtype=np.int16).astype(np.float32)
+            audio = pcm16 / 32768.0
             self._stream_ms += 1000.0 * len(audio) / self.sample_rate
             try:
                 with _INFER_LOCK:
@@ -336,7 +352,7 @@ class FsmnVadStack:
             if self._classifier is not None:
                 try:
                     self._classifier.update(
-                        audio, self._speech_open, self._stream_ms)
+                        pcm16, self._speech_open, self._stream_ms)
                 except Exception:
                     logger.exception("[VAD-STACK] classifier failed — "
                                      "disabling")

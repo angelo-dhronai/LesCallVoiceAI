@@ -35,7 +35,9 @@ _CITY_CORRECTIONS: dict[str, str] = {
     "wappi": "vapi",
     "vapee": "vapi",
     "waapi": "vapi",
-    "silver": "silvassa",
+    # NOT "silver" — it is an ordinary English word (a colour, and the name
+    # of half the insurance plans in India). Rewriting it to a Gujarati city
+    # inside a live call is a much bigger error than missing one mishear.
     "silvasa": "silvassa",
     "silver sa": "silvassa",
     "silversa": "silvassa",
@@ -303,7 +305,8 @@ _REAL_ESTATE_CORRECTIONS: dict[str, str] = {
     "pramuk group": "pramukh group",
     "pramuk groups": "pramukh group",
     "praamukh": "pramukh",
-    "premium": "pramukh",
+    # NOT "premium" — same reason as "silver" above. An insurance agent asks
+    # about the premium on every single call.
     "site visit": "site visit",
     "sight visit": "site visit",
     "booking": "booking",
@@ -380,11 +383,26 @@ def match_bhk(text: str) -> str | None:
 
 
 def _apply_corrections(text: str, corrections: dict[str, str]) -> str:
+    """Substring corrections, anchored at word boundaries for ASCII keys.
+
+    Unanchored, these tables rewrite the INSIDE of unrelated words: an
+    insurance agent saying "premium" got "pramukh", "silver" got "silvassa",
+    and "thank you" became "thaank you". Indic scripts have no \\b semantics
+    in Python's `re` (Devanagari matras are non-word characters), so those
+    keys keep the plain substring behaviour they were written for.
+    """
     lower = text.lower()
     for wrong, right in corrections.items():
-        if wrong in lower:
-            pattern = re.compile(re.escape(wrong), re.IGNORECASE)
-            text = pattern.sub(right, text)
+        if wrong and wrong in lower:
+            esc = re.escape(wrong)
+            if wrong.isascii():
+                # Only anchor the ends that are actually word characters —
+                # a key like "3 bhk" or "-ji" must still match.
+                pre = r"\b" if wrong[0].isalnum() else ""
+                post = r"\b" if wrong[-1].isalnum() else ""
+                esc = f"{pre}{esc}{post}"
+            pattern = re.compile(esc, re.IGNORECASE)
+            text = pattern.sub(lambda _m: right, text)  # literal replacement
             lower = text.lower()
     return text
 

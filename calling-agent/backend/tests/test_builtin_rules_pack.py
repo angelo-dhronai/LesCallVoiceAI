@@ -3,8 +3,11 @@ F2 — guardrails.builtin_rules_pack ('real_estate' default vs 'generic') and
 the strict KNOWLEDGE GROUNDING band.
 
 Pins today's behaviour:
-- default agent (no guardrails section) renders the real-estate FIRM RULES
-  band ('site visit', 'property pitches');
+- default agent (no guardrails section) renders the GENERIC band — the
+  default flipped from 'real_estate' to 'generic' on 2026-08-04, because an
+  agent that never set a pack inherited property rules whatever its industry;
+- builtin_rules_pack='real_estate' renders the property band ('site visit',
+  'property pitches');
 - builtin_rules_pack='generic' renders the industry-neutral band: no
   site-visit/property/portfolio/builders wording, mission/catalogue lines
   instead, universal hygiene rules unchanged;
@@ -47,10 +50,10 @@ UNIVERSAL_LINES = [
 ]
 
 
-# ── (a) default pack = real_estate ──────────────────────────────────────────
+# ── (a) real_estate pack (opt-in) + generic default ─────────────────────────
 
-def test_default_agent_renders_real_estate_band():
-    agent = make_agent()  # no guardrails section at all
+def test_real_estate_pack_renders_property_band():
+    agent = make_agent(guardrails={"builtin_rules_pack": "real_estate"})
     band = pb.firm_rules_block(agent, lang="en")
     joined = "\n".join(band)
     assert band[1] == "━━ FIRM RULES ━━"
@@ -58,6 +61,22 @@ def test_default_agent_renders_real_estate_band():
     assert "property pitches" in joined
     for line in UNIVERSAL_LINES:
         assert line in band
+
+
+def test_default_agent_renders_GENERIC_band_not_real_estate():
+    """Default flipped real_estate -> generic on 2026-08-04.
+
+    An agent that never sets a pack used to inherit property rules whatever
+    its industry: 12 of the 15 agents on the default were not real estate
+    (education, healthcare, fabric, footwear...), each told to push callers
+    toward a "site visit" it does not offer. The copilot prompt had already
+    documented "generic" as the default for new agents — only the code
+    disagreed.
+    """
+    agent = make_agent()  # no guardrails section at all
+    joined = "\n".join(pb.firm_rules_block(agent, lang="en")).lower()
+    for banned in ("site visit", "property", "portfolio", "builders"):
+        assert banned not in joined, banned
 
 
 # ── (b) generic pack ────────────────────────────────────────────────────────
@@ -157,10 +176,13 @@ def test_exact_n_with_slots_is_byte_identical():
 
 
 def test_real_estate_pack_slot_awareness():
-    slotless = "\n".join(pb.firm_rules_block(make_agent(), lang="en"))
+    _re = {"builtin_rules_pack": "real_estate"}
+    slotless = "\n".join(
+        pb.firm_rules_block(make_agent(guardrails=_re), lang="en"))
     assert RE_EXACT_N[0] not in slotless
     assert "for the site visit — no calendar is configured" in slotless
-    with_slots = pb.firm_rules_block(make_agent(calendar=SLOTS), lang="en")
+    with_slots = pb.firm_rules_block(
+        make_agent(guardrails=_re, calendar=SLOTS), lang="en")
     for line in RE_EXACT_N:
         assert line in with_slots
 
@@ -214,3 +236,36 @@ def test_extra_rules_empty_band_unchanged():
                                "extra_always_rules": []}), lang="en")
     without = pb.firm_rules_block(make_agent(), lang="en")
     assert with_empty == without
+
+
+def test_scheduling_window_is_enforced_in_the_band():
+    """call_flow.scheduling.days/.window were parsed but read by NO runtime
+    code until 2026-08-04, so a business's opening hours could not be
+    enforced: pramukh_agent (owner policy Mon-Fri 09:00-17:00) accepted
+    "Saturday at 12" and "Sunday morning" and stored the booking.
+    """
+    agent = make_agent(call_flow={
+        "stages": [{"id": "S1", "order": 0, "goal": "one"}],
+        "scheduling": {"style": "flexible",
+                       "days": ["Monday", "Friday"],
+                       "window": "09:00-17:00"}})
+    joined = "\n".join(pb.firm_rules_block(agent, lang="en"))
+    assert "APPOINTMENT HOURS ARE MONDAY, FRIDAY, 09:00-17:00" in joined
+    assert "CLOSED on Tuesday, Wednesday, Thursday, Saturday, Sunday" in joined
+
+
+def test_no_window_configured_emits_no_window_rule():
+    agent = make_agent(call_flow={
+        "stages": [{"id": "S1", "order": 0, "goal": "one"}],
+        "scheduling": {"style": "flexible"}})
+    joined = "\n".join(pb.firm_rules_block(agent, lang="en"))
+    assert "APPOINTMENT HOURS ARE" not in joined
+
+
+def test_scope_discipline_rule_renders_for_every_pack():
+    """Off-topic asks produced invented errands ("I can certainly check the
+    weather for you", "have our team share a pasta recipe")."""
+    for pack in ("generic", "real_estate"):
+        joined = "\n".join(pb.firm_rules_block(
+            make_agent(guardrails={"builtin_rules_pack": pack}), lang="en"))
+        assert "NEVER promise an action outside this business's scope" in joined, pack

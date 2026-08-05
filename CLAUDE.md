@@ -8,18 +8,43 @@ Inbound real-time voice AI for **Pramukh Group** (real estate). Phone calls arri
 
 ## Running the System
 
-### Start All Services
+### Restart the telephony runtime — IT IS A CONTAINER
 ```bash
-cd /home/angelo/lescall
-bash phase14_runtime/start_all.sh
+docker restart lescall-runtime     # THE way to apply voice code changes
 ```
-Starts two processes in order: `socket_server.py` (port 9000 — FreeSWITCH ESL controller) then `ws_audio_receiver.py` (port 9001 — media WebSocket + AI bridge). Logs land in `phase14_runtime/logs/latest/`.
+`lescall-runtime` runs `deploy/runtime_entry.sh`, which starts BOTH
+`socket_server.py` (port 9000 ESL + 9004 playback) and `ws_audio_receiver.py`
+(port 9001 media WS + AI bridge) on the **host network namespace**, from a
+bind mount of this repo — so a plain restart picks up new `.py` files. If
+either process dies the container exits and Docker restarts the pair.
+Its logs go to `phase14_runtime/logs/docker/`, and its entrypoint points
+`phase14_runtime/logs/latest` → `docker`.
 
-### Stop / Monitor
+⚠ **Do NOT run `phase14_runtime/start_all.sh` on this host.** It starts a
+SECOND, competing `socket_server` + `ws_audio_receiver` pair on the same
+ports; the container then cannot bind, exits, and enters a Docker restart
+loop while the unmanaged host pair serves calls (hit 2026-08-04). `stop_all.sh`
++ `check_runtime.sh` have the same blind spot — `check_runtime.sh` reads
+`logs/latest/*.pid`, which the container never writes, so it reports
+`[FAIL] ws_audio_receiver PID not found` even when the runtime is perfectly
+healthy. Verify with `docker ps` and `ss -ltnp | grep -E ':900[014]'` instead.
+The scripts remain useful only on a host where the container is not running.
+
+### Monitor
 ```bash
-bash phase14_runtime/stop_all.sh
-bash phase14_runtime/tail_logs.sh          # all logs
-bash phase14_runtime/check_runtime.sh      # service health
+tail -f phase14_runtime/logs/docker/ws_audio_receiver.log
+tail -f phase14_runtime/logs/docker/socket_server.log
+docker ps --format '{{.Names}}\t{{.Status}}'
+```
+Benign log noise from the healthchecks, on both ports every ~20s:
+`InvalidMessage: did not receive a valid HTTP request` (WS 9001) and an ESL
+`EOF during handshake at +0.001s` followed by an empty
+`CASE R2 — Both dialplan and ESL recordings FAIL` summary block (9000).
+Neither is a call and neither indicates a fault.
+
+### Restart the dashboard / Copilot API
+```bash
+docker restart lescall-api         # applies dashboard/*.py AND calling-agent/.env
 ```
 
 ### AI Pipeline Only (CLI mic, no telephony)
@@ -106,7 +131,8 @@ Five independent async tasks connected by bounded queues:
 
 - **Stage machine**: `CallState.conversation_stage` drives which goal the LLM is given. Stages advance only after explicit conditions are met (e.g. interest confirmed before moving to booking).
 - **`CallState`** (in `memory.py`) is the canonical session object — `customer_name`, `customer_phone`, `selected_project`, `selected_location`, `appointment_date/time`, `language`, `conversation_stage`. It is injected into every LLM system prompt so the agent never re-asks confirmed fields.
-- **Deterministic shortcuts** (`shortcuts.py`): common phrases (hello, bye, thanks) return a canned response instantly, bypassing the LLM.
+- **Deterministic shortcuts**: common phrases (hello, bye, thanks) return a canned response instantly, bypassing the LLM. These live **inside `conversation.py`'s `process_stream`**, not in `shortcuts.py` — that module is imported only by `main_loop.py` (CLI mic mode) and has never been on the telephony path (`git log -S"check_shortcut"` on `conversation.py` / `pipeline.py` / `conversation_call_bridge.py` is empty for all history). Debug the branches in `process_stream`.
+- **The two opening beats**: a call opens with `response_bank.opening_greeting` (or `outbound.opening_greeting`), and the moment the caller first responds the agent speaks a *second* line — `call_flow.connect.intro_line` when the business set one, otherwise composed from `identity.agent_name` + `identity.company_name`. `spoken_surfaces.resolve_spoken_surfaces()` resolves both by driving the real engine; never infer either from the YAML by eye.
 - **Project lock**: first confirmed Pramukh project is stored in `CallState.selected_project` and never overridden — prevents the agent from being steered to a different project mid-call.
 - **Language detection**: set from the caller's first substantive response and mirrored for the rest of the call. `SarvamSTT` and `SarvamTTS` both accept a `language` field (`en-IN`, `hi-IN`, `gu-IN`).
 - **LLM**: OpenAI-compatible client pointed at the configured endpoint (see `.env`). Responses are capped at 1-2 sentences for spoken delivery.

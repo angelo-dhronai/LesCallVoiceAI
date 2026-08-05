@@ -138,13 +138,34 @@ def test_intro_line_prefers_full_configured_opening():
         "Hello! This is Asha from TestCo. How can I help?"
 
 
-def test_intro_line_skips_unresolved_placeholder_opening():
-    """An opening carrying {contact_name} must not be spoken raw."""
-    r = hello_router("Hello")
+def test_intro_line_personalizes_a_placeholder_opening():
+    """A placeholder must never be SPOKEN raw — but it must also never cost
+    the business its own words.
+
+    This used to reject any opening containing "{" and fall through to the
+    platform's identity template, so precisely the businesses that wrote the
+    most tailored opening got the generic line ("Hello! This is X from Y.
+    Can you hear me clearly?" — the 2026-08-04 "all agents say the same
+    thing" report). Substitute it, don't discard it.
+    """
+    r = hello_router("Hello", call_direction="outbound")
+    r.outbound_contact_name = "Ramesh"
     r._def.response_bank.opening_greeting = \
         "Hello, am I speaking with {contact_name}?"
     line = r.connect_intro_line()
-    assert "{" not in line and "TestCo" in line
+    assert line == "Hello, am I speaking with Ramesh?"
+    assert "TestCo" not in line          # the template was NOT used
+
+
+def test_intro_line_reads_the_outbound_field_on_outbound_agents():
+    """An outbound agent's own opening lives in outbound.opening_greeting;
+    reading only response_bank there skipped the business's words."""
+    r = hello_router("Hello", call_direction="outbound",
+                     outbound={"opening_greeting": {
+                         "en": "Good day, calling from the TestCo desk about your enquiry."}},
+                     response_bank={"opening_greeting": "Hello"})
+    assert r.connect_intro_line() == \
+        "Good day, calling from the TestCo desk about your enquiry."
 
 
 def test_intro_line_prefers_substantive_last_response():
@@ -315,3 +336,124 @@ def test_bare_hello_delegate():
     assert ns._bare_hello("hello I need help") is False
     ns.conversation = None
     assert ns._bare_hello("hello") is False
+
+
+# ── the SECOND BEAT is settable: call_flow.connect.intro_line ───────────────
+#
+# The gap this closes (2026-08-04): since the 07-30 opening doctrine the
+# agent says a short "Hello", waits, and then speaks a second line the
+# platform composed from identity.agent_name + identity.company_name. There
+# was no field for it, so an owner asking five times across three agents for
+# "Hello, wait, THEN say <exact sentence>" got platform boilerplate every
+# time. intro_line is that field.
+
+def test_intro_line_config_wins_over_composed():
+    r = hello_router("Hello", connect={
+        "intro_line": {"en": "Thanks for picking up, this is Asha."}})
+    resp = drive(r, "hello")
+    assert "Thanks for picking up, this is Asha." in resp
+    assert "TestCo" not in resp          # the composed intro was bypassed
+
+
+def test_intro_line_accepts_a_bare_string():
+    r = hello_router("Hello", connect={"intro_line": "One line, no map."})
+    assert "One line, no map." in drive(r, "hello")
+
+
+def test_intro_line_per_language():
+    r = hello_router("Hello", connect={
+        "intro_line": {"en": "English line.", "hi": "हिंदी लाइन।"}})
+    r.state.language = "hi"
+    assert "हिंदी लाइन।" in drive(r, "hello")
+
+
+def test_intro_line_substitutes_contact_name():
+    r = hello_router("Hello", connect={
+        "intro_line": {"en": "Am I speaking to {contact_name}?"}},
+        call_direction="outbound")
+    r.outbound_contact_name = "Ramesh"
+    resp = drive(r, "hello")
+    assert "Ramesh" in resp and "{" not in resp
+
+
+def test_intro_line_absent_is_todays_behaviour():
+    """The backward-compat pin: every existing agent has connect={}."""
+    plain = drive(hello_router("Hello"), "hello")
+    empty = drive(hello_router("Hello", connect={}), "hello")
+    assert plain == empty
+    assert "TestCo" in plain
+
+
+def test_intro_line_bare_hello_is_rejected():
+    """A configured 'Hello' would re-open the parrot loop this path kills."""
+    r = hello_router("Hello", connect={"intro_line": {"en": "Hello"}})
+    resp = drive(r, "hello")
+    assert "TestCo" in resp              # fell through to the composed intro
+
+
+def test_intro_line_outranks_a_long_opening():
+    """response_bank.opening_greeting is tier 2 and is live on real agents
+    with long openings — it must not shadow what the owner dictated."""
+    r = hello_router("Hello", connect={"intro_line": {"en": "Dictated line."}},
+                     response_bank={"opening_greeting":
+                                    "Hello and welcome to TestCo, how may I help?"})
+    assert "Dictated line." in drive(r, "hello")
+
+
+def test_intro_line_drives_the_dead_air_reprompt():
+    r = hello_router("Hello", connect={"intro_line": {"en": "Dictated line."}})
+    r.state.turn_count = 0
+    assert "Dictated line." in r.generate_silence_reprompt()
+
+
+# ── the business's OWN identity line is the second beat (2026-08-04) ────────
+#
+# Live call b6c5d398 (Prakhar / Pramukh group, outbound): the caller said
+# "hello" and heard "Hello! This is Prakhar from Pramukh group. Can you hear
+# me clearly?" — the platform template — while the owner's own line sat in
+# outbound.identity_confirm_line, which the engine only ever fed to the LLM
+# as prompt context. The owner's words arrived a turn late, if at all.
+
+def test_outbound_identity_line_is_spoken_as_the_second_beat():
+    r = hello_router("Hello", call_direction="outbound",
+                     outbound={"opening_greeting": {"en": "Hello?"},
+                               "identity_confirm_line": {
+                                   "en": "Hope you're having a very good "
+                                         "{current_time}, just wanted to make "
+                                         "sure if I am speaking to {contact_name}?"}})
+    r.outbound_contact_name = "Angelo"
+    resp = drive(r, "hello")
+    assert "just wanted to make sure if I am speaking to Angelo?" in resp
+    assert "Can you hear me clearly" not in resp    # template NOT used
+    assert "{" not in resp
+
+
+def test_outbound_identity_line_is_per_language():
+    r = hello_router("Hello", call_direction="outbound",
+                     outbound={"opening_greeting": {"en": "Hello?"},
+                               "identity_confirm_line": {
+                                   "en": "Am I speaking to {contact_name}?",
+                                   "hi": "क्या मैं {contact_name} जी से बात कर रहा हूँ?"}})
+    r.outbound_contact_name = "Angelo"
+    r.state.language = "hi"
+    assert "क्या मैं Angelo जी से बात कर रहा हूँ?" in drive(r, "hello")
+
+
+def test_intro_line_outranks_the_identity_line():
+    """An explicitly dictated second beat wins over the identity line."""
+    r = hello_router("Hello", call_direction="outbound",
+                     connect={"intro_line": {"en": "Dictated second line."}},
+                     outbound={"opening_greeting": {"en": "Hello?"},
+                               "identity_confirm_line": {
+                                   "en": "Am I speaking to {contact_name}?"}})
+    assert "Dictated second line." in drive(r, "hello")
+
+
+def test_inbound_agents_ignore_the_identity_line():
+    """Nobody to confirm on an inbound call — it must not leak there."""
+    r = hello_router("Hello", call_direction="inbound",
+                     outbound={"identity_confirm_line": {
+                         "en": "Am I speaking to {contact_name}?"}})
+    resp = drive(r, "hello")
+    assert "Am I speaking to" not in resp
+    assert "TestCo" in resp

@@ -381,3 +381,6 @@ llm_config:
   max_response_length: 400
   extra_never_rules: []
   extra_always_rules: []
+guardrails:
+  builtin_rules_pack: real_estate
+  use_builtin_rules: true

@@ -251,6 +251,8 @@ class ConversationStateManager:
         if default_intent:
             self.state.setdefault("intent", default_intent)
         self.audit_log: list[AuditEntry] = []
+        # Log an unknown collect-name once per manager, not once per turn.
+        self._warned_unknown_collect: dict[str, bool] = {}
         self.language = language
         self.turn_index = 0
         self._pending_fields: set[str] = set()   # e.g. name awaiting confirmation
@@ -639,10 +641,30 @@ class ConversationStateManager:
 
     def collect_satisfied(self, names: list[str]) -> bool:
         """Stage-advancement check: every named slot is filled (pending
-        excluded) or skipped via max_asks (counts as satisfied)."""
+        excluded) or skipped via max_asks (counts as satisfied).
+
+        FAIL-CLOSED on a name that is not a defined slot. This used to
+        `continue` — treating the unknown name as already satisfied — so a
+        stage whose `collect` referenced slots that no longer existed
+        returned vacuously True and advanced on its FIRST evaluation. That is
+        not a hypothetical: a whole-list `slots` replacement orphaned the
+        `collect` of hardik's EXISTING_COVERAGE stage and the entire
+        existing-coverage qualification silently evaporated from live calls,
+        with no error and no lint (2026-08-04 audit).
+
+        A config mistake must degrade VISIBLY, not delete a stage. Holding is
+        safe: `advance_when.max_turns` is an OR-fallback (conversation.py),
+        so the stage still advances on its own turn budget.
+        """
         for n in names or []:
             if n not in self.slots:
-                continue
+                if not self._warned_unknown_collect.get(n):
+                    self._warned_unknown_collect[n] = True
+                    logger.warning(
+                        "[STATE] stage collects '%s' which is not a defined "
+                        "slot — gate held (was silently satisfied before). "
+                        "Fix the agent's slots or the stage's collect list.", n)
+                return False
             if n in self._pending_fields:
                 return False
             if self.state.get(n) is None and n not in self.skipped:
@@ -714,6 +736,20 @@ class ConversationStateManager:
         """
         gaps = self.detect_missing_slots()
         lines = ["━━ CONVERSATION STATE (ground truth for FACTS — never re-ask ✓ fields) ━━"]
+        # Compliance outranks the sales goal. _detect_dnd_request already
+        # RECORDS the opt-out, but the spoken reply was left entirely to the
+        # model on the assumption that "the prompt already handles polite
+        # disengagement". Adversarial testing on 2026-08-04 disproved that:
+        # after "stop calling me" the agent answered "We work with all major
+        # providers... it's always worth a quick comparison." Once the caller
+        # has opted out there is no pitch left to make.
+        if self.extra_flags.get("dnd_requested"):
+            lines.append(
+                "⛔ THIS CALLER HAS ASKED NOT TO BE CONTACTED. Acknowledge it, "
+                "confirm they will be removed, apologise briefly and close the "
+                "call. Do NOT pitch, do NOT ask another qualifying question, do "
+                "NOT offer a callback or 'one quick point' — no matter what the "
+                "stage goal below says.")
         for name, spec in sorted(self.slots.items(), key=lambda kv: kv[1].priority):
             val = self.state.get(name)
             if name in self._pending_fields:

@@ -223,6 +223,12 @@ class LanguageConfig:
     # restores the legacy single-signal switching. Per-agent opt-out for
     # LANG_EVIDENCE_SWITCH.
     evidence_switch: bool = True
+    # Mid-call language switching, ON by default and STRICTLY BOUNDED BY
+    # `supported`: if the caller speaks one of the agent's languages, the
+    # agent follows them into it; it can never be dragged into a language
+    # this agent was not built for. Set False for an agent that must answer
+    # in `default` no matter what the caller speaks.
+    auto_switch: bool = True
     # Language of the opening greeting ('' = languages.default — today).
     greeting_language: str = ""
     # Hint that the greeting should be bilingual (informational for now).
@@ -363,6 +369,13 @@ class CallFlowConfig:
     #     short burst of caller speech cannot cancel an agent reply the
     #     caller has not heard yet; the kill is deferred until STT proves
     #     the interruption was more than a "hello?".
+    #   intro_line: {lang: str} (or a bare string) — THE SECOND BEAT. The
+    #     exact sentence the caller hears the moment they first respond,
+    #     after a short opening like "Hello". {contact_name} and
+    #     {current_time} ARE substituted here, exactly as in the opening
+    #     greeting. Empty (the default) = the platform composes a line from
+    #     identity.agent_name + identity.company_name. A value that is
+    #     itself a bare hello is ignored (it would re-open the parrot loop).
     connect: dict = field(default_factory=dict)
 
     # Convenience accessors -------------------------------------------------
@@ -407,11 +420,21 @@ class ResponseBank:
     # Language-switch confirmation ("Sure, let's speak in Hindi")
     lang_switch_responses: dict[str, str] = field(default_factory=dict)
 
+    # Spoken when the caller asks for a language this agent was NOT built
+    # for ("do you speak Tamil?"). Empty = the agent simply answers in the
+    # language it is already speaking.
+    lang_unsupported_responses: dict[str, str] = field(default_factory=dict)
+
     # "I couldn't hear you / please repeat"
     lang_fallbacks: dict[str, str] = field(default_factory=dict)
 
     # LLM timed out mid-stream — spoken while retrying silently
     timeout_fallbacks: dict[str, str] = field(default_factory=dict)
+
+    # Spoken when the model answered a turn with a tool call and no words,
+    # and the text re-ask did not land either. Last line of defence against
+    # dead air on a turn where an action WAS taken. Empty = platform default.
+    tool_ack_fallbacks: dict[str, str] = field(default_factory=dict)
 
     # Absolute last resort — single universal string, no LLM
     response_fallback: str = ""
@@ -576,14 +599,25 @@ class GuardrailsConfig:
     Defaults = today's FIRM RULES band byte-for-byte."""
     use_builtin_rules: bool = True
     # Which builtin FIRM RULES pack renders when use_builtin_rules is true.
-    # 'real_estate' = today's exact band (default — every existing agent).
+    # 'real_estate' = the original band (site-visit/property/portfolio lines).
     # 'generic'     = industry-neutral variant: keeps every domain-neutral
     #                 hygiene rule, swaps the site-visit/property/portfolio
     #                 lines for appointment/catalogue equivalents.
+    #
+    # DEFAULT IS 'generic' since 2026-08-04. It used to be 'real_estate', so
+    # any agent that never set the field inherited property rules: an audit
+    # that day found 12 of 15 such agents were NOT real estate — an education
+    # counsellor, a healthcare clinic, a fabric mill and a shoe shop were all
+    # being told to push the caller toward a site visit. (This is the same
+    # failure the 'generic' pack was introduced for: "a fabric agent carrying
+    # 'push toward a site visit' is how the Kaapd call went off-script".)
+    # The three genuine real-estate agents now pin the pack explicitly, so
+    # flipping the default changed nothing for them.
+    #
     # honesty may additionally carry knowledge_grounding: 'strict' → renders
     # the KNOWLEDGE GROUNDING band (deflect-not-invent) after the knowledge
     # section. Absent = today (no band).
-    builtin_rules_pack: str = "real_estate"
+    builtin_rules_pack: str = "generic"
     never_rules: list[str] = field(default_factory=list)   # '✗ NEVER <rule>'
     always_rules: list[str] = field(default_factory=list)  # '✓ <rule>'
     # {unknown_answer_policy: '', forbidden_fabrications: [prices, dates]}
@@ -811,6 +845,7 @@ class AgentDefinition:
             allow_code_mixing=_as_bool(lang_d, "allow_code_mixing", False),
             tts_lang_from_text=_as_bool(lang_d, "tts_lang_from_text", True),
             evidence_switch=_as_bool(lang_d, "evidence_switch", True),
+            auto_switch=_as_bool(lang_d, "auto_switch", True),
             greeting_language=_as_str(lang_d, "greeting_language"),
             bilingual_greeting=_as_bool(lang_d, "bilingual_greeting", False),
             closing_language_policy=_as_str(lang_d, "closing_language_policy"),
@@ -903,8 +938,11 @@ class AgentDefinition:
             objection_responses=_as_dict(rb_d, "objection_responses"),
             decline_farewell=_as_dict(rb_d, "decline_farewell"),
             lang_switch_responses=_as_dict(rb_d, "lang_switch_responses"),
+            lang_unsupported_responses=_as_dict(
+                rb_d, "lang_unsupported_responses"),
             lang_fallbacks=_as_dict(rb_d, "lang_fallbacks"),
             timeout_fallbacks=_as_dict(rb_d, "timeout_fallbacks"),
+            tool_ack_fallbacks=_as_dict(rb_d, "tool_ack_fallbacks"),
             response_fallback=_as_str(rb_d, "response_fallback"),
             graceful_close=_as_dict(rb_d, "graceful_close"),
             localized_responses=_as_dict(rb_d, "localized_responses"),
@@ -1025,8 +1063,8 @@ class AgentDefinition:
         guardrails = GuardrailsConfig(
             use_builtin_rules=_as_bool(gr_d, "use_builtin_rules", True),
             builtin_rules_pack=(
-                _as_str(gr_d, "builtin_rules_pack", "real_estate")
-                or "real_estate"),
+                _as_str(gr_d, "builtin_rules_pack", "generic")
+                or "generic"),
             never_rules=[str(x) for x in _as_list(gr_d, "never_rules")],
             always_rules=[str(x) for x in _as_list(gr_d, "always_rules")],
             honesty=_as_dict(gr_d, "honesty"),

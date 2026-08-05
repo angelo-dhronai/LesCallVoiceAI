@@ -146,6 +146,13 @@ call_flow:
   scheduling:
     offer_count: 0
     style: flexible
+    days:
+    - Monday
+    - Tuesday
+    - Wednesday
+    - Thursday
+    - Friday
+    window: 09:00-17:00
   callback_policy:
     enabled: true
     capture_slot: follow_up_time
@@ -302,13 +309,7 @@ response_bank:
   enable_greeting_shortcut: false
 calendar:
   type: mock
-  mock_slots:
-  - day: Tomorrow
-    time: 11:00 AM
-  - day: Tomorrow
-    time: 4:00 PM
-  - day: This Saturday
-    time: 12:00 PM
+  mock_slots: []
   slots_text:
     hi: कल सुबह 11 बजे, कल शाम 4 बजे, या इस शनिवार दोपहर 12 बजे
     en: Tomorrow at 11:00 AM, Tomorrow at 4:00 PM, or This Saturday at 12:00 PM
@@ -550,6 +551,7 @@ guardrails:
     restricted_topics:
     - Negative comments about other properties.
   escalation: {}
+  builtin_rules_pack: real_estate
 follow_up:
   whatsapp_promise: {}
   callback: {}

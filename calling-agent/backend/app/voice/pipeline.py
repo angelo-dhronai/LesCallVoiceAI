@@ -388,6 +388,24 @@ LANG_MIRROR_GUARDED = os.environ.get(
 # switching is never locked out. false = always auto-detect (legacy).
 STT_LANG_PIN = os.environ.get("STT_LANG_PIN", "true").lower() == "true"
 STT_LANG_PIN_TURNS = int(os.environ.get("STT_LANG_PIN_TURNS", "2"))
+# A pin is only ever as good as the evidence behind it, and it is
+# SELF-SEALING: the pinned language shapes the transcript, which re-confirms
+# the pin. Two guards (2026-08-04): only caller evidence counts toward
+# STT_LANG_PIN_TURNS, and every STT_LANG_PIN_RECHECK_TURNS the pin is dropped
+# for one auto-detect turn so a wrong pin always has a way out. 0 = never
+# recheck (pre-08-04 behaviour).
+STT_LANG_PIN_RECHECK_TURNS = int(
+    os.environ.get("STT_LANG_PIN_RECHECK_TURNS", "8"))
+# lang_source values that represent something the CALLER actually said.
+# 'default' / 'stt_or_default_first_turn' / 'guard' / 'pending(...)' are the
+# agent's YAML default or a fallback, and must never earn a pin.
+_LANG_EVIDENCE_SOURCES = ("script", "script_gu_markers", "pattern", "llm",
+                          "evidence", "evidence_confirmed", "stt_mirror")
+
+
+def _lang_source_is_evidence(src: str) -> bool:
+    head = str(src or "").split("(", 1)[0].strip()
+    return head in _LANG_EVIDENCE_SOURCES
 # B2 (2026-07-30): spelled contact capture. While the conversation is
 # capturing an email/phone the merge window stretches so letter-by-letter
 # spelling with natural pauses aggregates into one turn instead of three
@@ -626,6 +644,7 @@ class VoicePipeline:
         self._stt_lang_pin: str | None = None      # BCP-47 or None (=unknown)
         self._stt_lang_last: str | None = None
         self._stt_lang_stable: int = 0
+        self._stt_lang_pinned_turns: int = 0
         # Whisper-hint gate (2026-08-03): the conversation language starts as
         # the AGENT's default — hinting Whisper with it before the CALLER has
         # confirmed a language makes Whisper transliterate/translate (Hindi
@@ -757,6 +776,10 @@ class VoicePipeline:
         self._vad_speech_frames: int = 0
         self._segments_created: int = 0
         self._segments_sent_to_stt: int = 0
+        # Caller speech we could not keep up with. Any non-zero value is an
+        # alarm condition (voice_health already has the hook) — it means the
+        # agent answered without hearing part of what was said.
+        self._stt_queue_drops: int = 0
         # Segments the real-speech floor rejected — paid STT calls not made.
         self._segments_dropped_no_speech: int = 0
         # Tail of the previous fragment of the turn in progress, for the
@@ -1319,9 +1342,18 @@ class VoicePipeline:
                 logger.info("[VAD] Speech start")
                 # Continuation-merge anchor: when the caller actually began
                 # speaking (accounting for the recovered pre-onset frames).
-                self._cur_speech_start_ts = (
-                    time.monotonic() - 0.02 * len(self._pre_speech_buffer)
-                )
+                #
+                # ONLY on the first onset of a segment. Speech resuming after
+                # a within-segment hangover gap re-entered this branch with
+                # `_pre_speech_buffer` already cleared, so the anchor jumped
+                # to `now` — which is how the audit transcript ended up
+                # carrying a 0.08s span and a 16.30s span for segments the
+                # log records at 980ms and 940ms. The spans feed the ASR
+                # replay corpus, so a wrong one silently poisons WER.
+                if not self._audio_buffer:
+                    self._cur_speech_start_ts = (
+                        time.monotonic() - 0.02 * len(self._pre_speech_buffer)
+                    )
                 # Speech resuming shortly after playback: the utterance may
                 # have BEGUN over the agent's audio — reattach that head
                 # from the shadow ring (chronologically before the pre-ring).
@@ -1451,6 +1483,22 @@ class VoicePipeline:
 
             _now_flush = time.monotonic()
             _speech_end_ts = _now_flush - self._silence_frames * 0.02
+            # A span must be consistent with the audio it labels. When the
+            # anchor is missing or the arithmetic disagrees with the buffered
+            # duration by more than a second, emit no span rather than a
+            # wrong one — a corpus row with a bad span is worse than a
+            # corpus row with none.
+            if self._cur_speech_start_ts <= 0.0 or abs(
+                    (_speech_end_ts - self._cur_speech_start_ts) * 1000.0
+                    - self._speech_duration_ms) > 1000.0:
+                if self._cur_speech_start_ts > 0.0:
+                    logger.warning(
+                        "[VAD] Dropping implausible speech span "
+                        "(%.2fs measured vs %.2fs buffered)",
+                        _speech_end_ts - self._cur_speech_start_ts,
+                        self._speech_duration_ms / 1000.0)
+                self._cur_speech_start_ts = 0.0
+                _speech_end_ts = 0.0
             segment = AudioSegment(
                 audio=bytes(self._audio_buffer),
                 duration_ms=self._speech_duration_ms,
@@ -1493,7 +1541,31 @@ class VoicePipeline:
                 )
 
             except asyncio.QueueFull:
-                logger.warning("[TURN] STT queue full — dropping segment")
+                # 47 segments of real caller speech were discarded this way
+                # on 2026-08-03 (two bursts, during the Sarvam degradation).
+                # Dropping the NEWEST arrival is the worst choice available:
+                # the caller's most recent words are the ones the agent is
+                # about to answer, while the oldest queued segment is the
+                # most likely to be stale by the time it is transcribed.
+                _evicted = None
+                try:
+                    _evicted = self._stt_queue.get_nowait()
+                    self._stt_queue.task_done()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    self._stt_queue.put_nowait(segment)
+                    self._segments_sent_to_stt += 1
+                    logger.warning(
+                        "[TURN] STT queue full — evicted the oldest queued "
+                        "segment (%.0fms) to keep the newest (%.0fms)",
+                        getattr(_evicted, "duration_ms", 0.0),
+                        segment.duration_ms)
+                except asyncio.QueueFull:
+                    logger.error("[TURN] STT queue full — dropping segment "
+                                 "(%.0fms) after eviction failed",
+                                 segment.duration_ms)
+                self._stt_queue_drops += 1
 
     def _reset_vad_state(self) -> None:
         self._audio_buffer.clear()
@@ -1664,24 +1736,51 @@ class VoicePipeline:
         language_code."""
         if not STT_LANG_PIN or self.conversation is None:
             return
-        cur = getattr(getattr(self.conversation, "state", None),
-                      "language", None)
+        _state = getattr(self.conversation, "state", None)
+        cur = getattr(_state, "language", None)
         if cur not in ("en", "hi", "gu"):
+            return
+        # A pin must be earned by the CALLER, never by the agent's YAML
+        # default. Measured 07-31..08-04: roughly half of all pins fired with
+        # no prior Sarvam detection in that call, and under a hi-IN pin 160
+        # of 166 turns came back in Indic script — including English speech
+        # transliterated into Devanagari ("व्हाट थिंग्स डू यू हैव...") and a
+        # mangled phone number. Seeded-default turns no longer count.
+        _src = str(getattr(_state, "lang_source", "") or "")
+        if not _lang_source_is_evidence(_src):
+            logger.debug("[STT] lang pin: turn not counted (source=%r)", _src)
             return
         if cur == self._stt_lang_last:
             self._stt_lang_stable += 1
         else:
             self._stt_lang_last = cur
             self._stt_lang_stable = 1
+        # Periodic release: a pin that is wrong is otherwise self-sealing —
+        # the pinned language shapes the transcript, which re-confirms the
+        # pin. One free auto-detect turn every STT_LANG_PIN_RECHECK_TURNS
+        # gives a wrong pin a way back out.
+        if self._stt_lang_pin is not None:
+            self._stt_lang_pinned_turns += 1
+            if (STT_LANG_PIN_RECHECK_TURNS
+                    and self._stt_lang_pinned_turns >= STT_LANG_PIN_RECHECK_TURNS):
+                logger.info("[STT] Language pin %s released for one "
+                            "auto-detect turn (%d turns pinned)",
+                            self._stt_lang_pin, self._stt_lang_pinned_turns)
+                self._stt_lang_pin = None
+                self._stt_lang_pinned_turns = 0
+                self._stt_lang_stable = 0
+                return
         mapped = {"en": "en-IN", "hi": "hi-IN", "gu": "gu-IN"}[cur]
         if self._stt_lang_pin and self._stt_lang_pin != mapped:
             self._stt_lang_pin = None
+            self._stt_lang_pinned_turns = 0
             logger.info("[STT] Language pin released (state now %s)", cur)
         elif (self._stt_lang_pin is None
                 and self._stt_lang_stable >= STT_LANG_PIN_TURNS):
             self._stt_lang_pin = mapped
-            logger.info("[STT] Language pinned to %s (stable %d turns)",
-                        mapped, self._stt_lang_stable)
+            self._stt_lang_pinned_turns = 0
+            logger.info("[STT] Language pinned to %s (stable %d evidence "
+                        "turns)", mapped, self._stt_lang_stable)
 
     async def _stt_submitter(self) -> None:
         """
@@ -1772,14 +1871,28 @@ class VoicePipeline:
                     logger.debug("[STT-WORKER] stt_lang=unknown (auto-detect every turn)")
                 _seg_samples = np.frombuffer(segment.audio, dtype=np.int16).astype(np.float32)
                 _seg_rms = float(np.sqrt(np.mean(_seg_samples ** 2))) if len(_seg_samples) else 0.0
+                # Full-segment RMS cannot tell noise from a quiet one-word
+                # answer padded with 620ms of pre-roll and hold — which is
+                # exactly the question anyone tuning an amplitude floor has
+                # to answer, and the logs have never carried the number that
+                # settles it. peak_rms is the loudest 100ms WINDOW inside the
+                # segment: measurement only, nothing is dropped on it.
+                _peak_rms = _seg_rms
+                _win = int(0.100 * 16_000)
+                if len(_seg_samples) > _win:
+                    _sq = np.cumsum(np.concatenate(
+                        ([0.0], (_seg_samples ** 2).astype(np.float64))))
+                    _win_ms = (_sq[_win:] - _sq[:-_win]) / _win
+                    _peak_rms = float(np.sqrt(_win_ms.max()))
                 logger.info(
                     "[STT-WORKER] Submitting segment: %.0fms audio (%d bytes) "
-                    "queued %.0fms ago lang=%s rms=%.0f",
+                    "queued %.0fms ago lang=%s rms=%.0f peak_rms=%.0f",
                     segment.duration_ms,
                     len(segment.audio),
                     (time.monotonic() - segment.timestamp) * 1000,
                     _stt_lang,
                     _seg_rms,
+                    _peak_rms,
                 )
                 # F16: best-known conversation language for the STT router's
                 # script-misdetection retry (genuine Hindi transcribed as
@@ -2064,6 +2177,9 @@ class VoicePipeline:
                             "[STT] Language auto-detected by Sarvam: %s → %s (guarded)",
                             stt_result.detected_language, _pending_mirror)
                         self.conversation.state.language = _pending_mirror
+                        # Provenance, so the pin can tell caller evidence
+                        # from the agent's YAML default.
+                        self.conversation.state.lang_source = "stt_mirror"
                     else:
                         logger.info(
                             "[STT] Language mirror suppressed: %r claim "

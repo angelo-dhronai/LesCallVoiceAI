@@ -27,6 +27,15 @@ _PHONE_RE = re.compile(
     r'(?!\d)',
 )
 
+# Words that trail a spoken self-introduction without being part of the name
+# ("this is sunita speaking", "main amit bol raha hu", "priya here").
+_NAME_TRAILING = {
+    "speaking", "calling", "here", "side", "this",
+    "bol", "bolta", "bolti", "raha", "rahi", "rahe",
+    "hu", "hoon", "hun", "hai", "hain", "ho",
+    "che", "chhe", "cho", "chu",
+}
+
 
 @dataclass
 class Turn:
@@ -325,6 +334,16 @@ class ConversationMemory:
             "thanks", "thank", "thankyou", "thanku", "thx", "welcome",
             "please", "yaar", "bhai", "sir", "madam", "you", "yourself",
             "today", "now", "also", "anyway", "though",
+            # Degree adverbs missed by the list above — observed live on
+            # 2026-08-04: "i'm fairly happy" was captured as the name "Fairly".
+            "fairly", "somewhat", "mostly", "rather", "slightly", "reasonably",
+            "extremely", "incredibly", "kinda", "sorta", "half", "abit",
+            # Time words after "call me ..." — "call me later" was captured
+            # as the name "Later" on a live maya_lescall_sdr-outbound run.
+            "later", "back", "tomorrow", "tonight", "soon", "afterwards",
+            "sometime", "anytime", "again", "after", "morning", "evening",
+            "afternoon", "monday", "tuesday", "wednesday", "thursday",
+            "friday", "saturday", "sunday", "week", "month",
             "surat", "vapi", "silvassa", "pramukh", "vishal", "patel",
             "mera", "meri", "mere", "naam", "my", "name",
             "maro", "mari", "maru", "apnu", "apna", "aapka",
@@ -339,12 +358,24 @@ class ConversationMemory:
                 match = re.search(pattern, lower)
                 if match:
                     name = match.group(1).strip()
-                    # Filter tokens against blocklist; capitalize each valid token
-                    name_tokens = []
-                    for tok in name.split():
-                        clean = re.sub(r"[^a-z]", "", tok)
-                        if clean and len(clean) >= 2 and clean not in _name_blocklist:
-                            name_tokens.append(clean.capitalize())
+                    raw = [re.sub(r"[^a-z]", "", t) for t in name.split()]
+                    raw = [t for t in raw if t]
+                    # Trailing self-intro verbs are part of the SENTENCE, not
+                    # the name: "this is sunita speaking" -> Sunita. Stripped
+                    # before the all-or-nothing check below so they don't
+                    # poison an otherwise real introduction.
+                    while len(raw) > 1 and raw[-1] in _NAME_TRAILING:
+                        raw.pop()
+                    # ALL-OR-NOTHING. The old code dropped blocklisted tokens
+                    # and kept the survivors, so any state phrase whose adverb
+                    # was not listed became a name: "i'm fairly happy" -> Fairly,
+                    # "i am really busy" -> Really, "call me later" -> Later.
+                    # One blocked token now poisons the whole candidate; a real
+                    # introduction ("my name is rahul sharma") carries none.
+                    if not raw or any(t in _name_blocklist for t in raw) \
+                            or any(len(t) < 2 for t in raw):
+                        continue
+                    name_tokens = [t.capitalize() for t in raw]
                     if name_tokens:
                         candidate = " ".join(name_tokens)
                         if len(candidate) > 2 and candidate.lower() not in _name_blocklist:

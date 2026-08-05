@@ -47,9 +47,9 @@ call_flow:
   stages:
   - id: WARM_WELCOME
     order: 0
-    goal: 'Confirm if you are speaking to the right person. The opening greeting asks:
-      ''Hi, hope you''re having a good {current_time}, am I speaking to {contact_name}?''
-      Once they confirm they are that person, advance immediately.'
+    goal: Say the opening greeting and wait for the caller to respond. Once they respond,
+      confirm you are speaking to the right person using the identity confirmation
+      line. Once they confirm, advance immediately.
     turns_until_advance: 1
     role: greeting
     label: ''
@@ -493,8 +493,7 @@ knowledge_base:
   fact_policy: {}
   product_lock: {}
 response_bank:
-  opening_greeting: Hi, hope you're having a good {current_time}, am I speaking to
-    {contact_name}?
+  opening_greeting: Hello?
   filler_responses:
     hi:
     - एक मिनट...

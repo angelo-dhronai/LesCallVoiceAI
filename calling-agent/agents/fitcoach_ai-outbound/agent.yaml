@@ -374,10 +374,7 @@ knowledge_base:
   fact_policy: {}
   product_lock: {}
 response_bank:
-  opening_greeting: Hi! Welcome to FitCoach AI, your personal fitness coach. Whether
-    your goal is to lose weight, build muscle, improve your health, or simply feel
-    more confident, I'm here to help you find the perfect plan. What's your biggest
-    fitness goal today?
+  opening_greeting: Hi, Am I speaking to {contact_name}?
   filler_responses:
     en:
     - One moment please...

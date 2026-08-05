@@ -12,9 +12,20 @@ import logging
 
 from openai import AsyncOpenAI
 
-from .base import STTProvider, STTResult, pcm_to_wav
+from .base import STTProvider, STTResult, normalize_pcm_audio, pcm_to_wav
 
 logger = logging.getLogger(__name__)
+
+# ISO-639-1 codes whisper-1 accepts. Anything else is a hard HTTP 400, not a
+# degraded transcript — notably `gu` (Gujarati), one of this platform's three
+# supported languages. Source: OpenAI's published whisper-1 language list.
+WHISPER_LANGUAGES = frozenset({
+    "af", "ar", "hy", "az", "be", "bs", "bg", "ca", "zh", "hr", "cs", "da",
+    "nl", "en", "et", "fi", "fr", "gl", "de", "el", "he", "hi", "hu", "is",
+    "id", "it", "ja", "kn", "kk", "ko", "lv", "lt", "mk", "ms", "mr", "mi",
+    "ne", "no", "fa", "pl", "pt", "ro", "ru", "sr", "sk", "sl", "es", "sw",
+    "sv", "tl", "ta", "th", "tr", "uk", "ur", "vi", "cy",
+})
 
 # Whisper is the LAST-RESORT provider: by the time it runs the caller has
 # already waited through Sarvam's read timeout. Observed healthy latency is
@@ -59,6 +70,11 @@ class OpenAIWhisperSTT(STTProvider):
         sample_rate: int = 16_000,
         language: str = "en",
     ) -> STTResult:
+        # Same signal the primary hears. Sarvam normalizes before upload
+        # (sarvam.py); Whisper never did, so the LAST-RESORT provider was
+        # always given the QUIETER version of audio the primary had already
+        # struggled with — on telephony callers that is exactly backwards.
+        audio_bytes = normalize_pcm_audio(audio_bytes)
         wav_data = pcm_to_wav(audio_bytes, sample_rate=sample_rate)
         duration_ms = len(audio_bytes) // (sample_rate * 2) * 1000
         logger.info("[STT:Whisper] Sending %d bytes (%.0fms) for transcription", len(wav_data), duration_ms)
@@ -70,8 +86,19 @@ class OpenAIWhisperSTT(STTProvider):
             "model": self._model,
             "file": ("audio.wav", wav_data, "audio/wav"),
         }
-        if language and language != "unknown":
-            kwargs["language"] = language.split("-")[0] if "-" in language else language
+        _hint = (language or "").split("-")[0].lower()
+        if _hint and _hint != "unknown" and _hint in WHISPER_LANGUAGES:
+            kwargs["language"] = _hint
+        elif _hint and _hint != "unknown":
+            # whisper-1 hard-400s on an unsupported code ("Language 'gu' is
+            # not supported"), and the router retries once — so BOTH attempts
+            # died and the segment was lost outright. 14 such 400s = 7
+            # segments of caller speech thrown away (07-30, 07-31, 08-03).
+            # Auto-detect is worse than a correct hint but infinitely better
+            # than nothing.
+            logger.info("[STT:Whisper] %r is not a whisper-1 language — "
+                        "auto-detecting instead of failing the request",
+                        _hint)
 
         result = await client.audio.transcriptions.create(**kwargs)
 

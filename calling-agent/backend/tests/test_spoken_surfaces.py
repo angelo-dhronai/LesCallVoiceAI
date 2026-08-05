@@ -153,3 +153,100 @@ def test_touches_opening():
     assert touches_opening({"outbound.opening_greeting.hi"})
     assert touches_opening({"call_direction"})
     assert not touches_opening({"guardrails.never_rules"})
+
+
+# ── the SECOND BEAT (2026-08-04) ───────────────────────────────────────────
+#
+# Everything above resolves the first line. The line the caller hears the
+# INSTANT they first respond was invisible to every tool — which is how a
+# dictated second line was "saved" five times across three agents and never
+# once spoken. The resolver drives the real engine for it too, so precedence
+# is never restated in prose here.
+
+def test_second_beat_is_composed_when_no_intro_line_is_set():
+    r = resolve_spoken_surfaces(_agent(
+        response_bank={"opening_greeting": "Hello"},
+        outbound={"opening_greeting": {"hi": "Hello", "en": "Hello"}}))
+    o = r["openings"]["en"]
+    assert "Acme Traders" in o["second_line"]
+    assert "identity" in o["second_source"]
+    assert "call_flow.connect.intro_line" in o["second_note"]
+
+
+def test_second_beat_is_the_configured_intro_line():
+    r = resolve_spoken_surfaces(_agent(
+        response_bank={"opening_greeting": "Hello"},
+        outbound={"opening_greeting": {"hi": "Hello", "en": "Hello"}},
+        call_flow={"connect": {"intro_line": {
+            "en": "Thanks for picking up — this is Asha."}}}))
+    o = r["openings"]["en"]
+    assert o["second_line"] == "Thanks for picking up — this is Asha."
+    assert o["second_source"] == "call_flow.connect.intro_line"
+
+
+def test_second_beat_substitutes_contact_name():
+    r = resolve_spoken_surfaces(_agent(
+        response_bank={"opening_greeting": "Hello"},
+        outbound={"opening_greeting": {"hi": "Hello", "en": "Hello"}},
+        call_flow={"connect": {"intro_line": {
+            "en": "Am I speaking to {contact_name}?"}}}))
+    assert r["openings"]["en"]["second_line"] == \
+        "Am I speaking to {contact_name}?"
+
+
+def test_second_beat_replays_a_long_opening():
+    r = resolve_spoken_surfaces(_agent())      # BASE openings are long
+    o = r["openings"]["en"]
+    assert o["second_line"] == o["line"]
+    assert "replay" in o["second_source"]
+
+
+def test_second_beat_reports_llm_driven_when_the_fastpath_is_off():
+    """Proves the resolver reads the ENGINE, not a prose summary — and that
+    a read-only preview never fires a live model request to find out."""
+    r = resolve_spoken_surfaces(_agent(
+        response_bank={"opening_greeting": "Hello"},
+        outbound={"opening_greeting": {"hi": "Hello", "en": "Hello"}},
+        call_flow={"connect": {"hello_fastpath": False}}))
+    o = r["openings"]["en"]
+    assert o["second_line"] == ""
+    assert o["second_source"] == "the AI decides"
+
+
+def test_resolver_makes_no_llm_call(monkeypatch):
+    from app.voice.conversation import ConversationRouter
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("a read-only preview must never call the LLM")
+
+    monkeypatch.setattr(ConversationRouter, "_get_client", _boom)
+    monkeypatch.setattr(ConversationRouter, "_get_fallback_client", _boom)
+    r = resolve_spoken_surfaces(_agent(
+        response_bank={"opening_greeting": "Hello"},
+        outbound={"opening_greeting": {"hi": "Hello", "en": "Hello"}},
+        call_flow={"connect": {"hello_fastpath": False}}))
+    assert r["openings"]["en"]["second_line"] == ""
+
+
+def test_intro_line_edits_count_as_greeting_edits():
+    """Otherwise the hearable readback never fires on the field that
+    actually changed what the caller hears second."""
+    assert touches_opening(["call_flow.connect.intro_line"]) is True
+    assert touches_opening(["identity.company_name"]) is True
+
+
+def test_second_beat_names_the_outbound_identity_line():
+    """The business already wrote this line — the resolver must SAY so, not
+    report it as a platform-composed default."""
+    r = resolve_spoken_surfaces(_agent(
+        response_bank={"opening_greeting": "Hello"},
+        outbound={"opening_greeting": {"hi": "Hello", "en": "Hello"},
+                  "identity_confirm_line": {
+                      "en": "Am I speaking to {contact_name}?"}}))
+    o = r["openings"]["en"]
+    assert o["second_line"] == "Am I speaking to {contact_name}?"
+    assert o["second_source"] == "outbound.identity_confirm_line"
+
+
+def test_identity_line_edits_count_as_greeting_edits():
+    assert touches_opening(["outbound.identity_confirm_line"]) is True

@@ -7,6 +7,7 @@ Requires SARVAM_API_KEY environment variable.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import logging
 
@@ -206,7 +207,7 @@ class SarvamSTT(STTProvider):
             logger.warning(
                 "[STT:Sarvam] Request timed out: %s — resetting client for retry", exc
             )
-            await self.close()
+            await self._retire_client()
             raise
         except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError) as exc:
             # Stale or closed connection — discard the client so the next
@@ -214,7 +215,7 @@ class SarvamSTT(STTProvider):
             logger.warning(
                 "[STT:Sarvam] Stale connection error: %s — resetting client for retry", exc
             )
-            await self.close()
+            await self._retire_client()
             raise
 
         if response.status_code == 402:
@@ -287,6 +288,37 @@ class SarvamSTT(STTProvider):
             logger.info("[STT:Sarvam] Connection warmed (first time this process)")
         except Exception as exc:
             logger.debug("[STT:Sarvam] Warmup skipped: %s", exc)
+
+    async def _retire_client(self) -> None:
+        """Detach the current client and close it in the BACKGROUND.
+
+        A per-request error path must never `aclose()` the process-global
+        client synchronously: with SARVAM_HTTP_SHARED=true that tears down
+        connections other in-flight requests are still using. It fired 85
+        times during the 2026-08-03 Sarvam degradation and caused no visible
+        cascade only because calls were running strictly one at a time —
+        i.e. it is a latent concurrency bug, not a safe one. Detaching is
+        immediate (the next `_get_client` builds a fresh one, which is the
+        whole point of the reset) while the old client drains on its own.
+        """
+        global _shared_client
+        if SARVAM_HTTP_SHARED:
+            client, _shared_client = _shared_client, None
+        else:
+            client, self._client = self._client, None
+        if client is None:
+            return
+
+        async def _drain() -> None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 — teardown of a dead client
+                pass
+
+        try:
+            asyncio.get_running_loop().create_task(_drain())
+        except RuntimeError:
+            await _drain()
 
     async def close(self) -> None:
         global _shared_client

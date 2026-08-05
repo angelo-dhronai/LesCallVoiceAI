@@ -491,6 +491,12 @@ _GUJARATI_PATTERNS = [
 # tokens and bare acknowledgements are NEUTRAL. See _evidence_switch_decision.
 LANG_EVIDENCE_SWITCH = os.environ.get(
     "LANG_EVIDENCE_SWITCH", "true").lower() == "true"
+# Words an utterance must carry before UNANIMOUS evidence (density 1.0, zero
+# competing votes) is enough to switch on its own. Guards against a single
+# stray token flipping a call while still following a caller who has clearly
+# changed language in a full sentence.
+LANG_UNANIMOUS_MIN_WORDS = int(
+    os.environ.get("LANG_UNANIMOUS_MIN_WORDS", "3"))
 
 # Indic script characters (Devanagari + Gujarati) are UNFAKEABLE language
 # evidence: no provider hallucinates Devanagari on English speech. A
@@ -691,6 +697,53 @@ _SAY_AGAIN = {
     "gu": "કૃપા કરીને ફરી કહેશો?",
 }
 
+# Text-less tool turn repair (2026-08-04). When the model answers with a tool
+# call and no sentence, ask it once more with the tools withdrawn so the
+# caller hears the agent's own words instead of a canned confirmation. Only
+# fires on turns that would otherwise be canned-or-silent, so the latency
+# cost is paid exactly where the alternative is worse.
+_TOOL_TEXT_REISSUE = (
+    os.environ.get("TOOL_TEXT_REISSUE", "true").lower() == "true")
+try:
+    _TOOL_TEXT_REISSUE_TIMEOUT_S = float(
+        os.environ.get("TOOL_TEXT_REISSUE_TIMEOUT_S", "2.5"))
+except ValueError:
+    _TOOL_TEXT_REISSUE_TIMEOUT_S = 2.5
+# Absolute floor when a tool ran, produced no canned line, and the re-ask
+# missed. Agents override via response_bank.tool_ack_fallbacks.
+_TOOL_ACK_FALLBACK = {
+    "en": "Got it, thank you — what else can I help you with?",
+    "hi": "जी, समझ गया — और कुछ बताइए, मैं कैसे मदद कर सकता हूँ?",
+    "gu": "જી, સમજાઈ ગયું — બીજું કંઈ મદદ કરી શકું?",
+}
+# Placeholder date/time words the model substitutes for a real slot. Read
+# back verbatim by the booking confirmation, they produce lines like
+# "Done — I have noted today at now." A booking needs a concrete slot.
+_UNBOOKABLE_WHEN = {
+    "now", "asap", "today", "tomorrow", "later", "soon", "anytime",
+    "any time", "tbd", "n/a", "na", "none", "unknown", "unspecified",
+    "sometime", "whenever", "immediately", "right now", "अभी", "आज", "कल",
+    "બહુ જલ્દી", "હમણાં", "આજે", "કાલે",
+}
+
+
+def _is_bookable_when(date: str, tm: str) -> bool:
+    """A booking slot must name a time, not a vague adverb.
+
+    `date` may legitimately be relative ("tomorrow", "Monday") — the calendar
+    layer resolves those. `time` may not: without a clock reading there is
+    nothing to confirm and nothing to put in a diary.
+    """
+    t = (tm or "").strip().lower()
+    if not t or t in _UNBOOKABLE_WHEN:
+        return False
+    # Accept anything carrying a digit (3, 3pm, 15:30, ३) or a spelled-out
+    # clock word; reject bare adverbs.
+    if any(ch.isdigit() for ch in t):
+        return True
+    return any(w in t for w in ("o'clock", "oclock", "noon", "midnight",
+                                "बजे", "વાગ્યે"))
+
 # Localized time-of-day words for the {current_time} greeting placeholder.
 _TIME_OF_DAY_WORDS = {
     "en": {"morning": "morning", "afternoon": "afternoon", "evening": "evening"},
@@ -793,6 +846,40 @@ _LANG_SWITCH_STOP_TOKENS = frozenset([
 # ---------------------------------------------------------------------------
 
 
+_UNRESOLVED_TOKEN_RE = re.compile(
+    r"\$\{[^{}]{0,60}\}|\{\{[^{}]{0,60}\}\}|\{[A-Za-z_][A-Za-z0-9_ .\-]{0,58}\}")
+
+
+def strip_unresolved_tokens(text: str, where: str = "") -> str:
+    """Last line of defence: never SPEAK a template placeholder.
+
+    The engine substitutes a fixed set of tokens ({contact_name},
+    {customer_name}, {current_time} and tolerated syntax variants). Anything
+    else an agent author or the copilot invents survives to TTS and is read
+    aloud, braces and all — academic_counsellor opened every call with
+    "am I speaking with the parent or guardian of {{student_name}}?".
+
+    Config can always be wrong; a caller hearing curly braces is never
+    acceptable, so this strips whatever is left AFTER substitution and logs
+    loudly enough to find the offending field.
+    """
+    if not text or "{" not in text:
+        return text
+    found = _UNRESOLVED_TOKEN_RE.findall(text)
+    if not found:
+        return text
+    cleaned = _UNRESOLVED_TOKEN_RE.sub("", text)
+    # Tidy the seams the removal leaves behind ("of ?" / " ," / double spaces).
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([?.!,])", r"\1", cleaned)
+    cleaned = re.sub(r"\b(of|for|to|with|from)\s*([?.!])", r"\2", cleaned)
+    logger.error(
+        "[TOKEN] unresolved placeholder(s) %s in %s — stripped before speaking. "
+        "Only {contact_name}/{customer_name}/{current_time} are substituted.",
+        found[:3], where or "agent text")
+    return cleaned.strip()
+
+
 def _validate_response(text: str, expected_lang: str = "en",
                        max_len: int = MAX_RESPONSE_LENGTH) -> str:
     if not text or not text.strip():
@@ -803,6 +890,7 @@ def _validate_response(text: str, expected_lang: str = "en",
     max_len = max(int(max_len or MAX_RESPONSE_LENGTH), MAX_RESPONSE_LENGTH)
     cleaned = _MARKDOWN_RE.sub("", text)
     cleaned = _EMOJI_RE.sub("", cleaned).strip()
+    cleaned = strip_unresolved_tokens(cleaned, "llm_response")
     if len(cleaned) > max_len:
         truncated = cleaned[:max_len]
         last_sentence = max(truncated.rfind("."), truncated.rfind("!"), truncated.rfind("?"))
@@ -879,6 +967,17 @@ class ConversationRouter:
         # rejects the param.
         _reff = os.environ.get("LLM_REASONING_EFFORT", "").strip()
         self._llm_extra: dict = {"reasoning_effort": _reff} if _reff else {}
+        # Model provenance, once per call. LLM_MODEL/LLM_REASONING_EFFORT live
+        # in a gitignored .env read at process start, so a model change leaves
+        # no commit and no record — the 08-01 bump had to be reconstructed
+        # from tool-call id alphabets weeks later. One line makes every future
+        # "it got worse after…" answerable from the log itself.
+        logger.info("[LLM-CONFIG] model=%s effort=%s base_url=%s "
+                    "max_tokens=%s tools=%s",
+                    self._model, _reff or "(unset)",
+                    self._base_url or "(default)",
+                    self._def.llm_config.max_tokens,
+                    os.environ.get("LLM_TOOLS_MODE", "(agent)"))
         self._timeout = timeout if timeout is not None else self._def.llm_config.timeout_s
         self._client: AsyncOpenAI | None = None
         _qa_signals = self._def.knowledge_base.qa_field_signals or None
@@ -1330,6 +1429,19 @@ class ConversationRouter:
             text = last
         else:
             phrase = _COULDNT_HEAR.get(self.state.language, _COULDNT_HEAR["en"])
+            # A bare acknowledgement is a REACTION to the caller, not a
+            # prompt — replaying it produces the nonsense observed live on
+            # 08-03: "Sorry, I couldn't hear you. Noted, thank you." Re-ask
+            # the last thing the agent actually asked instead.
+            if not self._invites_a_reply(last):
+                _q = self._last_question_asked()
+                last = _q or ""
+                if not last:
+                    self.memory.add_assistant(
+                        f"{phrase} {_SAY_AGAIN.get(self.state.language, _SAY_AGAIN['en'])}",
+                        language=self.state.language)
+                    return (f"{phrase} "
+                            f"{_SAY_AGAIN.get(self.state.language, _SAY_AGAIN['en'])}")
             # H7: replaying a long multi-sentence answer verbatim reads as a
             # malfunction (live: 166 chars ≈ 13s of TTS after an apology).
             # Condense to the final sentence — that is the question.
@@ -1347,6 +1459,40 @@ class ConversationRouter:
         # original question, not compound "couldn't hear you" prefixes.
         self.memory.add_assistant(text, language=self.state.language)
         return text
+
+    # Question marks across the platform's scripts, plus the Devanagari
+    # danda-free interrogatives that carry no '?' in practice.
+    _REPLY_INVITE_RE = re.compile(
+        r"\?|？|कीजिए|बताइए|बताएं|बोलिए|चाहिए|कहिए|शेयर|"
+        r"કહેશો|જણાવો|બતાવો|જોઈએ", re.IGNORECASE)
+
+    def _invites_a_reply(self, text: str) -> bool:
+        """Did this utterance ask the caller for something?
+
+        Used by dead-air repair: an utterance that asked nothing is not worth
+        replaying after "I couldn't hear you" — the caller has nothing to
+        answer.
+        """
+        t = (text or "").strip()
+        if not t:
+            return False
+        return bool(self._REPLY_INVITE_RE.search(t))
+
+    def _last_question_asked(self) -> str:
+        """Most recent agent utterance that actually asked the caller
+        something, scanning back through the conversation window."""
+        try:
+            for turn in reversed(self.memory.get_history_for_llm()):
+                if turn.get("role") != "assistant":
+                    continue
+                body = (turn.get("content") or "").strip()
+                if not body or self._is_bare_hello_text(body):
+                    continue
+                if self._invites_a_reply(body):
+                    return body if len(body) <= 220 else ""
+        except Exception:
+            logger.exception("[REPAIR] last-question scan failed")
+        return ""
 
     _SILENCE_GOODBYE = {
         "en": "It seems I'm not able to reach you right now, so I'll let you "
@@ -1491,6 +1637,47 @@ class ConversationRouter:
                 f"We spoke {when}{about}, and you'd asked me to give you a "
                 f"call back — so here I am. Is now a good time to talk?")
 
+    # Outbound personalization: greet the dialed contact by name. Canonical
+    # form is {contact_name}; also tolerate the template syntaxes LLM editors
+    # keep inventing (${contact_name}, {{contact_name}}, [name], <contact>) —
+    # a raw template token must NEVER be spoken to a caller.
+    _CONTACT_PH_RE = re.compile(
+        r"(?:\$\{|\{\{|\{|\[|<)\s*"
+        r"(?:contact[ _\-]?name|customer[ _\-]?name|person[ _\-]?name|callee[ _\-]?name|contact|name)"
+        r"\s*(?:\}\}|\}|\]|>)"
+        r"|\$contact[ _\-]?name\b",
+        re.IGNORECASE,
+    )
+    # Time-of-day personalization: {current_time} → morning/afternoon/evening
+    # in the caller's timezone (IST). Same tolerance for invented syntaxes.
+    _TIME_PH_RE = re.compile(
+        r"(?:\$\{|\{\{|\{|\[|<)\s*"
+        r"(?:current[ _\-]?time|time[ _\-]?of[ _\-]?day|greeting[ _\-]?time|day[ _\-]?part)"
+        r"\s*(?:\}\}|\}|\]|>)"
+        r"|\$current[ _\-]?time\b",
+        re.IGNORECASE,
+    )
+
+    def _personalize(self, text: str, field: str) -> str:
+        """Substitute the placeholders an authored spoken line may carry.
+
+        Shared by every line the business dictates word-for-word — the
+        opening greeting and the connect intro line (`call_flow.connect.
+        intro_line`) — so a placeholder behaves identically wherever the
+        owner types it. Anything still in braces afterwards is an invented
+        token and is stripped rather than read aloud.
+        """
+        if not text:
+            return text
+        if self._CONTACT_PH_RE.search(text):
+            _who = self.outbound_contact_name or "sir/ma'am"
+            # lambda: the name is a literal, not a regex replacement template
+            text = self._CONTACT_PH_RE.sub(lambda _m: _who, text)
+        if self._TIME_PH_RE.search(text):
+            _tod = _time_of_day_word(text)
+            text = self._TIME_PH_RE.sub(lambda _m: _tod, text)
+        return strip_unresolved_tokens(text, field)
+
     async def generate_opening(self) -> EngineResult:
         """Inbound warm welcome — agent answers the call.
         Bilingual so caller can respond in their preferred language."""
@@ -1509,32 +1696,7 @@ class ConversationRouter:
             _cb_greeting = self._callback_opening()
             if _cb_greeting:
                 greeting = _cb_greeting
-        # Outbound personalization: greet the dialed contact by name. Canonical
-        # form is {contact_name}; also tolerate the template syntaxes LLM
-        # editors keep inventing (${contact_name}, {{contact_name}}, [name],
-        # <contact>) — a raw template token must NEVER be spoken to a caller.
-        _ph = re.compile(
-            r"(?:\$\{|\{\{|\{|\[|<)\s*"
-            r"(?:contact[ _\-]?name|customer[ _\-]?name|person[ _\-]?name|callee[ _\-]?name|contact|name)"
-            r"\s*(?:\}\}|\}|\]|>)"
-            r"|\$contact[ _\-]?name\b",
-            re.IGNORECASE,
-        )
-        if _ph.search(greeting):
-            _who = self.outbound_contact_name or "sir/ma'am"
-            greeting = _ph.sub(lambda _m: _who, greeting)  # lambda: name is literal, not a regex template
-        # Time-of-day personalization: {current_time} → morning/afternoon/evening
-        # in the caller's timezone (IST). Same tolerance for invented syntaxes.
-        _tph = re.compile(
-            r"(?:\$\{|\{\{|\{|\[|<)\s*"
-            r"(?:current[ _\-]?time|time[ _\-]?of[ _\-]?day|greeting[ _\-]?time|day[ _\-]?part)"
-            r"\s*(?:\}\}|\}|\]|>)"
-            r"|\$current[ _\-]?time\b",
-            re.IGNORECASE,
-        )
-        if _tph.search(greeting):
-            _tod = _time_of_day_word(greeting)
-            greeting = _tph.sub(lambda _m: _tod, greeting)
+        greeting = self._personalize(greeting, "opening_greeting")
         self.memory.add_assistant(greeting, language=self.state.language)
         self.state.stage = STAGE_GREETING
         # Store for last-response memory (feature 3)
@@ -2094,6 +2256,17 @@ class ConversationRouter:
             _dnd = [str(p).lower() for p in
                     ((self._def.guardrails.compliance or {}).get("dnd_phrases") or [])]
             _is_dnd = any(p and p in text.lower() for p in _dnd)
+            # The per-agent dnd_phrases list above defaults to [] on EVERY
+            # agent, so before this line the configured close could never
+            # fire. Meanwhile _detect_dnd_request() (platform-wide, matches
+            # "stop calling", "remove my number", hi/gu forms) only recorded a
+            # CRM flag. The two were never connected, so on 2026-08-04 a
+            # caller who said "stop calling me" was answered with the
+            # objection playbook — "it's always worth a quick comparison" —
+            # instead of being let go. An explicit opt-out now takes the same
+            # graceful close as a configured dnd_phrase.
+            _is_dnd = _is_dnd or bool(
+                self.state_mgr.extra_flags.get("dnd_requested"))
 
             # Nth decline (per call_flow.decline_threshold; all live agents
             # carry 2 — wiring changes nothing): stop pushing, end gracefully.
@@ -2185,6 +2358,26 @@ class ConversationRouter:
         if intent == "language_switch":
             old_lang = self.state.language
             new_lang = self._extract_requested_language(text)
+            # An explicit request still cannot take the call outside the
+            # languages this agent was built for — it has no greeting, no
+            # canned responses and no TTS voice there. Say so instead of
+            # switching into a language the agent cannot actually speak.
+            if new_lang not in self._switchable_languages():
+                logger.info("[LANG] Explicit switch to %s refused — agent "
+                            "speaks %s", new_lang,
+                            sorted(self._switchable_languages()))
+                _unsupported = self._lang_response(
+                    self._def.response_bank.lang_unsupported_responses)
+                if _unsupported:
+                    _cancel_llm()
+                    self.memory.add_assistant(_unsupported,
+                                              language=self.state.language)
+                    yield EngineResult(text=_unsupported, is_shortcut=True,
+                                       intent="language_switch")
+                    return
+                # No configured line — let the LLM answer in the language it
+                # already speaks rather than say nothing.
+                new_lang = old_lang
             logger.info(
                 "[LANG] Explicit switch request -> %s (was %s, locked=%s)",
                 new_lang, old_lang, self.state.language_locked,
@@ -2343,7 +2536,7 @@ class ConversationRouter:
         # =============================================================
         self.state.llm_cancelled = False
         async for result in self._consume_llm_with_filler(
-            llm_queue, llm_done, intent, nudge_back=False,
+            llm_queue, llm_done, intent, nudge_back=False, user_text=text,
         ):
             yield result
 
@@ -2804,6 +2997,15 @@ class ConversationRouter:
                     if not date or not tm:
                         logger.info("[TOOLS] book_appointment rejected — "
                                     "missing args %r", p.args)
+                    elif not _is_bookable_when(date, tm):
+                        # The model passed placeholders instead of a real
+                        # slot (observed live 08-03: date='today',
+                        # time='now'), and the caller heard the canned
+                        # confirmation read it back verbatim — "Done, I have
+                        # noted today at now." An unusable slot is not a
+                        # booking; let the conversation ask properly.
+                        logger.info("[TOOLS] book_appointment rejected — "
+                                    "unusable date/time %r / %r", date, tm)
                     elif self.state.is_closing or self.state.turn_count <= 1:
                         # Stage-legality gate (phantom-booking protection).
                         logger.info("[TOOLS] book_appointment rejected — not "
@@ -3571,6 +3773,7 @@ class ConversationRouter:
         llm_done: asyncio.Event,
         intent: str,
         nudge_back: bool = False,
+        user_text: str = "",
     ):
         """Consume LLM queue with filler timeout.
 
@@ -3578,6 +3781,10 @@ class ConversationRouter:
         a second utterance — the flow re-prompts naturally on the next turn.
         This prevents the agent from talking non-stop (LLM answer + nudge
         back-to-back without letting the user speak).
+
+        user_text is the caller utterance this turn — needed only to re-ask
+        the model for spoken words when it answered with a tool call and no
+        sentence (see the text-less-tool-turn repair below).
         """
         full_parts: list[str] = []
 
@@ -3634,9 +3841,45 @@ class ConversationRouter:
         # marker uses. Confirmation lines are yielded only on TOOL-ONLY
         # turns (the compat shim returns tool calls INSTEAD of text) so an
         # executed action is never followed by dead air.
-        for _line in self._execute_tool_proposals(had_text=bool(full_parts)):
+        _had_text = bool(full_parts)
+        _had_proposals = bool(self._pending_tool_proposals)
+        _tool_lines = self._execute_tool_proposals(had_text=_had_text)
+
+        # ── Text-less tool turn: ask again, with tools switched off ──────
+        # The trailer at _call_llm_stream says "ALWAYS also reply with your
+        # normal 1-2 spoken sentences alongside any tool call". When the
+        # model ignores that, everything the caller hears comes from the
+        # canned CONFIRM_LINES — and when the tool filled nothing (a
+        # record_customer_details naming a property the agent does not have)
+        # there is no canned line either, so the caller hears NOTHING.
+        # Measured on this fleet: 0 canned lines in 1,206 agent turns
+        # 07-20..07-30, then 7.9% (08-01) / 10.3% (08-03) / 13.6% (08-04) —
+        # and 0/517 → 16.8% within maya_lescall_sdr alone, an agent whose
+        # slot roster and tool wiring never changed. The action is already
+        # committed at this point; re-asking only buys back the sentence.
+        if not _had_text and _had_proposals and _TOOL_TEXT_REISSUE:
+            _spoken = await self._reissue_text_only(user_text, intent)
+            if _spoken:
+                _tool_lines = []  # the model's own words ARE the confirmation
+                full_parts.append(_spoken)
+                yield EngineResult(text=_spoken, is_shortcut=False,
+                                   intent=intent)
+
+        for _line in _tool_lines:
             full_parts.append(_line)
             yield EngineResult(text=_line, is_shortcut=True, intent=intent)
+
+        # Last resort: a tool ran, nothing was spoken, and the re-ask did not
+        # land. Never end a turn on silence — the caller is waiting.
+        if not full_parts and _had_proposals:
+            _ack = (self._lang_response(self._def.response_bank.tool_ack_fallbacks)
+                    or _TOOL_ACK_FALLBACK.get(
+                        (self.state.language or "en")[:2],
+                        _TOOL_ACK_FALLBACK["en"]))
+            logger.warning("[TOOLS] tool-only turn produced no speech — "
+                           "acknowledging instead of dead air")
+            full_parts.append(_ack)
+            yield EngineResult(text=_ack, is_shortcut=True, intent=intent)
 
         # LLM end-call signal (termination.llm_end_call): the stream carried
         # an [END_CALL] token — the goodbye chunks above are the farewell, so
@@ -3764,7 +4007,47 @@ class ConversationRouter:
             await queue.put(None)
             done.set()
 
-    async def _call_llm_stream(self, text: str):
+    async def _reissue_text_only(self, user_text: str, intent: str) -> str:
+        """Re-ask the model for the sentence it owed this turn.
+
+        Runs only after a text-less tool turn, with the tool declarations
+        withdrawn (`force_text`), so the model has nothing to answer with
+        except words. Bounded by TOOL_TEXT_REISSUE_TIMEOUT_S — on timeout or
+        error the caller falls back to the canned confirmation, exactly
+        today's behaviour, so this can only add speech, never remove it.
+        """
+        _t0 = time.monotonic()
+        parts: list[str] = []
+        try:
+            async def _collect() -> None:
+                async for chunk in self._call_llm_stream(user_text,
+                                                         force_text=True):
+                    if chunk:
+                        parts.append(chunk)
+
+            await asyncio.wait_for(_collect(),
+                                   timeout=_TOOL_TEXT_REISSUE_TIMEOUT_S)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning("[TOOLS] text re-ask timed out after %.1fs — "
+                           "falling back to the canned confirmation",
+                           _TOOL_TEXT_REISSUE_TIMEOUT_S)
+        except Exception:
+            logger.exception("[TOOLS] text re-ask failed")
+        # A re-ask must never re-arm termination: end_call was already
+        # handled by the first pass, and a marker in the retry would hang up
+        # on a turn the caller has not finished.
+        self._llm_end_call_seen = False
+        self._pending_tool_proposals = []
+        spoken = " ".join(p.strip() for p in parts if p and p.strip()).strip()
+        if not spoken:
+            return ""
+        logger.info("[TOOLS] text re-ask recovered %d chars in %.0fms",
+                    len(spoken), (time.monotonic() - _t0) * 1000)
+        return spoken
+
+    async def _call_llm_stream(self, text: str, force_text: bool = False):
         client = self._get_client()
 
         # RAG: retrieve relevant document chunks for this turn (non-blocking try/except
@@ -3819,13 +4102,23 @@ class ConversationRouter:
         # never calls them (observed on the first live E2E). Lives in this
         # trailer, not _build_system_prompt, so the golden fixtures stay
         # env-independent.
-        if self._tools_mode == "on":
+        if self._tools_mode == "on" and not force_text:
             _final += (
                 "\nTOOLS: use the provided tools to record details the "
                 "customer states and actions they agree to — booking a "
                 "visit, a callback request, do-not-call, or ending the "
                 "call. ALWAYS also reply with your normal 1-2 spoken "
                 "sentences alongside any tool call.")
+        elif force_text:
+            # Text-only re-ask: the action is already recorded, so the ONLY
+            # thing missing is what the caller hears. Say so explicitly —
+            # left implicit, the model tends to re-narrate the tool call.
+            _final += (
+                "\nThe customer's details have already been recorded — you "
+                "do not need to record anything. Reply now with ONLY your "
+                "normal 1-2 spoken sentences to the customer, continuing "
+                "the conversation naturally. Do not mention recording, "
+                "systems, notes or tools.")
         # ONE system message, always. Gemini's OpenAI-compat endpoint keeps
         # only a single systemInstruction — with the language trailer sent as
         # a SECOND system message it silently REPLACED the entire agent
@@ -3844,7 +4137,7 @@ class ConversationRouter:
         self._pending_tool_proposals = []
         _tool_kwargs: dict = {}
         _tool_acc = None
-        if self._tools_mode == "on":
+        if self._tools_mode == "on" and not force_text:
             from .llm_tools import ToolCallAccumulator, build_tool_declarations
             _tool_kwargs["tools"] = build_tool_declarations(
                 list(self.state_mgr.slots.keys()))
@@ -4204,6 +4497,23 @@ class ConversationRouter:
                 en_function += 1
         return votes, en_function
 
+    def _switchable_languages(self) -> frozenset[str]:
+        """The languages this agent may be carried into mid-call.
+
+        Exactly `languages.supported` (plus the default, which is always
+        speakable). An agent built for Hindi/English/Gujarati follows the
+        caller across all three; an English-only agent stays English no
+        matter what it hears — that is a build decision, not a runtime one.
+        """
+        langs = {str(x).strip()[:2].lower()
+                 for x in (self._def.languages.supported or [])}
+        langs.add(str(self._def.languages.default or "en").strip()[:2].lower())
+        return frozenset(x for x in langs if x in ("en", "hi", "gu"))
+
+    def _auto_switch_enabled(self) -> bool:
+        """languages.auto_switch — ON by default, platform-wide."""
+        return bool(getattr(self._def.languages, "auto_switch", True))
+
     def _evidence_switch_decision(self, text: str) -> tuple[str | None, str]:
         """A2 (2026-07-30): decide a mid-call language switch from word
         evidence inside THIS utterance. Returns (target | None, reason).
@@ -4217,6 +4527,8 @@ class ConversationRouter:
         evidence switch, non-explicit switching pauses for 1 turn.
         """
         cur = self.state.language
+        if not self._auto_switch_enabled():
+            return None, "auto_switch_off"
         votes, en_function = self._language_votes(text)
         total = sum(votes.values())
         if total == 0:
@@ -4225,6 +4537,12 @@ class ConversationRouter:
         if votes[best] == 0 or best == cur:
             self._pending_lang_switch = None
             return None, "current"
+        # Switching is bounded by the languages this agent was BUILT for.
+        # Without this the switcher could carry a call into a language the
+        # agent has no greeting, no responses and no TTS voice for.
+        if best not in self._switchable_languages():
+            self._pending_lang_switch = None
+            return None, f"unsupported({best})"
         density = votes[best] / total
         if density < 0.3:
             self._pending_lang_switch = None
@@ -4237,6 +4555,18 @@ class ConversationRouter:
         if votes[best] >= 2 and density >= 0.6:
             self._pending_lang_switch = None
             return best, f"evidence({detail})"
+        # UNANIMOUS evidence on a real sentence switches immediately. The
+        # two-vote bar cost the caller a whole turn: live 2026-08-04,
+        # "haan, baat kar sakte hain." scored votes=1/1 density=1.00 and was
+        # held as `pending`, so a Hindi speaker was answered in English and
+        # had to say it again before the agent followed. Nothing in that
+        # utterance voted for another language — one vote out of one, in a
+        # multi-word sentence, is not a coin flip.
+        if (density >= 1.0
+                and len(text.split()) >= LANG_UNANIMOUS_MIN_WORDS
+                and not (best == "en" and en_function < 1)):
+            self._pending_lang_switch = None
+            return best, f"evidence_unanimous({detail})"
         if self._pending_lang_switch == best:
             self._pending_lang_switch = None
             return best, f"evidence_confirmed({detail})"
@@ -4512,6 +4842,7 @@ class ConversationRouter:
             if pb:
                 return pb
         resp = self._lang_response(self._def.response_bank.objection_responses)
+        resp = strip_unresolved_tokens(resp, "objection_response")
         return resp or "I understand. Could I share one quick point before you go?"
 
     # ── v2 callback policy (D10) ────────────────────────────────────────
@@ -5049,18 +5380,90 @@ class ConversationRouter:
         yield EngineResult(text=resp, is_shortcut=True,
                            intent="capture_reask")
 
+    def _connect_intro_configured(self) -> str:
+        """The business's own word-for-word second line, if it set one.
+
+        `call_flow.connect.intro_line` is the answer to the request the
+        platform could not honour before 2026-08-04: "say Hello, wait for
+        them to answer, THEN say <exact sentence>". Everything the caller
+        hears at the start of a call is now settable — the first line via
+        response_bank/outbound.opening_greeting, this one for the second
+        beat. Accepts a per-language map or a bare string.
+        """
+        raw = self._connect_cfg().get("intro_line")
+        if isinstance(raw, str):
+            raw = {"en": raw}
+        if not isinstance(raw, dict) or not raw:
+            return ""
+        line = self._personalize(
+            str(self._lang_response(raw) or "").strip(),
+            "call_flow.connect.intro_line")
+        # A configured intro that is itself a bare hello would re-open the
+        # exact "Hello" ↔ "Hello" parrot loop the fast path exists to kill.
+        if len(line) < 2 or self._is_bare_hello_text(line):
+            return ""
+        return line
+
     def connect_intro_line(self) -> str:
         """Full identity intro for the connect hello fast path (and for the
         dead-air reprompt when the last utterance was a bare hello). Prefers
-        the configured opening when it is a real line; otherwise composes one
-        from identity so the protection never depends on clean agent config."""
+        the business's configured intro_line, then the configured opening
+        when it is a real line; otherwise composes one from identity so the
+        protection never depends on clean agent config."""
+        # Tier 0: the owner dictated this line. It outranks everything —
+        # including response_bank.opening_greeting, which is LIVE on agents
+        # whose opening is long (that tier would otherwise shadow it exactly
+        # the way stage goals shadowed dictated speech before).
+        configured = self._connect_intro_configured()
+        if configured:
+            logger.info("[CONNECT] intro_line from config (lang=%s): %r",
+                        self.state.language, configured[:60])
+            return configured
         last = (self.last_agent_response or "").strip()
         if last and not self._is_bare_hello_text(last):
             return last
-        opening = (self._def.response_bank.opening_greeting or "").strip()
-        if len(opening) >= 15 and not self._is_bare_hello_text(opening) \
-                and "{" not in opening:
+        # Tier 1.5: on OUTBOUND calls the business has usually already
+        # written this exact beat — `outbound.identity_confirm_line` ("Hope
+        # you're having a very good {current_time}, just wanted to make sure
+        # if I am speaking to {contact_name}"). Until 2026-08-04 the engine
+        # only ever fed it to the LLM as prompt context
+        # (prompt_blocks.py:335), so the caller heard the generic identity
+        # template here and the owner's line arrived a turn late, if at all
+        # — precisely the live 2026-08-04 report. Speak the words they
+        # actually wrote.
+        if getattr(self._def, "call_direction", "") == "outbound":
+            _icl = self._personalize(
+                str(self._lang_response(
+                    self._def.outbound.identity_confirm_line) or "").strip(),
+                "outbound.identity_confirm_line")
+            if len(_icl) >= 10 and not self._is_bare_hello_text(_icl):
+                logger.info("[CONNECT] identity_confirm_line (lang=%s): %r",
+                            self.state.language, _icl[:60])
+                return _icl
+        # Tier 2: the agent's OWN authored opening, from the field this
+        # DIRECTION actually reads. Two bugs lived here:
+        #   • it read response_bank.opening_greeting even on outbound agents,
+        #     so an outbound business's own words were skipped;
+        #   • a line containing {contact_name} was REJECTED outright ("{" not
+        #     in opening) instead of being personalized — so exactly the
+        #     businesses that wrote the most tailored opening got the generic
+        #     platform template.
+        opening = ""
+        if getattr(self._def, "call_direction", "") == "outbound":
+            opening = str(self._lang_response(
+                self._def.outbound.opening_greeting) or "").strip()
+        if not opening:
+            opening = (self._def.response_bank.opening_greeting or "").strip()
+        opening = self._personalize(opening, "opening_greeting")
+        if len(opening) >= 15 and not self._is_bare_hello_text(opening):
             return opening
+        # Nothing authored for this beat — the platform composes one from
+        # identity. This is the "every agent says the same thing" line; the
+        # cure is call_flow.connect.intro_line, and the Copilot lint tells
+        # the business so before a caller ever hears it.
+        logger.info("[CONNECT] no authored second line — composing from "
+                    "identity (set call_flow.connect.intro_line to control "
+                    "this wording)")
         ident = self._def.identity
         agent = (ident.agent_name or "").strip()
         company = (ident.company_name or "").strip() or agent or "our team"

@@ -39,6 +39,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import time
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +65,7 @@ from backend.app.agent_definition.voice_catalog import (            # noqa: E402
 )
 from backend.app.agent_definition.boot_check import engine_boot_check  # noqa: E402
 from backend.app.agent_definition import spoken_surfaces as _surfaces  # noqa: E402
+from backend.app.agent_definition import controls as _controls  # noqa: E402
 from backend.app.agent_definition import store as agent_store       # noqa: E402
 from backend.app.agent_definition.diff import (                     # noqa: E402
     apply_ops as _apply_ops, compute_diff as _compute_diff,
@@ -124,7 +127,23 @@ def _billing_llm_gate(request, surface: str) -> None:
     check_copilot_turn(owner).raise_for_http()
     record_copilot_turn(owner, surface)
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{1,60}$")
+# The only languages the voice engine can actually speak.
+_PLATFORM_LANGUAGES = frozenset({"hi", "en", "gu"})
 _MAX_TOOL_ITERATIONS = 8
+# Read-only rounds no longer spend the budget. The system prompt ORDERS the
+# model to verify its own work (find_text before and after a wording sweep,
+# preview_opening after a greeting edit) and then charged it for obeying: a
+# single "change both directions" request costs get_agent ×2 + update ×2
+# before any verification, so the mandated checks were what got cut. Writes
+# still cap at _MAX_TOOL_ITERATIONS; _MAX_TOOL_ROUNDS is the anti-runaway
+# ceiling for read loops.
+_READ_ONLY_TOOLS = frozenset({
+    "get_agent", "list_agents", "preview_opening", "find_text",
+    "validate_agent", "get_routing", "list_revisions", "list_controls",
+})
+_MAX_TOOL_ROUNDS = 20
+# Same read, same arguments, three times in one turn = a loop, not research.
+_MAX_IDENTICAL_READS = 2
 _CONTEXT_MAX_MESSAGES = 48  # trim very long sessions before sending to the LLM
 
 
@@ -756,6 +775,119 @@ def _any_placeholder(text: str) -> bool:
     return bool(_PLACEHOLDER_RE.search(text) or _TIME_PLACEHOLDER_RE.search(text))
 
 
+# ── what the user dictated, and which beat they meant ───────────────────────
+# Two structural guards against the failure the owner hit five times across
+# three agents: a sentence they gave word-for-word was saved into a field the
+# caller never hears (a stage goal), or into the wrong beat (the opening line
+# instead of the line after the caller responds). Both looked like success.
+
+# "after they say hello", "once the caller responds", "then say", "second line",
+# "wait for the caller's response". Three shapes, any one is enough.
+_SECOND_BEAT_RE = re.compile(
+    # (a) a time word, then someone speaking
+    r"(?:\bafter\b|\bonce\b|\bwhen\b|\bthen\b)[^.?!]{0,60}?"
+    r"\b(?:say|says|said|saying|speak|speaks|spoke|respond|responds|responded|"
+    r"response|reply|replies|replied|answer|answers|answered|"
+    r"pick(?:s|ed)?\s*up|hello|hi)\b"
+    # (b) the user naming the beat outright
+    r"|\bsecond\s+(?:line|sentence|beat|thing)\b"
+    # (c) "wait for the caller / their response / them to answer"
+    r"|\bwait(?:s|ing)?\s+for\s+(?:the\s+|a\s+|their\s+|his\s+|her\s+)?"
+    r"(?:caller|callers|caller's|customer|contact|client|person|them|they|"
+    r"response|reply|answer|hello)\b",
+    re.IGNORECASE)
+
+# A quoted span, or a line following an explicit dictation cue.
+_QUOTED_RE = re.compile(r"[\"“”'‘’]([^\"“”\n]{8,300}?)[\"“”'‘’]")
+_DICTATION_CUE_RE = re.compile(
+    r"\b(?:say|says|should say|must say|start(?:s|ing)? with|"
+    r"continue with|greet(?:s|ing)? with|line is|exactly this|"
+    r"word for word|verbatim|like this)\b\s*[:\-—]?\s*(.+)$",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _describes_second_beat(message: str) -> bool:
+    """True when the request is about what the agent says AFTER the caller
+    first responds — the beat that lives in call_flow.connect.intro_line."""
+    return bool(_SECOND_BEAT_RE.search(str(message or "")))
+
+
+def _dictated_sentences(message: str, min_words: int = 4) -> list[str]:
+    """Sentences the user gave word-for-word for the agent to SAY.
+
+    Quote marks and cue words only — no NLP, so it behaves identically in
+    English, Hindi and Gujarati. Deliberately conservative: a miss costs
+    nothing, a false positive would nag on every turn.
+    """
+    text = str(message or "")
+    quoted = [m.group(1).strip() for m in _QUOTED_RE.finditer(text)]
+    quoted = [q for q in quoted if len(q.split()) >= min_words]
+    out: list[str] = list(quoted)
+    for m in _DICTATION_CUE_RE.finditer(text):
+        cand = m.group(1).strip().strip('"“”\'‘’ ')
+        # Quotes are the precise boundary — when the user gave both a cue AND
+        # quotes, the quoted span is the sentence, not the rest of the line.
+        if any(q in cand for q in quoted):
+            continue
+        if len(cand.split()) >= min_words and cand not in out:
+            out.append(cand)
+    # De-dup nested cue matches, keeping the longest form of each.
+    uniq: list[str] = []
+    for s in sorted(out, key=len, reverse=True):
+        if not any(s in u for u in uniq):
+            uniq.append(s)
+    return uniq[:4]
+
+
+_HEARABLE_FIELD_HINT = (
+    "the first thing the agent says (the opening line), or the line right "
+    "after the caller responds")
+
+
+def _landed_in_a_hearable_field(defn: dict, sentence: str) -> bool:
+    """Is this sentence somewhere the CALLER actually hears it?
+
+    Scoped deliberately: "anywhere in the definition" would have passed the
+    real 2026-07-31 failure, where a dictated WhatsApp line was filed into a
+    stage goal — present in the YAML, never spoken.
+    """
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", str(s or "")).strip().casefold().rstrip(".!?।")
+
+    target = _norm(sentence)
+    if not target:
+        return True
+    rb = defn.get("response_bank") or {}
+    ob = defn.get("outbound") or {}
+    cf = defn.get("call_flow") or {}
+    conn = cf.get("connect") if isinstance(cf, dict) else {}
+    candidates: list[Any] = [
+        rb.get("opening_greeting"), ob.get("opening_greeting"),
+        (conn or {}).get("intro_line"),
+        rb.get("objection_responses"), rb.get("objection_playbook"),
+        rb.get("closing_responses"), rb.get("graceful_close"),
+        rb.get("decline_farewell"), rb.get("identity_responses"),
+        rb.get("intent_responses"), rb.get("proactive_prompts"),
+        rb.get("lang_fallbacks"), rb.get("tool_ack_fallbacks"),
+        (cf.get("callback_policy") or {}).get("responses")
+        if isinstance(cf, dict) else None,
+    ]
+    for s in (d.get("question") for d in (defn.get("slots") or [])
+              if isinstance(d, dict)):
+        candidates.append(s)
+
+    def _walk(node) -> bool:
+        if isinstance(node, str):
+            return target in _norm(node)
+        if isinstance(node, dict):
+            return any(_walk(v) for v in node.values())
+        if isinstance(node, (list, tuple)):
+            return any(_walk(v) for v in node)
+        return False
+
+    return any(_walk(c) for c in candidates)
+
+
 def _prune_nones(node: Any) -> Any:
     """Recursively remove None values. A None from the LLM must NEVER survive
     to the deep-merge, where it would clobber a good platform default and
@@ -805,6 +937,8 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
         d["slots"] = [d["slots"]]
 
     # ── languages: list/str → {"supported": [...], "default": first} ────────
+    # The engine has detectors, scripts and TTS voices for exactly these.
+
     langs = d.get("languages")
     if isinstance(langs, (list, tuple)):
         d["languages"] = langs = {"supported": [str(x).strip().lower() for x in langs if str(x).strip()]}
@@ -833,6 +967,27 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
             langs.pop("default", None)
         if not langs.get("default") and langs.get("supported"):
             langs["default"] = langs["supported"][0]
+        # Only hi/en/gu exist on this platform. A language the engine has no
+        # detector, no scripts and no voice for must never reach `supported`
+        # — it would look configured and silently do nothing.
+        if isinstance(langs.get("supported"), list):
+            _kept = [x for x in langs["supported"] if x[:2] in _PLATFORM_LANGUAGES]
+            _dropped = [x for x in langs["supported"] if x[:2] not in _PLATFORM_LANGUAGES]
+            if _dropped:
+                notes.append(
+                    "this platform speaks only Hindi, English and Gujarati — "
+                    + ", ".join(sorted(set(_dropped)))
+                    + " was dropped. TELL THE USER it is not supported rather "
+                      "than leaving them to find out on a call.")
+            if _kept:
+                langs["supported"] = _kept
+                if langs.get("default", "")[:2] not in _PLATFORM_LANGUAGES:
+                    langs["default"] = _kept[0]
+            else:
+                langs.pop("supported", None)
+                langs.pop("default", None)
+        if "auto_switch" in langs:
+            langs["auto_switch"] = bool(langs["auto_switch"])
 
     # ── stray top-level tts_voices/voice/speaker → languages.tts_voices ─────
     stray_tts = d.pop("tts_voices", None)
@@ -1497,6 +1652,17 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
             for bk in ("hello_fastpath", "delivery_guard"):
                 if bk in conn:
                     conn[bk] = bool(conn[bk])
+            # intro_line is a SPOKEN surface — the second beat. Same
+            # per-language shape as every other spoken field, so a bare
+            # string is accepted and normalized rather than silently dropped.
+            if "intro_line" in conn:
+                fixed = _lang_dict(conn["intro_line"])
+                if fixed:
+                    conn["intro_line"] = fixed
+                else:
+                    conn.pop("intro_line", None)
+                    notes.append("call_flow.connect.intro_line had an "
+                                 "unusable shape — ignored")
 
     # ── knowledge_base v2 fields ─────────────────────────────────────────────
     kb2 = d.get("knowledge_base")
@@ -1646,7 +1812,110 @@ def _invariant_violations(merged: dict) -> list[str]:
             problems.append(
                 f"llm_config.max_tokens would become {lc['max_tokens']!r} "
                 "(must be an integer between 80 and 512)")
+    problems += _platform_invariants(merged)
     return problems
+
+
+# Object-list fields: every entry MUST be a mapping. A write of bare scalars
+# is accepted by the merge, then silently emptied by the normalizer.
+_OBJECT_LIST_FIELDS: tuple[tuple[str, ...], ...] = (
+    ("response_bank", "objection_playbook"),
+    ("response_bank", "canned_phrases"),
+    ("call_flow", "stages"),
+    ("slots",),
+    ("calendar", "mock_slots"),
+)
+# Only these are substituted before speech (conversation.py). Anything else
+# in braces is read out to the caller verbatim.
+_LIVE_TOKENS = {"contact_name", "customer_name", "current_time"}
+_TOKEN_RE = re.compile(r"\{\{([^{}]{1,60})\}\}|\{([A-Za-z_][A-Za-z0-9_ .\-]{0,58})\}")
+# Surfaces whose strings are spoken to the caller more or less verbatim.
+# stage goals are INSTRUCTIONS to the model, not speech, so they are excluded;
+# response_bank.slots_prompt is a documented {slots} template.
+_SPOKEN_PREFIXES = ("response_bank.", "outbound.")
+_SPOKEN_EXCLUDE = ("response_bank.slots_prompt",)
+_HUMAN_CLAIM_RE = re.compile(
+    r"(?:you\s+are|you're|i\s+am|i'm)\s+(?:a\s+)?(?:real|actual|human)\s*"
+    r"(?:person|human|being)?\b"
+    r"|never\s+(?:reveal|admit|say|disclose)[^.]{0,40}\b(?:ai|bot|robot|automated)\b"
+    r"|deny\s+(?:being|that\s+you\s+are)\s+(?:an?\s+)?(?:ai|bot)"
+    r"|\bnot\s+an?\s+(?:ai|bot|robot)\b",
+    re.I)
+
+
+def _walk_strings(obj, path=""):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _walk_strings(v, f"{path}.{k}" if path else str(k))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from _walk_strings(v, f"{path}[{i}]")
+    elif isinstance(obj, str):
+        yield path, obj
+
+
+def _platform_invariants(merged: dict) -> list[str]:
+    """Invariants the PLATFORM enforces for every agent, on every write.
+
+    These exist because each one was a real live-call defect that no human
+    was going to catch by reading YAML (2026-08-04 audit):
+      * bare scalars written into an object-list were accepted, the field was
+        silently emptied, and the tool still answered "updated" — that is how
+        both hardik twins lost their five objection answers;
+      * a stage collecting a slot that does not exist used to advance
+        vacuously, deleting a whole qualification stage from live calls;
+      * an invented placeholder is SPOKEN with its braces
+        ("...the parent or guardian of {{student_name}}?");
+      * telling an agent it is a real person makes it say so when challenged,
+        which is a compliance problem, not a tone choice.
+    """
+    out: list[str] = []
+
+    for path in _OBJECT_LIST_FIELDS:
+        node = merged
+        for key in path:
+            node = (node or {}).get(key) if isinstance(node, dict) else None
+        if isinstance(node, list):
+            bad = [type(x).__name__ for x in node if not isinstance(x, dict)]
+            if bad:
+                out.append(
+                    f"{'.'.join(path)} must be a list of objects — got "
+                    f"{', '.join(sorted(set(bad)))}. Send the full entries, "
+                    "not bare values (this silently empties the field).")
+
+    slot_names = {s.get("name") for s in (merged.get("slots") or [])
+                  if isinstance(s, dict)}
+    for st in ((merged.get("call_flow") or {}).get("stages") or []):
+        if not isinstance(st, dict):
+            continue
+        for c in (st.get("collect") or []):
+            if c not in slot_names:
+                out.append(
+                    f"stage {st.get('id')!r} collects {c!r}, which is not a "
+                    "defined slot — the stage would never complete. Add the "
+                    "slot or remove it from that stage's collect list.")
+
+    for path, text in _walk_strings(merged):
+        spoken = (path.startswith(_SPOKEN_PREFIXES)
+                  and not path.startswith(_SPOKEN_EXCLUDE))
+        if spoken:
+            for m in _TOKEN_RE.finditer(text):
+                name = (m.group(1) or m.group(2) or "").strip()
+                if name not in _LIVE_TOKENS:
+                    out.append(
+                        f"{path} contains {m.group(0)!r}, which the engine does "
+                        "not substitute — it would be read aloud to the caller. "
+                        "Use {contact_name}, {customer_name} or {current_time}.")
+                    break
+        if _HUMAN_CLAIM_RE.search(text) and path.split("[")[0] in (
+                "personality.custom_instructions",
+                "guardrails.never_rules", "guardrails.always_rules"):
+            out.append(
+                f"{path} tells the agent to claim it is human or to hide that "
+                "it is an AI. The platform will not do that — use "
+                "personality.ai_disclosure (deflect / admit / admit_if_pressed).")
+
+    return out[:12]
 
 
 def _paths_of_changes(changes: dict, prefix: str = "") -> set[str]:
@@ -1680,13 +1949,46 @@ def _read_full_definition(slug: str) -> tuple[dict, str]:
 # act on, and greeting edits return the engine-resolved next-call opening.
 
 
-def _block_dead_paths(paths) -> None:
+def _block_dead_paths(paths, notes: list | None = None) -> None:
     """Refuse a write whose changed paths include keys NO engine path reads —
-    it would succeed, diff cleanly, and change nothing on any call."""
+    it would succeed, diff cleanly, and change nothing on any call.
+
+    Two families. Dead LOCALIZED keys are always refused (proven dead, one
+    shape, zero false positives). Schema-unknown keys — a setting the
+    platform simply does not have — run through
+    COPILOT_UNKNOWN_PATH_GUARD: 'warn' (default) appends to `notes` so the
+    model must tell the user, 'strict' refuses the write, 'off' disables.
+    Warn-first because a too-tight allowlist would edit-lock working agents,
+    which is a worse failure than the one it prevents.
+    """
     reasons = [r for r in (_surfaces.dead_path_reason(p) for p in paths) if r]
     if reasons:
         raise ValueError("Refused — this write would change nothing on any "
                          "call: " + " ".join(dict.fromkeys(reasons)))
+    mode = os.environ.get("COPILOT_UNKNOWN_PATH_GUARD", "warn").lower()
+    if mode == "off":
+        return
+    try:
+        unknown = _controls.unknown_paths(paths)
+    except Exception:  # noqa: BLE001 — the guard must never break a write
+        logger.warning("[copilot] control-surface check failed", exc_info=True)
+        return
+    if not unknown:
+        return
+    near = _controls.nearest_controls(unknown[0][0], k=3)
+    msg = ("NOT A REAL SETTING: " + "; ".join(r for _, r in unknown[:3])
+           + ". Nothing on any call would change."
+           + (" The closest real controls are: " + ", ".join(near) + "."
+              if near else "")
+           + " If the user asked for something this platform cannot do, TELL "
+             "THEM plainly and name the closest thing you CAN do — never "
+             "write the request into a nearby field.")
+    if mode == "strict":
+        raise ValueError("Refused — " + msg)
+    logger.warning("[copilot] unknown control paths (warn mode): %s",
+                   [p for p, _ in unknown[:5]])
+    if notes is not None:
+        notes.append(msg)
 
 
 async def _fidelity_extras(merged: dict, changed_paths) -> dict:
@@ -1707,12 +2009,85 @@ async def _fidelity_extras(merged: dict, changed_paths) -> dict:
                 "opening_next_call": {
                     lang: o["line"] for lang, o in sr["openings"].items()},
                 "source": (sr["openings"].get(_dl) or {}).get("source", ""),
-                "note": (f"quote the {_dl} line to the user as what the "
-                         f"next {sr['direction']} call opens with"),
+                # The second beat: what the caller hears the moment they
+                # first respond. Invisible before 2026-08-04, which is how a
+                # dictated second line could be "saved" five times over three
+                # agents and never once spoken.
+                "second_line_next_call": {
+                    lang: o.get("second_line", "")
+                    for lang, o in sr["openings"].items()},
+                "second_source": (sr["openings"].get(_dl) or {}).get(
+                    "second_source", ""),
+                "note": (f"quote BOTH {_dl} lines to the user: "
+                         f"opening_next_call is what the next "
+                         f"{sr['direction']} call opens with, and "
+                         "second_line_next_call is what the agent says the "
+                         "moment the caller first responds"),
             }
+            if sr.get("shadowed"):
+                extras["hearable"]["shadowed"] = sr["shadowed"]
     except Exception as exc:  # noqa: BLE001 — advisory only
         logger.warning("[copilot] fidelity readback failed: %s", exc)
     return extras
+
+
+# Paths that MAKE the two directions different — mirroring them would erase
+# the distinction the twin pair exists for.
+_DIRECTION_SPECIFIC_PREFIXES = ("outbound.", "response_bank.opening_greeting")
+
+
+async def _mirror_to_twin(name: str, changes: dict, expected) -> dict:
+    """Apply the same partial change to `name`'s opposite-direction twin.
+
+    Best-effort by contract: the primary write has already committed, so
+    every failure here is REPORTED, never raised. Runs the full pipeline on
+    the twin's own current definition — never a copy of the primary's merged
+    dict, which would import the primary's direction-specific fields.
+    """
+    out: dict = {"applied": False}
+    try:
+        twin = builder.counterpart_of(name)
+        if not twin or not (_AGENTS_DIR / twin / "agent.yaml").exists():
+            return {"applied": False,
+                    "reason": "this agent has no opposite-direction version"}
+        out["slug"] = twin
+        if not _visible_slug(twin):
+            return {"applied": False, "slug": twin,
+                    "reason": "the other direction belongs to a different "
+                              "account"}
+        blocked = sorted({p for p in (str(x) for x in expected or ())
+                          if p.startswith(_DIRECTION_SPECIFIC_PREFIXES)
+                          or p == "call_direction"})
+        if blocked:
+            return {"applied": False, "slug": twin,
+                    "reason": ("these settings are what make the two "
+                               "directions different, so they were changed "
+                               "on this agent only: "
+                               + ", ".join(blocked[:5])
+                               + ". Edit the other direction separately if "
+                                 "you want it to match.")}
+        t_current, t_rev = _read_full_definition(twin)
+        t_merged = _deep_merge(copy.deepcopy(t_current), copy.deepcopy(changes))
+        violations = _invariant_violations(t_merged)
+        if violations:
+            return {"applied": False, "slug": twin,
+                    "reason": "; ".join(violations)}
+        t_result = agent_store.write_agent(
+            twin, t_merged, actor=_copilot_actor(), base_rev=t_rev,
+            reason="copilot update (both directions): "
+                   + ", ".join(sorted(changes.keys()))[:150],
+            owner=builder._ctx_owner(), is_admin=builder._ctx_is_admin(),
+            expected_paths=expected, agents_dir=_AGENTS_DIR)
+        logger.info("[copilot] mirrored update to twin '%s' rev=%s",
+                    twin, t_result["revision"])
+        out = {"applied": True, "slug": twin,
+               "revision": t_result["revision"],
+               "display": _agent_display_name(twin)}
+    except Exception as exc:  # noqa: BLE001 — the primary write already landed
+        logger.warning("[copilot] twin mirror failed for '%s': %s", name, exc)
+        out = {"applied": False, "slug": out.get("slug", ""),
+               "reason": f"the other direction could not be updated: {exc}"}
+    return out
 
 
 def _twin_note(name: str, changed_paths) -> dict | None:
@@ -1925,6 +2300,7 @@ _TOOL_VERBS = {
     "update_agent": "update the agent",
     "replace_mentions": "apply the replacement",
     "find_text": "search the agent",
+    "list_controls": "check what the platform can change",
     "preview_opening": "preview the opening line",
     "activate_agent": "activate the agent",
     "get_routing": "check call routing",
@@ -2011,6 +2387,26 @@ _DIGEST_DONE = {
 _DIGEST_NOTES = {"update_draft", "skip_layer", "mine_dump"}
 
 
+def _digest_direction_note(slugs) -> str:
+    """'both call directions' when a turn wrote to an inbound/outbound pair.
+
+    The digest names agents by DISPLAY name, and twins share one — so
+    without this, two real writes collapse into a single phrase and the user
+    is never told the other direction moved too.
+    """
+    fams: dict[str, set[str]] = {}
+    for s in slugs:
+        s = str(s or "").strip().lower()
+        for suffix, direction in (("-inbound", "inbound"),
+                                  ("-outbound", "outbound")):
+            if s.endswith(suffix):
+                fams.setdefault(s[: -len(suffix)], set()).add(direction)
+                break
+    if any(len(d) > 1 for d in fams.values()):
+        return " Both the inbound and outbound versions were updated."
+    return ""
+
+
 def _actions_digest(actions: list) -> str:
     """One short plain-English sentence describing what this turn actually
     did — what non-technical users see instead of per-tool chips. No tool
@@ -2020,10 +2416,13 @@ def _actions_digest(actions: list) -> str:
     notes = reads = 0
     read_agent = ""
     failed_change = False
+    changed_slugs: list[str] = []
     for a in actions or []:
         tool = str(a.get("tool") or "")
         summary = str(a.get("summary") or "")
         slug = str(a.get("agent") or "").strip()
+        if a.get("ok") and tool in _MUTATING_TOOLS and slug:
+            changed_slugs.append(slug)
         if not a.get("ok"):
             # An apply_update held for the user's confirmation is the designed
             # flow, not a failure — the diff card explains it.
@@ -2046,6 +2445,7 @@ def _actions_digest(actions: list) -> str:
         else:
             body = ", ".join(phrases[:-1]) + f" and {phrases[-1]}"
         line = body[0].upper() + body[1:] + ("" if body.endswith(("!", "?")) else ".")
+        line += _digest_direction_note(changed_slugs)
         if failed_change:
             line += " One other change didn't go through."
         return line
@@ -2057,6 +2457,43 @@ def _actions_digest(actions: list) -> str:
         who = _digest_agent_name(read_agent) if read_agent else "your setup"
         return f"Checked {who} — nothing was changed."
     return ""
+
+
+def _remaining_hint(session: dict, actions: list) -> str:
+    """What is demonstrably still open when the step budget runs out.
+
+    Derived only from state the server already holds — a pending diff, an
+    unedited twin, the last failed tool. Never from the model's prose, and
+    never a guess: an empty string is the honest answer when the server
+    cannot tell.
+    """
+    clauses: list[str] = []
+    try:
+        pend = session.get("pending_changes") or {}
+        for slug in list(pend)[:1]:
+            clauses.append(f"a change to {_digest_agent_name(slug)} "
+                           "waiting for your go-ahead")
+        edited = {str(a.get("agent") or "").strip().lower()
+                  for a in actions or []
+                  if a.get("ok") and a.get("tool") in _MUTATING_TOOLS}
+        edited.discard("")
+        for slug in sorted(edited):
+            twin = builder.counterpart_of(slug)
+            if twin and twin not in edited and \
+                    (_AGENTS_DIR / twin / "agent.yaml").exists():
+                other = "outbound" if twin.endswith("-outbound") else "inbound"
+                clauses.append(f"matching the {other} version")
+                break
+        if len(clauses) < 2:
+            for a in reversed(actions or []):
+                if not a.get("ok") and a.get("tool") in _TOOL_VERBS:
+                    clauses.append(
+                        f"the {_TOOL_VERBS[a['tool']].replace('the ', '')} "
+                        "that didn't go through")
+                    break
+    except Exception:  # noqa: BLE001 — advisory only
+        return ""
+    return " and ".join(clauses[:2])
 
 
 def _agent_links_for(actions: list) -> list[str]:
@@ -2543,7 +2980,8 @@ def _enrich_new_agent(d: dict, notes: list[str]) -> None:
 
 
 def _quality_warnings(merged: dict,
-                      include_wiring_lints: bool = True) -> list[str]:
+                      include_wiring_lints: bool = True,
+                      user_message: str = "") -> list[str]:
     """Deterministic depth check on the FINAL definition. The runtime only
     speaks as richly as these fields are written — a one-line stage goal or an
     empty knowledge paragraph makes a shallow call no matter how good the chat
@@ -2554,7 +2992,11 @@ def _quality_warnings(merged: dict,
     CREATE/VALIDATE only — on update results they would nag every edit of a
     pre-enricher agent (e.g. the live pramukh_agent) and the copilot's
     same-turn self-repair would push unrequested pacing edits onto a
-    production agent."""
+    production agent.
+
+    user_message: this turn's request, used only by the second-beat lint —
+    the same words decide whether a dictated line belongs in the opening or
+    in call_flow.connect.intro_line, and the definition alone cannot tell."""
     w: list[str] = []
     direction = str(merged.get("call_direction") or "inbound").strip().lower()
 
@@ -2600,8 +3042,27 @@ def _quality_warnings(merged: dict,
             "Stage goals are INSTRUCTIONS to the AI, not spoken text — placeholders like "
             "{contact_name} do NOT work there. Put the exact opening line in "
             "response_bank.opening_greeting (where {contact_name} IS substituted) and rewrite "
-            "the stage goal as instructions for what to accomplish."
+            "the stage goal as instructions for what to accomplish. "
+            "IF the sentence is what the agent says AFTER the caller first speaks or says "
+            "hello, it belongs in call_flow.connect.intro_line instead — "
+            "response_bank.opening_greeting is the FIRST line, spoken before the caller has "
+            "said anything, so putting a second-beat line there overwrites their opening."
         )
+
+    # The second-beat misfile: the user described what the agent says AFTER
+    # the caller responds, and the turn wrote the FIRST line instead. This is
+    # exactly how a dictated "say Hello, wait, then say <sentence>" request
+    # ends up replacing the opening the user was happy with.
+    if user_message and _describes_second_beat(user_message):
+        _cf_conn = cf.get("connect") if isinstance(cf, dict) else None
+        if not (isinstance(_cf_conn, dict) and _cf_conn.get("intro_line")):
+            w.append(
+                "The user described the SECOND line — what the agent says after the caller "
+                "first responds. That line lives in call_flow.connect.intro_line; "
+                "response_bank.opening_greeting / outbound.opening_greeting are spoken BEFORE "
+                "the caller has said anything. Put their exact sentence in "
+                "call_flow.connect.intro_line, or tell them which of the two lines you changed."
+            )
 
     kb = merged.get("knowledge_base") or {}
     ppt = str((kb.get("portfolio_prompt_text") if isinstance(kb, dict) else "") or "").strip()
@@ -2619,6 +3080,58 @@ def _quality_warnings(merged: dict,
             "pushback this specific call will get (e.g. 'not now', 'why should I', a flat no)."
         )
     greeting = str(rb.get("opening_greeting") or "") if isinstance(rb, dict) else ""
+
+    # ── the generic second line ─────────────────────────────────────────────
+    # A short opening ("Hello") is the platform default and is correct — but
+    # the line spoken the instant the caller answers is then COMPOSED from
+    # identity, so every agent built this way says the same sentence:
+    # "Hello! This is <Agent> from <Company>. Can you hear me clearly?"
+    # (reported live 2026-08-04: "all agents now have a common opening
+    # line"). The business's own words belong in call_flow.connect.intro_line.
+    _ob_g = (merged.get("outbound") or {}).get("opening_greeting") or {}
+    _first_lines = [greeting] + [str(v) for v in (
+        _ob_g.values() if isinstance(_ob_g, dict) else [])]
+    _all_short = all(len(str(x).strip()) < 20 for x in _first_lines if str(x).strip())
+    _conn = cf.get("connect") if isinstance(cf, dict) else None
+    _has_intro = isinstance(_conn, dict) and bool(_conn.get("intro_line"))
+    # An outbound agent's identity line is spoken as the second beat too, so
+    # having one means the caller is NOT getting the generic sentence.
+    if direction == "outbound" and (merged.get("outbound") or {}).get(
+            "identity_confirm_line"):
+        _has_intro = True
+    if _first_lines and _all_short and not _has_intro:
+        w.append(
+            "This agent opens with a short greeting and has no second line set, so the "
+            "platform will speak a GENERIC line the moment the caller answers — "
+            "\"Hello! This is <agent> from <company>. Can you hear me clearly?\" — the "
+            "same sentence every other agent says. Ask the user for the exact words they "
+            "want there and put them in call_flow.connect.intro_line (per language; "
+            "{contact_name} IS substituted). If they are happy with the generic line, say "
+            "so once and move on."
+        )
+
+    # ── language switching ──────────────────────────────────────────────────
+    _langs = merged.get("languages") or {}
+    _supported = [str(x) for x in (_langs.get("supported") or []) if str(x).strip()]
+    if len(_supported) > 1 and _langs.get("auto_switch") is False:
+        w.append(
+            f"This agent is built for {', '.join(_supported)} but automatic language "
+            "switching is OFF, so it will answer every caller in "
+            f"'{_langs.get('default') or _supported[0]}' even when they speak one of its "
+            "other languages. Set languages.auto_switch true unless the business "
+            "explicitly wants a single-language agent."
+        )
+    if len(_supported) > 1:
+        _voices = _langs.get("tts_voices") or {}
+        _missing_voice = [lg for lg in _supported
+                          if isinstance(_voices, dict) and not _voices.get(lg)]
+        if _missing_voice:
+            w.append(
+                f"No voice is configured for {', '.join(_missing_voice)}, but the agent is "
+                "built for those languages and will switch into them when the caller does. "
+                "Add languages.tts_voices for each, or drop the language from supported."
+            )
+
     _name_m = re.search(r"\b(?:Mr|Mrs|Ms|Miss|Dr|Shri|Smt)\.?\s+([A-Zऀ-ॿ][\w''-]*)", greeting)
     _agent_name = str(((merged.get("identity") or {}).get("agent_name")) or "").lower()
     if (
@@ -2957,6 +3470,17 @@ TOOLS: list[dict] = [
                 "properties": {
                     "name": {"type": "string", "description": "agent slug"},
                     "changes": {"type": "object", "description": "partial definition, e.g. {\"response_bank\": {\"opening_greeting\": \"...\"}}"},
+                    "both_directions": {
+                        "type": "boolean",
+                        "description": (
+                            "true = apply the SAME change to this agent AND its opposite-direction "
+                            "twin in one step. Use it for direction-neutral changes (wording, rules, "
+                            "knowledge, voice, pacing) — it is the correct way to honour 'change it "
+                            "in both the inbound and outbound scripts'. NEVER for the greeting, any "
+                            "outbound.* field, or call_direction: those are what make the two "
+                            "directions different, and they are refused on the twin."
+                        ),
+                    },
                 },
                 "required": ["name", "changes"],
             },
@@ -3012,13 +3536,40 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "list_controls",
+            "description": (
+                "Read-only: which settings this platform ACTUALLY has for a topic. Use it BEFORE "
+                "inventing a field name, and whenever a user asks for behaviour you are not sure "
+                "the platform supports. An empty result means the platform has no control for "
+                "that — say so plainly and offer the nearest thing it CAN do; never write the "
+                "request into a field that merely sounds related."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "what the user asked for, e.g. 'greeting', "
+                                       "'hang up', 'second line', 'callback'",
+                    },
+                },
+                "required": ["topic"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "preview_opening",
             "description": (
-                "Read-only: resolve EXACTLY what the agent will speak first on its next call — per "
-                "language, with the config field it comes from — by running the real call engine. "
-                "Use it whenever the user asks what the agent says first, and to VERIFY any greeting "
-                "edit actually changed what callers hear (an edit to a shadowed field looks applied "
-                "but is silent). {contact_name} in the result is spoken as the dialed contact's name."
+                "Read-only: resolve EXACTLY what the agent speaks at the start of its next call — "
+                "BOTH BEATS: the opening line, AND the line the caller hears the instant they first "
+                "respond (openings[lang].second_line, from call_flow.connect.intro_line or composed "
+                "from identity) — per language, with the config field each comes from, by running "
+                "the real call engine. Use it whenever the user asks what the agent says first, and "
+                "to VERIFY any greeting edit actually changed what callers hear (an edit to a "
+                "shadowed field looks applied but is silent). {contact_name} in the result is "
+                "spoken as the dialed contact's name."
             ),
             "parameters": {
                 "type": "object",
@@ -3788,6 +4339,10 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                 "direction": _sr["direction"],
                 "line": (_sr["openings"].get(_dl) or {}).get("line", "")[:160],
                 "source": (_sr["openings"].get(_dl) or {}).get("source", ""),
+                "second_line": (_sr["openings"].get(_dl) or {}).get(
+                    "second_line", "")[:160],
+                "second_source": (_sr["openings"].get(_dl) or {}).get(
+                    "second_source", ""),
             }
             _open_note = "; ".join(
                 f"{s['path']}: {s['note']}" for s in _sr["shadowed"])[:300]
@@ -3987,7 +4542,9 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         res = {
             "status": "created", "name": name, "agent_id": agent.agent_id,
             "family": _family, "twins": _twins,
-            "notes": notes, "quality": _quality_warnings(merged),
+            "notes": notes,
+            "quality": _quality_warnings(
+                merged, user_message=str(guard.get("user_message") or "")),
             "provenance_confirmed": sum(1 for v in (_iv.get("provenance") or {}).values()
                                         if v == "confirmed"),
         }
@@ -4143,7 +4700,7 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                 "None of those changes map to real settings — nothing was saved. "
                 + " ".join(notes)
             )
-        _block_dead_paths(_paths_of_changes(changes))
+        _block_dead_paths(_paths_of_changes(changes), notes)
         yaml_path = _AGENTS_DIR / name / "agent.yaml"
         if not yaml_path.exists():
             raise ValueError(f"Agent '{name}' not found")
@@ -4179,6 +4736,27 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                 logger.error("[copilot] %s (warn mode — write allowed)", _msg)
                 notes.append("ENGINE CHECK (advisory): " + _msg)
         expected = _paths_of_changes(changes)
+        # No-op guard. `write_agent(expected_paths=…)` proves nothing changed
+        # OUTSIDE the scope; it has never proved anything changed INSIDE it.
+        # So a write naming a setting the schema drops diffs to nothing, bumps
+        # the revision, and comes back "updated" — the user is told it landed
+        # and finds out on a call that it did not. `current` is already
+        # canonical (_read_full_definition round-trips through
+        # from_dict→asdict), so this comparison is exact and safe to enforce.
+        try:
+            _canon = dataclasses.asdict(AgentDefinition.from_dict(merged))
+            _eff = {d["path"] for d in _compute_diff(current, _canon)} - {
+                "revision", "updated_at", "updated_by"}
+        except Exception:  # noqa: BLE001 — never let the guard break a write
+            _eff = {"__unknown__"}
+        if not _eff:
+            raise ValueError(
+                "Refused — this is already the agent's current state, or it "
+                "names settings this platform does not have. Nothing was "
+                "saved and nothing on a call would sound different. Tell the "
+                "user plainly what the platform can and cannot do instead of "
+                "writing their request into a nearby field."
+                + (" " + " ".join(notes) if notes else ""))
         result = agent_store.write_agent(
             name, merged, actor=_copilot_actor(), base_rev=base_rev,
             reason="copilot update: " + ", ".join(sorted(changes.keys()))[:180],
@@ -4189,14 +4767,29 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         res = {
             "status": "updated", "name": name, "changed_sections": sorted(changes.keys()),
             "notes": notes,
-            "quality": _quality_warnings(merged, include_wiring_lints=False),
+            "quality": _quality_warnings(
+                merged, include_wiring_lints=False,
+                user_message=str(guard.get("user_message") or "")),
             "revision": result["revision"], "effective": "next_call",
         }
         res.update(await _fidelity_extras(merged, expected))
-        _twin = _twin_note(name, expected)
-        if _twin:
-            res["twin"] = _twin
-        return res, f"Updated {_agent_display_name(name)} — {_friendly_sections(sorted(changes.keys()))}", True, True
+        _summary = (f"Updated {_agent_display_name(name)} — "
+                    f"{_friendly_sections(sorted(changes.keys()))}")
+        # One request, both directions. A twin edit used to cost four of the
+        # eight steps (get ×2, update ×2) before any verification could run,
+        # which is how "change it in both scripts" turns became the ones that
+        # hit the cap. The mirror is BEST-EFFORT: the primary write is
+        # already committed, so a twin failure is reported, never raised —
+        # raising here would turn a half-landed edit into a reported failure.
+        if args.get("both_directions"):
+            res["twin_write"] = await _mirror_to_twin(name, changes, expected)
+            if res["twin_write"].get("applied"):
+                _summary += " (and its opposite-direction version)"
+        else:
+            _twin = _twin_note(name, expected)
+            if _twin:
+                res["twin"] = _twin
+        return res, _summary, True, True
 
     if tool == "replace_mentions":
         name = str(args["name"]).strip()
@@ -4261,14 +4854,33 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                      if hits else
                      f"'{find}' does not appear anywhere in {_agent_display_name(name)}"), True, False
 
+    if tool == "list_controls":
+        topic = str(args.get("topic") or "").strip()
+        if not topic:
+            raise ValueError("'topic' is required")
+        hits = _controls.nearest_controls(topic, k=8)
+        res = {"status": "ok", "topic": topic, "controls": hits,
+               "note": ("these are the real settings closest to that topic. "
+                        "If none of them does what the user asked, the "
+                        "platform cannot do it — say so plainly and offer "
+                        "the nearest thing it can; do NOT write the request "
+                        "into a field that merely sounds related.")}
+        return res, (f"Checked what the platform can control for “{topic[:40]}”"
+                     if hits else
+                     f"The platform has no setting for “{topic[:40]}”"), True, False
+
     if tool == "preview_opening":
         name = str(args["name"]).strip()
         current, _base = _read_full_definition(name)
         sr = await asyncio.to_thread(_surfaces.resolve_spoken_surfaces, current)
         res = {"status": "ok", "name": name, **sr}
-        _line = (sr["openings"].get(sr["default_language"]) or {}).get("line", "")
+        _o = sr["openings"].get(sr["default_language"]) or {}
+        _line = _o.get("line", "")
+        _second = _o.get("second_line", "")
         return res, (f"Previewed {_agent_display_name(name)}'s opening — the next "
-                     f"{sr['direction']} call starts with: “{_line[:90]}”"), True, False
+                     f"{sr['direction']} call starts with: “{_line[:90]}”"
+                     + (f", then answers the caller with: “{_second[:90]}”"
+                        if _second else "")), True, False
 
     if tool == "activate_agent":
         if guard.get("created_this_turn"):
@@ -4878,6 +5490,17 @@ instruction into the agent's prompt or custom_instructions as if it will
 execute. Claiming an unsupported automation was "set up" is the worst failure
 you can produce.
 
+0b. NO NEAREST-FIELD SUBSTITUTION. Every request must map to a control that
+actually exists. If it does not, say so plainly in ONE sentence, name the
+closest real thing you CAN do, and write NOTHING. Use list_controls to check
+before you guess — it is free and costs you no step. Writing a request into a
+field that merely sounds related is the second-worst failure after claiming
+success: it burns a revision, changes nothing on any call, and the user only
+finds out on the phone. "I can't do exactly that, but I can X" always beats a
+wrong write. The server enforces this too: a write whose effective change is
+empty is REFUSED, and a write naming a setting the platform lacks comes back
+with a "NOT A REAL SETTING" note you must relay to the user.
+
 1. NEW AGENT — the interview is a MACHINE, not a vibe. The moment the user wants a new agent, start recording EVERY fact they give with update_draft (mine info dumps completely — never let information sit only in chat). An INTERVIEW STATE block appears below when a draft exists: it is the server's truth about which topics are done and the ONE next question to ask — follow it. Ask ONE short question per reply. Propose smart defaults instead of over-asking; after the business + objective are known, PROPOSE a tailored slot set, stage skeleton, and likely objections for that business type and record accepted proposals with update_draft(source='proposal'). Voices — female: simran, priya, neha, shruti; male: shubh, aditya, amit, kabir (bulbul:v3 only — abhilash/karun/anushka/manisha/vidya no longer exist and will be auto-replaced). When you name voices in a reply, the chat automatically shows a play button for each — tell the user they can tap to hear a sample before choosing. create_agent is REFUSED by the server until every compulsory topic is complete or the user explicitly declined it (then call skip_layer with their exact words). When all topics close, summarize the plan in 3-5 short lines and ask "shall I build it?". Tool errors from update_draft/create_agent are YOURS to fix: correct the field paths (the error and the INTERVIEW STATE name the real ones) and retry silently — NEVER tell the user their answer "isn't a real setting" and NEVER ask them to rephrase because of a field-mapping problem.
 2. THE USER'S INPUT OUTRANKS YOU — ALWAYS. Anything they typed or put in a document is the source of truth: record it VERBATIM (their exact lines, their exact objection answers, their exact rules) and never paraphrase, "improve", translate away, or replace it with copy of your own. The server enforces this: a write that would overwrite better-sourced wording is dropped, and content you invented is flagged back to you as YOUR copy. Your own authorship is for GAPS ONLY — a topic the user has said nothing about. There, draft DEEP: stage goals of 2-4 full sentences of concrete instructions (never a 5-word label), a knowledge paragraph carrying real substance (it is injected on EVERY turn), real objection responses, natural phone-appropriate copy in the agent's languages. But when the user HAS spoken on a topic, your job is to transcribe them, not to write. NEVER invent facts (products, prices, phone numbers, brand claims, locations, policies) — a fabricated fact gets SPOKEN to real callers. If a tool result says content was recorded as YOUR draft copy and the user did give wording for it, re-record theirs verbatim in the same turn. For an outbound pitch, the mission and talking points MUST live in the stage goals and the knowledge paragraph — that is the only way they reach the live call.
 3. Get the copy into the DRAFT with update_draft BEFORE creating — create_agent builds the agent FROM THE INTERVIEW DRAFT, and the draft always wins: any definition you pass to create_agent is ignored for every topic the interview answered, and only fills topics the user explicitly skipped. NEVER invent facts (projects, prices, phone numbers, brand claims, locations) the user did not give you — a fabricated fact gets SPOKEN to real callers. Slug = lowercase with underscores.
@@ -4901,7 +5524,7 @@ you can produce.
 DEFINITION FIELDS you may set (all optional — deep-merged onto defaults). SHAPES ARE STRICT — get them right the first time:
 - identity: agent_name, company_name, company_tagline, role_description, contact, role_line (full replacement identity sentence)
 - personality: pronouns (she|he), energy (low|medium|high), tone, style, custom_instructions, traits [str], energy_mirroring (bool), ai_disclosure ("deflect"|"admit"|"admit_if_pressed"), verbosity_max_sentences (int)
-- languages MUST be an OBJECT, never a list: {{"supported": ["hi","en"], "default": "hi", "allow_code_mixing": true, "stt_forced_language": "", "tts_voices": {{"hi": {{"model":"bulbul:v3","speaker":"simran","pace":1.15}}, "en": {{...}}}}}}. tts_voices lives INSIDE languages — never at the top level. pace = speaking speed 0.5–2.0 (1.0 natural, 1.15 platform default) and is PER LANGUAGE. SPEED COMPLAINTS ('talks too fast', 'too slow' — overall or in one language): do NOT silently change anything. FIRST tell the user the current setting and the scale, read from the agent (get_agent's spoken_surfaces.pace has it), e.g. 'LesCall currently speaks at pace 1.15 on a 0.5–2.0 scale, where 1.0 is natural' — THEN ask what they'd prefer (slower or faster, or an exact number) and apply their choice to that language's pace in ±0.1 steps via update_agent. Never change the voice to fix speed.
+- languages MUST be an OBJECT, never a list: {{"supported": ["hi","en"], "default": "hi", "auto_switch": true, "allow_code_mixing": true, "stt_forced_language": "", "tts_voices": {{"hi": {{"model":"bulbul:v3","speaker":"simran","pace":1.15}}, "en": {{...}}}}}}. LANGUAGE SWITCHING IS ON BY DEFAULT and is BOUNDED BY `supported`: the agent follows the caller into any language listed there, and can never be dragged into one that is not. So "supported" is the real control — adding a language means the agent will actually speak it (give it a tts_voice too), and removing one means it never will. Set auto_switch false ONLY when the business explicitly wants one fixed language regardless of what the caller speaks; say plainly what that costs. If the user asks for a language the platform does not support (only hi/en/gu exist), tell them — do not add it to the list. response_bank.lang_unsupported_responses is what the agent says when a caller asks for a language it was not built for. tts_voices lives INSIDE languages — never at the top level. pace = speaking speed 0.5–2.0 (1.0 natural, 1.15 platform default) and is PER LANGUAGE. SPEED COMPLAINTS ('talks too fast', 'too slow' — overall or in one language): do NOT silently change anything. FIRST tell the user the current setting and the scale, read from the agent (get_agent's spoken_surfaces.pace has it), e.g. 'LesCall currently speaks at pace 1.15 on a 0.5–2.0 scale, where 1.0 is natural' — THEN ask what they'd prefer (slower or faster, or an exact number) and apply their choice to that language's pace in ±0.1 steps via update_agent. Never change the voice to fix speed.
 - call_direction: the STRING "inbound" or "outbound" — never a list. If the user wants BOTH, use "inbound" — the platform automatically applies the outbound approach whenever it places the call.
 - call_flow: {{"call_goal": "one-sentence mission", "stages": [{{id, order, goal, turns_until_advance, role, collect: [slot names], advance_when: {{all_collect_filled|slots|min_turns|intent|appointment_captured, max_turns: N (time escape — the stage also advances at turn N even if the condition never fires)}}, branches: [{{when_intent: affirmation|negation|question, goto: STAGE_ID, max_takes, actions: [capture_phone|promise_whatsapp_media|book_visit|schedule_callback]}}]}}], "scheduling": {{style: exact_n|flexible — flexible means the CALLER proposes the time; SET flexible whenever the user says not to suggest times or to ask when the caller is free; exact_n (the default) makes the platform force N specific time offers every turn, offer_count, enabled: false when the business doesn't book}}, "callback_policy": {{enabled, capture_slot, responses: {{lang: str}}, counts_as_decline}}, "completed_when": {{required_slots, require_appointment}}, "termination": {{"end_conditions": ["plain-English rules for when the agent should wrap up and END the call — e.g. 'once the site visit is booked and confirmed, thank them and end', 'if the caller becomes abusive, apologise briefly and end immediately' — injected into every turn as END-CALL RULES the agent acts on"], "farewell_patterns": ["extra caller phrases in ANY language/script that mean goodbye and hang up deterministically, e.g. 'chalo rakhta hu' — NEVER single common words like 'ok'/'no'/'haan', they would cut live calls"], "llm_end_call": true (default — lets the agent itself end the call after its goodbye; set false ONLY if the business wants hangups on caller-goodbye alone), "confirm_before_end": true (default, platform-wide — before hanging up on a heard goodbye the agent asks a short "alright then, shall I end the call here?" in the call's language, and after the caller confirms speaks a brief thank-you and hangs up; set false ONLY if the business explicitly wants instant hangups and accepts that a misheard "bye" cuts a live call),"silence_hangup": {{"enabled": true, "grace_s": 10}} (after both couldn't-hear reprompts go unanswered, say goodbye and end instead of holding the line open), "max_call_minutes": N (hard call-length ceiling — one polite wrap-up line, then the platform ends the call even mid-conversation; 0/omitted = no cap)}}, "connect": {{"hello_fastpath": true (default — an early bare "hello?" from the caller gets an instant identity intro instead of a slow LLM turn), "delivery_guard": true (default — during the first seconds a short "hello?" cannot cancel an agent reply the caller has not heard yet); set either false ONLY if the business explicitly wants the protection off}}}}. Stage roles: greeting|confirm_person|discovery|pitch|recommend|scheduling|confirmation|closing. Write goals in ENGLISH as instructions (the agent replies in the caller's language). STAGE WIRING IS WHAT MAKES THE FLOW ACTUALLY RUN: every stage SHOULD carry role; a stage whose goal asks for slots lists them in collect and uses advance_when {{all_collect_filled: true, max_turns: 6}}; a yes/no confirmation stage gets turns_until_advance 2-3 or advance_when {{intent: affirmation, max_turns: 3}}; NEVER leave a mid-flow stage needing 8+ caller turns — one such stage consumes an entire call and the rest of your flow never plays (this is exactly how a live agent ignored its whole script). If you omit the wiring at create time the platform derives it from the goals and slots — but wiring you write explicitly always wins.
 - slots (TOP-LEVEL list — the qualification schema, the heart of data capture): [{{name, priority (lower asked first), required, label, question: {{hi/en/gu: exact wording}}, type: text|number|money|enum|boolean|phone|email|date|time|location, enum_values, enum_synonyms, depends_on: [slot names never asked before], merge_policy: free|correction_gated|confirm, confirm_readback: ""|verbatim|digit_groups_2 (phone in 2-digit groups)|spelled (email letter-by-letter), max_asks (2 recommended), reask_question: {{lang}}}}]. EVERY new agent gets slots for what it must collect, with questions in EVERY supported language. EMAIL/PHONE CAPTURE IS ENGINE-OWNED (platform-wide): type an email slot "email" — the ENGINE then buffers spelled letters, assembles + validates the address, reads it back letter-by-letter, and confirms or flags it unresolved for follow-up. Write stage goals so the agent asks for the email ONCE and moves on; NEVER script the agent to ask callers to "speak slowly" (slow spelling fragments worse) and never promise letter-by-letter read-back in the goal — the engine does it.
@@ -4909,7 +5532,11 @@ DEFINITION FIELDS you may set (all optional — deep-merged onto defaults). SHAP
 - brand: spoken_company_name, positioning_tagline, credibility_markers [str], trust_proofs [top 2-3 — objection ammo], regions_served, contact_phone, whatsapp_number
 - response_bank: opening_greeting (ONE plain string in the default language — the INBOUND opening; see THE OPENING LINE below for which field outbound calls speak), identity_responses {{lang: str}}, objection_responses {{lang: [str]}}, objection_playbook [{{id, patterns: [caller phrasings], answer: {{lang: str — may use {{trust_proofs}}}}, prompt_guidance}}], closing_responses {{lang: str}}, canned_phrases [{{patterns, responses: {{lang}}}}], graceful_close {{lang: str}}
 - outbound (for outbound agents): identity_confirm_line/good_time_check_line/pitch/wrong_person_response/busy_response/wrong_number_close (all {{lang: str}}), wrong_number_patterns [str], opening_greeting {{lang}} — when set, OUTBOUND calls open with THIS (per language), beating response_bank.opening_greeting
-- guardrails: never_rules [str], always_rules [str], honesty {{unknown_answer_policy, forbidden_fabrications}}, compliance {{disclaimers, consent_line, dnd_phrases (["stop calling","remove my number"] recommended for new agents), restricted_topics}}, escalation {{enabled, triggers, handoff_message: {{lang}}}}
+- guardrails: use_builtin_rules (bool, default true), builtin_rules_pack ("generic" | "real_estate"), never_rules [str], always_rules [str], honesty {{unknown_answer_policy, forbidden_fabrications}}, compliance {{disclaimers, consent_line, dnd_phrases (["stop calling","remove my number"] recommended for new agents), restricted_topics}}, escalation {{enabled, triggers, handoff_message: {{lang}}}}
+  - builtin_rules_pack: SET IT EXPLICITLY ON EVERY NEW AGENT. "real_estate" ONLY when the business genuinely sells or leases property — it injects site-visit/property/portfolio rules. For every other business (clinic, coaching class, fabric mill, electronics, SaaS, finance...) use "generic". An agent on the wrong pack is told to push callers toward a "site visit" it does not offer.
+  - The caller's OWN OPENING HOURS belong in call_flow.scheduling.days + .window (e.g. days: ["Monday",...,"Friday"], window: "09:00-17:00"). Without them the agent will happily agree to a Sunday appointment. Ask for opening hours whenever the agent books anything.
+  - NEVER tell an agent to claim it is human, and never write a never_rule/always_rule/custom_instruction that says it is a "real person" or must "not reveal" that it is an AI. personality.ai_disclosure is the ONLY control (deflect = do not volunteer it; admit / admit_if_pressed = say so). No mode may deny being an AI — if the user asks for one that does, tell them plainly the platform will not claim to be human, and offer "deflect" instead.
+  - Placeholders: the ONLY tokens the engine substitutes into spoken text are {{contact_name}}, {{customer_name}}, {{current_time}} — single braces. Anything else you invent, or the same name in double braces (e.g. {{{{student_name}}}}), is SPOKEN ALOUD to the caller, braces and all — never write one.
 - follow_up: whatsapp_promise {{enabled, assets, promise_line: {{lang}}}}, callback {{enabled, default_delay_hours}}
 - calendar: {{"type": "mock", "mock_slots": [{{"day": "Tomorrow", "time": "11:00 AM"}}, {{"day": "Friday", "time": "4:30 PM"}}], day_synonyms, booking_confirmation_line: {{lang}}}}. Times must be REALISTIC and VARIED — never the same time repeated across days. Omit mock_slots entirely (or set type: "none") when the business doesn't book time slots — a phantom calendar steers the agent toward booking behaviour its flow doesn't have.
 - post_call: outcomes [{{id, label, kind: success|progress|failure}}], scoring {{enabled, criteria_prompt, score_labels}}
@@ -4924,7 +5551,7 @@ WHAT THE LIVE CALL ACTUALLY READS (the injection model — edits that ignore thi
 
 THE OPENING LINE & PLACEHOLDERS (get this right — it burned a real user TWICE):
 - WHICH FIELD OPENS THE CALL DEPENDS ON DIRECTION. Inbound calls open with response_bank.opening_greeting, word-for-word. Outbound calls open with outbound.opening_greeting for the call's language whenever it is non-empty, and fall back to response_bank.opening_greeting only when it is not — so on an outbound agent, editing response_bank.opening_greeting alone usually changes NOTHING the caller hears (a real user's "Hello?" edit was applied, reported as done, and never spoken, 2026-08-01). When the user talks about the greeting / the first line / "as soon as the call connects": inbound agent → edit response_bank.opening_greeting; outbound agent → edit outbound.opening_greeting in EVERY supported language (and keep response_bank.opening_greeting in step so the fallback matches). Scheduled follow-up calls always open with a platform-composed callback line — no greeting field changes those. Stage goals are INSTRUCTIONS to the AI (always written in English), never a script — editing a stage goal will NOT change what plays at connect.
-- VERIFY GREETING EDITS: after any greeting change the tool result carries "hearable" — QUOTE its line to the user as what the next call opens with (e.g. "the next outbound call now starts with: '…'"). Use the preview_opening tool whenever the user asks what the agent says first, or to double-check a greeting edit took. get_agent's spoken_surfaces.opening_line_next_call shows the same engine-resolved truth.
+- VERIFY GREETING EDITS: after any greeting change the tool result carries "hearable" with TWO lines — "opening_next_call" (what the call opens with) and "second_line_next_call" (what the agent says the instant the caller first responds). QUOTE BOTH to the user (e.g. "the next outbound call now starts with: '…', then when they answer she says: '…'"). Use the preview_opening tool whenever the user asks what the agent says at the start of a call, or to double-check a greeting edit took. get_agent's spoken_surfaces.opening_line_next_call shows the same engine-resolved truth, second line included.
 - Exactly TWO placeholders exist, both single curly braces and ONLY inside opening_greeting:
   * {{contact_name}} — on outbound calls, replaced with the dialed contact's name from Outbound Calls (fallback "sir/ma'am"). When the user wants the agent to greet whoever it calls by name, write e.g. "Hello, am I speaking with {{contact_name}}?"
   * {{current_time}} — replaced at call time with morning/afternoon/evening (India time). E.g. "Good {{current_time}}, am I speaking with {{contact_name}}?" becomes "Good morning, am I speaking with Rajesh?". If the greeting is written in Hindi or Gujarati script, the word comes out in that language automatically.
@@ -4935,11 +5562,12 @@ CALL-REPAIR BEHAVIOUR THE PLATFORM APPLIES TO EVERY AGENT (know this before you 
 - ENDING CALLS (platform-wide): before wrapping up, every agent asks the caller's permission ("anything else I can help you with?") and only says goodbye after the caller confirms they're done — then the PLATFORM hangs the call up automatically after the goodbye. Because speech recognition mishears goodbyes ("okay, by the way..." → "okay bye"), the platform ALSO asks one short confirmation — "alright then, shall I end the call here?" (in the call's language) — before acting on any heard goodbye; after a clear yes it speaks a brief thank-you ("thank you for talking with me — have a wonderful day") and hangs up. This is on for every agent by default (call_flow.termination.confirm_before_end) and needs no configuration; per-agent copy overrides live in response_bank.localized_responses under 'close_confirm' and 'close_confirmed'. The platform also ends the call on the caller's own goodbye, after the couldn't-hear reprompts go unanswered (silence hangup), and — by default — whenever the agent itself judges the conversation is over per its END-CALL RULES (see call_flow.termination).
 - CALLBACK REQUESTS & BUSY CALLERS (platform-wide): when a caller says "call me later / in 10 minutes / tomorrow" or brushes off with "sorry, not free right now", every agent stops pitching, pins down ONE specific time, confirms it with a goodbye, and the platform HANGS UP the call by itself right after that confirmation — then automatically places a real follow-up call at the agreed time, opening with a polite reference to the earlier conversation. This is on for all agents by default; a business can opt an agent out of the automatic calling (follow_up.auto_execute enabled false) but the time pin-down stays.
 - CALL-ENDING REQUIREMENTS GO IN call_flow.termination, NOT IN PROMPT TEXT: when a user asks for anything about cutting/ending/hanging up calls — "end the call once the booking is done", "hang up if they abuse the agent", "don't let calls run past 10 minutes", "cut the call when they say chalo rakhta hu" — map it into call_flow.termination (end_conditions for judgment-based rules, farewell_patterns for exact caller phrases, max_call_minutes for duration caps, silence_hangup for no-response behaviour). That section is real engine wiring: the platform physically ends the call from it. A guardrails rule or stage-goal sentence saying "end the call" does NOTHING by itself — never implement a termination request as prompt text alone, and never claim call-cutting behaviour you did not write into termination. Do NOT add rules like "never reschedule / never ask for a better time", which fight the platform's callback pin-down. After setting it, tell the user plainly which of their conditions now end the call.
-- OPENING STYLE — SHORT GREETING, THEN WAIT (platform-wide): a short opening like "Hello" is the intended default. The agent greets, WAITS for the caller, and the moment the caller responds the PLATFORM itself speaks a full identity intro composed from identity.agent_name and identity.company_name — instantly, with no LLM turn and cached audio. This is engine wiring, so a short opening does NOT stall or loop the call. NEVER rewrite a user's opening — not short-to-long, not long-to-short — unless they ask for different words. A business that wants the full intro spoken up front simply writes the full line into the opening field its direction reads (response_bank.opening_greeting for inbound, outbound.opening_greeting for outbound); both styles are fully supported. For agents with a short opening, make sure identity.agent_name and identity.company_name are filled in — the connect intro is composed from them. Connect-window protections (call_flow.connect: hello_fastpath, delivery_guard) default ON for every agent — configure them only when the business explicitly asks.
+- OPENING STYLE — SHORT GREETING, THEN WAIT (platform-wide): a short opening like "Hello" is the intended default. The agent greets, WAITS for the caller, and the moment the caller responds the agent speaks a SECOND LINE — instantly, with no LLM turn and cached audio. That second line IS SETTABLE WORD-FOR-WORD: call_flow.connect.intro_line, a per-language map ({{"en": "...", "hi": "..."}}) where {{contact_name}} IS substituted. Leave it empty and the platform composes one from identity.agent_name + identity.company_name. On OUTBOUND agents, outbound.identity_confirm_line is ALSO spoken as that second line when no intro_line is set — so a business that already wrote an identity line hears its own words, not the generic one. WHEN THE USER DICTATES WHAT THE AGENT SAYS AFTER THE CALLER FIRST SPEAKS OR SAYS HELLO ("say Hello, wait for them, THEN say ..."), that sentence goes in call_flow.connect.intro_line — NOT in response_bank.opening_greeting (that is the FIRST line, spoken before the caller has said anything) and NEVER in a stage goal (stage goals are instructions to the AI and are never spoken). This is engine wiring, so a short opening does NOT stall or loop the call. NEVER rewrite a user's opening — not short-to-long, not long-to-short — unless they ask for different words. A business that wants the full intro spoken up front simply writes the full line into the opening field its direction reads (response_bank.opening_greeting for inbound, outbound.opening_greeting for outbound); both styles are fully supported. For agents with a short opening, make sure identity.agent_name and identity.company_name are filled in — the connect intro is composed from them. Connect-window protections (call_flow.connect: hello_fastpath, delivery_guard) default ON for every agent — configure them only when the business explicitly asks.
 So if a user reports "it keeps repeating hello" or "it won't start its script", explain what actually happens rather than guessing — and do NOT rewrite their opening line to dodge a platform rule unless they want different words. Changing a greeting they liked, to work around behaviour you misdiagnosed, is a failure.
 If a tool result includes "notes", the platform auto-corrected or DROPPED some of your input — read them; if content was dropped, put it where the note says (usually a stage goal) with update_agent in the SAME turn.
 If a tool result includes "reachability", the write landed on a field this agent's calls DO NOT SPEAK — the change is invisible on the phone. Fix it in the SAME turn (edit the field the warning names) or tell the user plainly that nothing will sound different; NEVER report a change as done while a reachability warning stands unaddressed.
 If a tool result includes "twin", you edited only ONE direction of a twin pair and the other still differs on those fields — tell the user which direction you changed and offer to match the twin when the change is direction-neutral (wording, rules, knowledge). Never mirror silently.
+WHEN THE USER SAYS "both" (both scripts, both directions, inbound and outbound): pass both_directions: true on update_agent and it lands on BOTH twins in ONE step — do not spend two get_agent + two update_agent rounds doing it by hand. The result carries "twin_write": if applied is false, read its "reason" and tell the user plainly which direction did NOT change. Greetings, outbound.* fields and call type are direction-SPECIFIC and are refused on the twin by design — edit those per direction.
 CONFIRMATIONS ARE EXACT: when you ask the user to confirm a proposed change, list exactly what THAT pending change contains — never bundle already-applied items into the same "shall I apply?" question (say "the pace and language changes are already applied; this applies only the greeting"). If a proposal was lost and you re-propose it, show the new diff again before applying.
 If a tool result includes non-empty "quality" warnings, the agent is too shallow — you MUST resolve every one with update_agent in the SAME turn before telling the user it's ready. Do not report a hollow agent as done.
 WHEN THE USER SAYS A CHANGE "isn't in the agent" or "wasn't implemented": do not just re-word the same field. get_agent, and translate their intent into the fields the CALL actually reads — call_flow.call_goal (the every-turn CALL MISSION), call_flow.scheduling (time-offer behaviour), call_flow.stages goals AND knowledge_base.portfolio_prompt_text (both are spoken), guardrails rules. The pitch is not "implemented" if it only sits in one thin stage goal, and a ban is not implemented while call_goal or a platform scheduling default still orders the old behaviour. Enrich those, then confirm what specifically changed.
@@ -5300,7 +5928,8 @@ def _adapt_tool_calls_for_provider(messages: list[dict], cli) -> list[dict]:
     return out
 
 
-async def _chat_completion(client, model: str, messages: list[dict]):
+async def _chat_completion(client, model: str, messages: list[dict],
+                           trace: dict | None = None):
     """One LLM call with retries for Groq's `tool_use_failed` (the model emitted
     a malformed/truncated tool call — a known llama flakiness). On failure we
     re-ask with a corrective nudge appended; the nudge is never persisted.
@@ -5309,7 +5938,14 @@ async def _chat_completion(client, model: str, messages: list[dict]):
     quota), then OpenAI gpt-4o-mini. Every Groq attempt is FITTED to that
     model's tokens-per-minute ceiling first (Groq counts input + max_tokens
     per request, per model, per org) — a request that cannot fit is never
-    sent, so a 413 on one model can't kill the whole turn anymore."""
+    sent, so a 413 on one model can't kill the whole turn anymore.
+
+    `trace` (optional dict) records WHICH model actually answered and every
+    fallback that fired. Before 2026-08-04 a silent downgrade left no trace
+    at all: on 2026-07-15 the chain dropped to gpt-4o-mini and it authored a
+    whole agent definition — fabricated projects, brand facts and phone
+    numbers — and the only way to establish that afterwards was forensics on
+    the tool-call id alphabet. Never again."""
     from openai import APIStatusError, BadRequestError
 
     async def _attempt(cli, mdl: str, msgs: list[dict], max_toks: int):
@@ -5372,7 +6008,14 @@ async def _chat_completion(client, model: str, messages: list[dict]):
     for i, (cli, mdl, max_toks, budget) in enumerate(chain):
         msgs = _fit_messages(messages, budget) if budget else messages
         try:
-            return await _attempt(cli, mdl, msgs, max_toks)
+            _msg = await _attempt(cli, mdl, msgs, max_toks)
+            if trace is not None:
+                trace["model"] = mdl
+                trace["reasoning_effort"] = _env("LLM_REASONING_EFFORT") or ""
+                if i:
+                    trace.setdefault("fallbacks", []).append(
+                        {"from": chain[i - 1][1], "to": mdl})
+            return _msg
         except APIStatusError as exc:
             status = getattr(exc, "status_code", None)
             # Walk the chain on: token-limit failures (413/429) AND a model
@@ -5500,13 +6143,20 @@ async def _copilot_chat_turn(request: Request, sid: str, owner,
             logger.warning("[copilot] dump auto-mining failed (falling back to "
                            "prompt-driven mining)", exc_info=True)
 
+    _rounds = 0
+    _charged = 0
+    _read_signatures: dict[str, int] = {}
+    # Which model actually served this turn, and every silent downgrade.
+    _llm_trace: dict = {}
     try:
-        for _ in range(_MAX_TOOL_ITERATIONS):
+        while _charged < _MAX_TOOL_ITERATIONS and _rounds < _MAX_TOOL_ROUNDS:
+            _rounds += 1
             msg = await _chat_completion(
                 client,
                 model,
                 [{"role": "system", "content": _system_prompt(session)}]
                 + _context_window(session["messages"]),
+                trace=_llm_trace,
             )
 
             if not msg.tool_calls:
@@ -5548,6 +6198,19 @@ async def _copilot_chat_turn(request: Request, sid: str, owner,
                     # title below) works from the real slug.
                     if tool_name in _TOOLS_WITH_AGENT_NAME and args.get("name"):
                         args["name"] = _resolve_agent_slug(args["name"])
+                    if tool_name in _READ_ONLY_TOOLS:
+                        # Reads are free, so they need their own brake: the
+                        # same read with the same arguments returns the same
+                        # answer, and repeating it is a loop, not research.
+                        _sig = tool_name + "|" + json.dumps(
+                            args, sort_keys=True, default=str)
+                        _read_signatures[_sig] = _read_signatures.get(_sig, 0) + 1
+                        if _read_signatures[_sig] > _MAX_IDENTICAL_READS:
+                            raise ValueError(
+                                "You already ran this exact check twice this "
+                                "message and got the same answer both times. "
+                                "Act on what it told you, or tell the user "
+                                "what you found — do not run it again.")
                     result, summary, ok, mutated = await _execute_tool(tool_name, args, guard)
                     if tool_name == "create_agent" and ok:
                         guard["created_this_turn"] = True
@@ -5591,19 +6254,33 @@ async def _copilot_chat_turn(request: Request, sid: str, owner,
                     "name": tool_name,
                     "content": json.dumps(result, ensure_ascii=False, default=str)[:20000],
                 })
+
+            # A round that only looked things up costs nothing.
+            if any(tc.function.name not in _READ_ONLY_TOOLS
+                   for tc in msg.tool_calls):
+                _charged += 1
         else:
-            # Iteration cap hit. If real work landed, report IT — the generic
-            # "ran out of steps" next to a successful create_agent told the
-            # user the copilot failed while an agent was silently created.
-            _capped_ok = [a for a in actions
-                          if a["ok"] and a["tool"] in _MUTATING_TOOLS]
-            if _capped_ok:
-                done = "; ".join(a["summary"] for a in _capped_ok)
-                reply = (f"Done so far: {done}. I hit my per-message step "
-                         "limit before finishing everything — tell me what "
-                         "to continue with.")
+            # Step budget spent. Say what landed and what is still open, in
+            # the SAME plain English as every other reply: this branch used
+            # to join the raw internal `summary` strings, which is how a user
+            # ended up reading "update stage MEETING_BOOKING: collect, goal
+            # in LesCall; …" — the exact jargon _actions_digest exists to
+            # keep out of the chat.
+            logger.info("[copilot] step budget spent: %d rounds, %d charged "
+                        "(sid=%s)", _rounds, _charged, sid)
+            _digest = _actions_digest([a for a in actions if a.get("ok")])
+            _pending = _remaining_hint(session, actions)
+            _landed = any(a["ok"] and a["tool"] in _MUTATING_TOOLS
+                          for a in actions)
+            if _landed and _digest:
+                reply = (_digest + " I ran out of steps for this message"
+                         + (f" — still to do: {_pending}." if _pending else ".")
+                         + " Send me the next bit and I'll carry on.")
             else:
-                reply = "I ran out of steps trying to do that — could you rephrase or break it into smaller requests?"
+                reply = ("I ran out of steps before I could change anything"
+                         + (f" — I was still working on: {_pending}."
+                            if _pending else ".")
+                         + " Could you break that into smaller requests?")
     except Exception as exc:
         ok_saves_so_far = [a for a in actions if a["ok"] and a["tool"] in _MUTATING_TOOLS]
         if ok_saves_so_far:
@@ -5687,6 +6364,44 @@ async def _copilot_chat_turn(request: Request, sid: str, owner,
         reply += "\n\n⚠️ Nothing was saved in this step — the change did not go through."
         logger.warning("[copilot] truthfulness backstop fired (sid=%s)", sid)
 
+    # ── Verbatim backstop (deterministic) ──────────────────────────────────
+    # When the user dictates a sentence for the agent to SAY and the turn
+    # wrote something, that sentence must end up in a field the CALLER
+    # HEARS. Scoped to hearable fields on purpose: the real 2026-07-31
+    # failure put a dictated WhatsApp line inside a stage goal, where an
+    # "anywhere in the definition" check would have passed it silently and
+    # the user would only have found out on the phone.
+    if ok_saves:
+        try:
+            _dictated = _dictated_sentences(message)
+            if _dictated:
+                _missing: list[str] = []
+                _defs = {}
+                for _slug in {str(a.get("agent") or "").strip().lower()
+                              for a in ok_saves if a.get("agent")}:
+                    try:
+                        _defs[_slug] = _read_full_definition(_slug)[0]
+                    except Exception:  # noqa: BLE001 — advisory only
+                        continue
+                for _sent in _dictated:
+                    if _defs and not any(
+                            _landed_in_a_hearable_field(d, _sent)
+                            for d in _defs.values()):
+                        _missing.append(_sent)
+                if _missing:
+                    _first = _missing[0]
+                    reply += (
+                        "\n\n⚠️ I did not save your exact words — “"
+                        + (_first[:70] + ("…" if len(_first) > 70 else ""))
+                        + "” — anywhere the agent actually speaks them. Tell "
+                        "me which line you meant — " + _HEARABLE_FIELD_HINT
+                        + " — and I'll put it in word-for-word.")
+                    logger.warning(
+                        "[copilot] verbatim backstop fired (sid=%s): %r",
+                        sid, _first[:80])
+        except Exception:  # noqa: BLE001 — advisory only
+            logger.warning("[copilot] verbatim backstop failed", exc_info=True)
+
     # ── Hide self-corrected retries from the user-facing action list ────────
     # The LLM often gets a save rejected (e.g. invented setting name), reads
     # the error, and immediately retries correctly. A "Couldn't update …"
@@ -5708,6 +6423,25 @@ async def _copilot_chat_turn(request: Request, sid: str, owner,
     session["messages"].append({"role": "assistant", "content": reply})
     _t_entry: dict = {"role": "assistant", "content": reply, "actions": visible_actions,
                       "actions_summary": actions_summary, "agent_links": agent_links}
+    # Model provenance on every turn (2026-08-04). Every model attribution in
+    # the 08-04 forensics — the 07-15 gpt-4o-mini incident included — had to
+    # be inferred from tool-call id alphabets because nothing recorded this.
+    if _llm_trace:
+        _t_entry["llm"] = {"model": _llm_trace.get("model", ""),
+                           "reasoning_effort": _llm_trace.get(
+                               "reasoning_effort", ""),
+                           "rounds": _rounds}
+        if _llm_trace.get("fallbacks"):
+            _t_entry["llm"]["fallbacks"] = _llm_trace["fallbacks"]
+            # The user is entitled to know a weaker model answered them.
+            _fb_to = _llm_trace["fallbacks"][-1]["to"]
+            reply += ("\n\n(Note: the main AI model was unavailable for part "
+                      f"of this message, so a backup model ({_fb_to}) "
+                      "answered. Please double-check anything important — I "
+                      "can redo it if something looks off.)")
+            _t_entry["content"] = reply
+            logger.warning("[copilot] turn served by fallback model %s "
+                           "(sid=%s)", _fb_to, sid)
     if voice_samples:
         _t_entry["voice_samples"] = voice_samples  # reloaded chats keep players
     session["transcript"].append(_t_entry)
@@ -5852,76 +6586,437 @@ async def copilot_upload(request: Request) -> dict:
             "note": "pass this doc_id in the chat body's `attachments` list"}
 
 
-@router.post("/api/copilot/try/{name}")
-async def copilot_try_agent(name: str, request: Request) -> dict:
-    """F17: 'Try your agent' — one text turn against a built agent using the
-    LIVE env model, exactly the engine a phone call gets. The Kaapd failures
-    (fabricated products, ignored flow, real-estate objections) were all
-    discoverable in sixty seconds of text chat; the first execution of a
-    built agent must never again be a production phone call.
+# ===========================================================================
+# Voice prompting for the composer — speak instead of type.
+#
+# The correction pipeline lives in copilot_voice.py; what belongs here is the
+# part that only the API knows: WHOSE vocabulary to repair against. Generic
+# spellcheck is worthless on "make hardik-2-inbound greet in Gujarati" — the
+# words that get mangled are the caller's own agent slugs, agent names and
+# company names, and those are exactly what this module can enumerate.
+# ===========================================================================
 
-    Body: {"messages": [{"role": "user"|"assistant", "text": "..."}, ...]}
-    — full turn history each call; the router is rebuilt and replayed so the
-    endpoint stays stateless. Returns the reply plus the live stage/slot
-    state so the tester can SEE the flow advancing."""
+_VOICE_LEX_CACHE: dict[str, tuple[float, Any]] = {}
+_VOICE_LEX_TTL_S = 120.0
+_VOICE_RATE: dict[str, list[float]] = {}
+_VOICE_RATE_MAX = 60            # transcriptions per owner …
+_VOICE_RATE_WINDOW_S = 600.0    # … per 10 minutes
+
+
+def _voice_lexicon(owner: str | None):
+    """The caller's own nouns, plus this platform's jargon.
+
+    Rebuilt at most every two minutes: an agent renamed mid-conversation
+    should be sayable almost immediately, but not at the cost of re-reading
+    every YAML on every held mic button.
+    """
+    import copilot_voice
+    key = owner or "-"
+    now = time.monotonic()
+    hit = _VOICE_LEX_CACHE.get(key)
+    if hit and now - hit[0] < _VOICE_LEX_TTL_S:
+        return hit[1]
+
+    phrases: list[str] = []
+    try:
+        visible = builder._visible_slugs(owner or builder._ctx_owner())
+    except Exception:
+        visible = set()
+    for path in sorted(_AGENTS_DIR.glob("*/agent.yaml")):
+        slug = path.parent.name
+        if visible is not None and slug not in visible:
+            continue
+        # The slug itself is the highest-value entry: normalized it is
+        # "hardik2inbound", which is what "hardik 2 inbound" collapses to, so
+        # the spoken form repairs straight back to the canonical slug.
+        phrases.append(slug)
+        try:
+            agent = agent_registry.get(slug, _AGENTS_DIR)
+        except Exception:
+            continue
+        phrases.append(agent.identity.agent_name)
+        phrases.append(agent.identity.company_name)
+        try:
+            phrases.extend(list((agent.knowledge_base.known_projects or {}).keys()))
+            phrases.extend(list(agent.knowledge_base.locations or []))
+            phrases.extend(v.speaker for v in
+                           (agent.languages.tts_voices or {}).values())
+        except Exception:
+            pass
+    lex = copilot_voice.Lexicon(phrases + list(copilot_voice._PRODUCT_LEXICON))
+    _VOICE_LEX_CACHE[key] = (now, lex)
+    logger.info("[voice] lexicon for %s: %d phrases", key, len(lex.by_key))
+    return lex
+
+
+def _voice_rate_ok(owner: str | None) -> bool:
+    key = owner or "-"
+    now = time.monotonic()
+    hits = [t for t in _VOICE_RATE.get(key, []) if now - t < _VOICE_RATE_WINDOW_S]
+    if len(hits) >= _VOICE_RATE_MAX:
+        _VOICE_RATE[key] = hits
+        return False
+    hits.append(now)
+    _VOICE_RATE[key] = hits
+    return True
+
+
+@router.post("/api/copilot/transcribe")
+async def copilot_transcribe(request: Request) -> dict:
+    """Composer mic → prompt text. Multipart: `audio` (16 kHz mono WAV from
+    the browser; anything ffmpeg reads also works).
+
+    Returns the corrected text plus what was corrected and where the time
+    went, so a slow mic can be diagnosed without guessing which stage."""
+    import copilot_voice
+    owner = getattr(request.state, "owner", None)
+    if not _voice_rate_ok(owner):
+        raise HTTPException(status_code=429,
+                            detail="too many voice prompts — give it a minute")
+    form = await request.form()
+    upload = form.get("audio")
+    if upload is None or not hasattr(upload, "read"):
+        raise HTTPException(status_code=400, detail="'audio' is required")
+    raw = await upload.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="the recording is empty")
+    if len(raw) > copilot_voice.MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="the recording is too long")
+    # Auto-detect: this composer is used in English and in Hinglish, and
+    # forcing en-IN turns the Hindi words people mix in into nonsense.
+    language = str(form.get("language") or "unknown").strip() or "unknown"
+    want_polish = str(form.get("polish") or "").lower() in ("1", "true", "yes") \
+        or copilot_voice.POLISH_ENABLED
+    try:
+        out = await copilot_voice.transcribe(
+            raw, _voice_lexicon(owner),
+            language=language,
+            want_polish=want_polish,
+            get_client=_get_client,
+            polish_model=(_env("LLM_VOICE_MODEL")
+                          or _fallback_model_name() or _model_name()),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[voice] transcription failed")
+        raise HTTPException(status_code=502,
+                            detail=f"could not transcribe that: {exc}")
+    logger.info("[voice] %.1fs audio → %r (%s) %s", out["seconds"],
+                out["text"][:80], out["language"] or "?", out["ms"])
+    return out
+
+
+# ===========================================================================
+# F17 "Try your agent" — a LIVE SIMULATED CALL, not a chat with the agent.
+#
+# A phone call holds ONE ConversationRouter for its whole life, and the agent
+# speaks the first word. The original endpoint did neither: it rebuilt the
+# router on every request and replayed the entire history through it, which
+# was wrong four ways —
+#
+#   1. it iterated `router.process()`, which is a coroutine returning one
+#      EngineResult, not an async generator. EVERY turn 502'd with
+#      "'async for' requires an object with __aiter__ method, got coroutine".
+#      (`process_stream` is the generator; the pipeline drives that one.)
+#   2. the agent's opening was generated and thrown away, so the simulation
+#      began with the CALLER talking — the one thing that never happens on a
+#      call, and the reason the two-beat opening (greeting, then
+#      call_flow.connect.intro_line once the caller answers) could not be
+#      tested here at all.
+#   3. replay re-ran the LLM for every prior turn — turn N cost N generations
+#      — and then ALSO injected the UI's copy of each prior reply into
+#      memory, so every past agent line appeared twice in the LLM's context.
+#   4. every agent, inbound included, was handed contact_name="Test Caller",
+#      so inbound flows skipped asking the caller's name.
+#
+# Now: one router per simulated call, held server-side for the life of the
+# session, driven exactly as pipeline.py drives it. The only deliberate
+# divergence from a real call is persistence — a simulated booking must not
+# consume a real calendar slot — and the parts of the pipeline that only
+# exist because there is audio (VAD, barge-in, dead-air repair, silence and
+# max-duration timers) simply have no analogue in typed text.
+# ===========================================================================
+
+_TRY_SIM_TTL_S = 1800.0        # a simulated call goes stale after 30 idle min
+_TRY_SIM_MAX = 60              # process-wide ceiling on live simulations
+_TRY_SIM_MAX_TURNS = 200       # a runaway client cannot pin a router forever
+_TRY_SIMS: dict[str, dict] = {}
+_TRY_SIM_ID_RE = re.compile(r"^sim_[a-f0-9]{24}$")
+
+
+def _try_sim_gc() -> None:
+    """Drop idle simulations, then the oldest ones over the ceiling.
+
+    Committing the pending turn on the way out mirrors pipeline.stop(): an
+    abandoned simulation settles exactly like an abandoned call.
+    """
+    now = time.monotonic()
+    for sid, sim in list(_TRY_SIMS.items()):
+        if now - sim["last_used"] > _TRY_SIM_TTL_S:
+            _try_sim_close(_TRY_SIMS.pop(sid, None))
+    while len(_TRY_SIMS) > _TRY_SIM_MAX:
+        oldest = min(_TRY_SIMS, key=lambda k: _TRY_SIMS[k]["last_used"])
+        _try_sim_close(_TRY_SIMS.pop(oldest, None))
+
+
+def _try_sim_close(sim: dict | None) -> None:
+    if not sim:
+        return
+    try:
+        sim["router"].commit_pending_turn()
+    except Exception:
+        logger.exception("[copilot] sim commit_pending_turn failed")
+
+
+def _try_assert_agent(name: str, request: Request) -> None:
+    """Same tenancy + existence gate the old endpoint applied."""
     owner = getattr(request.state, "owner", None)
     _slug_owner = builder._slug_owner(name)
     if _slug_owner and owner and _slug_owner != owner \
             and not builder._ctx_is_admin():
         raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
-    yaml_path = _AGENTS_DIR / name / "agent.yaml"
-    if not yaml_path.exists():
+    if not (_AGENTS_DIR / name / "agent.yaml").exists():
         raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
+
+
+def _new_sim_router(name: str, sim_id: str, direction: str,
+                    contact_name: str):
+    """Build the router a real call would build for this agent.
+
+    Mirrors conversation_call_bridge._build_agent_stack + set_call_context:
+    the same registry load, the same "seed the language from the agent's own
+    default" rule, and the same per-call context. Returns the router plus the
+    list that captures calendar writes instead of performing them.
+    """
+    from backend.app.voice.conversation import ConversationRouter
+    agent = agent_registry.get(name, _AGENTS_DIR)
+    router_obj = ConversationRouter(
+        agent_def=agent,
+        default_language=(agent.languages.default or "hi"),
+    )
+    direction = (direction or agent.call_direction or "inbound").lower()
+    if direction == "outbound":
+        # Only an outbound dial knows who it is calling. Inbound callers are
+        # strangers — handing one a contact name pre-fills customer_name and
+        # the flow then never asks for it, which is precisely the bug an
+        # inbound test is supposed to catch.
+        router_obj.set_call_context(
+            direction="outbound",
+            contact_name=(contact_name or "Test Caller").strip(),
+            contact_phone="9999999999",
+            conn_id=sim_id)
+    else:
+        router_obj.set_call_context(direction="inbound", conn_id=sim_id)
+    # Persistence divergence: a simulated booking must not eat a real slot in
+    # the agent's calendar (later real callers would be told it is taken), so
+    # the write is captured and handed back to the tester instead.
+    bookings: list[str] = []
+    router_obj._write_calendar_booking = bookings.append
+    return router_obj, bookings
+
+
+def _sim_state(sim: dict) -> dict:
+    """The live engine readout — the reason to test in text rather than by
+    phone. Same fields the pipeline stamps on its per-turn trace."""
+    router_obj = sim["router"]
+    state = getattr(router_obj, "state", None)
+    flags = {k: v for k, v in
+             dict(getattr(router_obj.state_mgr, "extra_flags", {}) or {}).items()
+             if v}
+    return {
+        "sim_id": sim["id"],
+        "stage": (str(getattr(state, "conversation_stage", "")
+                      or getattr(state, "stage", "") or "")),
+        "language": getattr(state, "language", "") or "",
+        "slots": {k: v for k, v in dict(router_obj.state_mgr.state).items()
+                  if v is not None},
+        "flags": flags,
+        "bookings": list(sim["bookings"]),
+        "turn": sim["turns"],
+        "ended": bool(sim["ended"]),
+        "end_reason": sim["end_reason"],
+        "outcome": str(getattr(router_obj, "call_outcome", "") or ""),
+        "direction": router_obj.call_direction,
+        "agent_revision": (agent_registry.meta(sim["slug"]) or {}).get("revision", 0),
+        "model": router_obj._model,
+    }
+
+
+def _sim_reply(sim: dict, parts: list[dict]) -> dict:
+    """Fold one engine turn into the wire shape.
+
+    `reply` excludes fillers for the same reason the pipeline excludes them
+    from the stored transcript: "One moment please…" is played on the call but
+    is not what the agent SAID. They are returned separately so the tester can
+    still see that a filler was spoken.
+    """
+    out = _sim_state(sim)
+    out["reply"] = " ".join(p["text"] for p in parts
+                            if p["intent"] != "filler" and p["text"]).strip()
+    out["parts"] = parts
+    out["fillers"] = [p["text"] for p in parts if p["intent"] == "filler"]
+    return out
+
+
+async def _sim_run_turn(sim: dict, text: str) -> list[dict]:
+    """One caller utterance through the real engine, exactly as
+    pipeline._conversation_layer drives it."""
+    router_obj = sim["router"]
+    parts: list[dict] = []
+    try:
+        async for res in router_obj.process_stream(text):
+            if getattr(res, "text", ""):
+                parts.append({"text": res.text, "intent": res.intent,
+                              "is_shortcut": bool(res.is_shortcut)})
+    except Exception as exc:
+        logger.exception("[copilot] sim turn failed for %s", sim["slug"])
+        raise HTTPException(status_code=502,
+                            detail=f"engine turn failed: {exc}")
+    sim["turns"] += 1
+    sim["last_used"] = time.monotonic()
+    # The agent decided to hang up. The pipeline drains TTS and then breaks
+    # the channel; here the call is simply over — no further turns are taken,
+    # so the pending transaction is committed as pipeline.stop() would.
+    if getattr(router_obj, "hangup_pending", False):
+        sim["ended"] = True
+        sim["end_reason"] = (str(getattr(router_obj, "call_outcome", "") or "")
+                             or "agent ended the call")
+        _try_sim_close(sim)
+    elif sim["turns"] >= _TRY_SIM_MAX_TURNS:
+        sim["ended"] = True
+        sim["end_reason"] = "simulation turn limit reached"
+        _try_sim_close(sim)
+    return parts
+
+
+@router.post("/api/copilot/try/{name}/start")
+async def copilot_try_start(name: str, request: Request) -> dict:
+    """Answer the simulated call: build the router and return the agent's
+    OPENING line — the agent always speaks first, on every real call and now
+    here too. No LLM runs (the opening is configured text), so this does not
+    spend the tenant's turn budget."""
+    _try_assert_agent(name, request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    _try_sim_gc()
+    sim_id = "sim_" + secrets.token_hex(12)
+    try:
+        router_obj, bookings = _new_sim_router(
+            name, sim_id,
+            direction=str(body.get("direction") or ""),
+            contact_name=str(body.get("contact_name") or ""))
+        opening = await router_obj.generate_opening()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[copilot] sim start failed for %s", name)
+        raise HTTPException(status_code=502,
+                            detail=f"engine start failed: {exc}")
+    sim = {
+        "id": sim_id, "slug": name, "router": router_obj,
+        "bookings": bookings, "owner": getattr(request.state, "owner", None),
+        "turns": 0, "ended": False, "end_reason": "",
+        "last_used": time.monotonic(),
+    }
+    _TRY_SIMS[sim_id] = sim
+    logger.info("[copilot] sim %s started for %s (direction=%s)",
+                sim_id, name, router_obj.call_direction)
+    return _sim_reply(sim, [{"text": opening.text, "intent": "greeting",
+                             "is_shortcut": True}] if opening.text else [])
+
+
+@router.post("/api/copilot/try/{name}")
+async def copilot_try_agent(name: str, request: Request) -> dict:
+    """One caller turn against a built agent on the LIVE env model — exactly
+    the engine a phone call gets. The Kaapd failures (fabricated products,
+    ignored flow, real-estate objections) were all discoverable in sixty
+    seconds of text chat; the first execution of a built agent must never
+    again be a production phone call.
+
+    Body: {"sim_id": "...", "message": "..."} — one turn against the live
+    simulation opened by POST .../try/{name}/start.
+
+    Legacy body {"messages": [...]} is still accepted for browser tabs holding
+    a pre-simulation bundle: it opens a throwaway simulation and replays the
+    history through it. Replay costs one LLM generation per prior turn, which
+    is exactly why the session form exists.
+
+    Returns the reply plus the live stage/slot state so the tester can SEE the
+    flow advancing."""
+    _try_assert_agent(name, request)
     body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    # E10 — try-agent drives a REAL ConversationRouter, the most expensive
+    # LLM surface here per call.
+    _billing_llm_gate(request, "copilot_try")
+
+    sim_id = str(body.get("sim_id") or "").strip()
+    if sim_id:
+        if not _TRY_SIM_ID_RE.match(sim_id):
+            raise HTTPException(status_code=400, detail="invalid sim_id")
+        sim = _TRY_SIMS.get(sim_id)
+        if sim is None or sim["slug"] != name:
+            # 410, not 404: the agent is fine, this particular simulated call
+            # is gone (idle timeout or a dashboard restart). The UI reads the
+            # status and offers Restart rather than showing a dead error.
+            raise HTTPException(
+                status_code=410,
+                detail="this simulated call has expired — restart to begin a "
+                       "new one")
+        owner = getattr(request.state, "owner", None)
+        if sim["owner"] and owner and sim["owner"] != owner \
+                and not builder._ctx_is_admin():
+            raise HTTPException(status_code=404,
+                                detail="this simulated call has expired — "
+                                       "restart to begin a new one")
+        if sim["ended"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"the call has ended ({sim['end_reason']}) — restart "
+                       "to begin a new one")
+        text = str(body.get("message") or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="'message' is required")
+        parts = await _sim_run_turn(sim, text[:2000])
+        return _sim_reply(sim, parts)
+
+    # ---- legacy stateless replay (pre-simulation frontend bundles) --------
     msgs = [m for m in (body.get("messages") or [])
             if isinstance(m, dict) and str(m.get("text") or "").strip()][-30:]
     if not msgs or msgs[-1].get("role") != "user":
         raise HTTPException(status_code=400,
                             detail="messages must end with a user turn")
-    # E10 — try-agent spins a REAL ConversationRouter and replays up to 30
-    # turns per request, so it is the most expensive LLM surface here per call.
-    _billing_llm_gate(request, "copilot_try")
-    from backend.app.voice.conversation import ConversationRouter
-
-    def _fresh_router():
-        agent = agent_registry.get(name)
-        r = ConversationRouter(agent_def=agent,
-                               default_language=agent.languages.default)
-        r.call_direction = str(body.get("direction")
-                               or agent.call_direction or "outbound")
-        r.outbound_contact_name = str(body.get("contact_name") or "Test Caller")
-        r.outbound_contact_phone = "9999999999"
-        return r
-
-    router_obj = _fresh_router()
-    reply_parts: list[str] = []
+    _try_sim_gc()
+    replay_id = "sim_" + secrets.token_hex(12)
     try:
-        _ = await router_obj.generate_opening()
-        # Replay history: prior user turns re-drive the real state machine;
-        # prior assistant turns are injected as memory only.
-        for m in msgs[:-1]:
-            if m.get("role") == "user":
-                async for res in router_obj.process(str(m["text"])):
-                    pass
-            else:
-                router_obj.memory.add_assistant(str(m["text"]))
-        async for res in router_obj.process(str(msgs[-1]["text"])):
-            if getattr(res, "text", ""):
-                reply_parts.append(res.text)
+        router_obj, bookings = _new_sim_router(
+            name, replay_id,
+            direction=str(body.get("direction") or ""),
+            contact_name=str(body.get("contact_name") or ""))
+        await router_obj.generate_opening()
     except Exception as exc:
-        logger.exception("[copilot] try-agent turn failed for %s", name)
+        logger.exception("[copilot] sim replay start failed for %s", name)
         raise HTTPException(status_code=502,
-                            detail=f"engine turn failed: {exc}")
-    meta = agent_registry.meta(name) or {}
-    return {
-        "reply": " ".join(reply_parts).strip(),
-        "stage": router_obj.state.stage,
-        "language": router_obj.state.language,
-        "slots": {k: v for k, v in dict(router_obj.state_mgr.state).items()
-                  if v is not None},
-        "agent_revision": meta.get("revision", 0),
-        "model": router_obj._model,
-    }
+                            detail=f"engine start failed: {exc}")
+    sim = {"id": replay_id, "slug": name, "router": router_obj,
+           "bookings": bookings, "owner": getattr(request.state, "owner", None),
+           "turns": 0, "ended": False, "end_reason": "",
+           "last_used": time.monotonic()}
+    # Only the CALLER's turns are replayed. The router generates (and
+    # remembers) its own replies — re-injecting the UI's copy on top is what
+    # used to double every past agent line in the LLM's context.
+    for m in msgs[:-1]:
+        if m.get("role") == "user" and not sim["ended"]:
+            await _sim_run_turn(sim, str(m["text"])[:2000])
+    parts = await _sim_run_turn(sim, str(msgs[-1]["text"])[:2000])
+    _try_sim_close(sim)
+    return _sim_reply(sim, parts)
 
 
 @router.get("/api/copilot/sessions")

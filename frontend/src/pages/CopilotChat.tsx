@@ -7,8 +7,10 @@ import {
   type CopilotAction, type TranscriptMsg, type SessionSummary,
   type InterviewProgress, type PendingChange, type VoiceSample,
 } from '../api/copilot'
-import { cx, Badge, Button, EmptyState, Spinner } from '../components/ui'
+import { cx, Badge, Button, EmptyState, IconButton, Spinner } from '../components/ui'
 import { TextShimmer } from '../components/motion'
+import { Markdown } from '../components/markdown'
+import { useVoicePrompt } from '../lib/voicePrompt'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { TryAgentDialog } from '../components/TryAgent'
 import { ActivateAgentModal, type ActivateTarget } from '../components/ActivateAgent'
@@ -16,6 +18,7 @@ import {
   Sparkles, SendHorizontal, RotateCcw, Check, X, ArrowDown, Info,
   Plus, Pencil, Radio, Bot, Trash2, MessagesSquare, SquarePen, Lightbulb,
   Paperclip, FileText, ClipboardList, Eye, EyeOff, PlayCircle, Volume2,
+  Mic, Square, Languages,
 } from 'lucide-react'
 
 /* ─────────────────────────── session id ─────────────────────────── */
@@ -284,27 +287,10 @@ function ActionChips({ actions, summary, agentLinks }: {
   )
 }
 
-/* Split assistant text on ``` fences so config/YAML/scripts render as code
-   blocks instead of a flat text wall. All original content is preserved. */
+/* Assistant prose is Markdown — `**bold**`, bullets, headings and ``` fences
+   all render as themselves instead of as punctuation. See components/markdown. */
 function AssistantText({ content }: { content: string }) {
-  const parts = content.split('```')
-  if (parts.length < 3) return <>{content}</>
-  return (
-    <>
-      {parts.map((part, i) =>
-        i % 2 === 1 ? (
-          <pre
-            key={i}
-            className="mt-2 overflow-x-auto rounded-xl bg-[var(--bg-2)] px-3 py-2 font-mono text-xs leading-relaxed ring-1 ring-[var(--border)]"
-          >
-            {part.replace(/^[A-Za-z0-9_-]*\n/, '')}
-          </pre>
-        ) : (
-          <span key={i}>{part}</span>
-        ),
-      )}
-    </>
-  )
+  return <Markdown text={content} />
 }
 
 /* Playable voice previews — rendered when the copilot names TTS voices while
@@ -665,6 +651,42 @@ export default function CopilotChat() {
   const lastUserRef = useRef('')
   const refresh = useRefresh()
 
+  // Speak instead of type. Dictated text lands in the composer for review and
+  // is never sent on its own: a mis-heard word here becomes an instruction to
+  // edit a real agent, so the user gets the last look.
+  const dictatedRef = useRef('')
+  const insertDictation = useCallback((text: string) => {
+    setInput((prev) => (prev.trim() ? `${prev.trim()} ${text}` : text))
+    dictatedRef.current = text
+    requestAnimationFrame(() => {
+      const el = inputRef.current
+      if (!el) return
+      el.focus()
+      autoGrow(el)
+      el.selectionStart = el.selectionEnd = el.value.length
+    })
+  }, [])
+  const voice = useVoicePrompt({ onText: insertDictation })
+
+  // Hindi and Gujarati arrive romanized ("Aap kaise ho") because that is how
+  // this box is written in. But someone dictating the literal text of an
+  // agent's Hindi greeting wants देवनागरी — and only they know which of the
+  // two they are doing, so the original is one click away. No-ops if they
+  // have already edited what was inserted.
+  const useOriginalScript = () => {
+    const raw = voice.last?.raw_text
+    const inserted = dictatedRef.current
+    if (!raw || !inserted) return
+    setInput((prev) => (prev.endsWith(inserted)
+      ? prev.slice(0, prev.length - inserted.length) + raw
+      : prev))
+    dictatedRef.current = raw
+    requestAnimationFrame(() => {
+      const el = inputRef.current
+      if (el) { el.focus(); autoGrow(el) }
+    })
+  }
+
   const loadHistory = useCallback(() => {
     copilotSessions()
       .then((res) => setSessions(res.sessions ?? []))
@@ -1023,15 +1045,33 @@ export default function CopilotChat() {
               if (f) void attachFile(f)
             }}
           />
-          <Button
-            variant="ghost"
-            size="sm"
+          <IconButton
+            label="Attach a brochure or price sheet — the copilot reads it into the agent"
             disabled={busy || uploading}
             onClick={() => fileRef.current?.click()}
-            title="Attach a brochure / price sheet — the copilot reads it into the agent"
           >
-            {uploading ? <Spinner /> : <Paperclip size={15} />}
-          </Button>
+            {uploading ? <Spinner /> : <Paperclip size={16} />}
+          </IconButton>
+          {voice.supported && (
+            <IconButton
+              label={voice.state === 'recording'
+                ? 'Stop recording and transcribe'
+                : 'Dictate your message'}
+              active={voice.state === 'recording'}
+              disabled={busy || uploading || voice.state === 'transcribing'
+                || voice.state === 'starting'}
+              onClick={voice.toggle}
+              className={voice.state === 'recording'
+                ? 'bg-rose-500/12 text-rose-600 hover:bg-rose-500/20 dark:text-rose-300'
+                : ''}
+            >
+              {voice.state === 'transcribing' || voice.state === 'starting'
+                ? <Spinner />
+                : voice.state === 'recording'
+                  ? <Square size={13} className="fill-current" />
+                  : <Mic size={16} />}
+            </IconButton>
+          )}
           <textarea
             ref={inputRef}
             rows={1}
@@ -1047,10 +1087,70 @@ export default function CopilotChat() {
             {busy ? <Spinner /> : <SendHorizontal size={15} />}
           </Button>
         </div>
-        <p className="mt-1.5 px-1 text-center text-2xs text-dim">
-          Enter to send · Shift+Enter for a new line · the copilot writes real agents under{' '}
-          <code className="font-mono text-2xs">agents/</code>
-        </p>
+        {/* One status line under the composer: what the mic is doing, or the
+            usual hint. Recording has to be unmistakable — a page that is
+            listening and does not say so is the whole objection to mic
+            buttons. */}
+        {voice.state === 'recording' ? (
+          <div className="mt-1.5 flex flex-wrap items-center justify-center gap-2 px-1 text-2xs">
+            <span className="relative flex h-2 w-2" aria-hidden>
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-500 opacity-75" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-rose-500" />
+            </span>
+            <span role="status" className="font-semibold text-rose-600 dark:text-rose-300">
+              Listening… {voice.seconds.toFixed(1)}s
+            </span>
+            <span className="h-1.5 w-24 overflow-hidden rounded-full bg-[var(--surface-2)]" aria-hidden>
+              <span className="block h-full rounded-full bg-mint-500"
+                style={{ width: `${Math.min(100, Math.round(voice.level * 100))}%` }} />
+            </span>
+            <span className="text-dim">stops on its own · Esc to cancel</span>
+          </div>
+        ) : voice.state === 'transcribing' ? (
+          <p className="mt-1.5 px-1 text-center text-2xs text-dim" role="status">
+            <Spinner className="mr-1.5 inline h-3 w-3" /> Writing that down…
+          </p>
+        ) : (
+          <p className="mt-1.5 px-1 text-center text-2xs text-dim">
+            Enter to send · Shift+Enter for a new line
+            {voice.supported ? ' · mic to dictate' : ''} · the copilot writes real agents under{' '}
+            <code className="font-mono text-2xs">agents/</code>
+          </p>
+        )}
+        {voice.error && (
+          <p role="alert" className="mt-1 px-1 text-center text-2xs text-rose-600 dark:text-rose-300">
+            {voice.error}
+          </p>
+        )}
+        {/* What the corrector changed, and — for Hindi/Gujarati — the way out
+            of the romanization. A silent rewrite of the user's own words is
+            the one thing that would make dictation feel untrustworthy. */}
+        {voice.last?.corrections?.length || voice.last?.romanized ? (
+          <p className="mt-1 flex flex-wrap items-center justify-center gap-x-2 gap-y-1 px-1 text-center text-2xs text-dim">
+            {voice.last?.romanized && (
+              <span className="inline-flex items-center gap-1.5">
+                <Languages size={11} />
+                {voice.last.language?.startsWith('gu') ? 'Gujarati' : 'Hindi'} → Hinglish
+                <button type="button" onClick={useOriginalScript}
+                  title="Put the original script in the box instead"
+                  className="rounded px-1 py-0.5 font-semibold text-mint-700 underline underline-offset-2 hover:bg-[var(--surface-2)] dark:text-mint-300">
+                  use {voice.last.language?.startsWith('gu') ? 'ગુજરાતી' : 'देवनागरी'}
+                </button>
+              </span>
+            )}
+            {voice.last?.corrections?.length ? (
+              <span>
+                heard it as{' '}
+                {voice.last.corrections.slice(0, 3).map((c, i) => (
+                  <span key={i}>
+                    {i > 0 ? ', ' : ''}
+                    <span className="line-through opacity-70">{c.from}</span> → {c.to}
+                  </span>
+                ))}
+              </span>
+            ) : null}
+          </p>
+        ) : null}
       </div>
       </div>
 

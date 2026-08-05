@@ -131,7 +131,7 @@ knowledge_base:
     real_estate_corrections: {}
     project_name_corrections: {}
 response_bank:
-  opening_greeting: Hello, am I speaking with the parent or guardian of {{student_name}}?
+  opening_greeting: Hello, am I speaking with the parent or guardian?
   filler_responses:
     hi:
     - एक मिनट...

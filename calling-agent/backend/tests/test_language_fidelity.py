@@ -97,11 +97,24 @@ def test_switch_instant_on_dense_evidence():
 
 
 def test_switch_instant_gujarati_markers():
-    r = make_router()
+    # The agent must DECLARE Gujarati: since 2026-08-04 switching is bounded
+    # by languages.supported, so an agent with no Gujarati greeting, no
+    # Gujarati responses and no Gujarati voice is never carried into it.
+    r = make_router(languages={"supported": ["en", "hi", "gu"],
+                               "default": "hi", "tts_voices": {}})
     r.state.language = "hi"
     r.state.turn_count = 5
     target, reason = r._evidence_switch_decision("तमे केम छो")
     assert target == "gu"
+
+
+def test_gujarati_markers_do_not_switch_an_agent_without_gujarati():
+    """The same utterance, on an agent built only for English and Hindi."""
+    r = make_router()                       # supported = ["en", "hi"]
+    r.state.language = "hi"
+    r.state.turn_count = 5
+    target, reason = r._evidence_switch_decision("तमे केम छो")
+    assert target is None and "unsupported" in reason
 
 
 def test_switch_instant_english_needs_function_word():

@@ -258,3 +258,87 @@ def test_adapt_direction_inbound_clears_dormant_outbound_opener(copilot):
     out = builder.adapt_direction(spec, "inbound")
     assert out["outbound"]["opening_greeting"] == {}
     assert out["response_bank"]["opening_greeting"] == builder._INBOUND_GREETING
+
+
+# ── dictated speech must land where the caller HEARS it (2026-08-04) ────────
+#
+# Production failure, session sms2w7slva12a15 (07-31): the owner dictated
+# "Would it be okay if I could share the details to you on WhatsApp at this
+# same number?" and the Copilot filed it inside the MEETING_BOOKING STAGE
+# GOAL of both maya twins. Stage goals are instructions to the AI and are
+# never spoken. It was in the definition, it was "saved", and the owner
+# would only have found out on a call. So the check is scoped to hearable
+# fields on purpose — an "anywhere in the definition" check passes this.
+
+import sys as _sys
+from conftest import REPO_ROOT as _ROOT
+if str(_ROOT / "dashboard") not in _sys.path:
+    _sys.path.insert(0, str(_ROOT / "dashboard"))
+import agent_copilot_api as _cop  # noqa: E402
+
+
+def test_dictated_sentences_are_extracted_from_quotes():
+    got = _cop._dictated_sentences(
+        'Please make her say "Am I speaking to the right person today?" first')
+    assert "Am I speaking to the right person today?" in got
+
+
+def test_dictated_sentences_are_extracted_from_a_cue():
+    got = _cop._dictated_sentences(
+        "After that, continue with this: My name is Pooja from B2 Market.")
+    assert any("My name is Pooja from B2 Market." in g for g in got)
+
+
+def test_a_short_quote_is_not_treated_as_dictation():
+    assert _cop._dictated_sentences('rename "Asha" please') == []
+
+
+def test_second_beat_requests_are_recognised():
+    for msg in [
+        "I want the agent to first start with a simple Hello, wait for the "
+        "callers response as their first word will also be hello mostly. "
+        "After that, continue with this: My name is Pooja from B2 Market.",
+        "After a hello from the caller, I want the agent to say, "
+        "'Am I speaking to {contact_name}'",
+        "it should say hello, wait for their hello and after that tell them "
+        "that Jethalal was going through a list",
+    ]:
+        assert _cop._describes_second_beat(msg), msg
+
+
+def test_ordinary_edits_are_not_second_beat_requests():
+    for msg in ["change her voice to priya",
+                "add a rule that she never quotes prices",
+                "make the greeting shorter"]:
+        assert not _cop._describes_second_beat(msg), msg
+
+
+def test_a_line_in_a_stage_goal_is_not_hearable():
+    """The exact 07-31 failure."""
+    defn = {"call_flow": {"stages": [
+        {"id": "MEETING_BOOKING",
+         "goal": "Once they express interest, ask: Would it be okay if I "
+                 "could share the details to you on WhatsApp at this same "
+                 "number?"}]}}
+    assert _cop._landed_in_a_hearable_field(
+        defn, "Would it be okay if I could share the details to you on "
+              "WhatsApp at this same number?") is False
+
+
+def test_a_line_in_the_connect_intro_is_hearable():
+    defn = {"call_flow": {"connect": {"intro_line": {
+        "en": "My name is Pooja from B2 Market."}}}}
+    assert _cop._landed_in_a_hearable_field(
+        defn, "My name is Pooja from B2 Market.") is True
+
+
+def test_a_line_in_the_opening_is_hearable():
+    defn = {"response_bank": {"opening_greeting": "Hello, this is Asha."}}
+    assert _cop._landed_in_a_hearable_field(defn, "Hello, this is Asha.") \
+        is True
+
+
+def test_hearable_match_ignores_case_spacing_and_final_punctuation():
+    defn = {"response_bank": {"opening_greeting": "Hello,   this is  ASHA"}}
+    assert _cop._landed_in_a_hearable_field(defn, "hello, this is asha.") \
+        is True

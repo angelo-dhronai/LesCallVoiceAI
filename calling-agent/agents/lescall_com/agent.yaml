@@ -127,10 +127,9 @@ response_bank:
   identity_responses: {}
   objection_responses:
     en:
-    - '{''reply'': "Our platform can help you automate your calling process and improve
-      efficiency. I''d like to invite you to try out our pilot program. Please visit
-      our website at lescall.com to learn more.", ''response'': "We''re interested
-      in learning more."}'
+    - Our platform can help you automate your calling process and improve efficiency.
+      I'd like to invite you to try out our pilot program. Please visit our website
+      at lescall.com to learn more.
   decline_farewell:
     en: No problem at all — thank you for your time, have a great day!
   lang_switch_responses:

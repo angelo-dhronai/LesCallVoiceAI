@@ -910,9 +910,18 @@ class TelephonySession:
         """Starts the AI pipeline and the playback injection loop."""
         self._running = True
         SarvamCreditTracker.get().start_call(self.conn_id)
+        # Subscribe SYNCHRONOUSLY, before anything can emit. EventHub has no
+        # replay buffer, and the pipeline task reaches its opening-line emit
+        # without ever suspending (the 25ms first-audio yield is skipped when
+        # ws_audio_receiver has already pushed frame 1, which it now always
+        # has — session setup grew past ~900ms). The agent's opening line was
+        # therefore broadcast to zero subscribers and lost from EVERY audit
+        # transcript from 2026-07-22 onward. subscribe() is a plain sync call
+        # returning a bounded drop-oldest queue, so creating it here buffers
+        # everything until _event_loop starts draining.
+        self._hub_queue = self.hub.subscribe()
         self.pipeline_task = asyncio.create_task(self.pipeline.run_until_shutdown())
         self.playback_task = asyncio.create_task(self._playback_loop())
-        self.event_task = asyncio.create_task(self._event_loop())
         _audit_session = await audit_manager.create(
             self.conn_id, caller_number=self.caller_number,
             agent_slug=self.agent_slug,
@@ -928,6 +937,9 @@ class TelephonySession:
                 self.call_key = os.path.basename(str(_cd).rstrip("/"))
         except Exception as exc:
             logger.warning("[%s] could not capture call_key: %r", self.conn_id, exc)
+        # Consumer starts only now: add_event needs the audit session to
+        # exist, and the queue above has been holding everything meanwhile.
+        self.event_task = asyncio.create_task(self._event_loop())
         logger.info(f"[{self.conn_id}] Session started (Phase 14) call_key=%s", self.call_key)
 
         # E6 refusal: say one line through the normal TTS path, then arm the
@@ -1004,7 +1016,16 @@ class TelephonySession:
                     await t
                 except asyncio.CancelledError:
                     pass
-                
+
+        # If start() never got as far as creating the event task, the queue
+        # it pre-subscribed is still registered — release it.
+        if getattr(self, "_hub_queue", None) is not None and not self.event_task:
+            try:
+                self.hub.unsubscribe(self._hub_queue)
+            except Exception:
+                pass
+            self._hub_queue = None
+
         await self.source.stop()
         await self.sink.stop()
         self._print_summary()
@@ -1610,7 +1631,9 @@ class TelephonySession:
 
     async def _event_loop(self):
         """Listens for AI pipeline events to capture first_transcript_t."""
-        queue = self.hub.subscribe()
+        # start() pre-subscribes so nothing emitted before this task runs is
+        # lost; the fallback keeps the CLI/--web paths working unchanged.
+        queue = getattr(self, "_hub_queue", None) or self.hub.subscribe()
         try:
             while self._running:
                 event = await queue.get()

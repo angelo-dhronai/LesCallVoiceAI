@@ -29,7 +29,7 @@ import { Sparkline } from '../components/charts'
 import { CHART } from '../lib/chartColors'
 import { Modal } from '../components/Modal'
 import { useToast } from '../components/Toast'
-import { dur } from '../lib/format'
+import { dur, fmtDateTime, fmtDayLabel } from '../lib/format'
 
 const KIND_FILTERS: { label: string; value: string }[] = [
   { label: 'All', value: '' },
@@ -69,7 +69,7 @@ function eventTitle(e: ContactEvent): string {
     case 'call.missed': return `Missed — ${String(p.outcome ?? 'failed').replace(/_/g, ' ')}`
     case 'dial.attempted': return 'Dial placed'
     case 'call.analyzed': return `AI analysis · lead ${p.lead_score ?? '—'}`
-    case 'followup.created': return `Follow-up scheduled${p.scheduled_at ? ` · ${String(p.scheduled_at).slice(0, 16).replace('T', ' ')}` : ''}`
+    case 'followup.created': return `Follow-up scheduled${p.scheduled_at ? ` · ${fmtDateTime(String(p.scheduled_at))}` : ''}`
     case 'followup.completed': return 'Follow-up completed'
     case 'commitment.made': return `Promise (${p.made_by ?? '—'})`
     case 'memory.updated': return `Memory updated · v${p.version ?? '—'}`
@@ -229,7 +229,7 @@ export default function ContactHub() {
       <>
         <Badge tone={kindTone(e.kind)} soft>{e.kind}</Badge>
         <span className="text-2xs text-dim">
-          {e.occurred_at?.slice(0, 16).replace('T', ' ')}
+          {fmtDateTime(e.occurred_at)}
         </span>
       </>
     ),
@@ -414,7 +414,7 @@ export default function ContactHub() {
                         className={cx(c.call_key && 'cursor-pointer')}
                         onClick={() => c.call_key && nav(`/intelligence/${c.call_key}`)}>
                         <TD className="whitespace-nowrap text-xs">
-                          {c.started_at?.slice(0, 16).replace('T', ' ') ?? '—'}
+                          {fmtDateTime(c.started_at)}
                         </TD>
                         <TD><StatusBadge value={c.direction} /></TD>
                         <TD className="tabular-nums">{dur(c.duration_s)}</TD>
@@ -499,7 +499,7 @@ export default function ContactHub() {
                       </div>
                       {f.scheduled_at && (
                         <div className="mt-1 font-semibold">
-                          {f.scheduled_at.slice(0, 16).replace('T', ' ')}
+                          {fmtDateTime(f.scheduled_at)}
                         </div>
                       )}
                       <div className="mt-0.5 text-soft">{f.reason ?? f.summary}</div>
@@ -540,7 +540,7 @@ export default function ContactHub() {
                 <StatTile label="calls" value={d?.stats?.calls ?? 0} />
                 <StatTile label="talk time" value={dur(d?.stats?.talk_seconds ?? 0)} />
                 <StatTile label="calls · 30 days" value={d?.stats?.calls_30d ?? 0} />
-                <StatTile label="first contact" value={d?.stats?.first_call_at?.slice(0, 10) ?? '—'} />
+                <StatTile label="first contact" value={fmtDayLabel(d?.stats?.first_call_at)} />
               </div>
               {Object.keys(outcomeMix).length > 0 && (
                 <div className="mt-3">

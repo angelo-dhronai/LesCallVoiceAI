@@ -2146,6 +2146,15 @@ class VoicePipeline:
                                         language=(lang if lang in
                                                   ("en", "hi", "gu") else "en"),
                                     ))
+                                    # The caller hears this sentence, so it is
+                                    # part of the call. The identical phrase
+                                    # spoken by the dead-air watchdog is
+                                    # recorded (_queue_watchdog_line); without
+                                    # this emit the same words were in the
+                                    # transcript or not depending purely on
+                                    # which path produced them. Unlike a filler
+                                    # it carries meaning — it explains a gap.
+                                    self._emit_agent_line(fallback)
                                 except asyncio.QueueFull:
                                     logger.warning("[STT] TTS queue full — cannot play language-fallback phrase")
                     else:
@@ -2597,6 +2606,23 @@ class VoicePipeline:
             except Exception:
                 logger.exception("[REPAIR] silence watchdog error")
 
+    def _emit_agent_line(self, text: str) -> None:
+        """Record one agent utterance on the transcript.
+
+        Any path that makes the agent SAY something the caller can hear must
+        call this, or the sentence exists on the call and nowhere else — the
+        audit transcript, the stored call record and the intelligence pipeline
+        all read the same "agent" events. Fillers are the one deliberate
+        exception (see the engine loop) because they carry no content and used
+        to fuse onto the real reply in summaries and embeddings."""
+        if not text or self._hub is None:
+            return
+        self._hub.emit_nowait({
+            "type": "agent", "text": text,
+            "llm_latency_ms": 0, "first_chunk_ms": 0,
+            "total_latency_ms": 0,
+        })
+
     def _queue_watchdog_line(self, text: str, now: float) -> None:
         """Speak a watchdog-originated line (reprompt / silence goodbye /
         max-duration wrap-up) through the normal TTS path."""
@@ -2604,12 +2630,7 @@ class VoicePipeline:
             return
         self._tts_queue.put_nowait(Response(
             text=text, is_shortcut=True, timestamp=now, protected=True))
-        if self._hub is not None:
-            self._hub.emit_nowait({
-                "type": "agent", "text": text,
-                "llm_latency_ms": 0, "first_chunk_ms": 0,
-                "total_latency_ms": 0,
-            })
+        self._emit_agent_line(text)
 
     def _lang_conformance_check(self, stamp: str | None, text: str) -> None:
         """A6 telemetry (warning only, never behavioral): the language the
@@ -3376,6 +3397,10 @@ class VoicePipeline:
                         timestamp=response.timestamp,
                         language=lang if lang in ("en", "hi", "gu") else "en",
                     )
+                    # The engine emitted the (empty) original, which the audit
+                    # writer discards — so the substitute is what the caller
+                    # actually hears and the only thing worth recording.
+                    self._emit_agent_line(fallback)
 
                 # Preprocess text to avoid gibberish: normalize punctuation that
                 # can confuse Sarvam TTS (em-dashes produce audio glitches).
@@ -3484,6 +3509,10 @@ class VoicePipeline:
                 logger.info("[TTS] Playing silence-protection fallback phrase (lang=%s)", lang)
                 try:
                     await self.tts.speak(fallback)
+                    # Recorded only on success: this path bypasses the TTS
+                    # queue entirely, so nothing else would ever attribute
+                    # these words to the agent.
+                    self._emit_agent_line(fallback)
                 except Exception:
                     logger.warning("[TTS] Fallback phrase also failed — accepting silence")
             finally:

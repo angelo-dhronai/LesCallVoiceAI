@@ -1,0 +1,9 @@
+<include>
+  <gateway name="support-milledger-com_plivo-231897">
+    <param name="realm" value="16584853209835561.zt.plivo.com"/>
+    <param name="proxy" value="16584853209835561.zt.plivo.com"/>
+    <param name="register" value="false"/>
+    <param name="from-domain" value="16584853209835561.zt.plivo.com"/>
+    <param name="caller-id-in-from" value="true"/>
+  </gateway>
+</include>

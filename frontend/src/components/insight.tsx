@@ -12,6 +12,7 @@ import { CountingNumber } from './motion'
 import { RadialRing } from './charts'
 import { scoreColor } from '../lib/chartColors'
 import type { Commitment } from '../api/intel'
+import { fmtDateTime } from '../lib/format'
 
 export const SCORE_LEGEND = '70+ strong · 40-69 medium · <40 weak'
 
@@ -99,7 +100,7 @@ export function CommitmentCard({ c }: { c: Commitment }) {
       {c.quote && <div className="mt-1 italic text-dim">“{c.quote}”</div>}
       {(c.deadline_at || c.deadline_text) && (
         <div className="mt-1 text-dim">
-          Due: {c.deadline_at?.slice(0, 16).replace('T', ' ') ?? c.deadline_text}
+          Due: {c.deadline_at ? fmtDateTime(c.deadline_at) : c.deadline_text}
         </div>
       )}
     </li>

@@ -148,8 +148,27 @@ export const searchIntel = (q: string, limit = 25) =>
   api<{ items: IntelCallRow[]; degraded: boolean; query: string }>(
     `/intel/search?q=${encodeURIComponent(q)}&limit=${limit}`)
 
+/**
+ * Which calls a report covers. Either an explicit `call_ids` selection (the
+ * Intelligence page's tick-the-rows flow) or a `filters` object the server
+ * resolves with the SAME predicates the Intelligence list uses — so a report
+ * built from a filter covers exactly what that filter showed.
+ */
+export type ReportFilters = {
+  days?: number; search?: string; sentiment?: string; decision?: string
+  direction?: string; min_lead?: number; limit?: number
+}
+
 export const createReport = (body: {
-  title?: string; query_prompt?: string; call_ids: number[]
+  title?: string; query_prompt?: string
+  call_ids?: number[]; filters?: ReportFilters
 }) => api<{ ok: boolean; id: number }>('/intel/reports', {
   method: 'POST', body: JSON.stringify(body),
 })
+
+/** How many analyzed calls a filter would pull in, before committing to a
+ *  background generation job. */
+export const previewReport = (filters: ReportFilters) =>
+  api<{ ok: boolean; call_count: number; capped: boolean }>('/intel/reports/preview', {
+    method: 'POST', body: JSON.stringify({ filters }),
+  })

@@ -545,8 +545,17 @@ async def transcribe(raw_audio: bytes, lex: Lexicon, *, language: str = "unknown
                 "ms": {"total": round((time.monotonic() - t0) * 1000)}}
     t_decode = time.monotonic()
 
-    from backend.app.voice.stt.sarvam import SarvamSTT
-    stt = SarvamSTT()
+    # Dictation follows the platform's active STT provider (2026-08-07
+    # ElevenLabs switch): Scribe under VOICE_PROVIDER=elevenlabs, saarika
+    # otherwise. Fresh instance per request either way (AGC isolation);
+    # romanize below still rides Sarvam /transliterate — ElevenLabs has no
+    # transliteration API (documented gap, plan §7).
+    _vp = os.environ.get("VOICE_PROVIDER", "sarvam").strip().lower()
+    if _vp == "elevenlabs" and os.environ.get("ELEVENLABS_API_KEY", "").strip():
+        from backend.app.voice.stt.elevenlabs import ScribeSTT as _DictSTT
+    else:
+        from backend.app.voice.stt.sarvam import SarvamSTT as _DictSTT
+    stt = _DictSTT()
     result = await stt.transcribe(pcm, sample_rate=sr, language=language)
     raw_text = (result.text or "").strip()
     t_stt = time.monotonic()

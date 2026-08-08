@@ -26,7 +26,8 @@ from .voice_catalog import (  # single source of truth — re-exported here
     DEFAULT_TTS_MODEL,
     DEFAULT_TTS_SPEAKER,
     PLATFORM_LANGUAGES,
-    VALID_TTS_MODELS,
+    VALID_TTS_MODELS,  # noqa: F401 — re-exported for legacy importers
+    ALL_VALID_TTS_MODELS,
     speaker_gender,
     speaker_models,
 )
@@ -141,14 +142,14 @@ class BrandConfig:
 @dataclass
 class TTSVoiceConfig:
     """TTS model + speaker for one language."""
-    model: str = DEFAULT_TTS_MODEL   # must be one of VALID_TTS_MODELS
+    model: str = DEFAULT_TTS_MODEL   # must be one of ALL_VALID_TTS_MODELS
     speaker: str = DEFAULT_TTS_SPEAKER
     pace: float = 1.0  # speaking rate; >1.0 = faster (snappier phone delivery)
     gender: str = ""   # informational only (warn-only validation)
 
     def __post_init__(self) -> None:
         model = (self.model or "").strip()
-        if model not in VALID_TTS_MODELS:
+        if model not in ALL_VALID_TTS_MODELS:
             # A speaker name sometimes lands in the model field (e.g.
             # model: shubh). Salvage it as the speaker if that slot is empty,
             # then fall back to the platform default model.
@@ -745,6 +746,12 @@ class AgentDefinition:
     # "outbound" — the agent places calls: confirm who answered, state the
     #              purpose, pitch products/services, and lead the conversation.
     call_direction: str = "inbound"
+    # Voice-provider override for THIS agent: "" (platform VOICE_PROVIDER
+    # default), "sarvam", or "elevenlabs". Per-language routing still applies
+    # on top — a preference that cannot speak a given language is overruled
+    # (voice_catalog.tts_route). Used for canary rollout of the 2026-08-07
+    # ElevenLabs switch.
+    voice_provider: str = ""
     # v2 sections — all-default instances reproduce pre-v2 behaviour exactly.
     brand: BrandConfig = field(default_factory=BrandConfig)
     outbound: OutboundConfig = field(default_factory=OutboundConfig)
@@ -1117,6 +1124,9 @@ class AgentDefinition:
             personality=personality,
             slots=slots,
             call_direction=(_as_str(d, "call_direction", "inbound") or "inbound").strip().lower(),
+            voice_provider=(
+                lambda vp: vp if vp in ("sarvam", "elevenlabs") else ""
+            )((_as_str(d, "voice_provider") or "").strip().lower()),
             brand=brand,
             outbound=outbound,
             guardrails=guardrails,

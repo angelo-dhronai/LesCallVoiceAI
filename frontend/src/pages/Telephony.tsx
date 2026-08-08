@@ -13,6 +13,7 @@ import {
   PageHeader, Table, THead, TH, TR, TD, Select, Input, Field, AsyncState,
 } from '../components/kit'
 import { Modal } from '../components/Modal'
+import { fmtDateTime } from '../lib/format'
 
 type Trunk = {
   id: number; name: string; provider: string; sip_domain: string
@@ -44,12 +45,7 @@ function statusTone(s?: string): 'mint' | 'amber' | 'rose' | 'neutral' {
   if (s === 'error') return 'rose'
   return 'neutral'
 }
-function fmtDate(dt?: string | null) {
-  if (!dt) return '—'
-  const d = new Date(dt)
-  return isNaN(d.getTime()) ? dt
-    : d.toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })
-}
+const fmtDate = (dt?: string | null) => fmtDateTime(dt)
 const digits = (s: string) => s.replace(/\D/g, '')
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
 

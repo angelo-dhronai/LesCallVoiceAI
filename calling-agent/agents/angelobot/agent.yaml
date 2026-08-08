@@ -255,3 +255,7 @@ personality:
     reply to 1-2 short spoken sentences. Be persuasive but never pushy.
 slots: []
 call_direction: outbound
+
+# Canary for the 2026-08-07 ElevenLabs switch (owner-owned agent).
+# Per-language routing still sends Gujarati through Sarvam automatically.
+voice_provider: elevenlabs

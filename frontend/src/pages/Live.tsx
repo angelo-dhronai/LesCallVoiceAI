@@ -8,7 +8,7 @@ import { useSSE } from '../api/useSSE'
 import { Card, Badge, Button, EmptyState, LiveDot, SkeletonBlock, Spinner, cx } from '../components/ui'
 import { PageHeader } from '../components/kit'
 import { FullscreenModal } from '../components/Modal'
-import { dur, clockTime } from '../lib/format'
+import { dur, clockTime, parseTs } from '../lib/format'
 
 /* ------------------------------------------------------------------ types */
 
@@ -51,11 +51,8 @@ function callDuration(c: AnyCall): number {
   return Number.isFinite(n) ? n : 0
 }
 function callStartMs(c: AnyCall): number | null {
-  const v = pick(c, ['started_at', 'start_time', 'start_ts', 'startedAt'])
-  if (v == null) return null
-  if (typeof v === 'number') return v < 1e12 ? v * 1000 : v
-  const t = Date.parse(String(v))
-  return Number.isFinite(t) ? t : null
+  const at = parseTs(pick(c, ['started_at', 'start_time', 'start_ts', 'startedAt']) as never)
+  return at ? at.getTime() : null
 }
 /** Saved phone-book name for this caller, resolved server-side ('' if unknown). */
 function callName(c: AnyCall): string {
@@ -495,9 +492,8 @@ export default function Live() {
     : 0
 
   const updatedLabel = useMemo(() => {
-    if (!updatedAt) return null
-    const t = Date.parse(updatedAt)
-    return Number.isFinite(t) ? clockTime(new Date(t)) : null
+    const at = parseTs(updatedAt)
+    return at ? clockTime(at) : null
   }, [updatedAt])
 
   return (

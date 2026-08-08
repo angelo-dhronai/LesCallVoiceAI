@@ -25,8 +25,8 @@ import asyncio
 import datetime
 import json
 import logging
-import math
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,26 +35,66 @@ logger = logging.getLogger(__name__)
 _DEFAULT_LOG_DIR = "/home/angelo/lescall/credit_log"
 _CREDIT_LOG_DIR = Path(os.environ.get("SARVAM_CREDIT_LOG_DIR", _DEFAULT_LOG_DIR))
 
-# Sarvam pricing (Bulbul v3 TTS, saaras:v3 STT):
-#   STT  = ₹30 / hour  → ₹0.5 / min  (rounded up per-request to nearest second)
-#   TTS  = ₹30 / 10K chars → ₹3.0 / 1K chars (rounded up per-request to nearest char)
-# These match SARVAM_STT_PRICE_PER_MIN and SARVAM_TTS_PRICE_PER_1K_CHARS in .env.
-_STT_PRICE_PER_MIN = float(os.environ.get("SARVAM_STT_PRICE_PER_MIN", "0.5"))
-_TTS_PRICE_PER_1K_CHARS = float(os.environ.get("SARVAM_TTS_PRICE_PER_1K_CHARS", "3.0"))
-_PRICING_CONFIGURED = True  # real defaults now known; always show estimates
+# ---------------------------------------------------------------------------
+# Pricing lives in shared/sarvam_pricing.py — the single rate card the tracker,
+# the offline report and the dashboard all read, so no two of them can disagree
+# about what a call cost. Imported by path rather than assumed to be on
+# sys.path: this module is loaded both from the repo root (the telephony
+# bridge) and from calling-agent/backend (CLI run.py), and only the former has
+# `shared` importable by default.
+_REPO_ROOT = str(Path(__file__).resolve().parents[4])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from shared.sarvam_pricing import (  # noqa: E402
+    stt_billed_seconds as _ceil_seconds,
+    stt_cost as _calc_stt_cost,
+    tts_cost as _calc_tts_cost,
+    whisper_cost as _calc_whisper_cost,
+)
+from shared.elevenlabs_pricing import (  # noqa: E402
+    stt_cost as _calc_el_stt_cost,
+    tts_cost as _calc_el_tts_cost,
+)
+
+_PRICING_CONFIGURED = True  # real rates are known; always show estimates
 
 
-def _ceil_seconds(audio_seconds: float) -> float:
-    """Sarvam bills STT rounded up to the nearest second per request."""
-    return float(math.ceil(audio_seconds))
+def _usage_fields(a: "_CallAccum") -> dict:
+    """The usage + cost block shared by call_end, per-call and session summaries.
 
-
-def _calc_stt_cost(billed_seconds: float) -> float:
-    return round((billed_seconds / 60.0) * _STT_PRICE_PER_MIN, 6)
-
-
-def _calc_tts_cost(chars: int) -> float:
-    return round((chars / 1000.0) * _TTS_PRICE_PER_1K_CHARS, 6)
+    est_tts_cost is computed from tts_billed_chars (what Sarvam received), not
+    tts_chars (what we wanted spoken) — see record_tts. est_total_cost is the
+    real all-in figure and includes the Whisper fallback, which is a different
+    vendor and was previously priced at zero.
+    """
+    stt = _calc_stt_cost(a.stt_sarvam_billed_seconds)
+    # tts_billed_chars stays the ALL-provider total (historical field name,
+    # dashboards read it) — the Sarvam share is total minus the EL share.
+    tts = _calc_tts_cost(max(0, a.tts_billed_chars - a.tts_el_billed_chars))
+    whisper = _calc_whisper_cost(a.stt_whisper_seconds)
+    el_stt = _calc_el_stt_cost(a.stt_el_seconds)
+    el_tts = _calc_el_tts_cost(a.tts_el_billed_chars)
+    return {
+        "stt_sarvam_seconds": round(a.stt_sarvam_seconds, 3),
+        "stt_sarvam_billed_seconds": round(a.stt_sarvam_billed_seconds, 3),
+        "stt_sarvam_calls": a.stt_sarvam_calls,
+        "stt_whisper_seconds": round(a.stt_whisper_seconds, 3),
+        "stt_whisper_calls": a.stt_whisper_calls,
+        "stt_el_seconds": round(a.stt_el_seconds, 3),
+        "stt_el_calls": a.stt_el_calls,
+        "tts_chars": a.tts_chars,
+        "tts_billed_chars": a.tts_billed_chars,
+        "tts_calls": a.tts_calls,
+        "tts_cancelled_calls": a.tts_cancelled_calls,
+        "tts_el_billed_chars": a.tts_el_billed_chars,
+        "tts_el_calls": a.tts_el_calls,
+        "est_stt_cost": stt,
+        "est_tts_cost": tts,
+        "est_whisper_cost": whisper,
+        "est_el_stt_cost": el_stt,
+        "est_el_tts_cost": el_tts,
+        "est_total_cost": round(stt + tts + whisper + el_stt + el_tts, 6),
+    }
 
 
 @dataclass
@@ -67,9 +107,17 @@ class _CallAccum:
     stt_sarvam_calls: int = 0
     stt_whisper_seconds: float = 0.0
     stt_whisper_calls: int = 0
-    tts_chars: int = 0
+    tts_chars: int = 0            # characters the pipeline ASKED to speak
+    tts_billed_chars: int = 0     # characters actually SUBMITTED (all providers)
     tts_calls: int = 0
     tts_cancelled_calls: int = 0
+    # ElevenLabs share of the above (provider switch 2026-08-07). Sarvam's
+    # share is the total minus these — historical field names stay intact.
+    stt_el_seconds: float = 0.0
+    stt_el_calls: int = 0
+    tts_el_chars: int = 0
+    tts_el_billed_chars: int = 0
+    tts_el_calls: int = 0
 
 
 class SarvamCreditTracker:
@@ -93,9 +141,15 @@ class SarvamCreditTracker:
         self._s_stt_whisper_sec: float = 0.0
         self._s_stt_whisper_calls: int = 0
         self._s_tts_chars: int = 0
+        self._s_tts_billed_chars: int = 0
         self._s_tts_calls: int = 0
         self._s_tts_cancelled: int = 0
         self._s_call_count: int = 0
+        self._s_stt_el_sec: float = 0.0
+        self._s_stt_el_calls: int = 0
+        self._s_tts_el_chars: int = 0
+        self._s_tts_el_billed: int = 0
+        self._s_tts_el_calls: int = 0
 
     @classmethod
     def get(cls) -> "SarvamCreditTracker":
@@ -132,26 +186,18 @@ class SarvamCreditTracker:
             "call_id": call_id,
             "ts": ts,
             "start_time": accum.start_time,
-            "stt_sarvam_seconds": round(accum.stt_sarvam_seconds, 3),
-            "stt_sarvam_billed_seconds": round(accum.stt_sarvam_billed_seconds, 3),
-            "stt_sarvam_calls": accum.stt_sarvam_calls,
-            "stt_whisper_seconds": round(accum.stt_whisper_seconds, 3),
-            "stt_whisper_calls": accum.stt_whisper_calls,
-            "tts_chars": accum.tts_chars,
-            "tts_calls": accum.tts_calls,
-            "tts_cancelled_calls": accum.tts_cancelled_calls,
-            "est_stt_cost": _calc_stt_cost(accum.stt_sarvam_billed_seconds),
-            "est_tts_cost": _calc_tts_cost(accum.tts_chars),
+            **_usage_fields(accum),
         }
         _append_event(event)
         logger.info(
             "[CREDITS] Call ended: %s | STT: %.1fs billed=%ds (%d calls Sarvam / %d Whisper) | "
-            "TTS: %d chars (%d calls, %d barge-in) | est ₹%.4f",
+            "TTS: %d chars billed=%d (%d calls, %d barge-in) | est ₹%.4f",
             call_id,
             accum.stt_sarvam_seconds, accum.stt_sarvam_billed_seconds,
             accum.stt_sarvam_calls, accum.stt_whisper_calls,
-            accum.tts_chars, accum.tts_calls, accum.tts_cancelled_calls,
-            _calc_stt_cost(accum.stt_sarvam_billed_seconds) + _calc_tts_cost(accum.tts_chars),
+            accum.tts_chars, accum.tts_billed_chars,
+            accum.tts_calls, accum.tts_cancelled_calls,
+            event["est_total_cost"],
         )
 
     # ------------------------------------------------------------------
@@ -180,6 +226,12 @@ class SarvamCreditTracker:
                     self._active_calls[call_id].stt_sarvam_seconds += audio_seconds
                     self._active_calls[call_id].stt_sarvam_billed_seconds += billed_seconds
                     self._active_calls[call_id].stt_sarvam_calls += 1
+            elif provider == "elevenlabs":
+                self._s_stt_el_sec += audio_seconds
+                self._s_stt_el_calls += 1
+                if call_id and call_id in self._active_calls:
+                    self._active_calls[call_id].stt_el_seconds += audio_seconds
+                    self._active_calls[call_id].stt_el_calls += 1
             else:
                 self._s_stt_whisper_sec += audio_seconds
                 self._s_stt_whisper_calls += 1
@@ -200,25 +252,52 @@ class SarvamCreditTracker:
         call_id: str | None,
         chars: int,
         completed: bool = True,
+        billed_chars: int | None = None,
+        provider: str = "sarvam",
     ) -> None:
-        """Record one TTS API call. completed=False means barge-in cancelled it."""
+        """Record one TTS utterance. completed=False means barge-in cancelled it.
+
+        `chars` is what the pipeline asked to speak; `billed_chars` is what was
+        actually POSTed to Sarvam. They differ on barge-in: speak() synthesizes
+        an utterance as a sequence of clause-sized requests and breaks out of
+        that loop the moment the caller interrupts, so the tail clauses are
+        never sent — and Sarvam bills text it received, not text we intended.
+        Charging `chars` there invented cost that was never incurred.
+
+        billed_chars=None means the caller can't distinguish (older callers,
+        non-chunked paths) — fall back to `chars`, which is exact whenever the
+        utterance completed.
+        """
+        billed = chars if billed_chars is None else max(0, int(billed_chars))
         ts = _now_iso()
         async with self._lock:
             self._s_tts_chars += chars
+            self._s_tts_billed_chars += billed
             self._s_tts_calls += 1
             if not completed:
                 self._s_tts_cancelled += 1
+            if provider == "elevenlabs":
+                self._s_tts_el_chars += chars
+                self._s_tts_el_billed += billed
+                self._s_tts_el_calls += 1
             if call_id and call_id in self._active_calls:
                 self._active_calls[call_id].tts_chars += chars
+                self._active_calls[call_id].tts_billed_chars += billed
                 self._active_calls[call_id].tts_calls += 1
                 if not completed:
                     self._active_calls[call_id].tts_cancelled_calls += 1
+                if provider == "elevenlabs":
+                    self._active_calls[call_id].tts_el_chars += chars
+                    self._active_calls[call_id].tts_el_billed_chars += billed
+                    self._active_calls[call_id].tts_el_calls += 1
         _append_event({
             "type": "tts_event",
             "call_id": call_id,
             "ts": ts,
             "chars": chars,
+            "billed_chars": billed,
             "completed": completed,
+            "provider": provider,
         })
 
     # ------------------------------------------------------------------
@@ -233,32 +312,30 @@ class SarvamCreditTracker:
         return {
             "call_id": call_id,
             "start_time": accum.start_time,
-            "stt_sarvam_seconds": round(accum.stt_sarvam_seconds, 3),
-            "stt_sarvam_billed_seconds": round(accum.stt_sarvam_billed_seconds, 3),
-            "stt_sarvam_calls": accum.stt_sarvam_calls,
-            "stt_whisper_seconds": round(accum.stt_whisper_seconds, 3),
-            "stt_whisper_calls": accum.stt_whisper_calls,
-            "tts_chars": accum.tts_chars,
-            "tts_calls": accum.tts_calls,
-            "tts_cancelled_calls": accum.tts_cancelled_calls,
-            "est_stt_cost": _calc_stt_cost(accum.stt_sarvam_billed_seconds),
-            "est_tts_cost": _calc_tts_cost(accum.tts_chars),
+            **_usage_fields(accum),
         }
 
     def get_session_summary(self) -> dict:
         """Return totals since process start."""
         return {
             "call_count": self._s_call_count,
-            "stt_sarvam_seconds": round(self._s_stt_sarvam_sec, 3),
-            "stt_sarvam_billed_seconds": round(self._s_stt_sarvam_billed_sec, 3),
-            "stt_sarvam_calls": self._s_stt_sarvam_calls,
-            "stt_whisper_seconds": round(self._s_stt_whisper_sec, 3),
-            "stt_whisper_calls": self._s_stt_whisper_calls,
-            "tts_chars": self._s_tts_chars,
-            "tts_calls": self._s_tts_calls,
-            "tts_cancelled_calls": self._s_tts_cancelled,
-            "est_stt_cost": _calc_stt_cost(self._s_stt_sarvam_billed_sec),
-            "est_tts_cost": _calc_tts_cost(self._s_tts_chars),
+            **_usage_fields(_CallAccum(
+                call_id="", start_time="",
+                stt_sarvam_seconds=self._s_stt_sarvam_sec,
+                stt_sarvam_billed_seconds=self._s_stt_sarvam_billed_sec,
+                stt_sarvam_calls=self._s_stt_sarvam_calls,
+                stt_whisper_seconds=self._s_stt_whisper_sec,
+                stt_whisper_calls=self._s_stt_whisper_calls,
+                tts_chars=self._s_tts_chars,
+                tts_billed_chars=self._s_tts_billed_chars,
+                tts_calls=self._s_tts_calls,
+                tts_cancelled_calls=self._s_tts_cancelled,
+                stt_el_seconds=self._s_stt_el_sec,
+                stt_el_calls=self._s_stt_el_calls,
+                tts_el_chars=self._s_tts_el_chars,
+                tts_el_billed_chars=self._s_tts_el_billed,
+                tts_el_calls=self._s_tts_el_calls,
+            )),
         }
 
 

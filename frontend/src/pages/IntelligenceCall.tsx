@@ -14,10 +14,11 @@ import { useGet, useRefresh } from '../api/hooks/useApi'
 import { patch, post } from '../api/mutate'
 import type { IntelDetail } from '../api/intel'
 import { Badge, Button, Card, EmptyState, IconButton, SectionHead, cx } from '../components/ui'
-import { AsyncState, PageHeader, SearchInput, StatusBadge } from '../components/kit'
+import { AsyncState, ContactLabel, PageHeader, SearchInput, StatusBadge } from '../components/kit'
 import { Chips, CommitmentCard, ScoreRingRow, TimelineList } from '../components/insight'
 import { AudioPlayer } from '../components/AudioPlayer'
 import { useToast } from '../components/Toast'
+import { fmtDate, fmtDateTime } from '../lib/format'
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -103,11 +104,14 @@ export default function IntelligenceCall() {
 
   return (
     <div className="space-y-6">
+      {/* Saved contacts are headlined by name; the number then belongs in the
+          sub-line, where it stays visible without being the whole identity. */}
       <PageHeader detail
         crumbs={[{ label: 'Intelligence', to: '/intelligence' }]}
-        title={d?.call.phone ?? callKey}
+        title={d?.call.contact_name || d?.call.phone || callKey}
         sub={d
-          ? `${d.call.direction} · ${d.call.started_at?.slice(0, 16).replace('T', ' ') ?? '—'}`
+          ? (d.call.contact_name && d.call.phone ? `${d.call.phone} · ` : '')
+            + `${d.call.direction} · ${fmtDateTime(d.call.started_at)}`
             + ` · ${Math.round(d.call.duration_s ?? 0)}s · ${d.call.agent_slug ?? '—'}`
           : undefined}
         actions={
@@ -285,7 +289,7 @@ export default function IntelligenceCall() {
                     </div>
                     {d.followup.scheduled_at && (
                       <div className="font-semibold">
-                        {d.followup.scheduled_at.slice(0, 16).replace('T', ' ')}
+                        {fmtDateTime(d.followup.scheduled_at)}
                         {d.followup.auto_scheduled ? (
                           <span className="ml-1.5 text-2xs font-normal text-dim">(AI-picked time)</span>
                         ) : null}
@@ -334,7 +338,7 @@ export default function IntelligenceCall() {
                             <div className="text-soft">{a.description}</div>
                             <div className="text-2xs text-dim">
                               <StatusBadge value={a.priority} />
-                              {a.due_at && <span className="ml-1.5">due {a.due_at.slice(0, 10)}</span>}
+                              {a.due_at && <span className="ml-1.5">due {fmtDate(a.due_at)}</span>}
                             </div>
                           </div>
                         </li>

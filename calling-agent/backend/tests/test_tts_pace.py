@@ -77,11 +77,21 @@ def test_falsy_base_defaults_to_natural(monkeypatch):
     assert _effective_pace(0.0, "en", SHORT) == 1.0
 
 
-def test_lang_code_map_covers_platform_roster():
-    # A platform language missing here silently synthesizes as en-IN —
+def test_lang_code_map_covers_sarvam_routable_roster():
+    # A Sarvam-routable language missing here silently synthesizes as en-IN —
     # mispronounced Indic through the English frontend sounds slow/halting.
-    missing = [l for l in PLATFORM_LANGUAGES if l not in _LANG_CODE_MAP]
+    # Since the 2026-08-07 union roster, PLATFORM_LANGUAGES also carries
+    # ElevenLabs-only codes that can NEVER reach SarvamTTS (tts_route sends
+    # them to EL under either preference) — the map must cover exactly the
+    # languages that can route to bulbul.
+    from app.agent_definition.voice_catalog import SARVAM_LANGUAGES, tts_route
+    missing = [l for l in SARVAM_LANGUAGES if l not in _LANG_CODE_MAP]
     assert missing == []
+    # …and every code outside the map really is un-routable to Sarvam.
+    for lang in PLATFORM_LANGUAGES:
+        if lang not in _LANG_CODE_MAP:
+            assert tts_route(lang, "sarvam")[0] == "elevenlabs", lang
+            assert tts_route(lang, "elevenlabs")[0] == "elevenlabs", lang
 
 
 def test_cache_key_includes_pace_config(monkeypatch):

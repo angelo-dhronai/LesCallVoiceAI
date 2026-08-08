@@ -37,6 +37,26 @@ VOICES = {
 }
 
 
+# ElevenLabs roster (2026-08-07 provider switch): voice_id -> (name, gender,
+# sample line). Mirrors voice_catalog.EL_VOICE_CATALOG — keep in sync. WAVs
+# land as el_<name>.wav (voice_ids are not filename material) and index.json
+# carries provider + file so /api/voices can tell the rosters apart.
+EL_VOICES = {
+    "JvXnN4vCCagzhSTjMMjl": ("shivank", "male",
+        "Hello! I'm Shivank. नमस्ते, आपकी कॉल्स पर मैं ऐसा सुनाई दूँगा।"),
+    "EVsUc9VDoheXQmgm2NpK": ("aryaman", "male",
+        "Hello! I'm Aryaman. नमस्ते, आपकी कॉल्स पर मैं ऐसा सुनाई दूँगा।"),
+    "d2osXrwa36lUEkuaO4sP": ("maahir", "male",
+        "Hello! I'm Maahir. नमस्ते, आपकी कॉल्स पर मैं ऐसा सुनाई दूँगा।"),
+    "mnpQAOH9h8vn2tVUYJWD": ("roohi", "female",
+        "Hello! I'm Roohi. नमस्ते, आपकी कॉल्स पर मैं ऐसी सुनाई दूँगी।"),
+    "Em37RvLnPRGl6d9Suxcj": ("samhita", "female",
+        "Hello! I'm Samhita. नमस्ते, आपकी कॉल्स पर मैं ऐसी सुनाई दूँगी।"),
+    "Wu4iEB9NxSm711OvcrLo": ("mohini", "female",
+        "Hello! I'm Mohini. नमस्ते, आपकी कॉल्स पर मैं ऐसी सुनाई दूँगी।"),
+}
+
+
 def _api_key() -> str:
     key = os.environ.get("SARVAM_API_KEY", "").strip()
     if not key:
@@ -46,6 +66,52 @@ def _api_key() -> str:
     if not key:
         sys.exit("SARVAM_API_KEY not found (env or calling-agent/.env)")
     return key
+
+
+def _el_api_key() -> str:
+    key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    if not key:
+        env = REPO / "calling-agent" / ".env"
+        m = re.search(r"^ELEVENLABS_API_KEY=(\S+)", env.read_text(), re.M)
+        key = m.group(1) if m else ""
+    return key  # empty = skip the EL section (Sarvam set still generates)
+
+
+def _pcm_to_wav(pcm: bytes, sr: int = 16000) -> bytes:
+    import struct
+    wav = struct.pack("<4sI4s", b"RIFF", 36 + len(pcm), b"WAVE")
+    wav += struct.pack("<4sIHHIIHH", b"fmt ", 16, 1, 1, sr, sr * 2, 2, 16)
+    return wav + struct.pack("<4sI", b"data", len(pcm)) + pcm
+
+
+def _generate_el(index: list) -> None:
+    key = _el_api_key()
+    if not key:
+        print("  (ELEVENLABS_API_KEY not set — skipping EL samples)")
+        return
+    for voice_id, (name, gender, text) in EL_VOICES.items():
+        stem = f"el_{name}"
+        out = OUT_DIR / f"{stem}.wav"
+        index.append({"speaker": voice_id, "name": name.capitalize(),
+                      "gender": gender, "provider": "elevenlabs",
+                      "file": stem})
+        if out.exists() and out.stat().st_size > 10_000:
+            print(f"  {stem}: exists ({out.stat().st_size}b) — skipping")
+            continue
+        req = urllib.request.Request(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+            "?output_format=pcm_16000",
+            data=json.dumps({
+                "text": text,
+                "model_id": "eleven_flash_v2_5",
+                "language_code": "hi",
+            }).encode(),
+            headers={"xi-api-key": key, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            pcm = resp.read()
+        out.write_bytes(_pcm_to_wav(pcm))
+        print(f"  {stem} ({gender}): {len(pcm)} bytes PCM -> {out}")
 
 
 def main() -> None:
@@ -74,11 +140,12 @@ def main() -> None:
         wav = base64.b64decode(body["audios"][0])
         out.write_bytes(wav)
         print(f"  {speaker} ({gender}): {len(wav)} bytes -> {out}")
-    # index.json is what /api/voices serves — speaker + gender, in the
-    # curated order above.
-    (OUT_DIR / "index.json").write_text(json.dumps(
-        [{"speaker": s, "gender": g} for s, (g, _) in VOICES.items()],
-        indent=2))
+    # index.json is what /api/voices serves — Sarvam entries first (curated
+    # order above), then the ElevenLabs roster with provider + file fields.
+    index = [{"speaker": s, "gender": g, "provider": "sarvam", "file": s}
+             for s, (g, _) in VOICES.items()]
+    _generate_el(index)
+    (OUT_DIR / "index.json").write_text(json.dumps(index, indent=2))
     print(f"  index.json -> {OUT_DIR / 'index.json'}")
 
 

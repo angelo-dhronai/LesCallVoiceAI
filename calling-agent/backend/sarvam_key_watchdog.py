@@ -202,6 +202,57 @@ def write_status(active: str, pool: list[str], dead: set[str], exhausted: bool) 
     })
 
 
+# ── ElevenLabs quota (2026-08-07 provider switch) ────────────────────────────
+EL_STATUS_FILE = _REPO / "dashboard" / "elevenlabs_credit_status.json"
+EL_POLL_SECONDS = float(os.environ.get("EL_QUOTA_POLL_S", "300"))
+# Alert when remaining credits fall below this fraction of the monthly grant.
+EL_ALERT_FRACTION = float(os.environ.get("EL_QUOTA_ALERT_FRACTION", "0.10"))
+
+
+def _el_api_key() -> str:
+    try:
+        m = re.search(r"^ELEVENLABS_API_KEY=(\S+)",
+                      ENV_FILE.read_text(encoding="utf-8"), re.M)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def _el_quota_check() -> None:
+    """Poll the EL subscription meter; write status; alarm below threshold."""
+    key = _el_api_key()
+    if not key:
+        return
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.elevenlabs.io/v1/user/subscription",
+            headers={"xi-api-key": key})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            sub = json.loads(resp.read())
+    except Exception as exc:
+        log.warning("EL quota poll failed: %r", exc)
+        return
+    used = int(sub.get("character_count") or 0)
+    limit = int(sub.get("character_limit") or 0)
+    remaining = max(0, limit - used)
+    _write_json(EL_STATUS_FILE, {
+        "tier": sub.get("tier"),
+        "character_count": used,
+        "character_limit": limit,
+        "remaining": remaining,
+        "next_reset_unix": sub.get("next_character_count_reset_unix"),
+        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+    if limit and remaining <= limit * EL_ALERT_FRACTION:
+        log.critical(
+            "ELEVENLABS CREDITS LOW — %d of %d remaining (%.0f%%). "
+            "Voice calls routed to ElevenLabs will go silent when it hits 0. "
+            "Top up the workspace or flip VOICE_PROVIDER=sarvam.",
+            remaining, limit, 100.0 * remaining / limit,
+        )
+
+
 def main() -> None:
     master = load_master()
     dead = load_dead()
@@ -219,6 +270,7 @@ def main() -> None:
     tailers = [LogTailer(p) for p in WATCH_LOGS]
     last_active = active
     last_rotation = 0.0
+    last_el_poll = 0.0
 
     log.info(
         "watchdog started — active=%s pool=%d dead=%d master=%d",
@@ -227,6 +279,13 @@ def main() -> None:
 
     while True:
         try:
+            # ── ElevenLabs quota poll (2026-08-07 provider switch) ────────
+            # Unlike Sarvam, EL has a REAL quota endpoint — poll it instead
+            # of inferring credit death from log signatures. One workspace
+            # key, no rotation possible: below threshold we alarm loudly.
+            if time.time() - last_el_poll >= EL_POLL_SECONDS:
+                last_el_poll = time.time()
+                _el_quota_check()
             master = load_master()      # allow live edits (e.g. adding keys)
             dead = load_dead()
             active = read_active()
@@ -243,12 +302,26 @@ def main() -> None:
                 last_rotation = time.time()
 
             # (2) Scan new log lines for credit-exhaustion signatures.
+            #     [EL:CREDITS] is ElevenLabs going dry — a separate alarm,
+            #     NEVER a Sarvam key rotation (different vendor, one
+            #     workspace key, nothing to rotate to).
             hit = False
+            el_hit = False
             for t in tailers:
                 for line in t.read_new():
-                    if _EXHAUSTION_RE.search(line):
+                    if "[EL:CREDITS]" in line:
+                        el_hit = True
+                    elif _EXHAUSTION_RE.search(line):
                         hit = True
             now = time.time()
+            if el_hit and now - globals().get("_last_el_alarm", 0.0) > 3600:
+                globals()["_last_el_alarm"] = now
+                log.critical(
+                    "ELEVENLABS CREDITS EXHAUSTED reported by the live "
+                    "pipeline — EL-routed languages are failing. Top up the "
+                    "workspace or flip VOICE_PROVIDER=sarvam (hot, no "
+                    "restart needed for the key re-read).")
+                _el_quota_check()
 
             # (3) If exhaustion is being reported and we haven't just rotated,
             #     the current active key is dead → promote the next live key.

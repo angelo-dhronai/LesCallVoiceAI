@@ -11,6 +11,7 @@ import { cx, Badge, Button, EmptyState, IconButton, Spinner } from '../component
 import { TextShimmer } from '../components/motion'
 import { Markdown } from '../components/markdown'
 import { useVoicePrompt } from '../lib/voicePrompt'
+import { parseTs } from '../lib/format'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { TryAgentDialog } from '../components/TryAgent'
 import { ActivateAgentModal, type ActivateTarget } from '../components/ActivateAgent'
@@ -61,16 +62,15 @@ function syncSessionUrl(sid: string) {
 }
 
 function relTime(iso?: string | null): string {
-  if (!iso) return ''
-  const t = new Date(iso).getTime()
-  if (Number.isNaN(t)) return ''
-  const mins = Math.max(0, Math.round((Date.now() - t) / 60000))
+  const at = parseTs(iso)
+  if (!at) return ''
+  const mins = Math.max(0, Math.round((Date.now() - at.getTime()) / 60000))
   if (mins < 1) return 'now'
   if (mins < 60) return `${mins}m`
   const hours = Math.round(mins / 60)
   if (hours < 24) return `${hours}h`
   const days = Math.round(hours / 24)
-  return days < 7 ? `${days}d` : new Date(iso).toLocaleDateString()
+  return days < 7 ? `${days}d` : at.toLocaleDateString('en-IN')
 }
 
 /* Local message shape: TranscriptMsg plus a frontend-only error flag so

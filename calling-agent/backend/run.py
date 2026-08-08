@@ -25,17 +25,31 @@ def _setup_logging() -> None:
 
 
 def _validate_env() -> None:
-    """Fail fast if required API keys are missing. Logs a masked key on success."""
-    key = os.environ.get("SARVAM_API_KEY", "").strip()
+    """Fail fast if required API keys are missing. Logs a masked key on success.
+
+    Which key is REQUIRED depends on the active provider (VOICE_PROVIDER,
+    2026-08-07 ElevenLabs switch). Per-language routing can still reach the
+    other provider mid-call (e.g. Gujarati → bulbul under elevenlabs), so
+    the other key missing is a WARNING, not a fatal.
+    """
+    provider = os.environ.get("VOICE_PROVIDER", "sarvam").strip().lower()
+    required = ("ELEVENLABS_API_KEY" if provider == "elevenlabs"
+                else "SARVAM_API_KEY")
+    other = ("SARVAM_API_KEY" if required == "ELEVENLABS_API_KEY"
+             else "ELEVENLABS_API_KEY")
+    key = os.environ.get(required, "").strip()
     if not key:
         print(
-            "FATAL: SARVAM_API_KEY is not set. "
+            f"FATAL: {required} is not set (VOICE_PROVIDER={provider}). "
             "Add it to calling-agent/.env and restart.",
             file=sys.stderr,
         )
         sys.exit(1)
     masked = key[:6] + "…" + key[-4:]
-    print(f"[startup] SARVAM_API_KEY loaded: {masked}", flush=True)
+    print(f"[startup] {required} loaded: {masked}", flush=True)
+    if not os.environ.get(other, "").strip():
+        print(f"[startup] WARNING: {other} not set — languages routed to "
+              "that provider will fail", flush=True)
 
 
 def main() -> None:
@@ -53,8 +67,7 @@ def main() -> None:
         from app.voice.pipeline import VoicePipeline
         from app.voice.conversation import ConversationRouter
         from app.voice.stt.router import STTRouter
-        from app.voice.tracking_stt import TrackingSarvamSTT, TrackingWhisperSTT
-        from app.voice.tracking_tts import TrackingSarvamTTS
+        from app.voice.tracking_stt import TrackingWhisperSTT
         from app.voice.credit_tracker import SarvamCreditTracker
         from app.agent_definition.schema import AgentDefinition
 
@@ -99,24 +112,17 @@ def main() -> None:
 
             call_id_provider = lambda: call_id
             _corrections = agent_def.knowledge_base.stt_corrections if agent_def else None
+            # Provider selection (2026-08-07): factory reads
+            # agent.voice_provider / VOICE_PROVIDER env, routes per language.
+            from app.voice.provider_factory import build_stt_primary, build_tts
             stt = STTRouter(
-                primary=TrackingSarvamSTT(call_id_provider=call_id_provider),
+                primary=build_stt_primary(agent_def, call_id_provider),
                 fallback=TrackingWhisperSTT(call_id_provider=call_id_provider),
                 stt_corrections=_corrections,
             )
-            # Pick TTS voice from agent definition (default language's voice config)
-            _tts_model, _tts_speaker, _tts_pace = "bulbul:v3", "shubh", 1.0
-            if agent_def:
-                _dlang = agent_def.languages.default
-                _vcfg = agent_def.languages.tts_voices.get(_dlang)
-                if _vcfg:
-                    _tts_model, _tts_speaker = _vcfg.model, _vcfg.speaker
-                    _tts_pace = getattr(_vcfg, "pace", 1.0) or 1.0
-            tts = TrackingSarvamTTS(
-                call_id_provider=call_id_provider,
-                model=_tts_model,
-                speaker=_tts_speaker,
-                pace=_tts_pace,
+            tts = build_tts(
+                agent_def, call_id_provider, audio_sink=None,
+                sample_rate=16_000,
             )
 
             pipeline = VoicePipeline(

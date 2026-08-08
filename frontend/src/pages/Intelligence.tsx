@@ -14,7 +14,7 @@ import { useGet, useRefresh } from '../api/hooks/useApi'
 import { searchIntel, createReport, type IntelCallRow } from '../api/intel'
 import { Button, Card, EmptyState, Spinner } from '../components/ui'
 import {
-  AsyncState, PageHeader, Pagination, SearchInput, Segmented, Select,
+  AsyncState, ContactLabel, PageHeader, Pagination, SearchInput, Segmented, Select,
   StatusBadge, Table, TD, TH, THead, TR, Field, Input,
 } from '../components/kit'
 import { ScoreCell } from '../components/insight'
@@ -23,15 +23,16 @@ import { Modal } from '../components/Modal'
 import { StatCard } from '../components/StatCard'
 import { useToast } from '../components/Toast'
 import { useDebounced, useUrlNumber, useUrlParam } from '../lib/hooks'
+import { fmtDateTime } from '../lib/format'
 
 const LIMIT = 50
 const DAYS_VALUES = ['7', '30', '90', '0'] as const
 type Days = (typeof DAYS_VALUES)[number]
 
-function fmtWhen(ts?: string | null) {
-  if (!ts) return '—'
-  return ts.slice(0, 16).replace('T', ' ')
-}
+/* Slicing the raw string used to print the stored UTC clock verbatim; every
+   call time on this page read hours off. fmtDateTime renders the instant in the
+   viewer's zone — see lib/format.ts. */
+const fmtWhen = (ts?: string | null) => fmtDateTime(ts)
 
 export default function Intelligence() {
   const nav = useNavigate()
@@ -312,9 +313,7 @@ export default function Intelligence() {
                           </span>
                         </TD>
                         <TD>
-                          <div className="font-medium text-[var(--text)]">
-                            {r.contact_name || r.phone || 'Unknown'}
-                          </div>
+                          <ContactLabel name={r.contact_name} phone={r.phone} />
                           <div className="text-2xs text-dim">
                             {r.direction} · {Math.round(r.duration_s ?? 0)}s
                           </div>

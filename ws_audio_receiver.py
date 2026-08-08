@@ -1002,11 +1002,21 @@ async def _boot_warmup():
         # Throwaway sink: SarvamTTS's default LocalSpeakerSink may probe an
         # audio device that headless servers lack.
         tts = SarvamTTS(audio_sink=TelephonySink(conn_id="boot-warmup"))
+        warm = [stt.warmup(), tts.warmup(), _llm_warm()]
+        # ElevenLabs pools too when the platform (or any agent override)
+        # can route there — warming both is two cheap HEADs, and a canary
+        # agent's first caller shouldn't pay the cold TLS handshake.
+        try:
+            from backend.app.voice.stt.elevenlabs import ScribeSTT
+            from backend.app.voice.tts_elevenlabs import ElevenLabsTTS
+            if os.environ.get("ELEVENLABS_API_KEY", "").strip():
+                warm.append(ScribeSTT().warmup())
+                warm.append(ElevenLabsTTS(
+                    audio_sink=TelephonySink(conn_id="boot-warmup-el")).warmup())
+        except Exception as exc:
+            log.warning("[BOOT-WARMUP] EL warmup unavailable: %r", exc)
         await asyncio.wait_for(
-            asyncio.gather(
-                stt.warmup(), tts.warmup(), _llm_warm(),
-                return_exceptions=True,
-            ),
+            asyncio.gather(*warm, return_exceptions=True),
             timeout=10.0,
         )
         log.info("[BOOT-WARMUP] STT/TTS/LLM warmup complete")
@@ -1017,6 +1027,15 @@ async def _boot_warmup():
 async def main_async(args):
 
     import websockets
+
+    # Boot stamp for the code-freshness check (shared/runtime_freshness.py):
+    # /api/health and the copilot compare repo .py mtimes against this to
+    # tell the operator when the running code is behind the repo.
+    try:
+        from shared.runtime_freshness import write_boot_stamp
+        write_boot_stamp()
+    except Exception:
+        log.warning("[BOOT] freshness stamp failed", exc_info=True)
 
     asyncio.create_task(_live_state_writer_loop())
 

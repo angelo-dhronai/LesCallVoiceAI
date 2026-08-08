@@ -23,6 +23,7 @@ import { Modal } from './Modal'
 import { useToast } from './Toast'
 import { useConfirm } from './confirm'
 import { useRefresh } from '../api/hooks/useApi'
+import { parseTs } from '../lib/format'
 import {
   createShareLink, getShareLink, importShare, previewShare, revokeShareLink,
   type ImportResult, type ShareLink, type SharePreview,
@@ -41,9 +42,8 @@ function DirectionBadge({ direction }: { direction: string }) {
 }
 
 function formatExpiry(iso: string | null): string {
-  if (!iso) return 'never expires'
-  const at = new Date(iso)
-  if (Number.isNaN(at.getTime())) return 'never expires'
+  const at = parseTs(iso)
+  if (!at) return 'never expires'
   const days = Math.round((at.getTime() - Date.now()) / 86_400_000)
   if (days < 0) return 'expired'
   if (days === 0) return 'expires today'

@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import sys
+import urllib.request
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -33,7 +34,43 @@ from shared import freeswitch_config as fsc  # noqa: E402
 from shared import kamailio_acl  # noqa: E402
 
 AGENTS_DIR = _REPO_ROOT / "calling-agent" / "agents"
-PUBLIC_SIP_IP = os.environ.get("PUBLIC_SIP_IP", "35.207.225.237")
+
+# The original production host. Kept ONLY as the last-resort fallback so a box
+# without a metadata server behaves exactly as it did before this function
+# existed — never as the default.
+_LEGACY_SIP_IP = "35.207.225.237"
+
+
+def _detect_external_ip() -> str:
+    """This host's OWN public IP, from the GCP metadata server.
+
+    PUBLIC_SIP_IP is what the Telephony page tells a customer to paste into
+    their carrier's origination URI and IP ACL. Hardcoding it meant every
+    additional deployment (clone, staging, DR box) silently handed out the
+    ORIGINAL server's address: the customer pointed their trunk at the wrong
+    machine and inbound calls never arrived, with nothing in either box's logs
+    to explain it. Detecting ourselves makes the page correct by construction
+    on any host. Found 2026-08-07 on platform.lescall.com, which was showing
+    prod's IP to every tenant.
+    """
+    try:
+        req = urllib.request.Request(
+            "http://169.254.169.254/computeMetadata/v1/instance/"
+            "network-interfaces/0/access-configs/0/external-ip",
+            headers={"Metadata-Flavor": "Google"})
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            ip = resp.read().decode("utf-8", "replace").strip()
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ip):
+            return ip
+        logger.warning("metadata returned a non-IPv4 external-ip %r", ip)
+    except Exception as exc:                       # noqa: BLE001 - never fatal
+        logger.warning("could not detect external IP (%s); falling back to %s "
+                       "— set PUBLIC_SIP_IP explicitly", exc, _LEGACY_SIP_IP)
+    return _LEGACY_SIP_IP
+
+
+# Explicit env always wins; detection only fills the gap.
+PUBLIC_SIP_IP = os.environ.get("PUBLIC_SIP_IP", "").strip() or _detect_external_ip()
 PUBLIC_SIP_PORT = os.environ.get("PUBLIC_SIP_PORT", "5060")
 RTP_PORT_RANGE = os.environ.get("PUBLIC_RTP_RANGE", "16384-32768")
 

@@ -1,0 +1,8 @@
+ id |                  name                   | provider |           owner            |           sip_domain           | proxy | username | password | register |    caller_id     | provider_ips | transport | config_status |      last_applied_at       |         created_at         
+----+-----------------------------------------+----------+----------------------------+--------------------------------+-------+----------+----------+----------+------------------+--------------+-----------+---------------+----------------------------+----------------------------
+  4 | alwynantonyben-dhronai-com_plivo-231897 | plivo    | alwynantonyben@dhronai.com | 86116159722292477.zt.plivo.com |       |          |          |        0 | +91 22 6423 1897 |              | udp       | applied       | 2026-07-12 04:21:02        | 2026-07-12 04:21:01
+  5 | angelo-dhronai-com_plivo-953160         | plivo    | angelo@dhronai.com         | 25935838218519915.zt.plivo.com |       |          |          |        0 | +91806595 3160   |              | udp       | applied       | 2026-07-13 04:28:26        | 2026-07-13 04:28:26
+  6 | support-milledger-com_plivo-231897      | plivo    | support@milledger.com      | 16584853209835561.zt.plivo.com |       |          |          |        0 | +912264231897    |              | udp       | applied       | 2026-08-01 08:34:24.805736 | 2026-08-01 08:10:49.806852
+  7 | info-craftidea-in_plivo-339140          | plivo    | info@craftidea.in          | 86116159722292477.zt.plivo.com |       |          |          |        0 | +91 80 3133 9140 |              | udp       | applied       | 2026-08-05 10:46:33.796997 | 2026-08-05 10:46:33.423795
+(4 rows)
+

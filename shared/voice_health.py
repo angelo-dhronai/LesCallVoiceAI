@@ -79,8 +79,13 @@ ALERT_CALL_WAV = os.environ.get(
     "SENTINEL_ALERT_CALL_WAV", str(REPO / "deploy" / "sentinel_alert.wav"))
 ALERT_CALL_COOLDOWN_S = 2 * 3600
 
-_RE_STT_TIMEOUT = re.compile(r"\[STT:Sarvam\] Request timed out")
-_RE_TTS_TIMEOUT = re.compile(r"\[TTS:Sarvam\] Stream timeout")
+# Both providers' hang signatures feed the same counters — a hung voice
+# provider degrades calls identically whichever vendor it is (2026-08-07
+# ElevenLabs switch: [STT:Scribe]/[TTS:EL] are the EL modules' log tags).
+_RE_STT_TIMEOUT = re.compile(
+    r"\[STT:(?:Sarvam|Scribe)\] Request timed out")
+_RE_TTS_TIMEOUT = re.compile(
+    r"\[TTS:(?:Sarvam|EL)\] Stream timeout")
 _RE_TURN_LAT = re.compile(r"speech_end→engine (\d+)ms")
 _RE_HEDGE_WON = re.compile(r"Hedge won the race|Primary-race rescued")
 _RE_WHISPER = re.compile(r"\[STT\] Fallback succeeded")
@@ -141,7 +146,8 @@ def probe_sarvam() -> dict:
     import httpx
     key = _api_key()
     if not key:
-        return {"stt": "no-key", "tts": "no-key", "stt_ms": 0, "tts_ms": 0}
+        return {"stt": "no-key", "tts": "no-key", "stt_ms": 0, "tts_ms": 0,
+                "provider": "sarvam"}
     timeout = httpx.Timeout(PROBE_TIMEOUT_S, connect=2.0)
     with httpx.Client(timeout=timeout) as client:
         stt_v, stt_ms = _timed_post(lambda: client.post(
@@ -156,7 +162,57 @@ def probe_sarvam() -> dict:
             json={"text": "ok", "target_language_code": "en-IN",
                   "model": "bulbul:v3", "speaker": "shubh"},
         ).status_code)
-    return {"stt": stt_v, "tts": tts_v, "stt_ms": stt_ms, "tts_ms": tts_ms}
+    return {"stt": stt_v, "tts": tts_v, "stt_ms": stt_ms, "tts_ms": tts_ms,
+            "provider": "sarvam"}
+
+
+def _env_value(name: str) -> str:
+    try:
+        for line in ENV_FILE.read_text().splitlines():
+            if line.startswith(f"{name}="):
+                return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return os.environ.get(name, "")
+
+
+def probe_elevenlabs() -> dict:
+    """One timed STT + TTS probe round against the ElevenLabs key.
+    Scribe probe = tiny WAV; TTS probe = 'ok' through the default voice
+    (fractions of a credit, same doctrine as the Sarvam probe)."""
+    import httpx
+    key = _env_value("ELEVENLABS_API_KEY")
+    if not key:
+        return {"stt": "no-key", "tts": "no-key", "stt_ms": 0, "tts_ms": 0,
+                "provider": "elevenlabs"}
+    voice = _env_value("ELEVENLABS_TTS_VOICE") or "JvXnN4vCCagzhSTjMMjl"
+    timeout = httpx.Timeout(PROBE_TIMEOUT_S, connect=2.0)
+    with httpx.Client(timeout=timeout) as client:
+        stt_v, stt_ms = _timed_post(lambda: client.post(
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            headers={"xi-api-key": key},
+            files={"file": ("probe.wav", _PROBE_WAV, "audio/wav")},
+            data={"model_id": "scribe_v2", "tag_audio_events": "false"},
+        ).status_code)
+        tts_v, tts_ms = _timed_post(lambda: client.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice}"
+            "?output_format=pcm_8000",
+            headers={"xi-api-key": key},
+            json={"text": "ok", "model_id": "eleven_flash_v2_5"},
+        ).status_code)
+    return {"stt": stt_v, "tts": tts_v, "stt_ms": stt_ms, "tts_ms": tts_ms,
+            "provider": "elevenlabs"}
+
+
+def active_provider() -> str:
+    vp = (_env_value("VOICE_PROVIDER") or "sarvam").strip().lower()
+    return vp if vp in ("sarvam", "elevenlabs") else "sarvam"
+
+
+def probe_active() -> dict:
+    """Probe the platform's ACTIVE provider (VOICE_PROVIDER in .env)."""
+    return (probe_elevenlabs() if active_provider() == "elevenlabs"
+            else probe_sarvam())
 
 
 def _tail_new_lines(state_d: dict) -> list[str]:
@@ -256,18 +312,21 @@ def check_voice(state, cycle: int, alert_fn) -> dict:
                    else PROBE_EVERY_HEALTHY)
     probe = None
     if cycle % max(probe_every, 1) == 0:
-        probe = probe_sarvam()
+        probe = probe_active()
         probes = d.get("vh:probes", [])
         bad = (probe["stt"] in ("hung", "server-error")
                or probe["tts"] in ("hung", "server-error"))
         probes.append([now, bad, probe["stt_ms"], probe["tts_ms"]])
         d["vh:probes"] = probes[-10:]
         if probe["stt"] == "auth-error" or probe["tts"] == "auth-error":
+            _pname = probe.get("provider", "sarvam")
+            _keyname = ("ELEVENLABS_API_KEY" if _pname == "elevenlabs"
+                        else "SARVAM_API_KEY")
             alert_fn(state, "voice-probe-auth",
-                     "Sarvam probe rejected (401/403)",
-                     "The live SARVAM_API_KEY was rejected by api.sarvam.ai. "
+                     f"{_pname} probe rejected (401/403)",
+                     f"The live {_keyname} was rejected by the {_pname} API. "
                      "Calls are likely failing over to Whisper-only. Check "
-                     "the key watchdog / key pool.")
+                     "the key watchdog / key pool / workspace quota.")
 
     recent_probes = [p for p in d.get("vh:probes", []) if p[0] >= now - WINDOW_S]
     probe_bad = sum(1 for p in recent_probes[-3:] if p[1]) >= 2
@@ -300,21 +359,21 @@ def check_voice(state, cycle: int, alert_fn) -> dict:
         if probe_bad:
             cause.append("2 of last 3 direct API probes hung/5xx")
         alert_fn(state, "voice-degraded",
-                 "Sarvam voice provider DEGRADED — calls are being rescued "
-                 "by hedges",
+                 f"{active_provider()} voice provider DEGRADED — calls are "
+                 "being rescued by hedges",
                  "Detected: " + "; ".join(cause) + ".\n\n"
                  "The runtime is self-defending (primary-race + Whisper "
-                 "hedge + TTS fast-fail), so calls continue at reduced "
-                 "quality — but contact Sarvam support NOW and watch "
-                 "hedge/Whisper share in ws_audio_receiver.log. Recovery "
-                 "notice follows automatically.")
+                 f"hedge + TTS fast-fail), so calls continue at reduced "
+                 f"quality — but contact {active_provider()} support NOW and "
+                 "watch hedge/Whisper share in ws_audio_receiver.log. "
+                 "Recovery notice follows automatically.")
         _alert_call(d)
     elif new_state == "healthy" and prev_state == "degraded":
         mins = (now - d.get("vh:degraded_since", now)) / 60
         # Re-arm the 6-h alert window so the NEXT incident pages instantly.
         state.d.pop("alert:voice-degraded", None)
         alert_fn(state, "voice-recovered",
-                 "Sarvam voice provider recovered",
+                 f"{active_provider()} voice provider recovered",
                  f"Degradation lasted ~{mins:.0f} min; no bad signal for "
                  f"{CLEAR_AFTER_S // 60} min. Alert window re-armed.")
         state.d.pop("alert:voice-recovered", None)

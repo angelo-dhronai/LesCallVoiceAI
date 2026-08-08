@@ -28,15 +28,19 @@ from pathlib import Path
 _DEFAULT_LOG_DIR = "/home/angelo/lescall/credit_log"
 LOG_DIR = Path(os.environ.get("SARVAM_CREDIT_LOG_DIR", _DEFAULT_LOG_DIR))
 
-# Sarvam pricing defaults (Bulbul v3 TTS + saaras:v3 STT as of 2026-06)
-# STT  = ₹30/hour  → ₹0.5/min  (billed per second, rounded up per request)
-# TTS  = ₹30/10K chars → ₹3.0/1K chars
-STT_PRICE_PER_MIN = float(os.environ.get("SARVAM_STT_PRICE_PER_MIN", "0.5"))
-TTS_PRICE_PER_1K = float(os.environ.get("SARVAM_TTS_PRICE_PER_1K_CHARS", "3.0"))
+# Pricing comes from the one rate card (shared/sarvam_pricing.py) so this
+# report, the live tracker and the dashboard cannot drift apart.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from shared import sarvam_pricing as _pricing  # noqa: E402
+
+STT_PRICE_PER_MIN = _pricing.STT_PRICE_PER_MIN
+TTS_PRICE_PER_1K = _pricing.TTS_PRICE_PER_1K_CHARS
 
 
 def _cost_str(billed_stt_sec: float, tts_chars: int) -> str:
-    cost = (billed_stt_sec / 60.0) * STT_PRICE_PER_MIN + (tts_chars / 1000.0) * TTS_PRICE_PER_1K
+    cost = _pricing.stt_cost(billed_stt_sec) + _pricing.tts_cost(tts_chars)
     return f"est. ₹{cost:.4f}"
 
 
@@ -90,6 +94,7 @@ def _agg_from_events(events: list[dict]) -> dict:
     stt_whisper_sec = 0.0
     stt_whisper_calls = 0
     tts_chars = 0
+    tts_billed_chars = 0
     tts_calls = 0
     tts_cancelled = 0
 
@@ -111,7 +116,12 @@ def _agg_from_events(events: list[dict]) -> dict:
                 stt_whisper_sec += sec
                 stt_whisper_calls += 1
         elif t == "tts_event":
-            tts_chars += int(ev.get("chars", 0))
+            chars = int(ev.get("chars", 0))
+            tts_chars += chars
+            # billed_chars is what was actually POSTed (barge-in stops the
+            # part loop early). Absent on pre-2026-08-06 events — those fall
+            # back to the intended count, which is an upper bound.
+            tts_billed_chars += int(ev.get("billed_chars", chars))
             tts_calls += 1
             if not ev.get("completed", True):
                 tts_cancelled += 1
@@ -124,6 +134,7 @@ def _agg_from_events(events: list[dict]) -> dict:
         "stt_whisper_sec": stt_whisper_sec,
         "stt_whisper_calls": stt_whisper_calls,
         "tts_chars": tts_chars,
+        "tts_billed_chars": tts_billed_chars,
         "tts_calls": tts_calls,
         "tts_cancelled": tts_cancelled,
     }
@@ -166,13 +177,16 @@ def _print_summary(title: str, agg: dict) -> None:
     print(f"  TTS (Bulbul v3)    : {agg['tts_chars']:,} chars  ({agg['tts_calls']} requests @ ₹30/10K chars)")
     if agg["tts_calls"] > 0:
         pct = agg["tts_cancelled"] / agg["tts_calls"] * 100
-        print(f"  TTS barge-in cancel: {agg['tts_cancelled']} ({pct:.0f}% of requests — chars still billed)")
-    stt_cost = (billed / 60.0) * STT_PRICE_PER_MIN
-    tts_cost = (agg["tts_chars"] / 1000.0) * TTS_PRICE_PER_1K
+        print(f"  TTS barge-in cancel: {agg['tts_cancelled']} ({pct:.0f}% of requests — unsent tails NOT billed)")
+    stt_cost = _pricing.stt_cost(billed)
+    tts_cost = _pricing.tts_cost(agg["tts_billed_chars"])
+    whisper_cost = _pricing.whisper_cost(agg["stt_whisper_sec"])
     print(f"  ─────────────────────────────────────────────────────────")
     print(f"  STT cost           : ₹{stt_cost:.4f}")
     print(f"  TTS cost           : ₹{tts_cost:.4f}")
-    print(f"  Total estimate     : ₹{stt_cost + tts_cost:.4f}")
+    if whisper_cost:
+        print(f"  Whisper cost       : ₹{whisper_cost:.4f}")
+    print(f"  Total estimate     : ₹{stt_cost + tts_cost + whisper_cost:.4f}")
     print(_SEP)
 
 
@@ -189,11 +203,14 @@ def _print_call_detail(call_id: str, agg: dict) -> None:
         print(f"  STT (Whisper fback): {agg['stt_whisper_sec']:.2f}s  ({agg['stt_whisper_calls']} requests)")
     print(f"  TTS chars          : {agg['tts_chars']:,}  ({agg['tts_calls']} requests)")
     print(f"  TTS barge-in cancel: {agg['tts_cancelled']}")
-    stt_cost = (billed / 60.0) * STT_PRICE_PER_MIN
-    tts_cost = (agg["tts_chars"] / 1000.0) * TTS_PRICE_PER_1K
+    stt_cost = _pricing.stt_cost(billed)
+    tts_cost = _pricing.tts_cost(agg["tts_billed_chars"])
+    whisper_cost = _pricing.whisper_cost(agg["stt_whisper_sec"])
     print(f"  STT cost           : ₹{stt_cost:.4f}")
     print(f"  TTS cost           : ₹{tts_cost:.4f}")
-    print(f"  Total estimate     : ₹{stt_cost + tts_cost:.4f}")
+    if whisper_cost:
+        print(f"  Whisper cost       : ₹{whisper_cost:.4f}")
+    print(f"  Total estimate     : ₹{stt_cost + tts_cost + whisper_cost:.4f}")
     print(_SEP)
 
 
@@ -210,7 +227,9 @@ def _print_history(days: int) -> None:
     print(f"  {'Date':<12} {'Calls':>5} {'STT billed':>11} {'TTS chars':>10} {'Barge-in':>8} {'₹ Cost':>9}")
     print("  " + "─" * 60)
     for date_str, agg in rows:
-        cost = (agg["stt_sarvam_billed_sec"] / 60.0) * STT_PRICE_PER_MIN + (agg["tts_chars"] / 1000.0) * TTS_PRICE_PER_1K
+        cost = (_pricing.stt_cost(agg["stt_sarvam_billed_sec"])
+                + _pricing.tts_cost(agg["tts_billed_chars"])
+                + _pricing.whisper_cost(agg["stt_whisper_sec"]))
         print(
             f"  {date_str:<12} {agg['call_count']:>5} {agg['stt_sarvam_billed_sec']:>9.0f}s"
             f" {agg['tts_chars']:>10,} {agg['tts_cancelled']:>8} ₹{cost:>7.4f}"

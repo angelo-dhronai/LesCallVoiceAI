@@ -49,7 +49,10 @@ export default function Settings() {
       const res = await put<Profile & { status: string }>('/auth/profile', { name, phone, company })
       toast('Profile saved', 'success')
       setPhone(res.phone ? `+${res.phone}` : '')
-      refresh(['profile'])
+      // ['auth','me'] backs the account chip in the sidebar — without this the
+      // name you just saved keeps showing the one Google supplied at login
+      // until the next full reload.
+      refresh(['profile'], ['auth', 'me'])
     } catch (e: any) {
       toast(`Could not save: ${e.message || e}`, 'error')
     } finally {

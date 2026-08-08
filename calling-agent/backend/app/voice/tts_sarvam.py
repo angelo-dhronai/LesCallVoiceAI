@@ -275,6 +275,11 @@ class SarvamTTS(StreamingTTS):
         # Canned-audio cache capture (see speak_cached)
         self._capture_buf: bytearray | None = None
         self._last_speak_clean = False
+        # Characters actually POSTed to Sarvam by the last speak() — the
+        # billable quantity. Differs from len(text) when barge-in cuts the
+        # part loop short. Survives _reset() (which clears only _cancelled /
+        # _playing) so the credit-tracking subclass can read it afterwards.
+        self._last_speak_billed_chars = 0
         # Set when a mid-stream stall truncated the utterance — such audio
         # must never be cached (it would replay truncated forever).
         self._stream_truncated = False
@@ -291,13 +296,27 @@ class SarvamTTS(StreamingTTS):
     def set_voice(self, model: str | None = None, speaker: str | None = None,
                   pace: float | None = None) -> None:
         """v2: per-language voice on mid-call language switch. Invalid models
-        are ignored (the current voice keeps playing rather than 400-ing)."""
+        are ignored (the current voice keeps playing rather than 400-ing).
+
+        An ElevenLabs voice_id landing here (agent authored for EL, language
+        routed to Sarvam) is mapped to the same-gender bulbul default — an
+        unknown speaker string would 400 every utterance (dead-air trap)."""
         if model:
             if model in VALID_MODELS:
                 self._model = model
+            elif model.startswith("eleven_"):
+                logger.debug("[TTS:Sarvam] set_voice: EL model %r — keeping %s",
+                             model, self._model)
             else:
                 logger.warning("[TTS:Sarvam] set_voice: invalid model %r ignored", model)
         if speaker:
+            try:
+                from ..agent_definition.voice_catalog import el_voice_gender
+                _g = el_voice_gender(speaker)
+                if _g:   # it IS an EL voice_id — translate by gender
+                    speaker = "simran" if _g == "female" else "shubh"
+            except Exception:  # noqa: BLE001 — catalog must never kill a call
+                pass
             self._speaker = speaker
         if pace:
             try:
@@ -349,22 +368,27 @@ class SarvamTTS(StreamingTTS):
 
     async def speak(self, text: str) -> None:
         self._reset()
+        self._produced_audio = False   # new utterance — nothing at the sink yet
+        self._stop_seen = False
         self._playing = True
+        # Zero until a part is actually submitted — every early return below
+        # leaves Sarvam untouched, and so must leave the bill untouched.
+        self._last_speak_billed_chars = 0
 
         if not self._api_key:
-            logger.warning("[TTS:Sarvam] No API key — skipping")
+            logger.warning("[TTS] No API key — skipping")
             self._playing = False
             return
 
         # Check for empty or near-empty text
         if not text or len(text.strip()) < 2:
             logger.warning(
-                "[TTS:Sarvam] Attempting to speak empty or near-empty text: %r", text
+                "[TTS] Attempting to speak empty or near-empty text: %r", text
             )
             self.__class__._empty_text_count += 1
             if self.__class__._empty_text_count % 10 == 0:
                 logger.warning(
-                    "[TTS:Sarvam] Empty text count: %d", self.__class__._empty_text_count
+                    "[TTS] Empty text count: %d", self.__class__._empty_text_count
                 )
             self._playing = False
             self._reset()
@@ -378,7 +402,7 @@ class SarvamTTS(StreamingTTS):
         parts = _split_for_streaming(text)
         if len(parts) > 1:
             logger.info(
-                "[TTS:Sarvam] Utterance split into %d parts for incremental playback",
+                "[TTS] Utterance split into %d parts for incremental playback",
                 len(parts),
             )
         total_duration = 0.0
@@ -399,19 +423,23 @@ class SarvamTTS(StreamingTTS):
                 early_flushed = False
                 unflushed_bytes = 0
                 ceiling_bytes = int(self._sample_rate * 2 * _MAX_FLUSH_S)
+                # This part is about to be POSTed — bill it. Parts after a
+                # barge-in never reach here, so they are never charged.
+                self._last_speak_billed_chars += len(part)
                 async for chunk in self._stream_audio(part):
                     if self._cancelled:
-                        logger.info("[TTS:Sarvam] Cancelled mid-stream")
+                        logger.info("[TTS] Cancelled mid-stream")
                         break
 
                     await self._sink.write_frame(chunk.audio)
+                    self._produced_audio = True
                     unflushed_bytes += len(chunk.audio)
                     if self._capture_buf is not None:
                         self._capture_buf += chunk.audio
                     chunk_count += 1
                     if chunk_count == 1:
                         logger.info(
-                            "[TTS:Sarvam] First chunk sent to sink (%.0fms)",
+                            "[TTS] First chunk sent to sink (%.0fms)",
                             (time.monotonic() - speak_t0) * 1000,
                         )
 
@@ -434,7 +462,7 @@ class SarvamTTS(StreamingTTS):
                             early_flushed = True
                             unflushed_bytes = 0
                             logger.info(
-                                "[TTS:Sarvam] Early flush %.2fs after %.0fms",
+                                "[TTS] Early flush %.2fs after %.0fms",
                                 part_bytes / (self._sample_rate * 2),
                                 (time.monotonic() - speak_t0) * 1000,
                             )
@@ -452,7 +480,7 @@ class SarvamTTS(StreamingTTS):
                                 self._sink, 'last_flush_duration', 0.0)
                             flushed_parts += 1
                             logger.info(
-                                "[TTS:Sarvam] Ceiling flush %.2fs "
+                                "[TTS] Ceiling flush %.2fs "
                                 "(part still streaming)",
                                 unflushed_bytes / (self._sample_rate * 2))
                             unflushed_bytes = 0
@@ -466,7 +494,7 @@ class SarvamTTS(StreamingTTS):
                     flushed_parts += 1
 
         except Exception:
-            logger.exception("[TTS:Sarvam] speak() failed")
+            logger.exception("[TTS] speak() failed")
         finally:
             # We don't stop the sink here because it might be shared or need to finish playing
             self._playing = False
@@ -483,7 +511,7 @@ class SarvamTTS(StreamingTTS):
                     )
             if not self._cancelled:
                 logger.info(
-                    "[TTS:Sarvam] Playback complete (%d chunks, %d parts)",
+                    "[TTS] Playback complete (%d chunks, %d parts)",
                     chunk_count, flushed_parts or 1,
                 )
             # _reset() clears _cancelled — preserve completion state for
@@ -517,12 +545,12 @@ class SarvamTTS(StreamingTTS):
             tmp.write_bytes(pcm)
             os.replace(tmp, path)
             logger.info(
-                "[TTS:Sarvam] Cached utterance (%.1fs, %d bytes)",
+                "[TTS] Cached utterance (%.1fs, %d bytes)",
                 len(pcm) / (self._sample_rate * 2), len(pcm),
             )
             self._prune_cache(path.parent)
         except Exception:
-            logger.warning("[TTS:Sarvam] Cache write failed", exc_info=True)
+            logger.warning("[TTS] Cache write failed", exc_info=True)
 
     @staticmethod
     def _prune_cache(cache_dir: Path) -> None:
@@ -534,7 +562,7 @@ class SarvamTTS(StreamingTTS):
             for stale in entries[: max(excess, 0)]:
                 stale.unlink(missing_ok=True)
         except Exception:
-            logger.debug("[TTS:Sarvam] Cache prune failed", exc_info=True)
+            logger.debug("[TTS] Cache prune failed", exc_info=True)
 
     async def speak_cached(self, text: str) -> None:
         """speak() with a disk cache for canned lines (greeting, fillers,
@@ -557,7 +585,7 @@ class SarvamTTS(StreamingTTS):
                 pass
             except Exception:
                 logger.warning(
-                    "[TTS:Sarvam] Cache read failed for %r — synthesizing live",
+                    "[TTS] Cache read failed for %r — synthesizing live",
                     text[:40], exc_info=True,
                 )
             # Sanity floor: anything under 150ms of audio is a corrupt entry.
@@ -567,7 +595,7 @@ class SarvamTTS(StreamingTTS):
                 try:
                     await self._sink.start()
                     logger.info(
-                        "[TTS:Sarvam] Cache HIT (%.1fs, %s, %s) for %r",
+                        "[TTS] Cache HIT (%.1fs, %s, %s) for %r",
                         len(pcm) / (self._sample_rate * 2),
                         _LANG_CODE_MAP.get(self._language, "en-IN"),
                         self._speaker, text[:50],
@@ -601,10 +629,14 @@ class SarvamTTS(StreamingTTS):
                         await self._sink.write_frame(pcm)
                     self._playing = False
                     self._reset()
+                    # A cache hit is local playback — never a provider
+                    # failure — so it must never look like dead air to the
+                    # HybridTTS failover check (the _reset above cleared it).
+                    self._produced_audio = True
                     return
                 except Exception:
                     logger.exception(
-                        "[TTS:Sarvam] Cache replay failed — synthesizing live"
+                        "[TTS] Cache replay failed — synthesizing live"
                     )
                     self._playing = False
                     self._reset()
@@ -634,7 +666,7 @@ class SarvamTTS(StreamingTTS):
         actual = int.from_bytes(first_chunk[24:28], "little")
         if actual and actual != self._sample_rate:
             logger.warning(
-                "[TTS:Sarvam] Stream declares %d Hz but sink assumes %d Hz — "
+                "[TTS] Stream declares %d Hz but sink assumes %d Hz — "
                 "playback will run at %.2fx speed",
                 actual, self._sample_rate, self._sample_rate / actual,
             )

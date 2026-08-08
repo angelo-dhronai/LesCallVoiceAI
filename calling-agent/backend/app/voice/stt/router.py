@@ -30,7 +30,8 @@ import httpx
 from openai import APITimeoutError
 
 from .base import STTProvider, STTResult  # noqa: F401 — re-exported for pipeline
-from .sarvam import SarvamSTT, SarvamRateLimitError
+from .base import RateLimitError
+from .sarvam import SarvamSTT, SarvamRateLimitError  # noqa: F401 - re-export
 from .openai_whisper import OpenAIWhisperSTT
 from .post_processor import post_process_transcript
 from ...agent_definition.schema import STTCorrections
@@ -412,6 +413,20 @@ class STTRouter:
         self._stt_corrections = stt_corrections
         self._hedge_delay = (hedge_delay if hedge_delay is not None
                              else STT_HEDGE_DELAY_S)
+        # Hedge timings are calibrated to the PRIMARY's healthy latency
+        # distribution (saarika: 150-450ms; Scribe: 500-800ms). A provider
+        # whose normal p50 exceeds the trigger would fire the hedge on every
+        # turn — doubling every STT request for nothing (seen on the first
+        # ElevenLabs callsim run, 2026-08-07). Providers advertise their own
+        # floors via class attributes; env values still win when higher.
+        self._retry_hedge_s = max(
+            STT_PRIMARY_RETRY_HEDGE_S,
+            float(getattr(self._primary, "RETRY_HEDGE_FLOOR_S", 0.0)),
+        ) if STT_PRIMARY_RETRY_HEDGE_S > 0 else 0.0
+        self._hedge_delay = max(
+            self._hedge_delay,
+            float(getattr(self._primary, "HEDGE_DELAY_FLOOR_S", 0.0)),
+        ) if self._hedge_delay > 0 else self._hedge_delay
 
         # Rate-limit state (Sarvam HTTP 429 tracking)
         self._sarvam_rl_until: float = 0.0   # monotonic time when backoff expires
@@ -533,7 +548,7 @@ class STTRouter:
 
             try:
                 text, had_error, detected_lang, reject, conf = await primary_task
-            except SarvamRateLimitError as exc:
+            except RateLimitError as exc:
                 # Apply exponential backoff; reset on the next successful call
                 self._apply_sarvam_backoff(exc)
                 text, conf = await self._fallback_result(
@@ -628,14 +643,14 @@ class STTRouter:
         """
         t1 = asyncio.create_task(self._try_provider(
             self._primary, "primary", audio_bytes, sample_rate, language))
-        if STT_PRIMARY_RETRY_HEDGE_S <= 0:
+        if self._retry_hedge_s <= 0:
             return await t1
-        done, _ = await asyncio.wait({t1}, timeout=STT_PRIMARY_RETRY_HEDGE_S)
+        done, _ = await asyncio.wait({t1}, timeout=self._retry_hedge_s)
         if done:
             return t1.result()
         logger.warning(
             "[STT] Primary silent for %.1fs — racing a second primary "
-            "attempt", STT_PRIMARY_RETRY_HEDGE_S)
+            "attempt", self._retry_hedge_s)
         t2 = asyncio.create_task(self._try_provider(
             self._primary, "primary-race", audio_bytes, sample_rate, language))
         pending: set[asyncio.Task] = {t1, t2}
@@ -670,7 +685,7 @@ class STTRouter:
                 with contextlib.suppress(BaseException):
                     await t
 
-    def _apply_sarvam_backoff(self, exc: SarvamRateLimitError) -> None:
+    def _apply_sarvam_backoff(self, exc: RateLimitError) -> None:
         """Record a 429 strike and open the exponential backoff window."""
         self._sarvam_rl_count += 1
         backoff = min(
@@ -807,7 +822,7 @@ class STTRouter:
                 _retry_provider, "primary-script-retry",
                 audio_bytes, sample_rate, retry_lang,
             )
-        except SarvamRateLimitError as exc:
+        except RateLimitError as exc:
             # Same backoff bookkeeping as the main path; the segment stays
             # fallback-eligible since the audio contained speech.
             self._apply_sarvam_backoff(exc)
@@ -948,7 +963,7 @@ class STTRouter:
                     detected_language=detected_lang,
                 ), None
 
-            except SarvamRateLimitError:
+            except RateLimitError:
                 raise
 
             except (httpx.TimeoutException, APITimeoutError):

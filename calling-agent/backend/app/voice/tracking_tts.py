@@ -6,9 +6,13 @@ or completed naturally. Uses a per-instance flag set in stop() override
 because the parent's _cancelled flag is cleared by _reset() before
 speak() returns — so it can't be read after await super().speak().
 
-Credit is always recorded (Sarvam receives the full text in the HTTP
-request regardless of mid-stream cancellation), but completed=False
-lets the report distinguish barge-in waste from full utterances.
+Cost is recorded against the characters Sarvam actually RECEIVED, which
+is not the same as the characters we asked for: speak() synthesizes an
+utterance as a sequence of clause-sized HTTP requests and breaks out of
+that loop on barge-in, so the tail clauses are never POSTed and never
+billed. The parent reports the submitted total via
+_last_speak_billed_chars; `chars` is still reported alongside it so the
+report can show intended-vs-billed (barge-in waste).
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import logging
 from typing import Callable
 
 from .tts_sarvam import SarvamTTS
+from .tts_elevenlabs import ElevenLabsTTS
 from .credit_tracker import SarvamCreditTracker
 
 logger = logging.getLogger(__name__)
@@ -25,8 +30,15 @@ logger = logging.getLogger(__name__)
 CallIdProvider = Callable[[], str | None]
 
 
-class TrackingSarvamTTS(SarvamTTS):
-    """SarvamTTS with credit tracking. Behaviour is identical to parent."""
+class _TrackingTTSMixin:
+    """Credit-tracking layer shared by every TTS provider's wrapper.
+
+    Provider-agnostic by design: the concrete class sets _TRACK_PROVIDER and
+    the mixin records against it, so both wrappers stay byte-identical in
+    behaviour. Must be FIRST in the MRO.
+    """
+
+    _TRACK_PROVIDER = "sarvam"
 
     def __init__(self, call_id_provider: CallIdProvider, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -47,7 +59,23 @@ class TrackingSarvamTTS(SarvamTTS):
         # parent's _reset() has already cleared _cancelled — use our flag
         completed = not self._speak_was_cancelled
         self._speak_was_cancelled = False
+        # _reset() leaves _last_speak_billed_chars intact (it clears only
+        # _cancelled / _playing), so this is the count for THIS utterance.
+        billed = getattr(self, "_last_speak_billed_chars", chars)
         # Schedule as a task so speak() returns without blocking on file I/O
         asyncio.ensure_future(
-            self._tracker.record_tts(call_id, chars, completed=completed)
+            self._tracker.record_tts(
+                call_id, chars, completed=completed, billed_chars=billed,
+                provider=self._TRACK_PROVIDER,
+            )
         )
+
+
+class TrackingSarvamTTS(_TrackingTTSMixin, SarvamTTS):
+    """SarvamTTS with credit tracking. Behaviour is identical to parent."""
+    _TRACK_PROVIDER = "sarvam"
+
+
+class TrackingElevenLabsTTS(_TrackingTTSMixin, ElevenLabsTTS):
+    """ElevenLabsTTS with credit tracking. Behaviour is identical to parent."""
+    _TRACK_PROVIDER = "elevenlabs"

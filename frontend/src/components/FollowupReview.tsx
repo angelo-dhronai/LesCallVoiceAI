@@ -25,15 +25,15 @@ import type { FollowupReviewItem } from '../api/intel'
 import { useGet, useRefresh } from '../api/hooks/useApi'
 import { post } from '../api/mutate'
 import { Badge, Button, cx, IconButton, Spinner } from './ui'
-import { AsyncState, StatusBadge } from './kit'
+import { AsyncState, ContactLabel, StatusBadge } from './kit'
 import { FullscreenModal } from './Modal'
 import { useToast } from './Toast'
 import { useConfirm } from './confirm'
+import { fmtDateTime } from '../lib/format'
 
 type Props = { open: boolean; onClose: () => void }
 
-const fmtWhen = (ts?: string | null) =>
-  ts ? ts.slice(0, 16).replace('T', ' ') : 'no time set'
+const fmtWhen = (ts?: string | null) => (ts ? fmtDateTime(ts) : 'no time set')
 
 /** "Agent said" / "Customer said" — whose words created the obligation. */
 const SPEAKER: Record<string, string> = {
@@ -298,12 +298,9 @@ export function FollowupReview({ open, onClose }: Props) {
                       onChange={() => toggle(item.id)} />
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-medium text-[var(--text)]">
-                          {item.contact_name || item.dial_phone || 'Unknown contact'}
-                        </span>
-                        {item.dial_phone && (
-                          <span className="text-xs tabular-nums text-dim">{item.dial_phone}</span>
-                        )}
+                        {item.contact_name || item.dial_phone
+                          ? <ContactLabel name={item.contact_name} phone={item.dial_phone} />
+                          : <span className="font-medium text-dim">Unknown contact</span>}
                         {item.dnd && (
                           <Badge tone="rose" soft>asked not to be called</Badge>
                         )}

@@ -1,0 +1,9 @@
+<include>
+  <extension name="ai_inbound_2264231897">
+    <condition field="destination_number" expression="^(\+?\d*?)?2264231897$">
+      <action application="answer"/>
+      <action application="sleep" data="500"/>
+      <action application="socket" data="127.0.0.1:9000 async full"/>
+    </condition>
+  </extension>
+</include>

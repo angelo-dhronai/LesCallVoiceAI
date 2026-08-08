@@ -33,8 +33,7 @@ from backend.app.audio_transport.telephony_sink import TelephonySink
 # through the exact same stack run.py uses for the CLI/web pipeline.
 from backend.app.voice.conversation import ConversationRouter
 from backend.app.voice.stt.router import STTRouter
-from backend.app.voice.tracking_stt import TrackingSarvamSTT, TrackingWhisperSTT
-from backend.app.voice.tracking_tts import TrackingSarvamTTS
+from backend.app.voice.tracking_stt import TrackingWhisperSTT
 from backend.app.voice.credit_tracker import SarvamCreditTracker
 from backend.app.agent_definition.registry import agent_registry, default_agents_dir
 
@@ -689,44 +688,43 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
 
     call_id_provider = lambda: conn_id  # noqa: E731 - tiny provider closure
     corrections = agent_def.knowledge_base.stt_corrections if agent_def else None
-    # Batch STT: multipart WAV POST to api.sarvam.ai/speech-to-text per
-    # finalized VAD segment. The WebSocket streaming provider that briefly
-    # sat in front of this was removed 2026-07-31 (owner request) — this is
-    # the only STT primary again.
-    stt_primary = TrackingSarvamSTT(call_id_provider=call_id_provider)
-    # Per-call key lease (owner directive 2026-08-03): concurrent calls stop
-    # sharing one Sarvam key's rate limits. One lease serves this call's STT
-    # AND TTS; it re-leases only after a 402. SARVAM_PER_CALL_KEYS=false
-    # restores the process-wide key.
+    # Per-call Sarvam key lease (owner directive 2026-08-03): concurrent
+    # calls stop sharing one Sarvam key's rate limits. One lease serves this
+    # call's Sarvam-side STT AND TTS; it re-leases only after a 402.
+    # SARVAM_PER_CALL_KEYS=false restores the process-wide key. (ElevenLabs
+    # is one workspace key — leasing does not apply there.)
     try:
         from backend.app.voice.key_rotator import per_call_key_provider
         _key_provider = per_call_key_provider(conn_id)
-        stt_primary.key_provider = _key_provider
     except Exception as exc:
         _key_provider = None
         logger.warning("[%s] per-call key lease unavailable: %r",
                        conn_id, exc)
+    # Provider selection (2026-08-07 ElevenLabs switch): the factory reads
+    # agent.voice_provider / VOICE_PROVIDER env and routes per language —
+    # under VOICE_PROVIDER=sarvam with no agent override it builds exactly
+    # the objects this block used to construct inline. Batch STT remains one
+    # request per finalized VAD segment regardless of provider (the WS
+    # streaming provider was removed 2026-07-31, owner request).
+    from backend.app.voice.provider_factory import (
+        build_stt_fallback, build_stt_primary, build_tts)
+    stt_primary = build_stt_primary(
+        agent_def, call_id_provider, sarvam_key_provider=_key_provider)
+    # Scribe primary gets saarika as its hedge/fallback where the language
+    # set allows (owner 2026-08-07: Sarvam is the last-case fallback);
+    # Whisper stays the fallback everywhere else.
+    stt_fallback = (build_stt_fallback(
+        agent_def, call_id_provider, sarvam_key_provider=_key_provider)
+        or TrackingWhisperSTT(call_id_provider=call_id_provider))
     stt = STTRouter(
         primary=stt_primary,
-        fallback=TrackingWhisperSTT(call_id_provider=call_id_provider),
+        fallback=stt_fallback,
         stt_corrections=corrections,
     )
-    tts_model, tts_speaker, tts_pace = "bulbul:v3", "shubh", 1.0
-    if agent_def:
-        dlang = agent_def.languages.default
-        vcfg = agent_def.languages.tts_voices.get(dlang)
-        if vcfg:
-            tts_model, tts_speaker = vcfg.model, vcfg.speaker
-            tts_pace = getattr(vcfg, "pace", 1.0) or 1.0
-    tts = TrackingSarvamTTS(
-        call_id_provider=call_id_provider,
-        model=tts_model,
-        speaker=tts_speaker,
-        pace=tts_pace,
-        sample_rate=TTS_OUTPUT_SR,
+    tts = build_tts(
+        agent_def, call_id_provider, audio_sink=None,
+        sample_rate=TTS_OUTPUT_SR, sarvam_key_provider=_key_provider,
     )
-    if _key_provider is not None:
-        tts.key_provider = _key_provider
     # Seed the session language from the agent's own default — without this
     # every call opened in the hardcoded "hi" and English agents greeted with
     # a hi-IN accent (PLAN-tts-accent-consistency.md P0).

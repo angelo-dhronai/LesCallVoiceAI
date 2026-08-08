@@ -49,8 +49,21 @@ class StreamingTTS(ABC):
     async def stop(self) -> None:
         """Interrupt playback immediately."""
         self._cancelled = True
+        self._stop_seen = True
         self._playing = False
         logger.info("[TTS] Playback interrupted")
+
+    # True once any audio for the current utterance reached the sink.
+    # HybridTTS reads this after speak()/speak_cached() to detect a dead-air
+    # provider failure (zero chunks) and fail over. Deliberately NOT cleared
+    # by _reset(): speak() ends its finally with _reset(), so a per-reset
+    # flag is wiped before HybridTTS can read it (live false-failover +
+    # double greeting, 2026-08-07). Cleared only at utterance START.
+    _produced_audio = False
+    # True once stop() fired for the current utterance. Same survival rule
+    # as _produced_audio — _cancelled is gone by the time the failover check
+    # runs, and a barged-in zero-chunk utterance must NOT be re-spoken.
+    _stop_seen = False
 
     def _reset(self) -> None:
         self._cancelled = False

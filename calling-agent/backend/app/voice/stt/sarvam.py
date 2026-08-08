@@ -13,7 +13,9 @@ import logging
 
 import httpx
 
-from .base import STTProvider, STTResult, pcm_to_wav, normalize_pcm_audio
+from .base import (
+    STTProvider, STTResult, RateLimitError, pcm_to_wav, normalize_pcm_audio,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,15 +73,12 @@ def _make_client(timeout: float) -> httpx.AsyncClient:
     )
 
 
-class SarvamRateLimitError(Exception):
+class SarvamRateLimitError(RateLimitError):
     """Raised when Sarvam API returns HTTP 429 (Too Many Requests).
 
-    The caller (STTRouter) uses this to apply backoff and optionally
-    route to the fallback provider rather than retrying immediately.
+    Subclasses the provider-neutral RateLimitError (stt/base.py) so the
+    STTRouter's backoff logic catches every provider's 429 the same way.
     """
-    def __init__(self, retry_after: str | None = None) -> None:
-        self.retry_after = retry_after
-        super().__init__(f"Sarvam rate limited (Retry-After: {retry_after})")
 
 
 class SarvamSTT(STTProvider):

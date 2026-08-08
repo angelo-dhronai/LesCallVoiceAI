@@ -39,6 +39,23 @@ class STTResult:
     # pipeline's language mirror and the router's evidence scorer treat
     # them as non-voting (A3, 2026-07-30).
     source: str = "primary"
+    # Provider's own confidence in detected_language, 0..1. Sarvam saarika
+    # never returns one under a language pin; ElevenLabs Scribe returns it on
+    # every response. None means "provider said nothing" — consumers must not
+    # treat that as low confidence.
+    language_probability: float | None = None
+
+
+class RateLimitError(Exception):
+    """Provider returned HTTP 429 (Too Many Requests / concurrency cap).
+
+    Provider modules raise their own subclass; the STTRouter catches THIS
+    base class to apply backoff and route to the fallback provider, so a new
+    provider never needs a router edit to get correct 429 handling.
+    """
+    def __init__(self, retry_after: str | None = None) -> None:
+        self.retry_after = retry_after
+        super().__init__(f"STT rate limited (Retry-After: {retry_after})")
 
 
 def normalize_pcm_audio(

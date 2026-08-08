@@ -1,0 +1,9 @@
+<include>
+  <gateway name="alwynantonyben-dhronai-com_plivo-231897">
+    <param name="realm" value="86116159722292477.zt.plivo.com"/>
+    <param name="proxy" value="86116159722292477.zt.plivo.com"/>
+    <param name="register" value="false"/>
+    <param name="from-domain" value="86116159722292477.zt.plivo.com"/>
+    <param name="caller-id-in-from" value="true"/>
+  </gateway>
+</include>

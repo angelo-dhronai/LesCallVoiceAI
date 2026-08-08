@@ -1050,17 +1050,73 @@ async def apply_yaml_from_document(name: str, doc_id: str, request: Request) -> 
 @router.get("/api/tts/preview")
 async def tts_voice_preview(speaker: str, model: str = "bulbul:v3", language: str = "en-IN",
                             pace: float = 1.0):
-    """Stream a short TTS sample as audio/wav for in-browser playback."""
+    """Stream a short TTS sample as audio/wav for in-browser playback.
+
+    Provider-aware (2026-08-07): an eleven_* model — or a speaker that is an
+    ElevenLabs voice_id — synthesizes through ElevenLabs; everything else
+    stays on the Sarvam path unchanged.
+    """
     import httpx
-    api_key = os.environ.get("SARVAM_API_KEY", "")
-    if not api_key:
-        raise HTTPException(status_code=503, detail="SARVAM_API_KEY not configured")
     preview_text = {
         "en-IN": "Hi there! I'm your AI assistant. How can I help you today?",
         "hi-IN": "नमस्ते! मैं आपकी AI सहायक हूँ। आज मैं आपकी कैसे मदद कर सकती हूँ?",
         "gu-IN": "નમસ્તે! હું તમારી AI સહાયક છું. આજે હું તમને કેવી રીતે મદદ કરી શકું?",
     }
     text = preview_text.get(language, preview_text["en-IN"])
+
+    _is_el = (model or "").startswith("eleven_")
+    if not _is_el:
+        try:
+            from backend.app.agent_definition.voice_catalog import EL_VOICE_CATALOG
+            _is_el = speaker in EL_VOICE_CATALOG
+        except Exception:
+            pass
+    if _is_el:
+        el_key = os.environ.get("ELEVENLABS_API_KEY", "")
+        if not el_key:
+            raise HTTPException(status_code=503,
+                                detail="ELEVENLABS_API_KEY not configured")
+        try:
+            from backend.app.agent_definition.voice_catalog import (
+                el_voice_for_speaker)
+            from backend.app.voice.tts_elevenlabs import (
+                EL_VALID_MODELS, speed_from_pace)
+            voice_id = el_voice_for_speaker(speaker)
+            el_model = model if model in EL_VALID_MODELS else "eleven_flash_v2_5"
+            el_payload = {
+                "text": text,
+                "model_id": el_model,
+                "voice_settings": {"speed": speed_from_pace(pace)},
+            }
+            if el_model in ("eleven_flash_v2_5", "eleven_turbo_v2_5"):
+                el_payload["language_code"] = (language or "en-IN").split("-")[0]
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+                    "?output_format=pcm_16000",
+                    headers={"xi-api-key": el_key,
+                             "Content-Type": "application/json"},
+                    json=el_payload,
+                )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code,
+                                    detail=resp.text[:300])
+            pcm = resp.content
+            sr, ch, bps = 16000, 1, 16
+            wav = struct.pack("<4sI4s", b"RIFF", 36 + len(pcm), b"WAVE")
+            wav += struct.pack("<4sIHHIIHH", b"fmt ", 16, 1, ch, sr,
+                               sr * ch * bps // 8, ch * bps // 8, bps)
+            wav += struct.pack("<4sI", b"data", len(pcm)) + pcm
+            return Response(content=wav, media_type="audio/wav",
+                            headers={"Cache-Control": "no-store"})
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    api_key = os.environ.get("SARVAM_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="SARVAM_API_KEY not configured")
     payload = {
         "text": text,
         "target_language_code": language,

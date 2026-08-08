@@ -1,0 +1,7 @@
+ id |      number      | sig_digits | trunk_id |    inbound_agent_slug    |         owner         | direction |        label        | verified | config_status |      last_applied_at       |         created_at         |  outbound_agent_slug   
+----+------------------+------------+----------+--------------------------+-----------------------+-----------+---------------------+----------+---------------+----------------------------+----------------------------+------------------------
+  5 | +912264231897    | 2264231897 |        6 | hardik-inbound           | support@milledger.com | both      | connected via panel |        0 | applied       | 2026-08-01 08:34:24.805736 | 2026-08-01 08:10:49.874766 | hardik-outbound
+  6 | +91 80 3133 9140 | 8031339140 |        7 | fitcoach_ai-2-inbound    | info@craftidea.in     | both      | connected via panel |        0 | applied       | 2026-08-05 10:46:33.796997 | 2026-08-05 10:46:33.533817 | fitcoach_ai-2-outbound
+  4 | +91806595 3160   | 8065953160 |        5 | maya_lescall_sdr-inbound | angelo@dhronai.com    | both      | connected via panel |        0 | applied       | 2026-07-13 04:28:26        | 2026-07-13 04:28:26        | sen_studio-outbound
+(3 rows)
+

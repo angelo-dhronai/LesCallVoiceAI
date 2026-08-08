@@ -21,13 +21,14 @@ import {
 import {
   BasicsSection, CallDirectionSection, CalendarSection, LanguagesSection,
   PersonalitySection, KnowledgeSection, CallFlowSection, ResponsesSection,
-  RoutingFields, type TimeWindowDraft,
+  RoutingFields, useVoiceRoster, type TimeWindowDraft,
 } from './AgentFormSections'
 import {
   Radio, Archive, ArrowLeft, Save, CheckCircle2, AlertTriangle, Volume2,
   Upload, Trash2, FileText, Sparkles, Code2, Network, Files, SlidersHorizontal,
   CalendarDays, History, ListOrdered, ArrowUp, ArrowDown, Plus, RotateCcw,
 } from 'lucide-react'
+import { fmtDateTime } from '../../lib/format'
 
 type Tab = 'settings' | 'stages' | 'yaml' | 'routing' | 'documents' | 'voice' | 'history'
 const BCP47: Record<string, string> = { en: 'en-IN', hi: 'hi-IN', gu: 'gu-IN', mr: 'hi-IN' }
@@ -351,7 +352,7 @@ function BookingsList({ name }: { name: string }) {
           <div key={`${b.conn_id}-${i}`} className="flex flex-wrap items-center gap-3 rounded-lg bg-[var(--surface-2)] px-3 py-2 ring-1 ring-[var(--border)]">
             <span className="text-sm font-semibold">{b.appointment_time}</span>
             <span className="text-xs text-soft">{b.caller_name || 'Unknown caller'}{b.caller_phone ? ` · ${b.caller_phone}` : ''}</span>
-            <span className="ml-auto text-2xs text-dim">{b.booked_at?.slice(0, 16).replace('T', ' ') || ''}</span>
+            <span className="ml-auto text-2xs text-dim">{b.booked_at ? fmtDateTime(b.booked_at) : ''}</span>
             <Button variant="ghost" size="sm" onClick={() => void onFree(i)} title="Free this slot — the agent will offer it again"><Trash2 size={13} /></Button>
           </div>
         ))}
@@ -759,15 +760,19 @@ function ExtractReview({ fields, missing, busy, onCancel, onApply }: {
 /* ───────────────────────── Voice tab ───────────────────────── */
 function VoiceTab({ agent }: { agent: any }) {
   const toast = useToast()
+  const roster = useVoiceRoster()
   const voices: Record<string, { model: string; speaker: string; pace?: number }> = agent?.languages?.tts_voices ?? {}
   const entries = Object.entries(voices)
   const [playingLang, setPlayingLang] = useState<string | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const voiceName = (speaker: string) =>
+    roster.find((v) => v.speaker === speaker)?.name || speaker
+  const providerOf = (model: string) => (model?.startsWith('eleven_') ? 'ElevenLabs' : 'Sarvam')
 
   const play = (lang: string, v: { model: string; speaker: string; pace?: number }) => {
     try {
       audioRef.current?.pause()
-      const audio = new Audio(ttsPreviewUrl(v.speaker, v.model, BCP47[lang] || 'en-IN', v.pace))
+      const audio = new Audio(ttsPreviewUrl(v.speaker, v.model, BCP47[lang] || `${lang}-IN`, v.pace))
       audioRef.current = audio
       setPlayingLang(lang)
       audio.onended = () => setPlayingLang(null)
@@ -785,7 +790,9 @@ function VoiceTab({ agent }: { agent: any }) {
             playingLang === lang ? 'animate-pulse text-mint-500' : 'text-indigo-400')}><Volume2 size={18} /></span>
           <div className="min-w-0">
             <div className="text-sm font-semibold text-[var(--text)]">{lang.toUpperCase()}</div>
-            <div className="truncate text-2xs text-dim">{v.model} · {v.speaker}{v.pace ? ` · ${v.pace}× pace` : ''}</div>
+            <div className="truncate text-2xs text-dim">
+              {providerOf(v.model)} · {voiceName(v.speaker)}{v.pace ? ` · ${v.pace}× pace` : ''}
+            </div>
           </div>
           <Button variant="ghost" className="ml-auto" onClick={() => play(lang, v)}>
             {playingLang === lang ? <><Spinner className="h-3.5 w-3.5" /> Playing…</> : <><Volume2 size={14} /> Preview</>}
@@ -1007,7 +1014,7 @@ function HistoryTab({ name, onChanged }: { name: string; onChanged: () => void }
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-semibold">{r.reason || 'edit'}</div>
                 <div className="text-2xs text-dim">
-                  {r.actor || 'unknown'} · {String(r.created_at).slice(0, 16).replace('T', ' ')}
+                  {r.actor || 'unknown'} · {fmtDateTime(String(r.created_at))}
                 </div>
               </div>
               <Button variant="ghost" size="sm" disabled={busy} onClick={() => void onRollback(r)}

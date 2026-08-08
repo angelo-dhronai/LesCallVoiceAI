@@ -1,34 +1,92 @@
 [
   {
     "speaker": "shubh",
-    "gender": "male"
+    "gender": "male",
+    "provider": "sarvam",
+    "file": "shubh"
   },
   {
     "speaker": "aditya",
-    "gender": "male"
+    "gender": "male",
+    "provider": "sarvam",
+    "file": "aditya"
   },
   {
     "speaker": "amit",
-    "gender": "male"
+    "gender": "male",
+    "provider": "sarvam",
+    "file": "amit"
   },
   {
     "speaker": "kabir",
-    "gender": "male"
+    "gender": "male",
+    "provider": "sarvam",
+    "file": "kabir"
   },
   {
     "speaker": "simran",
-    "gender": "female"
+    "gender": "female",
+    "provider": "sarvam",
+    "file": "simran"
   },
   {
     "speaker": "priya",
-    "gender": "female"
+    "gender": "female",
+    "provider": "sarvam",
+    "file": "priya"
   },
   {
     "speaker": "neha",
-    "gender": "female"
+    "gender": "female",
+    "provider": "sarvam",
+    "file": "neha"
   },
   {
     "speaker": "shruti",
-    "gender": "female"
+    "gender": "female",
+    "provider": "sarvam",
+    "file": "shruti"
+  },
+  {
+    "speaker": "JvXnN4vCCagzhSTjMMjl",
+    "name": "Shivank",
+    "gender": "male",
+    "provider": "elevenlabs",
+    "file": "el_shivank"
+  },
+  {
+    "speaker": "EVsUc9VDoheXQmgm2NpK",
+    "name": "Aryaman",
+    "gender": "male",
+    "provider": "elevenlabs",
+    "file": "el_aryaman"
+  },
+  {
+    "speaker": "d2osXrwa36lUEkuaO4sP",
+    "name": "Maahir",
+    "gender": "male",
+    "provider": "elevenlabs",
+    "file": "el_maahir"
+  },
+  {
+    "speaker": "mnpQAOH9h8vn2tVUYJWD",
+    "name": "Roohi",
+    "gender": "female",
+    "provider": "elevenlabs",
+    "file": "el_roohi"
+  },
+  {
+    "speaker": "Em37RvLnPRGl6d9Suxcj",
+    "name": "Samhita",
+    "gender": "female",
+    "provider": "elevenlabs",
+    "file": "el_samhita"
+  },
+  {
+    "speaker": "Wu4iEB9NxSm711OvcrLo",
+    "name": "Mohini",
+    "gender": "female",
+    "provider": "elevenlabs",
+    "file": "el_mohini"
   }
 ]

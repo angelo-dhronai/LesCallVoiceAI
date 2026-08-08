@@ -325,17 +325,44 @@ def _upsert_user(email: str, name: str, google_sub: str, picture: str) -> None:
 router = APIRouter()
 
 
+def _saved_profile(email: str) -> dict:
+    """The user's own Settings row ({} when absent or unreadable).
+
+    The session cookie carries the name Google knew at login and is only
+    rewritten by a fresh sign-in — so it must never be the last word on who
+    the user is. Whatever they typed in Settings wins everywhere the identity
+    is rendered; a failed read degrades to the Google name rather than to a
+    blank account chip.
+    """
+    if not email:
+        return {}
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            row = db.execute("SELECT name, picture FROM users WHERE email=?",
+                             (email,)).fetchone()
+        return dict(row) if row else {}
+    except Exception as exc:
+        logger.warning("profile lookup failed for %s: %r", email, exc)
+        return {}
+
+
 @router.get("/api/auth/me")
 def me(request: Request):
     if not oauth_enabled():
+        saved = _saved_profile(DEFAULT_OWNER)
         return {"mode": "single-tenant", "email": DEFAULT_OWNER,
-                "login_required": False}
+                "login_required": False,
+                "name": (saved.get("name") or ""),
+                "picture": (saved.get("picture") or "")}
     session = read_session_cookie(request.cookies.get(SESSION_COOKIE))
     if not session:
         return JSONResponse({"mode": "multi-tenant", "login_required": True}, status_code=401)
+    saved = _saved_profile(session["email"])
     return {"mode": "multi-tenant", "login_required": False,
-            "email": session["email"], "name": session.get("name", ""),
-            "picture": session.get("picture", "")}
+            "email": session["email"],
+            "name": (saved.get("name") or "").strip() or session.get("name", ""),
+            "picture": session.get("picture", "") or (saved.get("picture") or "")}
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +449,14 @@ def login(request: Request, next: str = ""):
         "prompt": "select_account",
     })
     resp = RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
+    # This 307 must never be cached. It pins a single-use `state` AND the
+    # client_id/redirect_uri of the moment, so a browser replaying it defeats
+    # the CSRF check and — after any OAuth client change — keeps sending the
+    # OLD client_id, which Google rejects as redirect_uri_mismatch. That reads
+    # exactly like a server misconfiguration while the server is already
+    # correct (hit 2026-08-07 on the platform.lescall.com cutover).
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
     resp.set_cookie(STATE_COOKIE, state, max_age=600, httponly=True, samesite="lax",
                     secure=_cookie_secure())
     _set_return_cookie(resp, destination)
@@ -594,6 +629,9 @@ _TENANT_API_PREFIXES = (
     # speaker), no tenant data. Session still required. Absent from this list
     # 07-24→08-01, which made every "tap to hear" chip in the copilot 403.
     "/api/voices",
+    # Language capability roster (Sarvam + ElevenLabs union, 2026-08-07) —
+    # platform-wide catalog, no tenant data, session still required.
+    "/api/languages",
 )
 
 

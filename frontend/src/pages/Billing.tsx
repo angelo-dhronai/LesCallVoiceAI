@@ -13,6 +13,7 @@ import { Badge, Button, Card, Spinner } from '../components/ui'
 import { AsyncState, Field, Input, PageHeader, Table, TD, TH, THead, TR } from '../components/kit'
 import { useToast } from '../components/Toast'
 import { useConfirm } from '../components/confirm'
+import { fmtDateTime, parseTs } from '../lib/format'
 
 /* ── usage meter ───────────────────────────────────────────────────────────
    Amber at 80%, rose at 100% — the same thresholds the Overview chip uses, so
@@ -168,8 +169,9 @@ export default function Billing() {
   const trial = s?.subscription?.kind === 'one_time' && s.subscription.status === 'active'
   const daysLeft = useMemo(() => {
     const end = s?.subscription?.current_end
-    if (!end) return null
-    return Math.max(0, Math.ceil((new Date(end).getTime() - Date.now()) / 86_400_000))
+    const at = parseTs(end)
+    if (!at) return null
+    return Math.max(0, Math.ceil((at.getTime() - Date.now()) / 86_400_000))
   }, [s?.subscription?.current_end])
 
   return (
@@ -452,7 +454,7 @@ export default function Billing() {
               <tbody>
                 {attemptsQ.data.attempts.filter((a) => a.status !== 'captured').map((a) => (
                   <TR key={a.id}>
-                    <TD>{(a.created_at || '').slice(0, 16).replace('T', ' ')}</TD>
+                    <TD>{fmtDateTime(a.created_at)}</TD>
                     <TD>{a.plan_code || a.kind}</TD>
                     <TD className="text-right tabular-nums">{inr(a.amount_paise)}</TD>
                     <TD>

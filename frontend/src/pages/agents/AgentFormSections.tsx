@@ -1,5 +1,7 @@
+import { useEffect, useState } from 'react'
 import { Card, Button, IconButton, cx } from '../../components/ui'
 import { Field, Input, Textarea, Select } from '../../components/kit'
+import { api } from '../../api/client'
 import type { Routing, WizardData } from '../../api/agents'
 import { CalendarDays, ChevronDown, ChevronUp, PhoneIncoming, PhoneOutgoing, Plus, Trash2 } from 'lucide-react'
 
@@ -18,6 +20,43 @@ export const LANGS = [
   { code: 'gu', label: 'Gujarati' },
   { code: 'mr', label: 'Marathi' },
 ]
+
+/* Union language roster (Sarvam + ElevenLabs) served by /api/languages.
+ * Falls back to the static LANGS above if the endpoint is unreachable, so
+ * the form never renders an empty picker. */
+export type LangCap = { code: string; label: string; stt: string[]; tts: string[]; deep_support: boolean }
+
+let _langCache: LangCap[] | null = null
+export function useLanguageRoster(): LangCap[] {
+  const [langs, setLangs] = useState<LangCap[]>(
+    _langCache ?? LANGS.map((l) => ({ ...l, stt: ['sarvam'], tts: ['sarvam'], deep_support: l.code !== 'mr' })),
+  )
+  useEffect(() => {
+    if (_langCache) return
+    api<{ languages: LangCap[] }>('/api/languages')
+      .then((r) => { if (r.languages?.length) { _langCache = r.languages; setLangs(r.languages) } })
+      .catch(() => {})
+  }, [])
+  return langs
+}
+
+export type VoiceEntry = { speaker: string; name?: string; gender: string; provider: string; sample_url?: string }
+
+let _voiceCache: VoiceEntry[] | null = null
+export function useVoiceRoster(): VoiceEntry[] {
+  const [voices, setVoices] = useState<VoiceEntry[]>(_voiceCache ?? [])
+  useEffect(() => {
+    if (_voiceCache) return
+    api<{ voices: VoiceEntry[] }>('/api/voices')
+      .then((r) => { if (r.voices?.length) { _voiceCache = r.voices; setVoices(r.voices) } })
+      .catch(() => {})
+  }, [])
+  return voices
+}
+
+/** Default model that matches a picked voice's provider. */
+export const modelForVoice = (v: VoiceEntry) =>
+  v.provider === 'elevenlabs' ? 'eleven_flash_v2_5' : 'bulbul:v3'
 
 export const SLUG_RE = /^[a-z0-9_-]+$/i
 
@@ -210,34 +249,51 @@ export function CalendarSection({ d, set }: SectionProps) {
 
 /* ───────────────────────── Languages & voice ───────────────────────── */
 export function LanguagesSection({ d, set }: SectionProps) {
+  const roster = useLanguageRoster()
+  const voices = useVoiceRoster()
   const toggleLang = (code: string) => {
     const has = d.supported.includes(code)
     const supported = has ? d.supported.filter((l) => l !== code) : [...d.supported, code]
     const default_lang = supported.includes(d.default_lang) ? d.default_lang : supported[0] || 'en'
     set({ supported, default_lang })
   }
+  const indic = roster.filter((l) => l.tts.includes('sarvam'))
+  const global = roster.filter((l) => !l.tts.includes('sarvam'))
+  const chip = (l: LangCap) => (
+    <button
+      key={l.code}
+      type="button"
+      aria-pressed={d.supported.includes(l.code)}
+      onClick={() => toggleLang(l.code)}
+      className={cx(
+        'rounded-md px-3 py-1.5 text-sm font-semibold ring-1 transition',
+        d.supported.includes(l.code)
+          ? 'bg-mint-400/15 text-mint-700 ring-mint-400/30 dark:text-mint-300'
+          : 'bg-[var(--surface-2)] text-soft ring-[var(--border)]',
+      )}
+    >
+      {l.label} <span className="opacity-60">({l.code})</span>
+    </button>
+  )
+  const pickVoice = (speaker: string) => {
+    const v = voices.find((x) => x.speaker === speaker)
+    if (v) set({ tts_speaker: v.speaker, tts_model: modelForVoice(v) })
+    else set({ tts_speaker: speaker })
+  }
+  const sarvamVoices = voices.filter((v) => v.provider !== 'elevenlabs')
+  const elVoices = voices.filter((v) => v.provider === 'elevenlabs')
+  const knownVoice = voices.some((v) => v.speaker === d.tts_speaker)
   return (
     <div className="space-y-5">
       <div>
         <div className="eyebrow mb-2">Supported languages *</div>
-        <div className="flex flex-wrap gap-2">
-          {LANGS.map((l) => (
-            <button
-              key={l.code}
-              type="button"
-              aria-pressed={d.supported.includes(l.code)}
-              onClick={() => toggleLang(l.code)}
-              className={cx(
-                'rounded-md px-3 py-1.5 text-sm font-semibold ring-1 transition',
-                d.supported.includes(l.code)
-                  ? 'bg-mint-400/15 text-mint-700 ring-mint-400/30 dark:text-mint-300'
-                  : 'bg-[var(--surface-2)] text-soft ring-[var(--border)]',
-              )}
-            >
-              {l.label} <span className="opacity-60">({l.code})</span>
-            </button>
-          ))}
-        </div>
+        <div className="flex flex-wrap gap-2">{indic.map(chip)}</div>
+        {global.length > 0 && (
+          <>
+            <div className="eyebrow mb-2 mt-4">Global languages</div>
+            <div className="flex flex-wrap gap-2">{global.map(chip)}</div>
+          </>
+        )}
       </div>
       <div className="grid gap-4 sm:grid-cols-2">
         <Field label="Default language">
@@ -252,11 +308,27 @@ export function LanguagesSection({ d, set }: SectionProps) {
             <option value="they">they</option>
           </Select>
         </Field>
+        <Field label="Voice">
+          <Select value={knownVoice ? d.tts_speaker : ''} onChange={(e) => e.target.value && pickVoice(e.target.value)}>
+            {!knownVoice && <option value="">{d.tts_speaker ? `${d.tts_speaker} (custom)` : 'Pick a voice…'}</option>}
+            {sarvamVoices.length > 0 && (
+              <optgroup label="Sarvam (Indian languages)">
+                {sarvamVoices.map((v) => (
+                  <option key={v.speaker} value={v.speaker}>{(v.name || v.speaker)} · {v.gender}</option>
+                ))}
+              </optgroup>
+            )}
+            {elVoices.length > 0 && (
+              <optgroup label="ElevenLabs (all languages)">
+                {elVoices.map((v) => (
+                  <option key={v.speaker} value={v.speaker}>{(v.name || v.speaker)} · {v.gender}</option>
+                ))}
+              </optgroup>
+            )}
+          </Select>
+        </Field>
         <Field label="TTS model">
           <Input value={d.tts_model} onChange={(e) => set({ tts_model: e.target.value })} />
-        </Field>
-        <Field label="TTS speaker">
-          <Input value={d.tts_speaker} onChange={(e) => set({ tts_speaker: e.target.value })} />
         </Field>
       </div>
     </div>

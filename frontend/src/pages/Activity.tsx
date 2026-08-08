@@ -11,7 +11,7 @@ import {
 } from '../components/kit'
 import { useDebounced, useUrlNumber, useUrlParam, useUrlPatch } from '../lib/hooks'
 import { CALL_STATUS_FILTER } from '../lib/callStatus'
-import { inr, dur, num } from '../lib/format'
+import { inr, dur, num, parseTs } from '../lib/format'
 
 type Call = {
   call_id?: string
@@ -36,15 +36,13 @@ type HistoryResp = {
 }
 
 const fmtWhen = (s?: string): string => {
-  if (!s) return '—'
-  const d = new Date(s)
-  return isNaN(d.getTime()) ? '—' : d.toLocaleString()
+  const d = parseTs(s)
+  return d ? d.toLocaleString('en-IN') : '—'
 }
 
 const fmtTime = (s?: string): string => {
-  if (!s) return '—'
-  const d = new Date(s)
-  return isNaN(d.getTime()) ? '—' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  const d = parseTs(s)
+  return d ? d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) : '—'
 }
 
 /** react-router Link wearing the shared ghost-Button skin (sm size) — ui.Button
@@ -62,9 +60,8 @@ function LinkButton({ to, children }: { to: string; children: ReactNode }) {
 }
 
 const dayLabel = (s?: string): string => {
-  if (!s) return 'Unknown date'
-  const d = new Date(s)
-  if (isNaN(d.getTime())) return 'Unknown date'
+  const d = parseTs(s)
+  if (!d) return 'Unknown date'
   const today = new Date()
   const yesterday = new Date()
   yesterday.setDate(today.getDate() - 1)
@@ -129,8 +126,8 @@ export default function Activity() {
   // Group consecutive rows by calendar day for scannable date dividers.
   const groups: { key: string; label: string; items: Call[] }[] = []
   for (const c of calls) {
-    const d = c?.start_time ? new Date(c.start_time) : null
-    const key = d && !isNaN(d.getTime()) ? d.toDateString() : 'unknown'
+    const d = parseTs(c?.start_time)
+    const key = d ? d.toDateString() : 'unknown'
     const last = groups[groups.length - 1]
     if (last && last.key === key) last.items.push(c)
     else groups.push({ key, label: dayLabel(c?.start_time), items: [c] })

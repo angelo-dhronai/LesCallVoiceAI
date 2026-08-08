@@ -13,8 +13,9 @@ import {
 } from '../components/kit'
 import { Modal } from '../components/Modal'
 import { useToast } from '../components/Toast'
-import { useConfirm } from '../components/confirm'
+import { useConfirm, usePrompt } from '../components/confirm'
 import { useDebounced, useUrlNumber, useUrlParam } from '../lib/hooks'
+import { fmtDate } from '../lib/format'
 
 type Contact = {
   id: string
@@ -82,6 +83,7 @@ export default function Contacts() {
   const nav = useNavigate()
   const refresh = useRefresh()
   const confirm = useConfirm()
+  const prompt = usePrompt()
   // Group / search / page live in the URL so refresh & share keep the view.
   const [groupRaw, setGroupRaw] = useUrlParam('group', 'all')
   const groupSel: 'all' | 'none' | number =
@@ -181,15 +183,41 @@ export default function Contacts() {
     if (!name) return
     setBusy(true)
     try {
-      await post('/outbound/groups', { name })
-      toast(`Group “${name}” created`, 'success')
+      const r = await post<{ group?: { id: number; name: string } }>(
+        '/outbound/groups', { name })
+      toast(`Group “${name}” created — new contacts and imports go here now`, 'success')
       setNewGroupOpen(false)
       setNewGroupName('')
+      // Select what you just made. Creating a group is always the first half of
+      // "…and put these people in it", and leaving the sidebar on All contacts
+      // meant the very next Add or Import silently landed in No group.
+      if (r?.group?.id) setGroupSel(r.group.id)
       refresh(['contact-groups'])
     } catch (e: any) {
       toast(String(e?.message || e).includes('409') ? 'A group with that name already exists' : `Failed: ${e?.message || e}`, 'error')
     } finally {
       setBusy(false)
+    }
+  }
+
+  const renameGroup = async (g: Group) => {
+    const name = await prompt({
+      title: `Rename “${g.name}”`,
+      description: `Its ${g.count} contact(s) stay in it.`,
+      initial: g.name,
+      placeholder: 'Group name',
+      confirmLabel: 'Rename',
+      validate: (v) => (v.trim() ? null : 'Give the group a name'),
+    })
+    if (!name || name.trim() === g.name) return
+    try {
+      await patch(`/outbound/groups/${g.id}`, { name: name.trim() })
+      toast('Group renamed', 'success')
+      refreshAll()
+    } catch (e: any) {
+      toast(String(e?.message || e).includes('409')
+        ? 'A group with that name already exists'
+        : `Rename failed: ${e?.message || e}`, 'error')
     }
   }
 
@@ -214,12 +242,19 @@ export default function Contacts() {
     try {
       const form = new FormData()
       form.append('file', file)
-      const r = await postForm<{ ok: boolean; added?: number; duplicates?: number; parse_errors?: number; reason?: string }>(
-        '/outbound/contacts/upload', form,
-      )
+      // Import into the group you are standing in. Every import used to land in
+      // No group regardless of the sidebar selection, so filling "Marketing"
+      // from a spreadsheet meant re-filing every row by hand afterwards.
+      if (typeof groupSel === 'number') form.append('group_id', String(groupSel))
+      const r = await postForm<{
+        ok: boolean; added?: number; duplicates?: number; moved?: number
+        parse_errors?: number; reason?: string
+      }>('/outbound/contacts/upload', form)
       if (r.ok) {
-        toast(`Imported ${r.added} contact(s)` +
+        const into = typeof groupSel === 'number' ? ` into ${groupName(groupSel)}` : ''
+        toast(`Imported ${r.added} contact(s)${into}` +
           (r.duplicates ? `, ${r.duplicates} duplicate(s) skipped` : '') +
+          (r.moved ? `, ${r.moved} existing moved in` : '') +
           (r.parse_errors ? `, ${r.parse_errors} row(s) unreadable` : ''),
           'success')
         refreshAll()
@@ -234,11 +269,12 @@ export default function Contacts() {
     }
   }
 
-  /** Sidebar row: a real <button> (keyboard operable) + optional delete action
-   *  as a sibling — buttons must not nest. */
+  /** Sidebar row: a real <button> (keyboard operable) + optional rename/delete
+   *  actions as siblings — buttons must not nest. */
   const sidebarItem = (
     active: boolean, label: string, count: number | undefined,
-    onClick: () => void, icon: React.ReactNode, onDelete?: () => void,
+    onClick: () => void, icon: React.ReactNode,
+    onDelete?: () => void, onRename?: () => void,
   ) => (
     <div
       key={label}
@@ -257,6 +293,17 @@ export default function Contacts() {
         <span className="min-w-0 flex-1 truncate">{label}</span>
         {count != null && <span className="tabular-nums text-2xs text-dim">{count}</span>}
       </button>
+      {onRename && (
+        <button
+          type="button"
+          onClick={onRename}
+          aria-label={`Rename group ${label}`}
+          title="Rename group"
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-dim transition-opacity hover:text-soft lg:opacity-0 lg:group-focus-within:opacity-100 lg:group-hover:opacity-100"
+        >
+          <Pencil size={12} />
+        </button>
+      )}
       {onDelete && (
         <button
           type="button"
@@ -312,9 +359,17 @@ export default function Contacts() {
             {groups.map((g) =>
               sidebarItem(groupSel === g.id, g.name, g.count, () => setGroupSel(g.id),
                 groupSel === g.id ? <FolderOpen size={14} /> : <Folder size={14} />,
-                () => removeGroup(g)),
+                () => removeGroup(g), () => renameGroup(g)),
             )}
           </div>
+          {/* Where Add contact and Import CSV will actually put people. Both
+              follow the sidebar selection, which is not obvious until an import
+              lands somewhere you did not expect. */}
+          <p className="mt-3 border-t border-[var(--border)] px-1 pt-3 text-2xs leading-snug text-dim">
+            {typeof groupSel === 'number'
+              ? <>New contacts and CSV imports go into <span className="font-semibold text-soft">{groupName(groupSel)}</span>.</>
+              : 'New contacts and CSV imports start with no group — pick a group first to file them as they arrive.'}
+          </p>
         </Card>
 
         {/* Contact list */}
@@ -361,7 +416,7 @@ export default function Contacts() {
                         <TD>{groupName(c.group_id) ? <Badge tone="mint" soft>{groupName(c.group_id)}</Badge> : <span className="text-xs text-dim">No group</span>}</TD>
                         <TD className="tabular-nums">{c.call_count || <span className="text-dim">—</span>}</TD>
                         <TD className="whitespace-nowrap text-xs text-dim">
-                          {c.last_called_at ? c.last_called_at.slice(0, 10) : '—'}
+                          {fmtDate(c.last_called_at)}
                         </TD>
                         <TD className="max-w-[260px]">
                           <span className="block truncate text-xs text-dim" title={detailsPreview(c.details)}>

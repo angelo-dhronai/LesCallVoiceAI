@@ -6,9 +6,13 @@ or completed naturally. Uses a per-instance flag set in stop() override
 because the parent's _cancelled flag is cleared by _reset() before
 speak() returns — so it can't be read after await super().speak().
 
-Credit is always recorded (Sarvam receives the full text in the HTTP
-request regardless of mid-stream cancellation), but completed=False
-lets the report distinguish barge-in waste from full utterances.
+Cost is recorded against the characters Sarvam actually RECEIVED, which
+is not the same as the characters we asked for: speak() synthesizes an
+utterance as a sequence of clause-sized HTTP requests and breaks out of
+that loop on barge-in, so the tail clauses are never POSTed and never
+billed. The parent reports the submitted total via
+_last_speak_billed_chars; `chars` is still reported alongside it so the
+report can show intended-vs-billed (barge-in waste).
 """
 
 from __future__ import annotations
@@ -47,7 +51,12 @@ class TrackingSarvamTTS(SarvamTTS):
         # parent's _reset() has already cleared _cancelled — use our flag
         completed = not self._speak_was_cancelled
         self._speak_was_cancelled = False
+        # _reset() leaves _last_speak_billed_chars intact (it clears only
+        # _cancelled / _playing), so this is the count for THIS utterance.
+        billed = getattr(self, "_last_speak_billed_chars", chars)
         # Schedule as a task so speak() returns without blocking on file I/O
         asyncio.ensure_future(
-            self._tracker.record_tts(call_id, chars, completed=completed)
+            self._tracker.record_tts(
+                call_id, chars, completed=completed, billed_chars=billed
+            )
         )

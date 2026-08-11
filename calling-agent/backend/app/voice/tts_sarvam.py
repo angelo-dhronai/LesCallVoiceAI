@@ -275,6 +275,11 @@ class SarvamTTS(StreamingTTS):
         # Canned-audio cache capture (see speak_cached)
         self._capture_buf: bytearray | None = None
         self._last_speak_clean = False
+        # Characters actually POSTed to Sarvam by the last speak() — the
+        # billable quantity. Differs from len(text) when barge-in cuts the
+        # part loop short. Survives _reset() (which clears only _cancelled /
+        # _playing) so the credit-tracking subclass can read it afterwards.
+        self._last_speak_billed_chars = 0
         # Set when a mid-stream stall truncated the utterance — such audio
         # must never be cached (it would replay truncated forever).
         self._stream_truncated = False
@@ -350,6 +355,9 @@ class SarvamTTS(StreamingTTS):
     async def speak(self, text: str) -> None:
         self._reset()
         self._playing = True
+        # Zero until a part is actually submitted — every early return below
+        # leaves Sarvam untouched, and so must leave the bill untouched.
+        self._last_speak_billed_chars = 0
 
         if not self._api_key:
             logger.warning("[TTS:Sarvam] No API key — skipping")
@@ -399,6 +407,9 @@ class SarvamTTS(StreamingTTS):
                 early_flushed = False
                 unflushed_bytes = 0
                 ceiling_bytes = int(self._sample_rate * 2 * _MAX_FLUSH_S)
+                # This part is about to be POSTed — bill it. Parts after a
+                # barge-in never reach here, so they are never charged.
+                self._last_speak_billed_chars += len(part)
                 async for chunk in self._stream_audio(part):
                     if self._cancelled:
                         logger.info("[TTS:Sarvam] Cancelled mid-stream")

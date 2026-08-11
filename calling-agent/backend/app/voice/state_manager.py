@@ -93,6 +93,67 @@ _CORRECTION_MARKER_RE = re.compile(
     r"\b(actually|nahi|नहीं|nahin|galat|wrong|change|correct|sorry|"
     r"i meant|make it|instead|update)\b", re.IGNORECASE)
 
+# ---------------------------------------------------------------------------
+# Caller identity (2026-08-06)
+#
+# When the dialled contact's name is already known — an outbound list, or a
+# contacts row for an inbound caller — the agent opens with it ("Am I speaking
+# with Harshal?"). That name is authoritative. A live call proved what happens
+# without this: ASR heard "मैं रवि रेडी हूँ" (all four Sarvam decodes of the
+# original audio agree on "रवि"), the background slot-extractor read it as
+# "I am Ravi", and because the agent's own `customer_name` collect slot had
+# never been seeded from the CRM it counted as MISSING and was filled from that
+# one token. The prompt then re-published it as "✓ ground truth — never re-ask",
+# and the agent addressed Harshal as Ravi until he objected and hung up.
+#
+# So a known identity is LOCKED: background extraction (regex/LLM) may not
+# overwrite it. Only two things can — an explicit answer to a name question the
+# agent actually asked (source "system"/"answer"), or the caller explicitly
+# saying to change it. Everything else is a mishearing by definition, because
+# the caller already told us who they are.
+_IDENTITY_SLOT_NAMES = frozenset({
+    "name", "customer_name", "contact_name", "caller_name", "client_name",
+    "full_name", "person_name", "lead_name", "customer", "your_name",
+    "first_name", "prospect_name", "guest_name", "user_name",
+})
+
+# An explicit instruction to change the stored name — NOT a bare assertion.
+# "मैं रवि रेडी हूँ" must not unlock; "actually my name is Ravi" must.
+_NAME_CHANGE_RE = re.compile(
+    r"(?:"
+    r"\b(?:actually|sorry|no|not)\b[^.?!]{0,40}\b(?:name|naam)\b"
+    r"|\b(?:my|the)\s+name\s+(?:is|are|isn'?t|is\s+not)\b"
+    r"|\bname\s+(?:is\s+)?(?:wrong|incorrect|galat)\b"
+    r"|\b(?:call|address)\s+me\b"
+    r"|\bi'?m\s+not\b[^.?!]{0,30}\bi'?m\b"
+    r"|\b(?:mera|मेरा)\s*(?:naam|नाम)\b"
+    r"|\b(?:maru|મારું)\s*(?:naam|નામ)\b"
+    r"|\b(?:naam|नाम|નામ)\s*(?:badal|बदल|બદલ|change|update)"
+    r"|(?:नाम|નામ)\s*(?:है|छे|छ)\b"
+    r")", re.IGNORECASE)
+
+
+def is_identity_slot(slot_name: str) -> bool:
+    """True for slots that hold WHO the caller is.
+
+    Matched on the canonical name so agents built later — including anything
+    the Copilot writes — are covered without needing a new flag in their YAML.
+    """
+    n = (slot_name or "").strip().lower()
+    if n in _IDENTITY_SLOT_NAMES:
+        return True
+    # "customer_full_name", "contact person name", … — a name-ish tail with a
+    # person-ish head. Deliberately narrow: "company_name"/"project_name"/
+    # "policy_name" are NOT identities and must keep behaving exactly as before.
+    return bool(re.fullmatch(
+        r"(?:customer|client|caller|contact|lead|prospect|guest|person|user|your)"
+        r"[_\s-]*(?:full[_\s-]*)?name", n))
+
+
+def wants_name_change(utterance: str) -> bool:
+    """True only when the caller explicitly asks us to use a different name."""
+    return bool(_NAME_CHANGE_RE.search(utterance or ""))
+
 
 def format_readback(value: Any, mode: str) -> str:
     """Format a captured value for spoken read-back confirmation (D5)."""
@@ -262,6 +323,10 @@ class ConversationStateManager:
         self.skipped: set[str] = set()           # max_asks exhausted
         self.readback_done: set[str] = set()     # read-back confirmed slots
         self.extra_flags: dict[str, Any] = {}    # e.g. whatsapp_promised (→ collected_data)
+        # Identity slots seeded from a KNOWN contact (see _IDENTITY_SLOT_NAMES).
+        # Empty for an unknown caller, so those calls keep today's behaviour
+        # exactly — nothing is locked that was never known in the first place.
+        self.identity_locked: set[str] = set()
         # Precompile per-slot patterns/synonyms (hot path stays <1 ms).
         for s in self.slots.values():
             s._compiled_patterns = []
@@ -550,6 +615,22 @@ class ConversationStateManager:
             # www.gmail.com") as ground truth; fill_only then made it
             # immortal. LLM extraction may not touch these slots at all,
             # and no source may store a value that fails the validator.
+            # The caller already told us who they are (CRM name, confirmed on
+            # the opening line). Background extraction never gets to revise
+            # that from a mis-heard token — only a name question the agent
+            # actually asked ("system"/"answer") or an explicit request to
+            # change it. See _IDENTITY_SLOT_NAMES for why this exists.
+            if (key in self.identity_locked
+                    and source not in ("system", "answer")
+                    and not wants_name_change(utterance)):
+                self.update_audit_log(
+                    key, old, old, source,
+                    f"REJECTED {source} write {new!r} (identity confirmed as "
+                    f"{old!r}; no explicit name change): {(utterance or '')[:80]}")
+                logger.info(
+                    "[IDENTITY] kept %r, rejected %s guess %r from %r",
+                    old, source, new, (utterance or "")[:60])
+                continue
             if slot_type in ("email", "phone") and source in ("llm", "answer"):
                 self.update_audit_log(
                     key, old, old, source,
@@ -765,6 +846,19 @@ class ConversationStateManager:
         lines.append("RULES:")
         lines.append("  • NEVER ask about any ✓ field — the caller already told you. "
                       "Acknowledge ✓ facts naturally when relevant.")
+        # Without this the model still "corrects" the name mid-call off a
+        # mis-heard token, even though merge_state refuses to store it — and a
+        # caller who is addressed by the wrong name does not care which layer
+        # invented it.
+        _locked = [n for n in self.identity_locked if self.state.get(n)]
+        if _locked:
+            lines.append(
+                f"  • The caller's name is already confirmed: "
+                f"{self.state[_locked[0]]}. Keep using it. Do NOT infer a "
+                f"different name from anything you hear — names inside a "
+                f"sentence are usually mis-heard words. Change it ONLY if the "
+                f"caller explicitly says it is wrong or asks to be called "
+                f"something else.")
         # v2: read-back instruction for filled-but-unconfirmed readback slots.
         readback_due = [
             n for n, spec in self.slots.items()
@@ -845,6 +939,49 @@ class ConversationStateManager:
         old = self.state.get(field_name)
         self.state[field_name] = value
         self.update_audit_log(field_name, old, value, source)
+
+    def seed_identity(self, value: str, source: str = "crm") -> list[str]:
+        """Seed every identity slot with the KNOWN contact name and lock it.
+
+        Called once per call, before the greeting, whenever the platform
+        already knows who it dialled (outbound list) or who is calling
+        (contacts row). Two things happen, and both matter:
+
+          * the slot stops being MISSING, so the background extractor — which
+            only ever targets missing slots — never goes looking for a name;
+          * the slot is locked, so nothing but an explicit correction can
+            change it (see merge_state).
+
+        Only fills slots that are still empty: a value already captured this
+        call is the caller's own words and outranks the CRM.
+        """
+        value = (value or "").strip()
+        if not value:
+            return []
+        seeded: list[str] = []
+        for name in self.slots:
+            if not is_identity_slot(name):
+                continue
+            self.identity_locked.add(name)
+            if self.state.get(name) is None:
+                self.state[name] = value
+                self.update_audit_log(name, None, value, source,
+                                      "known contact — seeded before greeting")
+                seeded.append(name)
+        if seeded:
+            logger.info("[IDENTITY] seeded+locked %s = %r (%s)",
+                        ", ".join(seeded), value, source)
+        elif self.identity_locked:
+            logger.info("[IDENTITY] locked %s (already held a value)",
+                        ", ".join(sorted(self.identity_locked)))
+        return seeded
+
+    def unlock_identity(self, reason: str = "") -> None:
+        """Release the lock — the caller explicitly asked us to use a
+        different name, so subsequent turns may refine it normally."""
+        if self.identity_locked:
+            logger.info("[IDENTITY] unlocked (%s)", reason or "caller request")
+        self.identity_locked.clear()
 
     def mark_pending(self, field_name: str) -> None:
         """Field captured but awaiting caller confirmation (e.g. name)."""

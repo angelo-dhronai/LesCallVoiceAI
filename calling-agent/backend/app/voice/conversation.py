@@ -22,10 +22,62 @@ import time
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 from openai import AsyncOpenAI
 
 from .memory import ConversationMemory, BookingData, CallState
+from . import prompt_cache as _prompt_cache
+
+# Ask the provider to append a usage block to the stream. Until 2026-08-11 the
+# platform recorded ZERO LLM tokens, so half the cost of a call was
+# unmeasurable — this is what makes it measurable. Two behaviours it drags in,
+# both handled below: the usage chunk arrives with an EMPTY `choices` list
+# (indexing it unguarded raises IndexError mid-turn), and a provider that
+# rejects the parameter must not be allowed to fail the turn.
+# ENABLE_LLM_USAGE_TELEMETRY=false restores the previous blind behaviour.
+_LLM_USAGE_TELEMETRY = (
+    os.environ.get("ENABLE_LLM_USAGE_TELEMETRY", "true").lower() == "true")
+
+
+def _is_param_rejection(exc: Exception) -> bool:
+    """True only when the provider rejected the REQUEST SHAPE, not the request.
+
+    The distinction is load-bearing. `stream_options` is an optional telemetry
+    ask, so an unsupported-parameter error should disable it and retry — but a
+    429, a timeout or a 5xx says nothing about parameter support, and treating
+    one as such disables cost telemetry for the life of the process on the
+    first quota blip. That is exactly what happened on the first live call
+    after deploy (2026-08-11): the free tier's 20-requests-per-DAY cap was
+    already spent, every turn 429'd, and the first one switched telemetry off
+    permanently — so a call that made 7 LLM requests recorded none.
+
+    Deliberately narrow: only a 400/422 whose message actually names the
+    parameter counts. Anything unrecognised is NOT a param rejection, so the
+    request takes the normal fallback path with telemetry left intact.
+    """
+    status = getattr(exc, "status_code", None)
+    if status not in (400, 422):
+        return False
+    msg = str(exc).lower()
+    return ("stream_options" in msg or "stream options" in msg
+            or "include_usage" in msg)
+
+
+def _credit_tracker():
+    """The credit tracker singleton, or None if unavailable.
+
+    Imported lazily and defensively: credit_tracker reaches for `shared/` via a
+    sys.path insert that only holds in the deployed layouts, and a conversation
+    engine that cannot be constructed because a COST LEDGER failed to import
+    would be a self-inflicted outage. Cost telemetry is strictly optional to
+    the call path.
+    """
+    try:
+        from .credit_tracker import SarvamCreditTracker
+        return SarvamCreditTracker.get()
+    except Exception:  # pragma: no cover - import-environment dependent
+        return None
 from .stt.post_processor import match_location, match_bhk
 from ..agent_definition import AgentDefinition, get_pramukh_agent
 
@@ -933,6 +985,7 @@ class ConversationRouter:
         timeout: float | None = None,
         default_language: str = "hi",
         agent_def: AgentDefinition | None = None,
+        call_id_provider: "Callable[[], str | None] | None" = None,
     ) -> None:
         # Agent definition drives all domain-specific behaviour. It MUST be
         # explicit: the old `agent_def or get_pramukh_agent()` fallback meant a
@@ -967,6 +1020,14 @@ class ConversationRouter:
         # rejects the param.
         _reff = os.environ.get("LLM_REASONING_EFFORT", "").strip()
         self._llm_extra: dict = {"reasoning_effort": _reff} if _reff else {}
+        # Cost telemetry. Same call_id the TTS/STT trackers use, so one call's
+        # speech and token spend land on the same ledger row; None in contexts
+        # that have no call (tests, CLI single-turn) and the tracker no-ops.
+        self._call_id_provider = call_id_provider
+        # Set False by the first provider that rejects stream_options, so the
+        # retry-without-usage path is taken once and then remembered for the
+        # life of the process instead of costing a rejected request per turn.
+        self._llm_usage_supported: bool = _LLM_USAGE_TELEMETRY
         # Model provenance, once per call. LLM_MODEL/LLM_REASONING_EFFORT live
         # in a gitignored .env read at process start, so a model change leaves
         # no commit and no record — the 08-01 bump had to be reconstructed
@@ -1213,12 +1274,40 @@ class ConversationRouter:
             # the prompt still instructs an identity confirmation first.
             if not self.memory.call_state.customer_name:
                 self.memory.call_state.customer_name = self.outbound_contact_name
+            # CallState is only half the story: the agent's own name COLLECT
+            # slot is a separate store, and leaving it empty is what let a
+            # mis-heard token overwrite a known contact (see seed_identity).
+            self._seed_identity_slots(self.outbound_contact_name)
         if contact_phone:
             self.outbound_contact_phone = contact_phone.strip()
         if conn_id:
             self.conn_id = conn_id
         logger.info("[CONTEXT] direction=%s contact=%r", self.call_direction,
                     self.outbound_contact_name or None)
+
+    def _seed_identity_slots(self, name: str) -> None:
+        """Hand a KNOWN contact name to the slot layer, before the greeting.
+
+        Never fatal: an agent with no name slot, or a state manager not built
+        yet, must not cost the call. Also marks the legacy name flow satisfied
+        so the confirm-the-name loop doesn't re-ask for something the CRM
+        already told us and the caller confirmed on the opening line."""
+        name = (name or "").strip()
+        if not name:
+            return
+        try:
+            sm = getattr(self, "state_mgr", None)
+            if sm is None:
+                return
+            sm.seed_identity(name, source="crm")
+            # The legacy booking/name path has its own confirmation loop; a
+            # known contact is already past it.
+            if not self.memory.booking.user_name:
+                self.memory.booking.user_name = name
+                self.memory.context.user_name = name
+            self._name_confirmed = True
+        except Exception:
+            logger.exception("[IDENTITY] seeding failed (continuing)")
 
     def set_callback_context(self, context_note: str,
                              meta: dict | None = None) -> None:
@@ -1248,6 +1337,7 @@ class ConversationRouter:
             self.outbound_contact_name = name
             if not self.memory.call_state.customer_name:
                 self.memory.call_state.customer_name = name
+            self._seed_identity_slots(name)
         logger.info("[CONTEXT] known customer: name=%r calls=%s digest=%dch",
                     name or None, ctx.get("calls_count"),
                     len(ctx.get("digest") or ""))
@@ -3085,6 +3175,15 @@ class ConversationRouter:
         # off-limits too — email digressions are full of name-shaped noise.
         if self._capture_slot is not None:
             missing = [m for m in missing if m != "name"]
+        # A locked identity is no longer "missing", so the extractor would
+        # never see the one utterance that IS allowed to change it. Re-offer
+        # those slots exactly when the caller explicitly asks for a different
+        # name — merge_state applies the same test before storing anything.
+        if self._capture_slot is None:
+            from .state_manager import wants_name_change
+            if wants_name_change(text):
+                missing = list(dict.fromkeys(
+                    list(missing) + sorted(self.state_mgr.identity_locked)))
         if not missing:
             return
         if self._slot_extract_task and not self._slot_extract_task.done():
@@ -4151,11 +4250,15 @@ class ConversationRouter:
         _first_emitted = False
         deadline = time.monotonic() + self._def.llm_config.stream_timeout_s
 
+        _spoke_model = self._model
+        _usage = None
         try:
             # Primary LLM, with automatic fallback: Groq's free tier has a
             # shared tokens-per-day cap — when the primary fails (429/quota/
             # auth/network), retry ONCE on the fallback provider instead of
             # dropping the caller to a canned "please repeat" line.
+            _usage_kwargs = ({"stream_options": {"include_usage": True}}
+                             if self._llm_usage_supported else {})
             try:
                 stream = await client.chat.completions.create(
                     model=self._model,
@@ -4163,31 +4266,89 @@ class ConversationRouter:
                     max_tokens=self._def.llm_config.max_tokens,
                     temperature=0.7,
                     stream=True,
+                    **_usage_kwargs,
                     **_tool_kwargs,
                     **self._llm_extra,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as _primary_exc:
-                fb = self._get_fallback_client()
-                if fb is None:
-                    raise
-                logger.warning(
-                    "[LLM] Primary (%s) failed: %s — falling back to %s",
-                    self._model, _primary_exc, self._fallback_model,
-                )
-                # Fidelity record: a different model spoke this turn.
-                if self._fallback_model not in self.llm_models_used:
-                    self.llm_models_used.append(self._fallback_model)
-                self.llm_fallback_turns += 1
-                stream = await fb.chat.completions.create(
-                    model=self._fallback_model,
-                    messages=messages,
-                    max_tokens=self._def.llm_config.max_tokens,
-                    temperature=0.7,
-                    stream=True,
-                    **_tool_kwargs,
-                )
+                # Telemetry must never cost a turn. If the provider rejected
+                # the usage ask ITSELF, retry the primary without it before
+                # writing the model off as failed — dropping to the fallback
+                # model over an unsupported optional parameter would silently
+                # change which model speaks to every caller. Any other failure
+                # (429, timeout, 5xx) is a real failure: fall through to the
+                # normal fallback and LEAVE TELEMETRY ON, because a quota blip
+                # says nothing about whether the parameter is supported.
+                if _usage_kwargs and _is_param_rejection(_primary_exc):
+                    self._llm_usage_supported = False
+                    logger.warning(
+                        "[LLM] stream_options rejected by %s (%s) — usage "
+                        "telemetry disabled for this process, retrying",
+                        self._model, _primary_exc)
+                    try:
+                        stream = await client.chat.completions.create(
+                            model=self._model,
+                            messages=messages,
+                            max_tokens=self._def.llm_config.max_tokens,
+                            temperature=0.7,
+                            stream=True,
+                            **_tool_kwargs,
+                            **self._llm_extra,
+                        )
+                        _primary_exc = None
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as _retry_exc:
+                        _primary_exc = _retry_exc
+                if _primary_exc is not None:
+                    fb = self._get_fallback_client()
+                    if fb is None:
+                        raise _primary_exc
+                    logger.warning(
+                        "[LLM] Primary (%s) failed: %s — falling back to %s",
+                        self._model, _primary_exc, self._fallback_model,
+                    )
+                    # Fidelity record: a different model spoke this turn.
+                    if self._fallback_model not in self.llm_models_used:
+                        self.llm_models_used.append(self._fallback_model)
+                    self.llm_fallback_turns += 1
+                    _spoke_model = self._fallback_model
+                    # The fallback is not a rare path: with the primary's
+                    # free-tier day quota spent, it serves EVERY turn, so
+                    # leaving it unmetered would leave the real bill unmeasured
+                    # exactly when it matters. Same retry-without guard as the
+                    # primary — the fallback has nowhere further to fall, so a
+                    # rejected optional parameter must not be fatal here.
+                    try:
+                        stream = await fb.chat.completions.create(
+                            model=self._fallback_model,
+                            messages=messages,
+                            max_tokens=self._def.llm_config.max_tokens,
+                            temperature=0.7,
+                            stream=True,
+                            **_usage_kwargs,
+                            **_tool_kwargs,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as _fb_exc:
+                        if not _usage_kwargs or not _is_param_rejection(_fb_exc):
+                            raise
+                        self._llm_usage_supported = False
+                        logger.warning(
+                            "[LLM] stream_options rejected by fallback %s — "
+                            "usage telemetry off for this process",
+                            self._fallback_model)
+                        stream = await fb.chat.completions.create(
+                            model=self._fallback_model,
+                            messages=messages,
+                            max_tokens=self._def.llm_config.max_tokens,
+                            temperature=0.7,
+                            stream=True,
+                            **_tool_kwargs,
+                        )
 
             buffer = ""
             timed_out = False
@@ -4204,6 +4365,24 @@ class ConversationRouter:
                                    self._def.llm_config.stream_timeout_s)
                     timed_out = True
                     break
+                # Token counts, wherever the provider chose to put them. The
+                # two backends disagree and BOTH shapes have to work: OpenAI
+                # appends a final chunk with an EMPTY choices list carrying
+                # usage, while Gemini's compat layer hangs usage off a chunk
+                # that also carries content (measured 2026-08-11 — reading it
+                # only from empty-choice chunks recorded zero requests against
+                # a live Gemini call). Last writer wins; usage is cumulative
+                # for the request, not per-chunk.
+                if getattr(chunk, "usage", None):
+                    _usage = chunk.usage
+                # An empty choices list is not an error — it is OpenAI's usage
+                # chunk, and some providers send interim keepalives the same
+                # way. Unguarded, chunk.choices[0] below raises IndexError,
+                # the outer handler swallows it, and the caller hears the
+                # generic fallback line INSTEAD of the reply the model just
+                # streamed, on every single turn.
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta
                 if _tool_acc is not None and getattr(delta, "tool_calls", None):
                     _tool_acc.add_delta(delta.tool_calls)
@@ -4231,6 +4410,8 @@ class ConversationRouter:
                                 _validate_response(sentence, self.state.language,
                                                    self._def.llm_config.max_response_length))
                             _first_emitted = True
+
+            self._record_llm_usage(_usage, _spoke_model, system)
 
             if _tool_acc is not None and _tool_acc.has_calls:
                 self._pending_tool_proposals = _tool_acc.finish()
@@ -4260,6 +4441,58 @@ class ConversationRouter:
         except Exception as exc:
             logger.error("[LLM] Stream failed: %s", exc)
             yield self._def.response_bank.lang_fallbacks.get(self.state.language, self._def.response_bank.response_fallback)
+
+    # ------------------------------------------------------------------
+    # Cost telemetry
+    # ------------------------------------------------------------------
+
+    def _record_llm_usage(self, usage, model: str, system_prompt: str,
+                          request_type: str = "turn") -> None:
+        """Hand one request's provider-reported token counts to the ledger.
+
+        Silent no-op when `usage` is None — which is the case for the fallback
+        provider and for any process where stream_options was rejected. A
+        missing request is visibly missing (llm_requests lags the turn count);
+        substituting a local tokenizer estimate would put a guess in a cost
+        report where it reads as measurement.
+
+        Fire-and-forget: the ledger append is file I/O and the caller is a
+        streaming generator with a live caller on the line. Nothing here may
+        raise into the turn, so the whole body is defensive.
+        """
+        if usage is None:
+            return
+        try:
+            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            # `prompt_tokens_details` is where OpenAI reports the cached
+            # prefix. Gemini's OpenAI-compat endpoint returns it as null
+            # (measured 2026-08-11), so this stays 0 there — the compat layer
+            # gives us no way to see a cache hit even once the quota exists.
+            details = getattr(usage, "prompt_tokens_details", None)
+            cached = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
+            if not prompt_tokens and not completion_tokens:
+                return
+            fingerprint = _prompt_cache.prefix_fingerprint(system_prompt)
+            tracker = _credit_tracker()
+            if tracker is None:
+                return
+            call_id = (self._call_id_provider() if self._call_id_provider
+                       else None)
+            asyncio.ensure_future(tracker.record_llm(
+                call_id, model, prompt_tokens, completion_tokens,
+                cached_input_tokens=cached, request_type=request_type,
+                prefix_fingerprint=fingerprint,
+            ))
+            # One line per turn carrying the cacheable-prefix hash. Two turns
+            # of one call showing different hashes means the static band is no
+            # longer static and prompt caching cannot work — the failure is
+            # otherwise invisible until a bill arrives.
+            logger.info(
+                "[LLM-USAGE] model=%s in=%d cached=%d out=%d prefix=%s",
+                model, prompt_tokens, cached, completion_tokens, fingerprint)
+        except Exception:
+            logger.debug("[LLM-USAGE] record failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # System prompt — Pramukh Group domain
@@ -4352,17 +4585,66 @@ class ConversationRouter:
         _free_slots = [] if b.appointment_time else self._available_calendar_slots()
         _cal_lines = pb.calendar_block(self._def, b.appointment_time, _free_slots)
 
+        # Layout is CACHE-ORDERED (2026-08-10). Every turn of a call re-sends
+        # this entire prompt, so what it costs is decided by how much of it
+        # the provider can serve from its implicit prefix cache — cached input
+        # is 10x cheaper than fresh input. A prefix caches only up to the
+        # first byte that differs, so blocks are banded by how often they
+        # change:
+        #
+        #   STATIC   — identical for (agent, language) on every turn of every
+        #              call. This is the cached prefix; it must come FIRST.
+        #   PER-CALL — fixed once the call starts (direction, who the caller
+        #              is). Caches across the turns of a single call.
+        #   PER-TURN — stage, slots, goal, calendar. Nothing at or after the
+        #              first of these can ever cache, so they come LAST.
+        #
+        # Before this, ━━ CALL STATE ━━ sat at character 2,221 of a 12,724-
+        # character prompt: the cacheable prefix was ~550 tokens, under the
+        # provider's minimum, so ~3,200 tokens were billed fresh every turn
+        # even though 92% of consecutive prompts are byte-identical.
+        #
+        # Promoting a block to an earlier band is a real saving; demoting one
+        # costs tokens on every turn of every call. Relative order WITHIN a
+        # band is load-bearing prose ("the section above", "the END-CALL
+        # RULES below") — do not reshuffle it. Recency agrees with the split:
+        # the live state and the goal now sit closest to the caller's words.
         parts = [
+            # ── STATIC — the cached prefix ──────────────────────────────────
             # Language lock FIRST — highest priority
             lang_header.get(lang, lang_header["en"]),
-            *name_confirm_block,
             *pb.identity_block(self._def),
             *pb.mission_block(self._def),
-            *_direction_lines,
             *pb.brand_block(self._def),
+            *pb.portfolio_block(self._def, lang),
+            # Stays directly after the portfolio: its own text says "the
+            # section above is your ONLY source of truth".
+            *pb.knowledge_grounding_block(self._def),
+            *pb.guidelines_block(self._def),
+            *_personality_lines,
+            *pb.style_block(self._def),
+            *pb.anti_repetition_block(self._def),
+            *pb.objection_block(self._def, lang),
+            # Its fabrication rule says "not listed above" — must stay after
+            # the portfolio/knowledge sections.
+            *pb.firm_rules_block(self._def, lang),
+            *pb.call_closure_block(self._def, lang),
+
+            # ── PER-CALL — stable from the first turn to the last ───────────
+            *_direction_lines,
             *pb.customer_context_block(self.customer_context),
+
+            # ── PER-TURN — changes every turn; nothing below here caches ────
+            # The ━━ CALL STATE ━━ header is the cache boundary itself
+            # (prompt_cache.STATIC_PREFIX_MARKER), so it has to be the FIRST
+            # per-turn thing emitted. name_confirm_block used to sit above it:
+            # empty in every golden fixture, so nothing caught it, but on a
+            # live call the turn after a caller gives their name it appears
+            # INSIDE the supposedly-static prefix and breaks the cache for
+            # that turn. Anything conditional on this turn belongs below.
             "",
             "━━ CALL STATE ━━",
+            *name_confirm_block,
             f"Stage: {self.state.stage}  |  Language: {lang_name}  |  Turn: {self.state.turn_count}",
             *([f"  · Visit scheduled: {b.appointment_time}"] if b.appointment_time else []),
             *(["  · Phone: captured (stored internally — never repeat it back)"]
@@ -4404,16 +4686,9 @@ class ConversationRouter:
             stage_goal,
             *pb.match_rules_block(self._def, dict(self.state_mgr.state),
                                   self._stage_role()),
+            # Calendar stays after ━━ CALL STATE ━━: it returns [] once a
+            # visit is booked, on the grounds that CALL STATE already said so.
             *_cal_lines,
-            *pb.portfolio_block(self._def, lang),
-            *pb.knowledge_grounding_block(self._def),
-            *pb.guidelines_block(self._def),
-            *_personality_lines,
-            *pb.style_block(self._def),
-            *pb.anti_repetition_block(self._def),
-            *pb.objection_block(self._def, lang),
-            *pb.firm_rules_block(self._def, lang),
-            *pb.call_closure_block(self._def, lang),
         ]
 
         # C2 (2026-07-31): while an email capture is armed, the engine owns
@@ -6067,6 +6342,13 @@ class ConversationRouter:
         if ConversationRouter._warmup_done_flag:
             logger.debug("[CONV] LLM warmup skipped — already done this process")
             return
+        # Same once-per-process moment, and equally off the call path: ask the
+        # provider whether it will actually cache a repeated prompt prefix.
+        # The answer decides whether ~86% of every turn's input tokens are
+        # billed fresh, and before this it was not visible anywhere. Detached
+        # task — a hung probe must never delay the warmup or a call.
+        _prompt_cache.spawn_capability_probe(
+            self._model, self._api_key, self._base_url)
         try:
             client = self._get_client()
             await client.chat.completions.create(

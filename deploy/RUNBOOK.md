@@ -2175,3 +2175,209 @@ redirected at a tmp tree. The load-bearing ones: independence after import,
 `is_active` stays 0, routing/bookings excluded, double-import, re-import after
 archive, revoked/expired/deleted-source, name-collision walk, cap refusal, and
 "a failed import leaves nothing behind".
+
+---
+
+## 27. LLM cost telemetry + prompt-cache readiness (2026-08-11) — AUDIT + SHIPPED
+
+Before this, the platform measured **half** its AI bill. `credit_tracker.py`
+knew every call's Sarvam credits to six decimals and recorded **zero LLM
+tokens**, so "what does a minute cost?" was unanswerable for the model that
+does the talking. This section is the audit that closed that gap and what it
+found.
+
+### 27.1 The measured cost of a call-minute
+
+All figures measured, not modelled. Sarvam from 46 days of `credit_log/*.jsonl`
+(3,375 real calls), turn rate from `call_turns` (106 calls / 196 min), token
+counts from the live endpoint.
+
+| Component | Rate | Measured usage | ₹/min |
+|---|---|---|---|
+| Sarvam STT `saarika:v2.5` | ₹30/hr, per-request ceil | 15–20 billed-sec/min | **0.14** |
+| Sarvam TTS `bulbul:v3` | ₹3/1K chars | ~650 chars/min | **1.95** |
+| Whisper fallback | ₹0.53/min | ~0 (never fires) | 0.00 |
+| LLM `gemini-3.5-flash` | $1.50/$9.00 per 1M | 3,311 in / 25 out per turn × 4.8 turns/min | **2.20**¹ |
+
+¹ **at list price. Actual LLM spend today is ₹0 — see 27.3.**
+
+Per-day Sarvam is stable at ₹1.93–2.19/min across 29 Jul – 8 Aug. **TTS is 93%
+of the Sarvam bill**; STT is noise.
+
+### 27.2 Where the LLM money is: the prompt, re-sent every turn
+
+Input is ~98% of the LLM bill. One turn = 3,311 input tokens vs 25 output. The
+system prompt is 12,724 characters ≈ 3,236 tokens and it is re-sent on all 4.8
+turns/minute.
+
+`_build_system_prompt` therefore emits its blocks in three bands — STATIC,
+PER-CALL, PER-TURN — so a provider prefix cache can serve the stable part.
+Measured across the golden fixtures (6 stages × 3 languages × 2 directions):
+
+    86% of the prompt is byte-identical across every stage
+    = 2,708–2,946 tokens, diverging exactly at "━━ CALL STATE ━━"
+
+That property is the entire precondition for prompt caching and nothing else in
+the repo checked it — a timestamp in the identity block would silently take it
+to zero. `tests/test_prompt_cache.py` now pins it, and `prompt_cache.
+prefix_fingerprint()` logs a hash of the static band on every turn so a break
+is visible in production the turn it happens.
+
+### 27.3 The blocker: the Gemini key is on the FREE TIER
+
+Probed live 2026-08-11 against `LLM_API_KEY`:
+
+| Probe | Result |
+|---|---|
+| 6 consecutive byte-identical 3,226-token prefixes | `cachedContentTokenCount = 0` every time |
+| `cachedContents.create`, all 4 fleet models | `429 TotalCachedContentStorageTokensPerModelFreeTier limit exceeded: limit=0` |
+| `generateContent` burst | `429 … quotaValue: '5'` — **5 requests/minute** |
+
+Three consequences, in order of severity:
+
+1. **5 RPM is a hard scaling ceiling.** One call consumes 4.8 LLM turns/minute.
+   The platform can serve roughly **one concurrent call** before turns start
+   429ing. Today that is invisible because volume is low
+   (`llm_fallback_turns > 0` on 3 of 419 calls in 30 days).
+2. **Prompt caching is unavailable by policy, not by misconfiguration.**
+   Implicit and explicit both. No application code can change `limit=0`;
+   it needs billing enabled on the Google Cloud project.
+3. **LLM spend is currently ₹0.** The ₹2.20/min above is what the *same
+   traffic* costs the day billing is switched on — which it must be, per (1).
+
+### 27.4 What enabling billing is worth
+
+Measured token counts through the rate card in `shared/ai_pricing.py`:
+
+| | per turn | per call-minute | platform total |
+|---|---|---|---|
+| no prefix cache | ₹0.4586 | ₹2.20 | ₹4.29/min |
+| 2,800-token prefix cached | ₹0.1247 | ₹0.60 | **₹2.69/min** |
+
+**−73% of the LLM bill, −37% of the platform bill**, ₹1,603 saved per 1,000
+call-minutes. Sarvam's ₹2.09 is unaffected.
+
+Order of operations matters: enable billing → implicit caching begins serving
+the already-ordered prefix with no code change. Do not reorder the prompt to
+chase this; it is already ordered.
+
+### 27.5 What was deliberately NOT built
+
+Measured first, then declined — each of these is a standard optimisation that
+this codebase's data does not support:
+
+| Not built | Why — measured |
+|---|---|
+| Response/semantic cache | 2,621 agent utterances over 45 days: **85.5% are unique**. Nothing to hit, and replaying a stale reply into a live call is a correctness hazard for a ~0% gain. |
+| Wider TTS cache | Only **7.5%** of agent characters are exact repeats, and the top phrases are canned lines the disk cache in `tts_sarvam.speak_cached` already serves. Ceiling is ~₹0.15/min before dedupe, less after. |
+| Redis | Nothing needs it. There is no Redis in this deployment (Postgres + a disk cache), and the only genuinely cacheable artefact is the provider-side prompt prefix, which lives at the provider. |
+| Explicit `cachedContents` integration | The compat layer cannot reference a cache, and the tier returns `limit=0`, so the code path could not be tested. Untestable code on the live call path is worse than no code. |
+
+### 27.6 What shipped
+
+| File | Change |
+|---|---|
+| `shared/ai_pricing.py` | NEW. Central LLM rate card (USD/1M in · cached_in · out), `AI_PRICING_FILE`/`AI_PRICING_OVERRIDES`, USD→INR. Re-exports the Sarvam card so one import prices a whole call. Unpriced model → cost `None`, never `0.0`. |
+| `app/voice/prompt_cache.py` | NEW. `split_prompt()`, `prefix_fingerprint()`, `estimate_tokens()`, and `probe_cache_capability()` — which turns the free-tier finding into one startup log line instead of a silent leak. |
+| `app/voice/credit_tracker.py` | `record_llm()` + per-call/session LLM accumulators; `llm_event` rows in the same JSONL ledger as speech. |
+| `app/voice/conversation.py` | `stream_options={"include_usage": True}` on the streaming turn; usage captured and recorded; capability probe fired from `warmup()`. |
+| `conversation_call_bridge.py` | Passes the existing `call_id_provider` into the router so tokens and speech land on one ledger row. |
+| `credit_report.py` | LLM section: requests, models, in/out tokens, **prefix cache hit-rate**, cost, and a FLOOR-ONLY warning when a model is unpriced. |
+| `tests/test_prompt_cache.py` | NEW, 35 tests. Prefix stability per fixture group, provider-minimum check, fingerprint semantics, tier-variant mispricing, unpriced≠free, tracker accumulation. |
+
+### 27.7 Two traps this cost, for whoever touches it next
+
+**The usage chunk is provider-shaped.** OpenAI appends a final chunk with an
+EMPTY `choices` list carrying `usage`; **Gemini's compat layer hangs `usage`
+off a chunk that also has content.** Reading it only from empty-choice chunks
+recorded zero requests against a live Gemini call. Both shapes are handled —
+and the empty-`choices` guard is mandatory regardless: unguarded,
+`chunk.choices[0]` raises IndexError, the outer handler swallows it, and the
+caller hears the fallback line instead of the reply on *every* turn.
+
+**Tier suffixes are not release suffixes.** `gemini-3.5-flash-lite`
+`.startswith("gemini-3.5-flash")` is a naming coincidence; pricing it by naive
+prefix match overstated it 6×. `llm_rate()` matches segment-wise and rejects a
+match when an extra segment names a tier (`lite`, `mini`, `pro`, …).
+
+### 27.8 Feature flags
+
+    ENABLE_LLM_USAGE_TELEMETRY=true    # stream_options + ledger writes
+    ENABLE_PROMPT_CACHE_PROBE=true     # startup capability probe
+    PROMPT_CACHE_MIN_TOKENS=1024       # provider prefix floor used by the CI guard
+    AI_PRICING_FILE= / AI_PRICING_OVERRIDES=   # rate card without a code change
+    AI_USD_INR=88.33                   # matches WHISPER_PRICE_PER_MIN_INR
+
+Telemetry fails open everywhere: a provider that rejects `stream_options` gets
+one retry without it and the flag flips off for the process (it must never
+demote the turn to the fallback model); a tracker that cannot import is a
+no-op; the probe is a detached task that cannot delay a call.
+
+### 27.9 LIVE PROOF (2026-08-11, `docker restart lescall-runtime`)
+
+Deployed and verified with three full simulated calls through the real
+pipeline (`callsim`, real Sarvam + real LLM). What the live runs established:
+
+**The capability probe fires in production**, one line per process start:
+
+    [PROMPT-CACHE] gemini/gemini-3.5-flash: provider caching UNAVAILABLE —
+    free tier, cache quota is zero (…limit=0…) — enable billing on the Google
+    Cloud project. The static prompt prefix is re-billed fresh on every turn.
+
+**The cache-ordered prompt WORKS — measured, on a live call.** The primary's
+free-tier day quota was spent, so every turn fell back to `gpt-4o-mini`, whose
+automatic prompt caching *is* available. The ledger rows it wrote:
+
+    gpt-4o-mini in=3282 cached=1920 (58.5%) out=34  prefix=c09bdeae92b5
+    gpt-4o-mini in=3317 cached=1920 (57.9%) out=75  prefix=174f46c14bfb
+    gpt-4o-mini in=3330 cached=3200 (96.1%) out=62  prefix=174f46c14bfb
+    …
+    day total: 22,144 of 30,376 input tokens — 72.9% served from cache
+
+**96% prefix cache on a real turn.** The 27.4 projection is no longer a
+projection: give this prompt a provider that offers caching and it hits. The
+only thing between the platform and that saving on Gemini is the free tier.
+
+Note the stable `prefix=` hash across turns — that is the fingerprint doing its
+job. It changes once early (language lock re-renders the header) and then holds.
+
+### 27.10 The free tier's real cap is 20 requests per DAY
+
+The 5/minute limit in 27.3 is not the binding one. The live call surfaced:
+
+    quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier
+    quotaValue: '20'   model: gemini-3.5-flash
+
+**20 requests per day per model.** An average call is 8.8 turns, so the
+configured voice model is exhausted after roughly **two calls a day**, after
+which every turn silently falls back to `gpt-4o-mini` — a different model, a
+different persona-following ability, and a different bill. This is invisible
+without §27's telemetry: the fallback is logged per turn but nothing
+aggregated it, and `calls.llm_models_used` only records that it happened, not
+how often it dominated. Enabling billing fixes the cap and the caching in one
+action.
+
+### 27.11 Bug this deploy caught, and the guard added
+
+The first live call recorded ZERO tokens despite making 7 LLM requests. Cause:
+the retry-without-`stream_options` path treated **any** primary failure as
+"provider rejected the parameter" and latched `_llm_usage_supported = False`
+for the process. The first 429 (day quota) therefore disabled cost telemetry
+permanently — a telemetry feature defeated by the exact condition it exists to
+measure.
+
+`_is_param_rejection()` now narrows it to a 400/422 whose message actually
+names `stream_options`/`include_usage`. Quota, timeout, auth and 5xx take the
+normal fallback path with telemetry left armed. Pinned by
+`test_quota_error_is_not_mistaken_for_a_parameter_rejection`.
+
+The fallback provider now also sends `stream_options`: with the primary's day
+quota spent it serves every turn, and leaving it unmetered would leave the real
+bill unmeasured exactly when it matters.
+
+Separately, `name_confirm_block` was rendering ABOVE the ━━ CALL STATE ━━ cache
+boundary — empty in every golden fixture, so nothing caught it, but on a live
+call the turn after a caller gives their name it broke its own prefix. Moved
+below the marker (fixture-neutral: the goldens are byte-identical). Pinned by
+`test_pending_name_does_not_break_the_static_prefix`, which drives a real
+router because only live state exposes this class of bug.

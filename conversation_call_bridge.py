@@ -733,6 +733,9 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
     conversation = ConversationRouter(
         agent_def=agent_def,
         default_language=(agent_def.languages.default or "hi") if agent_def else "hi",
+        # Same closure the STT/TTS trackers get, so this call's token spend
+        # lands on the same credit-log row as its speech spend.
+        call_id_provider=call_id_provider,
     )
     return slug, conversation, stt, tts, agent_health
 

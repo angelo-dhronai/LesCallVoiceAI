@@ -59,6 +59,7 @@ from shared.sarvam_pricing import (  # noqa: E402
     whisper_cost as _calc_whisper_cost,
 )
 from shared.ai_pricing import (  # noqa: E402
+    embedding_cost as _calc_embed_cost,
     llm_cost as _calc_llm_cost,
     llm_cost_without_cache as _calc_llm_cost_uncached,
 )
@@ -94,6 +95,10 @@ def _usage_fields(a: "_CallAccum") -> dict:
         "llm_output_tokens": a.llm_output_tokens,
         "llm_models": sorted(a.llm_models),
         "llm_unpriced_models": sorted(a.llm_unpriced_models),
+        "embed_requests": a.embed_requests,
+        "embed_tokens": a.embed_tokens,
+        "embed_models": sorted(a.embed_models),
+        "est_embed_cost": a.embed_cost,
         "est_stt_cost": stt,
         "est_tts_cost": tts,
         "est_whisper_cost": whisper,
@@ -103,10 +108,12 @@ def _usage_fields(a: "_CallAccum") -> dict:
         # today (the provider grants no cache — see prompt_cache.py), so any
         # future "caching saved X" is a subtraction of two measured numbers.
         "est_llm_cost_uncached": a.llm_cost_uncached,
-        # Speech + LLM. `llm or 0.0` treats an unpriced model as zero HERE and
-        # only here, so the total stays a number; llm_unpriced_models is what
-        # tells the reader the total is a floor rather than the real figure.
-        "est_total_cost": round(stt + tts + whisper + (llm or 0.0), 6),
+        # Speech + LLM + embeddings. `llm or 0.0` treats an unpriced model as
+        # zero HERE and only here, so the total stays a number;
+        # llm_unpriced_models is what tells the reader the total is a floor
+        # rather than the real figure.
+        "est_total_cost": round(
+            stt + tts + whisper + (llm or 0.0) + (a.embed_cost or 0.0), 6),
     }
 
 
@@ -136,6 +143,14 @@ class _CallAccum:
     llm_cost_uncached: float | None = None
     llm_models: set = field(default_factory=set)
     llm_unpriced_models: set = field(default_factory=set)
+    # Embeddings — the document-RAG query embedding, one per turn that reaches
+    # retrieval, plus whatever ingestion spent. Small per request and
+    # relentless per call, which is exactly the shape of cost that goes
+    # unnoticed until it is counted.
+    embed_requests: int = 0
+    embed_tokens: int = 0
+    embed_cost: float | None = None
+    embed_models: set = field(default_factory=set)
 
 
 class SarvamCreditTracker:
@@ -171,6 +186,10 @@ class SarvamCreditTracker:
         self._s_llm_cost_uncached: float | None = None
         self._s_llm_models: set[str] = set()
         self._s_llm_unpriced_models: set[str] = set()
+        self._s_embed_requests: int = 0
+        self._s_embed_tokens: int = 0
+        self._s_embed_cost: float | None = None
+        self._s_embed_models: set[str] = set()
 
     @classmethod
     def get(cls) -> "SarvamCreditTracker":
@@ -383,6 +402,45 @@ class SarvamCreditTracker:
             "est_cost": cost,
         })
 
+    def record_embedding_sync(self, tokens: int, model: str,
+                              stage: str = "query",
+                              call_id: str | None = None) -> None:
+        """Record one embedding request. Synchronous by design.
+
+        The document-RAG retrieval runs in a worker thread (so it cannot stall
+        the audio loop), and a thread has no event loop to await the async
+        recorders on. Accumulation is guarded by the GIL-atomic `+=` on ints
+        rather than the asyncio lock the other recorders use; the ledger file
+        write is append-only and already tolerant of interleaving.
+
+        Like `record_llm`, `tokens` must be the provider's own count — callers
+        that cannot obtain one pass 0 and the request is visibly uncounted.
+        """
+        if not tokens:
+            return
+        cost = _calc_embed_cost(model, tokens)
+        self._s_embed_requests += 1
+        self._s_embed_tokens += int(tokens)
+        self._s_embed_models.add(model)
+        if cost is not None:
+            self._s_embed_cost = (self._s_embed_cost or 0.0) + cost
+        accum = self._active_calls.get(call_id) if call_id else None
+        if accum is not None:
+            accum.embed_requests += 1
+            accum.embed_tokens += int(tokens)
+            accum.embed_models.add(model)
+            if cost is not None:
+                accum.embed_cost = (accum.embed_cost or 0.0) + cost
+        _append_event({
+            "type": "embed_event",
+            "call_id": call_id,
+            "ts": _now_iso(),
+            "model": model,
+            "stage": stage,
+            "tokens": int(tokens),
+            "est_cost": cost,
+        })
+
     # ------------------------------------------------------------------
     # Summary accessors
     # ------------------------------------------------------------------
@@ -421,6 +479,10 @@ class SarvamCreditTracker:
                 llm_cost_uncached=self._s_llm_cost_uncached,
                 llm_models=set(self._s_llm_models),
                 llm_unpriced_models=set(self._s_llm_unpriced_models),
+                embed_requests=self._s_embed_requests,
+                embed_tokens=self._s_embed_tokens,
+                embed_cost=self._s_embed_cost,
+                embed_models=set(self._s_embed_models),
             )),
         }
 

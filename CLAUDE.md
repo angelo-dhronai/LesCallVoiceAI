@@ -66,6 +66,18 @@ ENABLE_BARGE_IN=true           # interrupt TTS mid-playback
 TELEPHONY_MODE=false           # set true when running via FreeSWITCH
 ENABLE_CALL_AUDIT=true         # record WAV + transcripts to ./recordings/
 ```
+
+Document-RAG knobs (all optional; defaults are measured — see
+`app/documents/config.py` and RUNBOOK §28):
+```
+RAG_RETRIEVAL_TOP_K=20         # candidates before re-ranking
+RAG_FINAL_TOP_K=3              # ceiling on chunks in the prompt (weak ones are pruned)
+RAG_RERANK_ENABLED=true        # BM25 + vector, fused with RRF
+RAG_MMR_LAMBDA=1.0             # 1.0 = MMR off; measured worse at every grid point
+RAG_ABSTENTION_THRESHOLD=0.25  # NOT the abstention mechanism — see config.py
+RAG_SEMANTIC_CACHE_ENABLED=true
+RAG_CHUNK_WORDS=250            # changing this needs a re-index to take effect
+```
 `run.py` validates `SARVAM_API_KEY` at startup and exits immediately if missing.
 
 ### Dependencies
@@ -141,6 +153,29 @@ Five independent async tasks connected by bounded queues:
 
 - **`tts_sarvam.py` — SarvamTTS**: HTTP streaming to `api.sarvam.ai/text-to-speech/stream`, model `bulbul:v3`, speaker `shubh`. Audio chunks are written to the `AudioSink` as they arrive (true streaming, no buffer-all-first).
 - **`tts_stream.py` — StreamingTTS**: abstract base class. `MockStreamingTTS` available for testing.
+
+### Document RAG (`app/documents/`)
+
+Grounds live calls in tenant-uploaded documents. `retrieval.retrieve_async()` is
+the entry point (`conversation._call_llm_stream` awaits it); it returns evidence
+**plus a decision**, never a bare string.
+
+```
+turn → filler guard → cache (exact tier answers with no API call)
+     → embed (worker thread, hard deadline) ‖ BM25 → RRF fuse → prune weak
+     → abstention gate → labelled context + structured citations → trace
+```
+
+- **Never raises into a call.** No credentials, a provider timeout, a stale or
+  unreadable index: each degrades to the lexical arm with `degraded` set.
+- **Citations are data, not dialogue** — `[S1]` labels flow to the turn record
+  and the API; the prompt forbids speaking them (`RAG_SPOKEN_CITATIONS=false`).
+- **Changing `RAG_EMBED_MODEL` or `RAG_CHUNK_WORDS` requires a re-index.**
+  Indexes record how they were built and a mismatch is reported, never silently
+  reinterpreted. `POST /api/agents/{slug}/documents/reindex`.
+- **Measure before changing anything here**: `rag_eval/` holds the golden set,
+  the runner, a parameter sweep and a real-caller-turn replay. `tests/test_rag_*`
+  is the regression gate. RUNBOOK §28 has the numbers.
 
 ### Memory (`app/voice/memory.py`)
 

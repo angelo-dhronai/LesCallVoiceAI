@@ -1,0 +1,67 @@
+name: RAG evaluation gate
+
+# Runs the golden retrieval evaluation and the RAG failure-mode tests on every
+# change that can move retrieval quality. Entirely offline: embeddings come
+# from the committed frozen vector cache, so the job needs no API key, spends
+# nothing, and returns identical numbers on every run — a red build means
+# someone changed retrieval, not that a provider had a bad afternoon.
+#
+# Answer-quality metrics (faithfulness, answer relevance) need a live model and
+# are deliberately NOT gated here. Measure them before a release with:
+#   ../venv/bin/python -m rag_eval.runner --generate --judge --gen-provider openai
+
+on:
+  pull_request:
+    paths:
+      - 'calling-agent/backend/app/documents/**'
+      - 'calling-agent/backend/rag_eval/**'
+      - 'calling-agent/backend/tests/test_rag_*.py'
+      - 'calling-agent/backend/app/voice/conversation.py'
+      - 'shared/ai_pricing.py'
+      - '.github/workflows/rag-eval.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'calling-agent/backend/app/documents/**'
+      - 'calling-agent/backend/rag_eval/**'
+  workflow_dispatch:
+
+jobs:
+  rag-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Deliberately not calling-agent/requirements.txt: that pulls the speech
+      # and VAD stack (onnxruntime, torch) for a job that only needs to rank
+      # text. The RAG modules import numpy and PyYAML; the OpenAI client is
+      # imported lazily inside the provider and is never reached offline.
+      - name: Install
+        run: pip install numpy pyyaml pytest
+
+      - name: Golden evaluation + regression gate
+        working-directory: calling-agent/backend
+        run: python -m pytest tests/test_rag_eval_gate.py -q
+
+      - name: RAG failure modes and cache isolation
+        working-directory: calling-agent/backend
+        run: python -m pytest tests/test_rag_retrieval.py tests/test_rag_cache.py -q
+
+      - name: Evaluation report (for the run log)
+        if: always()
+        working-directory: calling-agent/backend
+        run: |
+          python -m rag_eval.runner --label ci --out /tmp/rag-eval.json
+          python -m rag_eval.runner --label ci \
+            --compare rag_eval/baselines/legacy_shipped.json || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rag-eval-report
+          path: /tmp/rag-eval.json

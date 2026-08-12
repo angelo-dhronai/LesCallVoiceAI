@@ -81,6 +81,49 @@ _DEFAULT_LLM_RATES: dict[str, dict[str, float]] = {
 # are counted and reported as unpriced until someone adds a sourced rate.
 
 
+# --- embedding rate card (USD per 1M input tokens) --------------------------
+#
+# Embeddings are billed on input only — there is no output side — so this is a
+# flat per-token rate rather than the in/out pair above. Two callers today: the
+# document RAG that grounds live calls (`RAG_EMBED_MODEL`) and the call-search
+# index (`INTEL_EMBED_MODEL`).
+#
+# The same "unpriced is not free" rule applies: a model absent here returns
+# None, its tokens are still counted, and the report names it rather than
+# inventing a rate.
+#
+# Sources (checked 2026-08-12):
+#   text-embedding-3-small  $0.02 / 1M   OpenAI published card
+#   text-embedding-3-large  $0.13 / 1M   OpenAI published card
+#   text-embedding-ada-002  $0.10 / 1M   OpenAI published card (legacy)
+_DEFAULT_EMBED_RATES: dict[str, float] = {
+    "text-embedding-3-small": 0.02,
+    "text-embedding-3-large": 0.13,
+    "text-embedding-ada-002": 0.10,
+}
+# gemini-embedding-001 (INTEL_EMBED_MODEL) is deliberately absent — same reason
+# as its LLM siblings above: no vendor page checked.
+
+
+def _load_embed_overrides() -> dict[str, float]:
+    """`AI_PRICING_FILE` / `AI_PRICING_OVERRIDES` may carry an `embeddings` key."""
+    merged: dict[str, float] = {}
+    path = os.environ.get("AI_PRICING_FILE", "").strip()
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                merged.update((json.load(f).get("embeddings") or {}))
+        except Exception:
+            pass  # the LLM loader below already warns about an unreadable file
+    inline = os.environ.get("AI_PRICING_OVERRIDES", "").strip()
+    if inline:
+        try:
+            merged.update((json.loads(inline).get("embeddings") or {}))
+        except Exception:
+            pass
+    return {k: float(v) for k, v in merged.items() if v is not None}
+
+
 def _load_overrides() -> dict[str, dict[str, float]]:
     """File then inline JSON, merged per-field over the defaults. Never raises."""
     merged: dict[str, dict[str, float]] = {}
@@ -191,12 +234,47 @@ def llm_cost_without_cache(
     return llm_cost(model, input_tokens, output_tokens, cached_input_tokens=0.0)
 
 
+EMBED_RATES: dict[str, float] = {**_DEFAULT_EMBED_RATES, **_load_embed_overrides()}
+
+
+def embedding_rate(model: str) -> float | None:
+    """USD per 1M tokens for `model`, or None when unpriced.
+
+    Uses the same segment-wise prefix match as `llm_rate` so a dated suffix
+    stays priced while a different tier (`-large` vs `-small`) never inherits
+    its sibling's rate.
+    """
+    if not model:
+        return None
+    if model in EMBED_RATES:
+        return EMBED_RATES[model]
+    parts = model.split("-")
+    for known in sorted(EMBED_RATES, key=len, reverse=True):
+        kparts = known.split("-")
+        if parts[:len(kparts)] != kparts:
+            continue
+        if any(seg.lower() in _TIER_TOKENS for seg in parts[len(kparts):]):
+            continue
+        return EMBED_RATES[known]
+    return None
+
+
+def embedding_cost(model: str, tokens: float) -> float | None:
+    """₹ for one embedding request, or None when `model` has no registered rate."""
+    rate = embedding_rate(model)
+    if rate is None:
+        return None
+    return round(float(tokens) / 1e6 * rate * USD_INR, 8)
+
+
 def rate_card() -> dict:
     """The live rates, for display next to any figure derived from them."""
     from . import sarvam_pricing as _sp
     return {
         "llm": LLM_RATES,
         "llm_unit": "USD per 1M tokens",
+        "embeddings": EMBED_RATES,
+        "embedding_unit": "USD per 1M input tokens",
         "usd_inr": USD_INR,
         "speech": _sp.rate_card(),
         "currency": "INR",

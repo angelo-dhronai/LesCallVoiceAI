@@ -20,6 +20,7 @@ Design notes
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -998,14 +999,99 @@ async def upload_document(
 
 @router.get("/api/agents/{name}/documents")
 async def list_agent_documents(name: str) -> dict:
+    """List documents, plus the health of the vector index built from them.
+
+    `documents` keeps its exact previous shape and meaning — the Agent Builder
+    UI reads it and must not break. `index` is additive: it is how an operator
+    finds out that a document is uploaded but NOT searchable, which used to be
+    invisible (a failed embed left no trace, and the agent simply stopped
+    citing that document forever).
+    """
     index_path = _AGENTS_DIR / name / "documents" / "index.json"
-    if not index_path.exists():
-        return {"documents": []}
+    docs: list = []
+    if index_path.exists():
+        try:
+            docs = json.loads(index_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("[builder/docs] could not read index for '%s': %s", name, exc)
+    payload: dict = {"documents": docs}
     try:
-        return {"documents": json.loads(index_path.read_text(encoding="utf-8"))}
+        from backend.app.documents.embeddings import index_status
+        payload["index"] = index_status(name)
     except Exception as exc:
-        logger.warning("[builder/docs] could not read index for '%s': %s", name, exc)
-        return {"documents": []}
+        logger.warning("[builder/docs] index status failed for '%s': %s", name, exc)
+    return payload
+
+
+@router.post("/api/agents/{name}/documents/reindex")
+async def reindex_agent_documents(name: str) -> dict:
+    """Re-chunk and re-embed every document of this agent.
+
+    The deliberate migration step after a chunking or embedding-model change.
+    Nothing re-indexes implicitly: it spends real embedding tokens and takes
+    seconds per document, so it is an operator's decision, and
+    `GET /documents` (`index.needs_reindex`) is what tells them it is due.
+    """
+    if not (_AGENTS_DIR / name).exists():
+        raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
+    _billing_llm_gate(_ctx_owner(), "documents-reindex")
+    from backend.app.documents.embeddings import index_status, reindex_agent
+    result = await asyncio.to_thread(reindex_agent, name)
+    result["index"] = index_status(name)
+    logger.info("[builder/docs] reindexed %s: %d ok, %d failed", name,
+                len(result["reindexed"]), len(result["failed"]))
+    return result
+
+
+@router.get("/api/agents/{name}/rag/metrics")
+async def rag_metrics(name: str) -> dict:
+    """Live RAG health: latency percentiles, abstention, cost, cache, errors.
+
+    Read off the in-process ring of recent retrievals, so these are the
+    percentiles of what actually happened rather than of a benchmark. Note the
+    window is per API process; the voice runtime keeps its own.
+    """
+    from backend.app.documents import config as rag_config
+    from backend.app.documents import trace as rag_trace
+    from backend.app.documents.embeddings import index_status
+    return {
+        "agent": name,
+        "config": rag_config.snapshot(),
+        "index": index_status(name),
+        "live": rag_trace.metrics_snapshot(),
+    }
+
+
+@router.post("/api/agents/{name}/rag/probe")
+async def rag_probe(name: str, request: Request) -> dict:
+    """Run one retrieval and return exactly what the agent would be given.
+
+    The debugging tool the old pipeline had no equivalent of: when a caller
+    says "it didn't know its own brochure", this answers whether retrieval
+    missed, the index was stale, or the evidence was there and the model
+    ignored it — without placing a call.
+    """
+    body = await request.json()
+    query = (body.get("query") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+    from backend.app.documents import retrieval
+    result = await retrieval.retrieve_async(name, query, request_id=f"probe:{name}")
+    return {
+        "query": query,
+        "context": result.context_block,
+        "abstained": result.abstained,
+        "abstain_reason": result.abstain_reason,
+        "degraded": result.degraded,
+        "degraded_reason": result.degraded_reason,
+        "index_problems": result.index_problems,
+        "chunks": [{
+            "label": c.label, "document_id": c.doc_id, "chunk_id": c.chunk_id,
+            "scores": c.stage_scores,
+            "preview": c.text[:300],
+        } for c in result.chunks],
+        **result.to_api(),
+    }
 
 
 @router.delete("/api/agents/{name}/documents/{doc_id}")

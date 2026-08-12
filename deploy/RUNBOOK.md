@@ -2381,3 +2381,109 @@ call the turn after a caller gives their name it broke its own prefix. Moved
 below the marker (fixture-neutral: the goldens are byte-identical). Pinned by
 `test_pending_name_does_not_break_the_static_prefix`, which drives a real
 router because only live state exposes this class of bug.
+
+---
+
+## 28. Document RAG hardening + measurable evaluation (2026-08-12) — AUDIT + SHIPPED
+
+### What the document RAG was
+
+`calling-agent/backend/app/documents/` grounds live calls in tenant-uploaded
+documents. Before this work the whole pipeline was:
+
+```
+caller turn -> one embedding HTTP call -> cosine vs every chunk
+            -> keep score >= 0.25 -> take 3 -> paste into the prompt
+```
+
+No lexical arm, no re-ranking, no citations, no cost accounting, no evaluation,
+and — the load-bearing detail — **no record of how the index was built**.
+
+### Four silent failures it had
+
+1. **A model change made every stored vector meaningless.** `_EMBED_MODEL` was
+   a module constant, the `.npy` recorded nothing, and the query-time cosine
+   either raised a shape error or produced noise. Both were swallowed by
+   `except Exception: logger.debug(...)`. The agent just quietly stopped using
+   its documents. Now every index carries provider/model/dim/chunk-geometry and
+   a content hash (`index_meta.json`); a mismatch is a named condition an
+   operator sees in `GET /api/agents/{name}/documents` → `index.needs_reindex`.
+2. **A failed embed at upload was permanent and invisible.** Now reported per
+   document, repairable with `POST /api/agents/{name}/documents/reindex`, and
+   the document stays reachable through the lexical arm meanwhile.
+3. **The embedding HTTP call ran inline in the async turn** — measured p50
+   320ms / p95 622ms of frozen event loop, taking VAD, STT and TTS with it. Now
+   `retrieve_async` runs it in a worker thread with a deadline.
+4. **Every turn retrieved, including "hmm".** Fillers now short-circuit before
+   the API call: on 300 replayed real caller turns, 97 never reach it.
+
+### What shipped
+
+Hybrid retrieval (BM25 + vector, fused with RRF — the same fusion
+`shared/intelligence/search.py` already uses), a conservative abstention gate,
+structured citations, a two-tier semantic cache, per-retrieval tracing, and
+embedding cost in the existing AI ledger (`credit_tracker.record_embedding_sync`
+→ `shared/ai_pricing.embedding_cost`).
+
+Measured on 37 golden questions over a 10-document corpus copied from live
+platform content (`rag_eval/`):
+
+| | before | after |
+|---|---|---|
+| Recall@1 | 0.66 | 0.79 |
+| Recall@3 | 0.98 | 0.98 |
+| MRR | 0.83 | 0.89 |
+| NDCG@5 | 0.84 | 0.90 |
+| End-to-end abstention (no-answer questions) | 0.56 | **1.00** |
+| Over-abstention (answerable refused) | 0.00 | 0.00 |
+| Faithfulness (LLM-judged) | 0.97 | 1.00 |
+| Citation accuracy | n/a — none existed | 1.00 |
+
+### Two defaults that are the opposite of the textbook
+
+Both were measured, and both comments in `app/documents/config.py` carry the
+table that decided them.
+
+* **MMR is OFF** (`RAG_MMR_LAMBDA=1.0`). Diversity assumes the top hits are
+  near-duplicates competing for one slot; here they are often joint evidence,
+  because chunking overlaps by 60 words. MMR at 0.75 was worse at all 12 grid
+  points — Recall@3 1.00 → 0.80 at the shipped chunking.
+* **The similarity threshold stays at 0.25** and is NOT the abstention
+  mechanism. Answerable and unanswerable questions overlap almost completely in
+  cosine (0.26–0.74 vs 0.27–0.71: "how many employees does DhronAI have?"
+  scores 0.71 because it is *about* the document's subject). Raising the floor
+  to 0.40 catches 2 of 7 unanswerable questions and wrongly refuses 15 of 28
+  answerable ones. Semantic absence is caught at generation time by the
+  grounding contract (`app/documents/grounding.py`) instead, and the two layers
+  are measured separately.
+
+### Operating it
+
+```bash
+cd calling-agent/backend
+../venv/bin/python -m rag_eval.runner                 # offline, free, deterministic
+../venv/bin/python -m rag_eval.runner --fresh         # real API — the only real latency
+../venv/bin/python -m rag_eval.runner --generate --judge --gen-provider openai
+../venv/bin/python -m rag_eval.replay --limit 300 --live   # real caller turns
+../venv/bin/python -m rag_eval.sweep --live           # parameter grid
+../venv/bin/python -m pytest tests/test_rag_*.py      # 42 tests, the CI gate
+```
+
+`GET /api/agents/{slug}/rag/metrics` is the live view (latency percentiles,
+abstention, cache, index health). `POST /api/agents/{slug}/rag/probe` with
+`{"query": "..."}` answers "did retrieval miss, or did the model ignore the
+evidence?" without placing a call.
+
+### Migration — documents indexed before today
+
+They keep working (the loader accepts an unlabelled index whose dimension
+matches) and are reported as `unlabelled` / `needs_reindex`. Chunking also moved
+400 → 250 words, which only applies to documents that are re-chunked. To adopt
+both, per agent:
+
+```bash
+curl -X POST https://agent.lescall.com/api/agents/<slug>/documents/reindex
+```
+
+Re-embedding spends real tokens (~₹0.0000141 per 8-token query at
+text-embedding-3-small), so nothing re-indexes itself implicitly.

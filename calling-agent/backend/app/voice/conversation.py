@@ -130,6 +130,13 @@ LANG_LLM_CLASSIFY_FIRST_TURN = os.environ.get(
 logger = logging.getLogger(__name__)
 
 _MARKDOWN_RE = re.compile(r"[*#`~_\[\]()>|]")
+# A size/configuration token is never a product name, however often owners
+# and the Copilot doc-miner park one in knowledge_base.known_projects /
+# catalog. Guards the project lock and the recommendation gate: "3 BHK" once
+# latched as the caller's chosen "project" for a whole live call.
+_CONFIG_TOKEN_RE = re.compile(
+    r"^\s*\d+(?:\.\d+)?\s*(?:bhk|rk|bed|beds|bedroom|bedrooms)\s*$",
+    re.IGNORECASE)
 # LLM end-of-call signal (call_flow.termination.llm_end_call): the model
 # appends [END_CALL] after its goodbye line. Must be stripped BEFORE
 # _validate_response — the markdown filter would mangle it into spoken
@@ -977,6 +984,9 @@ class ConversationRouter:
     # Class-level warmup flag: LLM API connection warms at most once per
     # process regardless of how many calls arrive (Issue 6).
     _warmup_done_flag: bool = False
+    # Per-agent, not per-process: a document index belongs to one agent, so a
+    # process-wide flag would warm at most one of them.
+    _rag_warmed_agents: set = set()
 
     def __init__(
         self,
@@ -1073,6 +1083,8 @@ class ConversationRouter:
         self._name_confirmed: bool = False
         self._name_pending_turn: int = 0   # turn index when _name_pending was set
         self._rag_context: str = ""        # populated from documents before each LLM call
+        self._rag_citations: list = []     # structured evidence for the turn record
+        self._rag_trace_id: str = ""       # correlates the turn with its RAG trace
         # A2 evidence-density switching state (2026-07-30): Tier-2 pending
         # target + oscillation-guard anchor. Tier-0 inputs: the STT source of
         # the current turn (set by the pipeline before process_stream —
@@ -3361,9 +3373,94 @@ class ConversationRouter:
         lower = text.lower()
         _projects = self._def.knowledge_base.known_projects
         for key in sorted(_projects, key=len, reverse=True):
+            if _CONFIG_TOKEN_RE.match(key):
+                # A size/configuration is not a product. Owners (and the
+                # Copilot doc-miner) routinely park "3 BHK" / "2 BHK" in
+                # known_projects; matching one locked matched_entity to
+                # "3 BHK" and told the model "DO NOT ask which one they want
+                # — it is: 3 BHK", so no real project was ever matched.
+                # _extract_bhk already owns these tokens.
+                continue
             if re.search(r'\b' + re.escape(key) + r'\b', lower):
                 return _projects[key]
         return None
+
+    def _note_recommendation(self, text: str) -> None:
+        """Record that the AGENT put a named option in front of the caller.
+
+        `project_recommended` is documented as "project name mentioned to
+        caller" but the only writer was the extractor for names the CALLER
+        said — the agent naming three projects left it None. Every consumer
+        (the post-call 'Project discussed' line, and now the
+        recommend-before-schedule gate) was reading a field the agent's own
+        speech never filled.
+        """
+        if self.state.project_recommended or not text:
+            return
+        try:
+            from ..agent_definition.catalog import derive_known_projects
+            names = derive_known_projects(self._def.knowledge_base)
+        except Exception:
+            names = self._def.knowledge_base.known_projects or {}
+        lower = text.lower()
+        for key in sorted(names, key=len, reverse=True):
+            if _CONFIG_TOKEN_RE.match(key) or len(key) < 4:
+                continue
+            if re.search(r'\b' + re.escape(key) + r'\b', lower):
+                canonical = names[key]
+                self.state.project_recommended = (
+                    canonical[0] if isinstance(canonical, (list, tuple)) else str(canonical))
+                logger.info("[RECOMMEND] agent named %r",
+                            self.state.project_recommended)
+                return
+
+    def _qualifying_facts_known(self) -> bool:
+        """Has the caller said anything a recommendation could be built on?
+
+        Any filled required slot that is not their identity, plus the legacy
+        discovery fields. One is enough — a caller who has said "Surat" has
+        told us more than enough to be given a name.
+        """
+        cs = self.memory.call_state
+        if any(k in cs.domain_fields
+               for k in ("location", "property_type", "budget")):
+            return True
+        sm = self.state_mgr
+        return any(
+            sm.state.get(n) is not None
+            for n, spec in sm.slots.items()
+            if spec.required and n not in sm.identity_locked
+        )
+
+    def _recommendation_gate_open(self) -> bool:
+        """True when a recommendation is DUE and none has been made yet.
+
+        Three conditions, all cheap and all per-turn:
+          1. the flow declares a recommendation stage (explicit role
+             'recommend', or the legacy PROJECT_MATCH id) — a support or
+             survey agent has nothing to recommend and is never gated;
+          2. there is something to recommend from (non-empty catalog);
+          3. the caller has already given at least one qualifying fact
+             beyond their name, and no option has been named to them yet.
+
+        call_flow.recommend_before_schedule = on|off overrides (1); 'auto'
+        (the default) derives it from the flow as above.
+        """
+        mode = str(getattr(self._def.call_flow, "recommend_before_schedule",
+                           "auto") or "auto").strip().lower()
+        if mode == "off":
+            return False
+        if not (getattr(self._def.knowledge_base, "catalog", None) or []):
+            return False
+        if mode != "on":
+            has_reco_stage = any(
+                self._stage_role(s.id) == "recommend" or s.id == STAGE_PROJECT_MATCH
+                for s in self._def.call_flow.stages)
+            if not has_reco_stage:
+                return False
+        if self.state.project_recommended:
+            return False
+        return self._qualifying_facts_known()
 
     def _update_call_state(self) -> None:
         """Sync CallState from ConversationState + BookingData.
@@ -4026,6 +4123,7 @@ class ConversationRouter:
             self.last_agent_language = self.state.language
             # QA: detect which field this agent response is asking about
             self.memory.qa_tracker.observe_agent_turn(full_text, self.memory.turn_index)
+            self._note_recommendation(full_text)
             # C1/C4/C6: LLM utterances reset + re-derive the capture
             # expectation exactly like shortcut ones — the live email ask
             # came from the LLM and capture stayed dark for five turns.
@@ -4149,17 +4247,38 @@ class ConversationRouter:
     async def _call_llm_stream(self, text: str, force_text: bool = False):
         client = self._get_client()
 
-        # RAG: retrieve relevant document chunks for this turn (non-blocking try/except
-        # so a missing documents module or API error never interrupts the conversation)
+        # RAG: retrieve evidence for this turn.
+        #
+        # `retrieve_async` runs the whole retrieval — including the embedding
+        # HTTP request — in a worker thread with a deadline. The previous
+        # version called the blocking client directly from this coroutine, so
+        # every turn that reached RAG froze the event loop for the duration of
+        # that request (measured p50 320ms / p95 622ms against the live
+        # provider) and took VAD, STT and TTS down with it.
+        #
+        # It never raises: a failure, a timeout or an empty corpus all come
+        # back as a result with `abstained` set, and the block below simply has
+        # nothing to add to the prompt.
         self._rag_context = ""
+        self._rag_citations = []
+        self._rag_trace_id = ""
         try:
             from ..documents.store import get_folder_by_agent_id, has_documents
             _agent_folder = get_folder_by_agent_id(self._def.agent_id)
             if _agent_folder and has_documents(_agent_folder):
-                from ..documents.embeddings import retrieve_context
-                self._rag_context = retrieve_context(_agent_folder, text)
+                from ..documents.retrieval import retrieve_async
+                _rag = await retrieve_async(
+                    _agent_folder, text,
+                    call_id=(self._call_id_provider() if self._call_id_provider
+                             else None),
+                    turn_index=self.memory.turn_index)
+                self._rag_context = _rag.context_block
+                # Citations are structured data on the turn record, never
+                # dialogue — a phone agent does not say "per source two".
+                self._rag_citations = _rag.citations
+                self._rag_trace_id = _rag.trace_id
         except Exception:
-            pass
+            logger.debug("[RAG] retrieval skipped for this turn", exc_info=True)
 
         system = self._build_system_prompt()
 
@@ -4503,6 +4622,18 @@ class ConversationRouter:
         cs = self.memory.call_state
         lang = self.state.language
         lang_name = {"hi": "Hindi", "gu": "Gujarati", "en": "English"}.get(lang, "English")
+        # Evaluated once per turn. _reco_due drives the hard gate; the softer
+        # _match_now drives the deterministic candidate list, which stays
+        # visible for as long as the caller's facts could produce a BETTER
+        # match than whatever has already been named. Closing it at the first
+        # named project is how a ₹4-5 Cr caller kept being shown ₹1.66 Cr
+        # stock: the rules that reach the top of the portfolio never rendered.
+        try:
+            _reco_due = self._recommendation_gate_open()
+            _match_now = _reco_due or self._qualifying_facts_known()
+        except Exception:
+            logger.exception("[RECOMMEND] gate check failed — treating as closed")
+            _reco_due = _match_now = False
 
         # ── LANGUAGE LOCK — put this FIRST so LLM sees it immediately ────────
         _register_notes = self._def.languages.register_notes
@@ -4685,10 +4816,15 @@ class ConversationRouter:
             "━━ CURRENT GOAL ━━",
             stage_goal,
             *pb.match_rules_block(self._def, dict(self.state_mgr.state),
-                                  self._stage_role()),
+                                  self._stage_role(), force=_match_now),
             # Calendar stays after ━━ CALL STATE ━━: it returns [] once a
             # visit is booked, on the grounds that CALL STATE already said so.
             *_cal_lines,
+            # Last block before the caller's words, and deliberately after
+            # CURRENT GOAL: while it is open it OUTRANKS the stage goal — a
+            # greeting-stage goal must not be able to talk the model into
+            # booking a visit before anything has been recommended.
+            *(pb.recommend_first_block(self._def) if _reco_due else []),
         ]
 
         # C2 (2026-07-31): while an email capture is armed, the engine owns
@@ -6234,6 +6370,7 @@ class ConversationRouter:
         self.last_agent_response = text
         self.last_agent_language = self.state.language
         self.memory.qa_tracker.observe_agent_turn(text, self.memory.turn_index)
+        self._note_recommendation(text)
         # C1/C3/C4/C6: every agent utterance resets the capture expectation
         # and re-derives it from what was actually said; the capture yield
         # sites re-set their flag right after calling this.
@@ -6334,11 +6471,52 @@ class ConversationRouter:
     # LLM warmup (feature 6)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _warm_rag_index_impl(agent_id: str) -> None:
+        """Load the document index and open the embedding connection.
+
+        Runs in a worker thread off the warmup path. Everything it touches is
+        cached per process afterwards: the parsed chunks, the normalised vector
+        matrix, the BM25 index and the HTTPS connection.
+        """
+        try:
+            from ..documents.store import get_folder_by_agent_id, has_documents
+            folder = get_folder_by_agent_id(agent_id)
+            if not folder or not has_documents(folder):
+                return
+            from ..documents import embeddings, retrieval
+            retrieval.load_cached_index(folder)
+            provider = embeddings.get_provider()
+            if embeddings.provider_available(provider):
+                embeddings.embed_query("warmup", provider)
+            logger.info("[RAG] index + embedding connection warm for %s", folder)
+        except Exception as exc:
+            logger.warning("[RAG] warmup failed (first turn will be slower): %r", exc)
+
     async def warmup(self) -> None:
         """Warm up LLM API connection to reduce first-call latency.
 
         Runs at most once per process (class-level flag) — Issue 6.
         """
+        # The document-RAG warmup is deliberately ABOVE the once-per-process
+        # gate below, and guarded per AGENT instead. The LLM connection is a
+        # process-wide resource; a document index is not — it belongs to one
+        # agent. Gating it per process meant it fired for whichever agent
+        # happened to start first, which on this runtime is the document-less
+        # neutral fallback, so it did nothing at all in production and every
+        # agent with documents still paid the cold-start on its first RAG turn.
+        #
+        # Cost of getting this wrong: the embedding endpoint is a different
+        # host, and its first request in a fresh process pays DNS + TLS —
+        # measured at 1.7s against 232ms warm, i.e. most of the retrieval
+        # deadline spent on setup. Detached and best-effort: a failed warmup
+        # costs the first RAG turn its context, never the call.
+        agent_id = self._def.agent_id
+        if agent_id and agent_id not in ConversationRouter._rag_warmed_agents:
+            ConversationRouter._rag_warmed_agents.add(agent_id)
+            asyncio.ensure_future(asyncio.to_thread(
+                ConversationRouter._warm_rag_index_impl, agent_id))
+
         if ConversationRouter._warmup_done_flag:
             logger.debug("[CONV] LLM warmup skipped — already done this process")
             return

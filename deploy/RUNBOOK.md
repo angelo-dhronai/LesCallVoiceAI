@@ -2571,3 +2571,10 @@ schema mid-run, and the symptom is a scatter of `UndefinedTable: relation
 Observed while validating this work: the same commit produced 0, 3, 5 and 41
 errors depending on what else was running, and a clean serial run is green.
 Run one suite at a time, or give the second one its own database.
+
+**And the reason it happened twice:** `credit_tracker._DEFAULT_LOG_DIR` was the
+hardcoded string `/home/angelo/lescall/credit_log`, so ANY second checkout on
+this host — a git worktree, a clone, a CI job — filed its test usage into the
+production ledger no matter which tree it ran from. It is now resolved from the
+module's own location, which is byte-identical in production and in the
+container, and correct everywhere else. `SARVAM_CREDIT_LOG_DIR` still overrides.

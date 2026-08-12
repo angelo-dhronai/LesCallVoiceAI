@@ -39,7 +39,14 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_LOG_DIR = "/home/angelo/lescall/credit_log"
+# Resolved from THIS file's location, not hardcoded to the deployment path.
+# Identical in production (the module lives under that repo), but a second
+# checkout on the same host — a git worktree, a clone, a CI job — used to write
+# its test usage straight into the production ledger. That happened twice while
+# this was being built: a worktree running the suite filed 3,457 embedding
+# requests against a model named `fake-embed-v1` into the file credit_report.py
+# reads. SARVAM_CREDIT_LOG_DIR still overrides.
+_DEFAULT_LOG_DIR = str(Path(__file__).resolve().parents[4] / "credit_log")
 _CREDIT_LOG_DIR = Path(os.environ.get("SARVAM_CREDIT_LOG_DIR", _DEFAULT_LOG_DIR))
 
 # ---------------------------------------------------------------------------

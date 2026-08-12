@@ -175,3 +175,24 @@ def required_facts_present(answer: str, case: GoldenCase) -> float | None:
         if any(normalize(v) in body for v in variants):
             hits += 1
     return hits / len(case.required_facts)
+
+
+def contamination(case: GoldenCase, hits: list[RetrievedChunk]) -> float | None:
+    """Fraction of supplied evidence that comes from a document that should
+    have no part in this answer.
+
+    The sharp form of the failure precision@k only hints at: an agent quoting
+    fabric prices on a real-estate call. Precision counts a chunk as bad when
+    it lacks the anchor — including a chunk of the RIGHT document that simply
+    isn't the answering passage, which is harmless padding. Contamination
+    counts only chunks from the WRONG DOCUMENT, which is the one that puts a
+    confident, irrelevant fact in front of a caller.
+
+    None for cases with no expected sources: when the right answer is to
+    abstain, "which document did it come from" is the wrong question — that is
+    what the abstention metrics measure.
+    """
+    if not case.expected_sources or not hits:
+        return None
+    expected = case.expected_docs
+    return sum(1 for c in hits if c.doc not in expected) / len(hits)

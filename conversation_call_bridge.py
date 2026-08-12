@@ -1611,13 +1611,18 @@ class TelephonySession:
                 return
             call_id = row["id"]
             for t in traces:
+                # rag_sources: the documents whose chunks were placed in this
+                # turn's prompt (migration 0018). Serialised here rather than in
+                # the pipeline so the in-memory trace stays a plain dict.
+                _sources = t.get("rag_sources")
                 db.execute(
                     "INSERT INTO call_turns (call_id, turn_index, ts, stage, "
                     "intent, language, user_chars, agent_chars, "
                     "stt_latency_ms, stt_confidence, speech_end_to_engine_ms, "
                     "llm_first_chunk_ms, llm_total_ms, "
-                    "speech_end_to_first_audio_ms, is_filler, barged_in) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "speech_end_to_first_audio_ms, is_filler, barged_in, "
+                    "rag_sources, rag_trace_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT (call_id, turn_index) DO NOTHING",
                     (call_id, t.get("turn_index"),
                      _iso(t["ts"]) if t.get("ts") else None,
@@ -1627,7 +1632,9 @@ class TelephonySession:
                      t.get("speech_end_to_engine_ms"),
                      t.get("llm_first_chunk_ms"), t.get("llm_total_ms"),
                      t.get("speech_end_to_first_audio_ms"),
-                     bool(t.get("is_filler")), bool(t.get("barged_in"))),
+                     bool(t.get("is_filler")), bool(t.get("barged_in")),
+                     json.dumps(_sources) if _sources else None,
+                     t.get("rag_trace_id")),
                 )
         logger.info("[%s] call_turns: persisted %d turn traces",
                     self.conn_id, len(traces))

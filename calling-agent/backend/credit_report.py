@@ -104,6 +104,12 @@ def _agg_from_events(events: list[dict]) -> dict:
     llm_cost = 0.0
     llm_models: dict[str, int] = {}
     llm_unpriced: set[str] = set()
+    embed_requests = 0
+    embed_tokens = 0
+    embed_cost = 0.0
+    embed_models: dict[str, int] = {}
+    embed_unpriced: set[str] = set()
+    embed_stages: dict[str, int] = {}
 
     for ev in events:
         t = ev.get("type")
@@ -147,6 +153,24 @@ def _agg_from_events(events: list[dict]) -> dict:
                 llm_unpriced.add(_m)
             else:
                 llm_cost += float(_c)
+        elif t == "embed_event":
+            # Document-RAG embeddings. Absent from every log written before
+            # 2026-08-12, when the retrieval pipeline started reporting them —
+            # an older day legitimately shows 0 rather than missing data, the
+            # same convention llm_event follows. Small per request and
+            # relentless per call, which is the shape of cost that goes
+            # unnoticed until something counts it.
+            embed_requests += 1
+            embed_tokens += int(ev.get("tokens", 0))
+            _m = ev.get("model") or "unknown"
+            embed_models[_m] = embed_models.get(_m, 0) + 1
+            _stage = ev.get("stage") or "query"
+            embed_stages[_stage] = embed_stages.get(_stage, 0) + 1
+            _c = ev.get("est_cost")
+            if _c is None:
+                embed_unpriced.add(_m)
+            else:
+                embed_cost += float(_c)
 
     return {
         "call_count": len(calls),
@@ -157,6 +181,12 @@ def _agg_from_events(events: list[dict]) -> dict:
         "llm_models": llm_models,
         "llm_unpriced_models": sorted(llm_unpriced),
         "llm_cost": llm_cost,
+        "embed_requests": embed_requests,
+        "embed_tokens": embed_tokens,
+        "embed_models": embed_models,
+        "embed_stages": embed_stages,
+        "embed_unpriced_models": sorted(embed_unpriced),
+        "embed_cost": embed_cost,
         "stt_sarvam_sec": stt_sarvam_sec,
         "stt_sarvam_billed_sec": stt_sarvam_billed_sec,
         "stt_sarvam_calls": stt_sarvam_calls,
@@ -220,10 +250,18 @@ def _print_summary(title: str, agg: dict) -> None:
         if inp:
             print(f"                       prefix cache: {cached:,} of {inp:,} input tok "
                   f"({cached / inp * 100:.1f}% served from cache)")
+    if agg.get("embed_requests"):
+        models = ", ".join(f"{m}×{n}" for m, n in
+                           sorted(agg["embed_models"].items(), key=lambda kv: -kv[1]))
+        stages = ", ".join(f"{k}×{v}" for k, v in
+                           sorted(agg["embed_stages"].items(), key=lambda kv: -kv[1]))
+        print(f"  Embeddings (RAG)   : {agg['embed_requests']} requests  ({models})")
+        print(f"                       {agg['embed_tokens']:,} tok   [{stages}]")
     stt_cost = _pricing.stt_cost(billed)
     tts_cost = _pricing.tts_cost(agg["tts_billed_chars"])
     whisper_cost = _pricing.whisper_cost(agg["stt_whisper_sec"])
     llm_cost = agg.get("llm_cost", 0.0)
+    embed_cost = agg.get("embed_cost", 0.0)
     print(f"  ─────────────────────────────────────────────────────────")
     print(f"  STT cost           : ₹{stt_cost:.4f}")
     print(f"  TTS cost           : ₹{tts_cost:.4f}")
@@ -231,13 +269,18 @@ def _print_summary(title: str, agg: dict) -> None:
         print(f"  Whisper cost       : ₹{whisper_cost:.4f}")
     if agg.get("llm_requests"):
         print(f"  LLM cost           : ₹{llm_cost:.4f}")
-    total = stt_cost + tts_cost + whisper_cost + llm_cost
+    if agg.get("embed_requests"):
+        # 6 decimals, not 4: a query embedding costs ~₹0.00002 and rounding it
+        # to 4 places prints ₹0.0000 — a measured cost that reads as free.
+        print(f"  Embedding cost     : ₹{embed_cost:.6f}")
+    total = stt_cost + tts_cost + whisper_cost + llm_cost + embed_cost
     print(f"  Total estimate     : ₹{total:.4f}")
     # An unpriced model is not a free one — say so rather than let the total
     # read as complete.
-    if agg.get("llm_unpriced_models"):
-        print(f"  ⚠ FLOOR ONLY — no rate registered for: "
-              f"{', '.join(agg['llm_unpriced_models'])}")
+    _unpriced = (list(agg.get("llm_unpriced_models") or [])
+                 + list(agg.get("embed_unpriced_models") or []))
+    if _unpriced:
+        print(f"  ⚠ FLOOR ONLY — no rate registered for: {', '.join(_unpriced)}")
         print(f"    Add it to shared/ai_pricing.py or set AI_PRICING_OVERRIDES.")
     print(_SEP)
 
@@ -318,6 +361,9 @@ def cmd_call(call_id: str) -> None:
         elif t == "tts_event":
             status = "ok" if ev.get("completed", True) else "barge-in"
             detail = f"{ev.get('chars',0)} chars [{status}]"
+        elif t == "embed_event":
+            detail = (f"{ev.get('tokens',0)} tok {ev.get('model','?')} "
+                      f"[{ev.get('stage','query')}]")
         else:
             detail = ""
         print(f"  {i:<3} {t:<11} {ts:<28} {detail}")

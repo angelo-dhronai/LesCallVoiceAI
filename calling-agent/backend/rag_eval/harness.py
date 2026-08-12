@@ -109,6 +109,15 @@ class _embedder_installed:
         self._saved = {}
 
     def __enter__(self):
+        # An evaluation is not a call. Its embedding spend is real but belongs
+        # in the eval report, not in the per-call AI ledger that prices what
+        # customers were served.
+        try:
+            from app.documents import config as _dcfg
+            self._saved["cost_tracking"] = _dcfg.COST_TRACKING_ENABLED
+            _dcfg.COST_TRACKING_ENABLED = False
+        except Exception:
+            pass
         if hasattr(self.mod, "set_provider"):          # upgraded shape
             self._saved["provider"] = self.mod.get_provider()
             self.mod.set_provider(_ProviderShim(self.embedder))
@@ -118,6 +127,9 @@ class _embedder_installed:
         return self
 
     def __exit__(self, *exc):
+        if "cost_tracking" in self._saved:
+            from app.documents import config as _dcfg
+            _dcfg.COST_TRACKING_ENABLED = self._saved["cost_tracking"]
         if "provider" in self._saved:
             self.mod.set_provider(self._saved["provider"])
         else:

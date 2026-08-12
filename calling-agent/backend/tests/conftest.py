@@ -78,3 +78,27 @@ def stub_llm(monkeypatch):
     monkeypatch.setattr(ConversationRouter, "_get_fallback_client",
                         lambda self: None)
     return STUB_LLM_REPLY
+
+
+# ---------------------------------------------------------------------------
+# Ledger isolation
+#
+# The document-RAG pipeline reports embedding tokens into the real AI ledger
+# (credit_log/<date>.jsonl) through a module-level singleton. Tests embed
+# constantly with a fake provider, so without this they write thousands of
+# fabricated `embed_event` rows into the file the cost report reads — which is
+# exactly how a cost report becomes confidently wrong. Observed: 3,457 rows of
+# `fake-embed-v1` usage in a production day's ledger.
+#
+# The log directory is resolved at import time, so the module attribute is
+# patched rather than the environment variable.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _isolate_credit_ledger(tmp_path_factory, monkeypatch):
+    try:
+        from app.voice import credit_tracker
+    except Exception:
+        return
+    monkeypatch.setattr(credit_tracker, "_CREDIT_LOG_DIR",
+                        tmp_path_factory.mktemp("credit_log"), raising=False)

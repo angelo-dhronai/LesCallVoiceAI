@@ -121,6 +121,7 @@ def _score_case(case: ds.GoldenCase, outcome, generated: dict | None) -> dict:
     row["precision@3"] = M.precision_at_k(case, outcome.hits, 3)
     row["precision@5"] = M.precision_at_k(case, outcome.hits, 5)
     row["mrr"] = M.reciprocal_rank(case, outcome.hits)
+    row["contamination"] = M.contamination(case, outcome.hits)
     row["ndcg@5"] = M.ndcg_at_k(case, outcome.hits, 5)
 
     # Abstention is scored on the two cases that matter: a question with no
@@ -187,6 +188,7 @@ def _agg(rows: list[dict]) -> dict:
             "precision@5": avg("precision@5"),
             "mrr": avg("mrr"),
             "ndcg@5": avg("ndcg@5"),
+            "contamination": avg("contamination"),
         },
         "abstention": {
             "correct_abstention_rate": (
@@ -244,15 +246,18 @@ def _agg(rows: list[dict]) -> dict:
 
     by_cat: dict[str, dict] = {}
     for r in rows:
-        c = by_cat.setdefault(r["category"], {"n": 0, "recall@5": [], "mrr": []})
+        c = by_cat.setdefault(r["category"],
+                              {"n": 0, "recall@5": [], "mrr": [], "contamination": []})
         c["n"] += 1
-        for key in ("recall@5", "mrr"):
+        for key in ("recall@5", "mrr", "contamination"):
             if r.get(key) is not None:
                 c[key].append(r[key])
     summary["by_category"] = {
         k: {"n": v["n"],
             "recall@5": round(sum(v["recall@5"]) / len(v["recall@5"]), 3) if v["recall@5"] else None,
-            "mrr": round(sum(v["mrr"]) / len(v["mrr"]), 3) if v["mrr"] else None}
+            "mrr": round(sum(v["mrr"]) / len(v["mrr"]), 3) if v["mrr"] else None,
+            "contamination": round(sum(v["contamination"]) / len(v["contamination"]), 3)
+            if v["contamination"] else None}
         for k, v in sorted(by_cat.items())}
     return summary
 
@@ -289,6 +294,8 @@ def render(report: dict) -> str:
     A("Precision@5:".ljust(26) + f(r["precision@5"]))
     A("MRR:".ljust(26) + f(r["mrr"]))
     A("NDCG@5:".ljust(26) + f(r["ndcg@5"]))
+    A("Cross-doc contamination:".ljust(26) + f(r["contamination"])
+      + "   (evidence from the wrong document — lower is better)")
     A("")
     ab = s["abstention"]
     A("Correct abstention:".ljust(26) + f(ab["correct_abstention_rate"])
@@ -333,7 +340,9 @@ def render(report: dict) -> str:
     for cat, v in s["by_category"].items():
         A(f"  {cat:<16} n={v['n']:<3} recall@5="
           + ("n/a " if v["recall@5"] is None else f"{v['recall@5']:.2f}")
-          + "  mrr=" + ("n/a" if v["mrr"] is None else f"{v['mrr']:.2f}"))
+          + "  mrr=" + ("n/a" if v["mrr"] is None else f"{v['mrr']:.2f}")
+          + "  contam=" + ("n/a" if v.get("contamination") is None
+                           else f"{v['contamination']:.2f}"))
     return "\n".join(L)
 
 
@@ -355,6 +364,7 @@ THRESHOLDS: dict[str, tuple[str, float]] = {
     "retrieval.recall@3": ("up", 0.03),
     "retrieval.mrr": ("up", 0.03),
     "retrieval.ndcg@5": ("up", 0.03),
+    "retrieval.contamination": ("down", 0.10),
     "abstention.correct_abstention_rate": ("up", 0.05),
     "generation.faithfulness": ("up", 0.03),
     "generation.correct_abstention_rate": ("up", 0.05),

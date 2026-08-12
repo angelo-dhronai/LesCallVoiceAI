@@ -49,6 +49,7 @@ class RetrievedChunk:
     title: str = ""
     label: str = ""                    # S1, S2, … — the citation handle
     has_vector: bool = False           # False = judged by the lexical arm only
+    kept_by: str = ""                  # "vector" | "lexical" — why it survived
     stage_scores: dict[str, float] = field(default_factory=dict)
 
 
@@ -276,7 +277,15 @@ def retrieve(agent_folder: str, query: str, *,
         # same switch: `abstention_enabled=False` means "hand back the best
         # candidates whatever their confidence", which is what the evaluation
         # needs to measure raw ranking.
-        chosen = (_prune_weak(candidates) if do_abstain else candidates)[:final_k]
+        # Chunks the lexical arm ranks at the top, whatever their cosine. A
+        # short exact-term question ("what are the six stages?") scores 0.22
+        # against the chunk that literally contains "Six Stage Implementation
+        # Approach" — under the absolute floor — while BM25 puts it first.
+        # Pruning on the vector score alone threw those away, which defeats the
+        # entire purpose of running a lexical arm.
+        lexical_keep = {i for i in lexical_ranked[:final_k] if bm_scores.get(i, 0) > 0}
+        chosen = (_prune_weak(candidates, lexical_keep, ordered) if do_abstain
+                  else candidates)[:final_k]
 
         # -- abstention gate ----------------------------------------------
         cache_key = (ns, query, qvec) if do_cache else None
@@ -383,7 +392,8 @@ def _mk_chunk(index, i: int, fused, cosines, bm_scores) -> RetrievedChunk:
         })
 
 
-def _prune_weak(candidates: list[RetrievedChunk]) -> list[RetrievedChunk]:
+def _prune_weak(candidates: list[RetrievedChunk], lexical_keep: set | None = None,
+                order: list | None = None) -> list[RetrievedChunk]:
     """Drop candidates that only made the list because the list had room.
 
     FINAL_TOP_K is a ceiling, not a quota. The previous path always emitted its
@@ -395,17 +405,49 @@ def _prune_weak(candidates: list[RetrievedChunk]) -> list[RetrievedChunk]:
     """
     if not candidates:
         return []
+    # Relative floor is computed against the best VECTOR-scored candidate for
+    # this query, so it scales with how well the corpus covers the question
+    # instead of assuming a fixed similarity is meaningful across queries.
+    scored = [c.stage_scores.get("vector", 0.0) for c in candidates if c.has_vector]
+    floor = config.ABSTAIN_MIN_SCORE
+    if scored and config.RELATIVE_FLOOR > 0:
+        floor = max(floor, max(scored) * config.RELATIVE_FLOOR)
     kept = []
     for c in candidates:
         if c.has_vector:
-            if c.stage_scores.get("vector", 0.0) >= config.ABSTAIN_MIN_SCORE:
+            if c.stage_scores.get("vector", 0.0) >= floor:
+                c.kept_by = "vector"
                 kept.append(c)
         elif c.stage_scores.get("lexical", 0.0) > 0:
             # No vector to judge it by — an un-embedded or stale document.
             # Holding it to a cosine floor it cannot have would silently make
             # every such document unreachable, which is the exact failure the
             # index metadata was added to surface.
+            c.kept_by = "lexical"
             kept.append(c)
+    if kept:
+        return kept
+
+    # LEXICAL RESCUE — a FALLBACK, not an addition.
+    #
+    # Embeddings systematically under-score short exact-term questions: "what
+    # are the six stages?" scores 0.222 against the chunk that literally
+    # contains "Six Stage Implementation Approach", below the absolute floor,
+    # while BM25 ranks it first. Pruning on cosine alone discarded it and the
+    # agent abstained on a question its own document answers in a heading.
+    #
+    # Adding these hits alongside the vector results instead of only when there
+    # are none was measurably worse — Precision@3 0.53 -> 0.46 and cross-doc
+    # contamination 0.05 -> 0.17 on the golden set, because a shared common word
+    # is enough to drag another tenant's document in. As a fallback it costs
+    # nothing when the vector arm is working and rescues the case where it is
+    # blind.
+    lexical_keep = lexical_keep or set()
+    if lexical_keep and order:
+        for pos, c in enumerate(candidates):
+            if pos < len(order) and order[pos] in lexical_keep:
+                c.kept_by = "lexical"
+                kept.append(c)
     return kept
 
 
@@ -422,6 +464,11 @@ def _abstain_reason(chosen: list[RetrievedChunk], query: str, cosines) -> str:
     """
     if not chosen:
         return "no_candidates"
+    if any(c.kept_by == "lexical" for c in chosen):
+        # The lexical arm found an exact term match. Refusing on the cosine
+        # floor here would discard the one signal that is RIGHT about
+        # exact-term questions, which embeddings are worst at.
+        return ""
     vector_scored = [c for c in chosen if c.has_vector]
     if vector_scored:
         best = max(c.stage_scores.get("vector", 0.0) for c in vector_scored)

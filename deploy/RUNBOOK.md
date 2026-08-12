@@ -2487,3 +2487,87 @@ curl -X POST https://agent.lescall.com/api/agents/<slug>/documents/reindex
 
 Re-embedding spends real tokens (~₹0.0000141 per 8-token query at
 text-embedding-3-small), so nothing re-indexes itself implicitly.
+
+### 28b. Follow-ups from a second-opinion review (2026-08-12)
+
+The same brief was run independently on another machine; comparing the two
+implementations surfaced three real gaps in this one. All three are fixed above
+their measurements:
+
+**Embedding spend was recorded but never reported.** `credit_tracker` wrote
+`embed_event` to the ledger from day one, but `credit_report.py` only knew
+`stt_event` / `tts_event` / `llm_event`, so the cost existed in the log and
+nowhere a human looks. It now prints requests, tokens, stage split (query vs
+ingest) and cost — at 6 decimals, because a query embedding costs ~₹0.00002 and
+4 decimals renders a measured cost as ₹0.0000.
+
+**Citations never reached the call record.** `_rag_citations` was assigned on
+the router and read by nothing — the claim "citations are structured data on the
+turn record" was true of the design and false of the code. Migration 0018 adds
+`call_turns.rag_sources` (JSONB) + `rag_trace_id`; the pipeline attaches them
+after generation and the bridge persists them. "The agent quoted a price on
+Tuesday, where did that come from?" is now a SQL query against the call record
+rather than a grep of a rotating trace file.
+
+**Cross-document contamination was unmeasured.** Precision@K blurs two very
+different failures: a chunk of the RIGHT document that is not the answering
+passage (harmless padding) and a chunk of the WRONG document (a confident
+irrelevant fact). Split out, the average is 0.11 legacy → 0.05 now, but the
+average is the wrong number to quote — it is ~0.00 everywhere except
+`wrong_context` (0.33) and `multi_hop` (0.10). A relative quality floor
+(`RAG_RELATIVE_FLOOR=0.6`, swept) removes the case that motivated it: a caller
+asking for a 3BHK in Surat under ₹1.1 crore was being handed the property list,
+a rental listing for another city, AND a Nintendo console catalogue. Quality is
+untouched at 0.6 and pays real recall past 0.7 — the table is in config.py.
+
+Not adopted: the other implementation reports contamination 0.50 → 0.00 on its
+own trap set. Ours starts at 0.11 and lands at 0.05 on this corpus, and the
+residual is two documents about the SAME company (a company profile and a
+staff-introduction blurb) ranking alongside each other — cross-document by the
+metric's definition, benign in a caller's ears. Different corpus, different
+number; the mechanism is the same and the measurement here is what shipped.
+
+**Exact-term questions could be refused by their own document.** Found while
+probing the live `dhron_calling` agent after the re-index: "what are the six
+stages?" retrieved nothing. The chunk that literally contains "Six Stage
+Implementation Approach" scores 0.222 — under the absolute floor — because
+embeddings under-score short keyword questions, exactly the case the BM25 arm
+exists to cover. The pruner then discarded it on the cosine alone, so the
+lexical arm could find the answer and never deliver it.
+
+The fix is a lexical FALLBACK: when the vector arm yields nothing above the
+floor, the top BM25 hits are admitted instead. Fallback and not addition,
+because admitting them alongside working vector results measured Precision@3
+0.53 -> 0.46 and contamination 0.05 -> 0.17 — one shared common word is enough
+to drag in another tenant's document. As a fallback it changes nothing on the
+golden set and rescues the live query. `RetrievedChunk.kept_by` records which
+arm admitted each chunk, and it is in the trace.
+
+Worth noting for whoever tunes this next: it was found by probing a REAL agent
+after deploying, not by the golden set, whose phrasing of the same question
+scores above the floor. Probe production after a retrieval change.
+
+**The tests were writing fake usage into the production cost ledger.** Caught by
+reading the patched cost report on real data: it showed 3,457 embedding requests
+against a model called `fake-embed-v1`. The RAG pipeline reports embedding
+tokens through the credit-tracker singleton, and the unit tests — which embed
+constantly with a fake provider — were appending to `credit_log/<date>.jsonl`,
+the file `credit_report.py` reads. A cost ledger containing fabricated usage is
+worse than one missing the feature entirely.
+
+Closed at both sources: an autouse fixture in `tests/conftest.py` repoints the
+tracker's log directory (resolved at import, so the module attribute is patched,
+not the env var), and the evaluation harness disables cost tracking for its own
+runs — an evaluation's spend is real but it is not a call, and it is already
+reported by the eval itself. The 3,907 synthetic rows were removed from
+2026-08-12; real STT/TTS/LLM events were untouched.
+
+**Test-suite gotcha, for whoever chases this next:** the Postgres fixture
+(`tests/test_intel_queue.pg_test_db`, session-scoped, shared by 10 modules)
+rebuilds ONE database — `lescall_test` — with `DROP SCHEMA public CASCADE`.
+Two pytest processes against the same host therefore destroy each other's
+schema mid-run, and the symptom is a scatter of `UndefinedTable: relation
+"phone_numbers" does not exist` in whichever modules happened to be running.
+Observed while validating this work: the same commit produced 0, 3, 5 and 41
+errors depending on what else was running, and a clean serial run is green.
+Run one suite at a time, or give the second one its own database.

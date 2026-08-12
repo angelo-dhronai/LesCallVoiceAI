@@ -155,6 +155,29 @@ ABSTAIN_MIN_QUERY_CHARS = _int("RAG_ABSTENTION_MIN_QUERY_CHARS", 4)
 # threshold started refusing answerable questions (synonymy — "servers" vs
 # "infrastructure" — makes term overlap a poor proxy for answerability).
 ABSTAIN_ON_ZERO_OVERLAP = _flag("RAG_ABSTENTION_ZERO_OVERLAP", True)
+# Relative quality floor: drop a candidate scoring far below the BEST candidate
+# for this query, even when it clears the absolute floor. The absolute floor
+# asks "is this chunk about anything at all"; this asks "is it in the same
+# league as the best thing we found", which is the question that keeps another
+# tenant's document out of the prompt. 0.0 disables it.
+#
+# 0.6, measured (37 golden questions). Quality is untouched up to 0.7 and pays
+# real recall beyond it:
+#
+#     floor  Recall@1  Recall@3  Precision@3  MRR   contamination
+#      0.0     0.79      0.98       0.52      0.89      0.06
+#      0.6     0.79      0.98       0.53      0.89      0.05
+#      0.8     0.79      0.91       0.57      0.86      0.05
+#      0.9     0.75      0.82       0.68      0.81      0.04
+#
+# The averages understate what it does, which is why the per-category numbers
+# matter: contamination is ~0 everywhere except wrong_context (0.33) and
+# multi_hop (0.13). The case it fixes is a caller asking for a 3BHK in Surat
+# under ₹1.1 crore and being handed the property list, a rental listing for a
+# different city, AND a Nintendo console catalogue — the third arrived purely
+# because K had a slot free. That is the "agent quotes console prices on a
+# real-estate call" failure, and it is the one worth spending precision on.
+RELATIVE_FLOOR = _float("RAG_RELATIVE_FLOOR", 0.6)
 
 # --- context assembly ------------------------------------------------------
 # Cap on the evidence block. Context is ~98% of the LLM bill on this platform

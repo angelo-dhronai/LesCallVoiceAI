@@ -489,6 +489,28 @@ _SINGLE_WORD_GREETINGS = frozenset({
     "નમસ્તે", "નમસ્કાર", "હેલો", "હલો", "કેમ", "બોલો",
 })
 
+
+def _is_self_contained_greeting(text: str) -> bool:
+    """True for a turn that is nothing but greeting words ("hello", "हेलो").
+
+    The merge window exists to reassemble an utterance ASR split in two, and a
+    short transcript arriving while the caller has only just gone quiet is
+    normally the head of such a split. A bare greeting is the exception: it is
+    a COMPLETE turn — the caller checking the line is alive — and holding it
+    buys nothing while adding the very silence that makes them say it again.
+    Every other short fragment keeps the full hold.
+    """
+    toks = re.findall(r"[^\s.,!?।॥]+", (text or "").lower())
+    if not toks or len(toks) > 3:
+        return False
+    if all(t in _SINGLE_WORD_GREETINGS for t in toks):
+        return True
+    # Two-word spellings of a single greeting ("kem cho"). Joined here rather
+    # than added to _SINGLE_WORD_GREETINGS, which the VAD single-word gate also
+    # reads — "cho" on its own is not a greeting.
+    return "".join(toks) in _SINGLE_WORD_GREETINGS
+
+
 # Fallback phrases played when STT returns empty on substantial speech,
 # or when TTS receives an empty string or fails to play (feature 2 & 5).
 _STT_FALLBACK_PHRASES: dict[str, str] = {
@@ -2146,6 +2168,15 @@ class VoicePipeline:
                                         language=(lang if lang in
                                                   ("en", "hi", "gu") else "en"),
                                     ))
+                                    # The caller hears this sentence, so it is
+                                    # part of the call. The identical phrase
+                                    # spoken by the dead-air watchdog is
+                                    # recorded (_queue_watchdog_line); without
+                                    # this emit the same words were in the
+                                    # transcript or not depending purely on
+                                    # which path produced them. Unlike a filler
+                                    # it carries meaning — it explains a gap.
+                                    self._emit_agent_line(fallback)
                                 except asyncio.QueueFull:
                                     logger.warning("[STT] TTS queue full — cannot play language-fallback phrase")
                     else:
@@ -2597,6 +2628,23 @@ class VoicePipeline:
             except Exception:
                 logger.exception("[REPAIR] silence watchdog error")
 
+    def _emit_agent_line(self, text: str) -> None:
+        """Record one agent utterance on the transcript.
+
+        Any path that makes the agent SAY something the caller can hear must
+        call this, or the sentence exists on the call and nowhere else — the
+        audit transcript, the stored call record and the intelligence pipeline
+        all read the same "agent" events. Fillers are the one deliberate
+        exception (see the engine loop) because they carry no content and used
+        to fuse onto the real reply in summaries and embeddings."""
+        if not text or self._hub is None:
+            return
+        self._hub.emit_nowait({
+            "type": "agent", "text": text,
+            "llm_latency_ms": 0, "first_chunk_ms": 0,
+            "total_latency_ms": 0,
+        })
+
     def _queue_watchdog_line(self, text: str, now: float) -> None:
         """Speak a watchdog-originated line (reprompt / silence goodbye /
         max-duration wrap-up) through the normal TTS path."""
@@ -2604,12 +2652,7 @@ class VoicePipeline:
             return
         self._tts_queue.put_nowait(Response(
             text=text, is_shortcut=True, timestamp=now, protected=True))
-        if self._hub is not None:
-            self._hub.emit_nowait({
-                "type": "agent", "text": text,
-                "llm_latency_ms": 0, "first_chunk_ms": 0,
-                "total_latency_ms": 0,
-            })
+        self._emit_agent_line(text)
 
     def _lang_conformance_check(self, stamp: str | None, text: str) -> None:
         """A6 telemetry (warning only, never behavioral): the language the
@@ -2721,7 +2764,13 @@ class VoicePipeline:
             _quiet_ms = (time.monotonic() - self._last_voice_activity) * 1000.0
             _fragment = (
                 len(transcript.text.split()) <= MERGE_NO_FASTPATH_MAX_WORDS
-                and _quiet_ms < MERGE_NO_FASTPATH_QUIET_MS)
+                and _quiet_ms < MERGE_NO_FASTPATH_QUIET_MS
+                # A bare "hello" is a finished turn, not the head of a split;
+                # the caller is checking we are still there. Paying the hold
+                # here is what produced the dead air they were probing for.
+                # The idle guards below still apply, so this only fast-paths
+                # when nothing else is in flight and the caller is not talking.
+                and not _is_self_contained_greeting(transcript.text))
             if (
                 TRANSCRIPT_MERGE_SKIP_WHEN_IDLE
                 and not _capture_active
@@ -3257,6 +3306,23 @@ class VoicePipeline:
                                                   None) or None
                         trace["is_filler"] = (
                             getattr(first_result, "intent", "") == "filler")
+                        # Which uploaded document backed what the agent just
+                        # said. The router resolved this before generating, so
+                        # by here it describes THIS turn. Persisted with the
+                        # turn so "why did the agent say that?" is answerable
+                        # from the call record months later, rather than only
+                        # from a rotating trace file.
+                        _cites = getattr(self.conversation, "_rag_citations", None)
+                        if _cites:
+                            trace["rag_sources"] = [
+                                {"label": c.get("label"),
+                                 "document_id": c.get("document_id"),
+                                 "chunk_id": c.get("chunk_id"),
+                                 "score": c.get("relevance_score")}
+                                for c in _cites]
+                        _rag_tid = getattr(self.conversation, "_rag_trace_id", "")
+                        if _rag_tid:
+                            trace["rag_trace_id"] = _rag_tid
 
                         logger.info(
                             "[ENGINE] %r -> %r (%.0fms, first_chunk=%.0fms)",
@@ -3376,6 +3442,10 @@ class VoicePipeline:
                         timestamp=response.timestamp,
                         language=lang if lang in ("en", "hi", "gu") else "en",
                     )
+                    # The engine emitted the (empty) original, which the audit
+                    # writer discards — so the substitute is what the caller
+                    # actually hears and the only thing worth recording.
+                    self._emit_agent_line(fallback)
 
                 # Preprocess text to avoid gibberish: normalize punctuation that
                 # can confuse Sarvam TTS (em-dashes produce audio glitches).
@@ -3484,6 +3554,10 @@ class VoicePipeline:
                 logger.info("[TTS] Playing silence-protection fallback phrase (lang=%s)", lang)
                 try:
                     await self.tts.speak(fallback)
+                    # Recorded only on success: this path bypasses the TTS
+                    # queue entirely, so nothing else would ever attribute
+                    # these words to the agent.
+                    self._emit_agent_line(fallback)
                 except Exception:
                     logger.warning("[TTS] Fallback phrase also failed — accepting silence")
             finally:

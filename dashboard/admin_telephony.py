@@ -308,6 +308,45 @@ def tenant_telephony(owner: str, request: Request):
   </form>
 </div>"""
 
+    # ---- what the console CANNOT do ------------------------------------
+    #
+    # Adding a DID is not self-contained and no form here can make it so. This
+    # console owns the platform half (trunk row → gateway XML, number row →
+    # dialplan XML, agent bindings); steps 1-3 below happen in the carrier's
+    # own console. Miss any of them and Connect still reports `applied` —
+    # FreeSWITCH is correctly configured to answer a call that never arrives.
+    # Saying so here is the difference between "ready" and "working".
+    import os
+    sip_ip = os.environ.get("PUBLIC_SIP_IP", "35.207.225.237")
+    sip_port = os.environ.get("PUBLIC_SIP_PORT", "5060")
+    domains = sorted({t["sip_domain"] for t in trunks if t.get("sip_domain")})
+    carrier = f"""
+<div class="card">
+  <h2>Before a NEW number will work</h2>
+  <p class="small muted" style="margin:-.3rem 0 .7rem">
+    This page only configures our side. A number that has never been used
+    before also needs three things done in the carrier's own console — and
+    until they are, <b>Connect still reports “in service”</b>: FreeSWITCH is
+    correctly set up to answer a call that will never arrive.</p>
+  <ol class="small" style="margin:0 0 .8rem 1.1rem;padding:0">
+    <li>The number is <b>owned</b> in the carrier account (Plivo, Twilio…).</li>
+    <li>It is <b>attached to the trunk</b> whose SIP domain is listed below —
+        not just to the account.</li>
+    <li>That trunk's <b>origination URI points here</b>:
+        <code>sip:{e(sip_ip)}:{e(sip_port)}</code> over UDP.</li>
+  </ol>
+  <dl>
+    <dt>Send SIP to</dt><dd><code>sip:{e(sip_ip)}:{e(sip_port)}</code> · udp</dd>
+    <dt>This account's SIP domain{'s' if len(domains) != 1 else ''}</dt>
+    <dd>{'<br>'.join(f'<code>{e(d)}</code>' for d in domains) or '<span class="muted">— no trunk yet —</span>'}</dd>
+    <dt>Media (RTP)</dt><dd>flows directly between the carrier and this server</dd>
+  </dl>
+  <p class="small muted" style="margin:.6rem 0 0">
+    Outbound caller ID is authorised by the <b>carrier</b>, not by us — we egress
+    through this account's own gateway, so the carrier rejects any caller ID the
+    account does not own. There is no “verify this number” step here by design.</p>
+</div>"""
+
     body = f"""
 <h1>{e(owner)} · telephony</h1>
 <p class="sub"><a href="/admin/telephony">← all numbers</a> ·
@@ -315,7 +354,7 @@ def tenant_telephony(owner: str, request: Request):
 {gate}
 <div class="grid side">
   <div>{''.join(cards) or '<div class="card"><h2>No numbers</h2><p class="muted small">This account has no number yet. Add one on the right.</p></div>'}</div>
-  <div>{add_number}{trunk_card}</div>
+  <div>{add_number}{carrier}{trunk_card}</div>
 </div>"""
     return page(f"{owner} · telephony", body, _flash(request))
 

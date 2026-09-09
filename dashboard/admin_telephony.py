@@ -230,6 +230,21 @@ def tenant_telephony(owner: str, request: Request):
     <b>Remove</b> deletes both.</p>
 
   <hr style="border:0;border-top:1px solid #eef0f3;margin:1rem 0">
+  <form class="act" method=post action="/admin/telephony/{e(owner)}/number/{n['id']}/test-call">
+    {csrf}
+    <label>Prove it works — ring a phone FROM this number</label>
+    <input name=destination placeholder="919876543210 (with country code)"
+           style="width:16rem;display:inline-block">
+    <button type=submit class=ghost style="margin-top:.5rem">Place test call</button>
+  </form>
+  <p class="small muted" style="margin:.5rem 0 0">
+    Dials out over this number's own trunk with its outbound agent live, so it
+    proves the whole path — caller ID, carrier, gateway, agent. <b>This is a real
+    call</b>: it costs money and counts against {e(owner)}'s quota. It is also the
+    only way to tell "connected" apart from "the carrier is actually sending us
+    this number" — Connect cannot know the difference.</p>
+
+  <hr style="border:0;border-top:1px solid #eef0f3;margin:1rem 0">
   <form class="act" method=post action="/admin/telephony/{e(owner)}/number/{n['id']}/transfer">
     {csrf}
     <label>Move this number to another account</label>
@@ -420,6 +435,25 @@ def ui_disconnect(owner: str, number_id: int, request: Request, csrf: str = Form
         return out
     return _back(owner, "ok", f"{out['number']} is out of service. Its setup is kept — "
                               f"press Connect to restore it.")
+
+
+@telephony.post("/{owner}/number/{number_id}/test-call")
+def ui_test_call(owner: str, number_id: int, request: Request, csrf: str = Form(""),
+                 destination: str = Form("")):
+    _guard(request, csrf)
+    from shared.telephony_admin import test_call
+    out = _run(owner, request, "number.test_call",
+               lambda: test_call(number_id, destination, actor="admin-ui"),
+               {"number_id": number_id, "destination": destination})
+    if isinstance(out, RedirectResponse):
+        return out
+    if not out["ok"]:
+        return _back(owner, "err",
+                     f"FreeSWITCH refused the call: {out['response']}. That usually "
+                     f"means the carrier is not routing this number to us yet.")
+    return _back(owner, "ok",
+                 f"Ringing {out['destination']} from {out['number']} with "
+                 f"{out['agent_slug']} — answer it to hear the agent.")
 
 
 @telephony.post("/{owner}/number/{number_id}/remove")

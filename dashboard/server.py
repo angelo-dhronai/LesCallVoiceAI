@@ -4414,26 +4414,17 @@ async def _fs_esl_exec(cmd: str, timeout: float = 55.0) -> str:
 
 def _fs_originate_cmd(phone: str, agent_slug: str = "", campaign_id: str = "",
                       caller_id: str = "", gateway_name: str = "") -> str:
-    """Build the fs_cli originate. Egress is ALWAYS through a named gateway
-    (sofia/gateway/<name>/…) so the call uses that trunk's own credentials/
-    caller-id authorisation — never a bare domain that could resolve to the
-    shared profile."""
-    caller_id = caller_id or OUTBOUND_CALLER_ID
-    gateway_name = gateway_name or ADMIN_GATEWAY_NAME
-    chan_vars = [
-        f"origination_caller_id_number={caller_id}",
-        "originate_timeout=45",
-        "ignore_early_media=true",
-    ]
-    if agent_slug:
-        chan_vars.append(f"lescall_agent_slug={agent_slug}")
-    if campaign_id:
-        chan_vars.append(f"lescall_campaign_id={campaign_id}")
-    return (
-        "originate {" + ",".join(chan_vars) + "}"
-        f"sofia/gateway/{gateway_name}/{phone} "
-        f"{OUTBOUND_DP_EXT} XML {OUTBOUND_DP_CTX}"
-    )
+    """Build the fs_cli originate — see shared/fs_originate.py.
+
+    The body moved there when the admin plane gained its own "test this number"
+    dial: two hand-written copies of this string is how `lescall_dest` (RUNBOOK
+    §33) goes missing on one surface and nobody notices for months. This stays
+    as the name every caller in this module already uses.
+    """
+    from shared.fs_originate import originate_cmd
+    return originate_cmd(phone, agent_slug=agent_slug, campaign_id=campaign_id,
+                         caller_id=caller_id or OUTBOUND_CALLER_ID,
+                         gateway_name=gateway_name or ADMIN_GATEWAY_NAME)
 
 
 def _parse_fs_result(stdout: str, stderr: str) -> str:

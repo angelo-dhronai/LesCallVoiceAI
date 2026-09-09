@@ -585,6 +585,26 @@ def admin_disconnect_number(number_id: int, request: Request,
     return {"ok": True, **out}
 
 
+@router.post("/api/numbers/{number_id}/test-call")
+async def admin_test_call(number_id: int, request: Request,
+                          _: str = Depends(require_token)):
+    """Ring a phone FROM this number, to prove the path end to end.
+
+    Connect can only report that OUR side is configured; it says `applied` even
+    when the carrier is not yet sending us the number. This is what separates
+    "ready" from "working". It places a REAL, metered, billable call and goes
+    through the tenant's own dial gate.
+    """
+    body = await request.json()
+    reason = _reason(body)
+    from shared.telephony_admin import test_call
+    out = _tel(lambda: test_call(number_id, str(body.get("destination") or ""),
+                                 actor="admin-api"))
+    _audit(request, "telephony.number.test_call", str(number_id),
+           {"reason": reason, "result": out})
+    return out
+
+
 @router.delete("/api/numbers/{number_id}")
 def admin_remove_number(number_id: int, request: Request,
                         _: str = Depends(require_token)):

@@ -2758,3 +2758,25 @@ docker restart lescall-api lescall-runtime   # no live calls first: `show channe
 
 Tests: `tests/test_admin_credits.py` (24) + `tests/test_admin_telephony.py` (22),
 both on the `<db>_test` Postgres rebuilt from the real migrations.
+
+### 38.7 Proving a number works — the admin test call
+
+`Connect` can only ever report that OUR side is configured (§38.5), so the
+console gained the one action that tells "ready" apart from "working": ring a
+phone FROM this number, over its own trunk, with its outbound agent live.
+`/admin/telephony/<owner>` → **Place test call**, or
+`POST /admin/api/numbers/{id}/test-call`.
+
+It is a REAL call — metered, billable, counted against the tenant's quota — so
+it goes through `check_dial_allowed()` like any other, and it releases its own
+reservation in a `finally` rather than leaving a hold when the call is refused
+or unanswered.
+
+The originate string moved to **`shared/fs_originate.py`** to build it. That is
+the point of the extraction: a second hand-written originate is how
+`lescall_dest` goes missing on one surface only, and `lescall_dest` is what
+stops the bridge falling back to "the most recently logged dial" — the §33 bug
+that greeted 44 real people by a stranger's name. `server._fs_originate_cmd()`
+now delegates to it and was verified byte-identical across four argument shapes
+before the change went in; `test_outbound_identity.py` (16) still passes, and
+`test_originate_carries_the_dialled_number` pins the channel variable.

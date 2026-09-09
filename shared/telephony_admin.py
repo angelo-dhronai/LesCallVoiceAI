@@ -443,6 +443,81 @@ def disconnect_number(number_id: int, actor: str = "admin") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# proving it actually works
+# ---------------------------------------------------------------------------
+
+def test_call(number_id: int, destination: str, actor: str = "admin") -> dict:
+    """Ring `destination` FROM this number, over its trunk, with its agent live.
+
+    Connect can only ever report that OUR side is configured. It writes the
+    gateway and the dialplan and says `applied`, and it says exactly that when
+    the number is not yet pointed at us by the carrier — FreeSWITCH is then
+    correctly set up to answer a call that will never arrive. This is the only
+    thing on the admin plane that distinguishes "ready" from "working".
+
+    It exercises the OUTBOUND binding, which is the one worth proving before a
+    campaign runs: caller id + trunk + agent, end to end.
+
+    THIS PLACES A REAL CALL. It meters, it costs money and it counts against
+    the tenant's quota exactly like any other call — so it goes through the
+    same dial gate, and the reservation it takes is released here rather than
+    left to expire.
+    """
+    dest = "".join(c for c in str(destination or "") if c.isdigit())
+    if len(dest) < 7:
+        raise TelephonyAdminError(
+            "Enter the number to ring, with country code — the test call dials it.")
+
+    num = number_or_404(number_id)
+    owner = (num["owner"] or "").strip().lower()
+    require_subscription(owner)
+    if not num.get("trunk_name"):
+        raise TelephonyAdminError(f"{num['number']} has no trunk to dial out through.")
+    if (num.get("trunk_status") or "") != "applied":
+        raise TelephonyAdminError(
+            f"Press Connect on {num['number']} first — its trunk's gateway is "
+            f"{num.get('trunk_status') or 'not applied'}, so there is nothing to dial through.")
+
+    # The OUTBOUND slot, falling back to inbound exactly as the live dial path
+    # does, so the test proves what a real outbound call would use.
+    slug = num.get("outbound_agent_slug") or num.get("inbound_agent_slug") or ""
+    from shared.db.database import get_db
+    with get_db() as db:
+        _check_agent(db, slug, owner, "outbound")
+
+    from shared.billing.entitlements import check_dial_allowed, release_reservation
+    decision = check_dial_allowed(owner, origin="admin-test")
+    if not decision.allowed:
+        raise TelephonyAdminError(
+            f"The billing gate refused this call for {owner}: {decision.message}",
+            status=402)
+
+    from shared.fs_esl import fs_api
+    from shared.fs_originate import originate_cmd
+    caller = "".join(c for c in num["number"] if c.isdigit())
+    cmd = originate_cmd(dest, agent_slug=slug, caller_id=caller,
+                        gateway_name=num["trunk_name"])
+    try:
+        out = fs_api(cmd, timeout=60)
+    except Exception as exc:
+        release_reservation(getattr(decision, "reservation", "") or "")
+        raise TelephonyAdminError(f"Could not reach FreeSWITCH: {exc!r}", status=502)
+    finally:
+        # The ledger row for a real answered call closes the reservation on its
+        # own; this one is ours to drop either way, so a refused or unanswered
+        # test never leaves a hold against the tenant's quota.
+        release_reservation(getattr(decision, "reservation", "") or "")
+
+    body = (out or "").strip()
+    ok = body.startswith("+OK")
+    log.info("[admin-tel] %s test-called %s from %s via %s: %s",
+             actor, dest, num["number"], num["trunk_name"], body[:120])
+    return {"ok": ok, "number": num["number"], "destination": dest,
+            "agent_slug": slug, "gateway": num["trunk_name"],
+            "response": body[:300]}
+
+
+# ---------------------------------------------------------------------------
 # transfer
 # ---------------------------------------------------------------------------
 

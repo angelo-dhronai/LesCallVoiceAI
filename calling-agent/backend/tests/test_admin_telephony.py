@@ -390,3 +390,94 @@ def test_tenant_agents_lists_only_this_accounts_claimed_agents(accounts):
     _agent(accounts["free"], theirs)
     slugs = [a["slug"] for a in tenant_agents(accounts["paid"])]
     assert mine in slugs and theirs not in slugs
+
+
+# ── test call ───────────────────────────────────────────────────────────────
+
+def test_originate_carries_the_dialled_number(accounts):
+    """RUNBOOK §33: without lescall_dest on the channel the bridge falls back to
+    'the most recently logged dial', which during a burst is somebody else —
+    44 calls greeted a real person by a stranger's name. A second hand-written
+    originate builder is how that comes back on one surface only."""
+    from shared.fs_originate import originate_cmd
+    cmd = originate_cmd("919876543210", agent_slug="a1",
+                        caller_id="918031339140", gateway_name="gw1")
+    assert "lescall_dest=919876543210" in cmd
+    assert "lescall_agent_slug=a1" in cmd
+    assert "origination_caller_id_number=918031339140" in cmd
+    assert "sofia/gateway/gw1/919876543210" in cmd
+
+
+def test_test_call_needs_a_real_destination(accounts):
+    from shared.telephony_admin import TelephonyAdminError, test_call
+    slug = _real_agent_slugs(1)[0]
+    _agent(accounts["paid"], slug)
+    trunk = _trunk(accounts["paid"])
+    num = _number(accounts["paid"], trunk["id"], _digits(), outbound_agent_slug=slug)
+    for bad in ("", "123", "not a number"):
+        with pytest.raises(TelephonyAdminError, match="with country code"):
+            test_call(num["id"], bad)
+
+
+def test_test_call_refuses_until_the_trunk_is_applied(accounts):
+    """Its gateway does not exist in FreeSWITCH yet, so there is nothing to
+    dial through — a clearer refusal than an ESL error."""
+    from shared.telephony_admin import TelephonyAdminError, test_call
+    slug = _real_agent_slugs(1)[0]
+    _agent(accounts["paid"], slug)
+    trunk = _trunk(accounts["paid"])          # created 'pending', never applied
+    num = _number(accounts["paid"], trunk["id"], _digits(), outbound_agent_slug=slug)
+    with pytest.raises(TelephonyAdminError, match="Press Connect"):
+        test_call(num["id"], "919876543210")
+
+
+def test_test_call_refuses_a_number_with_no_agent_of_its_own(accounts):
+    from shared.telephony_admin import TelephonyAdminError, connect_number, test_call
+    slug = _real_agent_slugs(1)[0]
+    _agent(accounts["paid"], slug)
+    trunk = _trunk(accounts["paid"])
+    num = _number(accounts["paid"], trunk["id"], _digits(), outbound_agent_slug=slug)
+    connect_number(num["id"])
+    from shared.db.database import get_db
+    with get_db() as db:                      # the agent leaves the account
+        db.execute("UPDATE agents SET owner=? WHERE slug=?", (accounts["free"], slug))
+    with pytest.raises(TelephonyAdminError, match="belongs to"):
+        test_call(num["id"], "919876543210")
+
+
+def test_test_call_refuses_an_unentitled_account(accounts):
+    from shared.db.database import get_db
+    from shared.telephony_admin import TelephonyAdminError, connect_number, test_call
+    slug = _real_agent_slugs(1)[0]
+    _agent(accounts["paid"], slug)
+    trunk = _trunk(accounts["paid"])
+    num = _number(accounts["paid"], trunk["id"], _digits(), outbound_agent_slug=slug)
+    connect_number(num["id"])
+    with get_db() as db:
+        db.execute("UPDATE entitlements SET telephony=0 WHERE owner=?", (accounts["paid"],))
+    with pytest.raises(TelephonyAdminError, match="does not include telephony"):
+        test_call(num["id"], "919876543210")
+
+
+def test_test_call_never_leaves_a_quota_reservation_behind(accounts, monkeypatch):
+    """A refused or unanswered test must not hold minutes against the tenant."""
+    from shared.db.database import get_db
+    from shared.telephony_admin import connect_number, test_call
+    import shared.fs_esl as fs_esl
+    slug = _real_agent_slugs(1)[0]
+    _agent(accounts["paid"], slug)
+    trunk = _trunk(accounts["paid"])
+    num = _number(accounts["paid"], trunk["id"], _digits(), outbound_agent_slug=slug)
+    connect_number(num["id"])
+
+    seen = {}
+    monkeypatch.setattr(fs_esl, "fs_api",
+                        lambda cmd, timeout=15: seen.setdefault("cmd", cmd) or "-ERR NO_ANSWER")
+    out = test_call(num["id"], "919876543210", actor="pytest")
+    assert out["ok"] is False
+    assert "lescall_dest=919876543210" in seen["cmd"]
+    assert f"sofia/gateway/{trunk['name']}/" in seen["cmd"]
+    with get_db() as db:
+        held = db.execute("SELECT COUNT(*) AS n FROM billing_reservations WHERE owner=?",
+                          (accounts["paid"],)).fetchone()["n"]
+    assert held == 0

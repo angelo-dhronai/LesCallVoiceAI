@@ -194,11 +194,23 @@ services:
     container_name: lescall-admin
     network_mode: host
     user: "1000:1000"
+    # freeswitch group + the /etc/freeswitch mount + telephony.env below: the
+    # SAME three things the api needs, and for the same reason. /admin/telephony
+    # Connect/Disconnect/Remove write the gateway and dialplan XML and then
+    # reload FS over ESL. Without all three the console writes nothing
+    # (PermissionError at the container root, because /etc/freeswitch does not
+    # exist inside the container) and could not reload even if it had
+    # (no FS_ESL_PASSWORD, and fs_cli is not installed in the app image).
+    # The DB half of every action would still succeed — which is worse than
+    # failing outright: the number would look connected and answer nothing.
+    group_add: ["994"]
     working_dir: /home/angelo/lescall/dashboard
     command: ["python", "admin_app.py"]
     env_file:
       - .pg_env
       - path: /etc/lescall/admin.env
+        required: false
+      - path: /etc/lescall/telephony.env
         required: false
       - path: /etc/lescall/billing.env
         required: false
@@ -211,6 +223,8 @@ services:
       # Socket directory, created by the operator:
       #   sudo install -d -m 0770 -o angelo -g angelo /run/lescall-admin
       - /run/lescall-admin:/run/lescall-admin
+      # Generated gateway + dialplan XML for /admin/telephony Connect.
+      - /etc/freeswitch:/etc/freeswitch
     restart: unless-stopped
     logging: *log
 

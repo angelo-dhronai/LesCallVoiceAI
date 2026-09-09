@@ -2696,7 +2696,48 @@ regardless. Only a **partially** consumed pool pins the entitlement read — tha
 assertion is in `test_settlement_charges_only_the_overspend`, and it was
 confirmed to fail against `SUM(minutes)`.
 
-### 38.4 Deploy
+### 38.4 The admin container could not reach FreeSWITCH — found on first review
+
+`/admin/telephony` Connect/Disconnect/Remove shipped broken and the DB half
+would still have succeeded, which is worse than failing outright: the console
+would report the number connected and it would answer nothing.
+
+`lescall-admin` had none of the three things `lescall-api` has for exactly this
+job — no `/etc/freeswitch` bind mount (so the write died with `PermissionError`
+at the container root), no `group_add: ["994"]`, and no `telephony.env`, so
+`_fs_reload()` had no `FS_ESL_PASSWORD` and fell through to `fs_cli`, which is
+not installed in the app image. All three added to the admin service; recreate
+with `sudo docker compose -f deploy/docker-compose.services.yml up -d admin`
+(sudo because compose reads `/etc/lescall/admin.env`, root 0600).
+
+Verified after the fix: `POST /admin/api/numbers/6/connect` →
+`status: applied`, all three reload commands `ok` over ESL.
+
+The general rule: any container that writes generated FreeSWITCH config needs
+**mount + group 994 + telephony.env**. Two of the three fail silently-ish; the
+mount is the only one that raises.
+
+### 38.5 What the Add-a-number form CANNOT do
+
+Adding a DID is not self-contained, and no form on this platform can make it so.
+The console owns the platform half — trunk row → gateway XML, number row →
+dialplan XML, agent bindings. The rest is at the carrier and is done in their
+console:
+
+1. the DID must be owned in the Plivo/Twilio account;
+2. it must be attached to a trunk whose SIP domain matches `trunks.sip_domain`;
+3. that trunk's origination URI must point at `sip:35.207.225.237:5060` (udp).
+
+Miss any of those and Connect still reports `applied` — FreeSWITCH is correctly
+configured to answer a call that will never arrive. So `applied` means "we are
+ready for it", never "it works".
+
+`provider_ips` is currently inert: **Kamailio is `inactive`** on this host and
+FreeSWITCH is the SIP edge directly, so the carrier ACL those CIDRs feed is not
+in the path. Every trunk has it blank and inbound works. That stops being true
+the moment Kamailio is enabled.
+
+### 38.6 Deploy
 
 ```bash
 python -m shared.db.migrate          # 0025_admin_credit_grants

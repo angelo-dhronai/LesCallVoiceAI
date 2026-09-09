@@ -440,6 +440,192 @@ async def pilot_reset(owner: str, request: Request,
     return {"ok": True, "owner": owner}
 
 
+@router.post("/api/tenants/{owner}/credits")
+async def grant_credit(owner: str, request: Request,
+                       _: str = Depends(require_token)):
+    """Reward a tenant with free minutes for a number of months.
+
+    `minutes` is a POOL for the whole validity window, not a monthly allowance —
+    see shared/billing/credits.py for why that distinction had to be built
+    rather than assumed. Takes effect on their next call; no payment or invoice
+    row is created, because no money moved.
+    """
+    body = await request.json()
+    reason = _reason(body)
+    from shared.billing.credits import CreditError, grant_minutes
+    try:
+        grant = grant_minutes(owner, body.get("minutes"), body.get("valid_months", 1),
+                              actor="admin-api", note=reason)
+    except CreditError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    _audit(request, "tenant.credit.grant", owner, {"reason": reason, "grant": grant})
+    from shared.billing.entitlements import usage_summary
+    return {"ok": True, "grant": grant, "usage": usage_summary(owner)}
+
+
+@router.get("/api/tenants/{owner}/credits")
+def list_credits(owner: str, request: Request, _: str = Depends(require_token)):
+    _audit(request, "tenant.credit.list", owner)
+    from shared.billing.credits import list_grants, live_balance
+    return {"owner": owner, "balance": live_balance(owner),
+            "grants": list_grants(owner)}
+
+
+@router.post("/api/credits/{grant_id}/revoke")
+async def revoke_credit(grant_id: int, request: Request,
+                        _: str = Depends(require_token)):
+    """Withdraw the UNUSED part of a grant. Minutes already spent are not
+    clawed back — the tenant made those calls in good faith."""
+    body = await request.json()
+    reason = _reason(body)
+    from shared.billing.credits import CreditError, revoke_grant
+    try:
+        grant = revoke_grant(grant_id, actor="admin-api", reason=reason)
+    except CreditError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    _audit(request, "tenant.credit.revoke", grant.get("owner") or "",
+           {"reason": reason, "grant": grant})
+    return {"ok": True, "grant": grant}
+
+
+# ---------------------------------------------------------------------------
+# telephony plane — attach, bind, connect and move a DID
+#
+# The tenant's own /api/numbers surface can only touch what the tenant already
+# owns and is refused entirely on an unpaid plan, so none of this is reachable
+# from the product. Every handler delegates to shared/telephony_admin.py, which
+# is also what the HTML console calls — the two must not be able to disagree
+# about who may bind what.
+# ---------------------------------------------------------------------------
+
+def _tel(fn):
+    """Run a telephony_admin call, mapping its refusals onto HTTP."""
+    from shared.telephony_admin import TelephonyAdminError
+    try:
+        return fn()
+    except TelephonyAdminError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
+
+
+@router.get("/api/tenants/{owner}/telephony")
+def tenant_telephony(owner: str, request: Request, _: str = Depends(require_token)):
+    _audit(request, "telephony.read", owner)
+    from shared.telephony_admin import (subscription_state, tenant_agents,
+                                        tenant_numbers, tenant_trunks)
+    return {"owner": owner, "eligibility": subscription_state(owner),
+            "numbers": tenant_numbers(owner), "trunks": tenant_trunks(owner),
+            "agents": tenant_agents(owner)}
+
+
+@router.post("/api/tenants/{owner}/numbers")
+async def admin_add_number(owner: str, request: Request,
+                           _: str = Depends(require_token)):
+    body = await request.json()
+    reason = _reason(body)
+    from shared.telephony_admin import create_number
+    out = _tel(lambda: create_number(
+        owner, str(body.get("number") or ""), body.get("trunk_id"),
+        inbound_agent_slug=str(body.get("inbound_agent_slug") or ""),
+        outbound_agent_slug=str(body.get("outbound_agent_slug") or ""),
+        direction=str(body.get("direction") or "both"),
+        label=str(body.get("label") or ""), actor="admin-api"))
+    _audit(request, "telephony.number.add", owner, {"reason": reason, "result": out})
+    return {"ok": True, **out}
+
+
+@router.post("/api/tenants/{owner}/trunks")
+async def admin_add_trunk(owner: str, request: Request,
+                          _: str = Depends(require_token)):
+    body = await request.json()
+    reason = _reason(body)
+    from shared.telephony_admin import create_trunk
+    out = _tel(lambda: create_trunk(
+        owner, str(body.get("name") or ""), str(body.get("sip_domain") or ""),
+        provider=str(body.get("provider") or "plivo"),
+        caller_id=str(body.get("caller_id") or ""),
+        provider_ips=str(body.get("provider_ips") or ""),
+        proxy=str(body.get("proxy") or ""), username=str(body.get("username") or ""),
+        password=str(body.get("password") or ""), register=bool(body.get("register")),
+        transport=str(body.get("transport") or "udp"), actor="admin-api"))
+    _audit(request, "telephony.trunk.add", owner, {"reason": reason, "result": out})
+    return {"ok": True, **out}
+
+
+@router.patch("/api/numbers/{number_id}")
+async def admin_bind_number(number_id: int, request: Request,
+                            _: str = Depends(require_token)):
+    """Rebind a number to agents IN ITS OWN ACCOUNT. Live on the next call."""
+    body = await request.json()
+    from shared.telephony_admin import bind_number
+    out = _tel(lambda: bind_number(
+        number_id,
+        inbound_agent_slug=body.get("inbound_agent_slug"),
+        outbound_agent_slug=body.get("outbound_agent_slug"),
+        direction=body.get("direction"), label=body.get("label"),
+        actor="admin-api"))
+    _audit(request, "telephony.number.bind", str(number_id), {"result": out})
+    return {"ok": True, **out}
+
+
+@router.post("/api/numbers/{number_id}/connect")
+def admin_connect_number(number_id: int, request: Request,
+                         _: str = Depends(require_token)):
+    from shared.telephony_admin import connect_number
+    out = _tel(lambda: connect_number(number_id, actor="admin-api"))
+    _audit(request, "telephony.number.connect", str(number_id), {"result": out})
+    return {"ok": out.get("status") == "applied", **out}
+
+
+@router.post("/api/numbers/{number_id}/disconnect")
+def admin_disconnect_number(number_id: int, request: Request,
+                            _: str = Depends(require_token)):
+    from shared.telephony_admin import disconnect_number
+    out = _tel(lambda: disconnect_number(number_id, actor="admin-api"))
+    _audit(request, "telephony.number.disconnect", str(number_id), {"result": out})
+    return {"ok": True, **out}
+
+
+@router.delete("/api/numbers/{number_id}")
+def admin_remove_number(number_id: int, request: Request,
+                        _: str = Depends(require_token)):
+    from shared.telephony_admin import remove_number
+    out = _tel(lambda: remove_number(number_id, actor="admin-api"))
+    _audit(request, "telephony.number.remove", str(number_id), {"result": out})
+    return {"ok": True, **out}
+
+
+@router.get("/api/numbers/{number_id}/transfer-preview")
+def admin_transfer_preview(number_id: int, to: str, request: Request,
+                           _: str = Depends(require_token)):
+    from shared.telephony_admin import transfer_preview
+    out = _tel(lambda: transfer_preview(number_id, to))
+    _audit(request, "telephony.number.transfer_preview", str(number_id), {"to": to})
+    return out
+
+
+@router.post("/api/numbers/{number_id}/transfer")
+async def admin_transfer_number(number_id: int, request: Request,
+                                _: str = Depends(require_token)):
+    """Hand a number to another account, with its trunk and bound agents.
+
+    Moving the row alone is a half-migration: outbound checks the TRUNK's owner
+    and the AGENT's owner too, so the number would answer calls and never be
+    able to place one. Both move by default.
+    """
+    body = await request.json()
+    reason = _reason(body)
+    from shared.telephony_admin import transfer_number
+    out = _tel(lambda: transfer_number(
+        number_id, str(body.get("to") or body.get("new_owner") or ""),
+        move_trunk=body.get("move_trunk", True) is not False,
+        move_agents=body.get("move_agents", True) is not False,
+        rename_trunk=body.get("rename_trunk", True) is not False,
+        actor="admin-api", reason=reason))
+    _audit(request, "telephony.number.transfer", str(number_id),
+           {"reason": reason, "result": out})
+    return {"ok": True, **out}
+
+
 @router.post("/api/tenants/{owner}/reconcile")
 async def reconcile(owner: str, request: Request, _: str = Depends(require_token)):
     """Re-ask the gateway about this tenant's unresolved payments."""
@@ -575,6 +761,12 @@ app.include_router(_ui_router)
 # operator would otherwise need SSH, psql or docker for.
 from admin_ops import ops as _ops_router  # noqa: E402
 app.include_router(_ops_router)
+
+# Telephony plane — which account owns which number, which of THAT account's
+# agents answers it, and whether it is in service. Mounted AFTER `router` so its
+# HTML routes cannot shadow the bearer-only /admin/api/* JSON namespace.
+from admin_telephony import telephony as _telephony_router  # noqa: E402
+app.include_router(_telephony_router)
 
 
 @app.exception_handler(401)

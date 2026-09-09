@@ -147,6 +147,18 @@ def pass_topup_expiry() -> dict:
     return {"topups_expired": len(owners)}
 
 
+def pass_credit_settlement() -> dict:
+    """Drain admin credit pools by what each CLOSED month overspent.
+
+    This is what stops a multi-month reward from being re-granted at every
+    period rollover — see shared/billing/credits.py. It must run BEFORE the
+    grace/cycle passes touch periods, and after topup expiry so a grant that
+    lapsed this pass is not settled for a month it no longer covers.
+    """
+    from shared.billing.credits import settle_all
+    return settle_all()
+
+
 def pass_grace_expiry() -> dict:
     """Failed payments past their grace window.
 
@@ -403,6 +415,7 @@ def run_once() -> dict:
         ("reservations", pass_reservations),
         ("pilot", pass_pilot_expiry),
         ("topups", pass_topup_expiry),
+        ("credits", pass_credit_settlement),
         ("grace", pass_grace_expiry),
         ("cycle", pass_cycle_end),
         ("stale", pass_stale_checkouts),

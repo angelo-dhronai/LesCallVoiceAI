@@ -2578,3 +2578,142 @@ this host — a git worktree, a clone, a CI job — filed its test usage into th
 production ledger no matter which tree it ran from. It is now resolved from the
 module's own location, which is byte-identical in production and in the
 container, and correct everywhere else. `SARVAM_CREDIT_LOG_DIR` still overrides.
+
+---
+
+## 38. Admin plane: number handover + reward minutes (2026-09-09) — SHIPPED, LIVE
+
+Two operator capabilities that only existed as `psql` sessions, plus the live
+handover of `+91 80 3133 9140` that prompted them.
+
+### 38.1 The handover, and why moving one row is not a transfer
+
+`info@craftidea.in` → `craftidearesearch@gmail.com`, same company, both accounts
+already on the platform. The number's row was the obvious thing to change and
+the *least* of what had to move. Three separate ownership checks sit on the live
+path and all three are read at dial time:
+
+| what | who reads it | what breaks if it stays behind |
+|---|---|---|
+| `phone_numbers.owner` | `_did_owner()`, `billing_owner()` | the wrong tenant is billed; the caller is matched against the wrong contact book |
+| `trunks.owner` | `server._outbound_identity()` | the number answers calls and can **never place one** — "its trunk belongs to another account" |
+| `agents.owner` | `_outbound_identity` → `_agent_owned_by()` | same: refused before the originate |
+
+So a transfer moves the number, its trunk and the agents bound to it, or it is a
+half-migration that looks finished in the console and fails on the first
+outbound call.
+
+**The trunk name is also the FreeSWITCH gateway name**, and it is shown to the
+tenant in their own Telephony panel — leaving `info-craftidea-in_plivo-339140`
+on the receiving account puts the previous owner's email address in their UI.
+`telephony_api.update_trunk` refuses renames for a good reason (the XML would be
+orphaned and every live DID would point at a gateway that no longer exists), so
+the rename is done properly: write the new gateway XML, `reloadxml` +
+`sofia profile external rescan`, verify the new gateway is `UP`, then
+`killgw` the old one and delete its file. `reloadxml`/`rescan` **only ever add**
+gateways — without `killgw` the retired one keeps accepting originates until
+FreeSWITCH restarts.
+
+What did NOT move, deliberately: `calls`, `usage_ledger` and `contacts` rows for
+the old account. Those are the record of what that account did.
+
+The DID's dialplan (`ai_inbound_8031339140.xml`) needed no change at all — it is
+keyed on the number, not the owner, and routes to `127.0.0.1:9000` regardless.
+
+Verified after the move:
+
+```
+inbound  agent: fitcoach_ai-2-inbound        # resolve_agent_slug(did=…)
+outbound agent: fitcoach_ai-2-outbound
+did owner     : craftidearesearch@gmail.com
+outbound id   : gateway craftidearesearch-gmail-com_plivo-339140, caller 918031339140
+dial gate     : ALLOWED (growth, 8000 min, telephony=1)
+```
+
+### 38.2 `/admin/telephony` — the operator's number plane
+
+`shared/telephony_admin.py` is the logic; the HTML console
+(`dashboard/admin_telephony.py`) and the JSON API (`/admin/api/...` in
+`admin_app.py`) both call it, so the two surfaces cannot drift on who may bind
+what. Per account: add a number, add a trunk, rebind inbound/outbound agents,
+**Connect** (write gateway + dialplan, reload), **Disconnect** (delete the
+dialplan, keep the row and its bindings), **Remove**, **Transfer**.
+
+Two rules are enforced in the module, not in the page:
+
+* **The receiving account must be entitled to telephony** — `telephony_allowed()`,
+  the same predicate the tenant's own panel and the dial gate use, re-checked at
+  Connect and not only at create. A number parked on a Free account answers calls
+  the billing gate then refuses to meter.
+* **A number may only bind to agents in its OWN account.** The inbound resolver
+  *trusts* the binding and never re-checks ownership (`resolve_agent_slug`), so a
+  cross-tenant binding is RUNBOOK §33 from the other end: another tenant's agent
+  answering in their own company's name, billing their own minutes.
+
+`freeswitch_config.remove_inbound_dialplan()` / `remove_gateway()` are new. Both
+delete endpoints previously said *"generated config file (if applied) is not
+auto-removed; see deploy/RUNBOOK.md"* — fine as a note a human reads, not fine
+once a console button does it: a "removed" number kept answering calls.
+
+### 38.3 Reward minutes — and the pool that had to be built
+
+`/admin/tenant/<owner>` → **Reward minutes**: N minutes, valid M months, audited
+reason. It runs on the existing `minute_topups` rail (`source='admin_credit'`,
+`amount_paise=0`, no gateway order), so `get_entitlements()` folds it into
+`minutes_limit` and every gate, meter and invoice picks it up with no other
+change. No payment row and no invoice — no money moved, and a ₹0 receipt would
+put a fake sale in the GST series.
+
+**The defect that had to be designed out.** A paid top-up expires with the period
+that sold it, so "add N to this period's ceiling" was always exact — there is
+only ever one period. Validity in MONTHS breaks that: `minutes_limit` is
+recomputed as `included + topup` at every rollover, so *1000 minutes for 3
+months* would have handed out **3000**. The pool would silently refill.
+
+So a grant drains. `minutes_consumed` + `settled_through` on the row;
+`credits.settle_owner()` walks the CLOSED IST calendar months in the grant's
+window and charges `max(0, minutes_used − minutes_included)` — only what the
+tenant spent **beyond their own plan** — against the oldest grant covering that
+month. The live period is never settled: its overspend is already bounded by
+`included + remaining`, and settling it would double-count. The entitlement read
+became `SUM(GREATEST(minutes - minutes_consumed, 0))`.
+
+Wired into `sync.run_once()` as the `credits` pass, not a cron: if it never ran,
+a multi-month grant would behave exactly like the bug.
+
+Two honest limits, both documented in the module: the settlement grid is the IST
+calendar month (historical period boundaries are recorded nowhere in this
+schema), and it charges against the tenant's CURRENT `minutes_included`, so a
+plan change mid-grant settles at the new size.
+
+A grant younger than one calendar month has nothing to settle and behaves
+exactly like today's paid top-up — the common case stays on the old fast path.
+
+**Testing note.** The obvious test (*grant 1000/3mo, burn it, roll over, assert
+the topup is 0*) passes even with the bug, because settlement marks a fully
+drained grant `spent` and `spent` rows drop out of the `status='active'` sum
+regardless. Only a **partially** consumed pool pins the entitlement read — that
+assertion is in `test_settlement_charges_only_the_overspend`, and it was
+confirmed to fail against `SUM(minutes)`.
+
+### 38.4 Deploy
+
+```bash
+python -m shared.db.migrate          # 0025_admin_credit_grants
+docker restart lescall-admin         # console + JSON API
+docker restart lescall-workers       # the credits settlement pass
+```
+
+`lescall-api` and `lescall-runtime` need the restart too, once: both IMPORT
+`shared/billing/entitlements.py` (the dial gate and the inbound E6 gate), and a
+bind mount does not reload a module that is already in memory. Skip them and the
+call path keeps summing `minutes` instead of what is LEFT of each pool — the
+exact over-grant this shipped to prevent, live on the only surface that spends
+the minutes.
+
+```bash
+docker restart lescall-api lescall-runtime   # no live calls first: `show channels count`
+```
+
+Tests: `tests/test_admin_credits.py` (24) + `tests/test_admin_telephony.py` (22),
+both on the `<db>_test` Postgres rebuilt from the real migrations.

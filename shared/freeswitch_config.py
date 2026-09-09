@@ -264,3 +264,65 @@ def apply_config(
         result["reload_results"] = _fs_reload()
         result["reloaded"] = all(r["ok"] for r in result["reload_results"].values())
     return result
+
+
+# ---------------------------------------------------------------------------
+# unapply — the other half, which used to be a manual RUNBOOK step
+# ---------------------------------------------------------------------------
+#
+# Deleting a number or a trunk in the API only ever removed the DATABASE row:
+# both endpoints answer "generated config file (if applied) is not auto-removed;
+# see deploy/RUNBOOK.md". So a disconnected DID kept its dialplan and kept
+# answering calls, and a deleted trunk kept a live gateway. That is fine as long
+# as a human reads the note; it is not fine once an operator can disconnect a
+# number from a console button.
+
+def remove_inbound_dialplan(number: dict, conf_dir: str | None = None,
+                            reload: bool = True) -> dict:
+    """Delete a DID's generated dialplan so FreeSWITCH stops answering it.
+
+    Idempotent: a file that is already gone is a success, not an error — the
+    caller's goal is "this DID does not route", and it does not.
+    """
+    path = Path(conf_dir or FS_CONF_DIR) / "dialplan" / "public" / dialplan_file_name(number)
+    existed = path.exists()
+    if existed:
+        path.unlink()
+    out: dict = {"removed": str(path), "existed": existed,
+                 "reloaded": False, "reload_results": {}}
+    if reload:
+        out["reload_results"] = _fs_reload()
+        out["reloaded"] = all(r["ok"] for r in out["reload_results"].values())
+    return out
+
+
+def remove_gateway(trunk: dict, conf_dir: str | None = None,
+                   reload: bool = True) -> dict:
+    """Delete a trunk's gateway XML and tear the live gateway down.
+
+    Removing the file alone is not enough: `reloadxml` + `rescan` ADD gateways,
+    they never retire one, so the deleted trunk would keep accepting originates
+    until FreeSWITCH restarted. `killgw` is what actually removes it.
+    """
+    path = Path(conf_dir or FS_CONF_DIR) / "sip_profiles" / "external" / gateway_file_name(trunk)
+    existed = path.exists()
+    if existed:
+        path.unlink()
+    out: dict = {"removed": str(path), "existed": existed, "killgw": None,
+                 "reloaded": False, "reload_results": {}}
+    if reload:
+        try:
+            from shared.fs_esl import fs_api
+            out["killgw"] = fs_api(
+                f"sofia profile external killgw {trunk['name']}", timeout=15).strip()[:200]
+        except Exception as exc:
+            try:
+                proc = subprocess.run(
+                    [FS_CLI, "-x", f"sofia profile external killgw {trunk['name']}"],
+                    capture_output=True, text=True, timeout=15)
+                out["killgw"] = (proc.stdout or proc.stderr or "").strip()[:200]
+            except Exception as exc2:
+                out["killgw"] = f"esl: {exc!r} / fs_cli: {exc2!r}"[:200]
+        out["reload_results"] = _fs_reload()
+        out["reloaded"] = all(r["ok"] for r in out["reload_results"].values())
+    return out

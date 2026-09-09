@@ -118,6 +118,7 @@ button.danger{background:#b42318}button.ghost{background:#eef0f3;color:#16181d}
 button:hover{filter:brightness(1.07)}
 .flash{padding:.65rem .9rem;border-radius:9px;margin-bottom:1rem;font-size:.9rem}
 .flash.ok{background:#d9f5e6;color:#0b6b45}.flash.err{background:#fee2e2;color:#9b1c1c}
+.flash.warn{background:#fef3c7;color:#8a5b00}
 .muted{color:#697086}.small{font-size:.8rem}
 .bar{height:6px;background:#eef0f3;border-radius:99px;overflow:hidden;margin-top:.3rem}
 .bar>i{display:block;height:100%;background:#0b6bcb}
@@ -143,6 +144,7 @@ def page(title: str, body: str, flash: tuple[str, str] | None = None) -> str:
     <a href="/admin">Tenants</a>
     <a href="/admin/calls">Calls</a>
     <a href="/admin/agents">Agents</a>
+    <a href="/admin/telephony">Telephony</a>
     <a href="/admin/invoices">Outstanding</a>
     <a href="/admin/payments">Payments</a>
     <a href="/admin/health">Health</a>
@@ -369,6 +371,10 @@ def tenant_page(owner: str, request: Request):
         plans = [dict(r) for r in db.execute(
             "SELECT code, name FROM plans WHERE active=1 ORDER BY sort").fetchall()]
 
+    from shared.billing.credits import list_grants, live_balance
+    grants = list_grants(owner)
+    reward = live_balance(owner)
+
     if user is None and ent is None:
         raise HTTPException(status_code=404, detail="no such tenant")
     user = dict(user) if user else {"email": owner}
@@ -403,7 +409,9 @@ def tenant_page(owner: str, request: Request):
       {pill(usage['status'], 'rose' if usage['status'] == 'locked' else ('amber' if usage['status'] == 'grace' else 'mint'))}</dd>
     <dt>Period</dt><dd>{when(usage['period_start'], '%d %b')} → {when(usage['period_end'], '%d %b %Y')}</dd>
     <dt>Minutes</dt><dd>{num(used)} / {'unlimited' if limit is None else num(limit)}
-      {f'<div class="bar"><i class="{bar_cls}" style="width:{pct}%"></i></div>' if limit else ''}</dd>
+      {f'<div class="bar"><i class="{bar_cls}" style="width:{pct}%"></i></div>' if limit else ''}
+      {f'<div class="small muted">{num(usage["minutes_included"])} on plan + '
+       f'{num(reward["minutes_remaining"])} rewarded</div>' if reward["minutes_remaining"] else ''}</dd>
     <dt>Agents</dt><dd>{num(usage['agents_used'] if 'agents_used' in usage else len([a for a in agents if not a['archived_at']]))} /
       {'unlimited' if usage['max_agent_families'] is None else num(usage['max_agent_families'])}</dd>
     <dt>Concurrent</dt><dd>{'unlimited' if usage['max_concurrent_calls'] is None else num(usage['max_concurrent_calls'])}</dd>
@@ -464,6 +472,75 @@ def tenant_page(owner: str, request: Request):
     {csrf}
     <button type=submit class=ghost>Re-check payments with gateway</button>
   </form>
+</div>
+
+<div class="card">
+  <h2>Telephony</h2>
+  <dl>
+    <dt>Numbers</dt><dd>{num(len(numbers))}
+      {pill('in service: ' + str(sum(1 for n in numbers if n['config_status'] == 'applied')), 'mint')
+        if numbers else ''}</dd>
+    <dt>Trunks</dt><dd>{num(len(trunks))}</dd>
+    <dt>Entitled</dt><dd>{yn(ent.get('telephony'))}</dd>
+  </dl>
+  <p class="small muted" style="margin:.6rem 0 0">
+    <a href="/admin/telephony/{e(owner)}">Add, connect, rebind or move this
+    account's numbers →</a></p>
+</div>"""
+
+    # ---- reward credits -----------------------------------------------
+    #
+    # Free minutes an operator hands out: onboarding sweeteners, an apology for
+    # an outage, a negotiated extension. Runs on the existing top-up rail
+    # (shared/billing/credits.py) so it lands in `minutes_limit` and every gate
+    # and meter picks it up with no other code change.
+    grant_rows = "".join(
+        f"<tr><td class=num>{num(g['minutes'])}</td>"
+        f"<td class=num>{num(g['minutes_remaining'])}</td>"
+        f"<td>{when(g['period_end'], '%d %b %Y')}</td>"
+        f"<td>{pill(g['status'], {'active': 'mint', 'spent': 'amber', 'revoked': 'rose', 'expired': ''}.get(g['status'], ''))}</td>"
+        f"<td class=small muted>{e(g['note'] or '—')}<div>{e(g['granted_by'] or '')} · "
+        f"{when(g['created_at'], '%d %b %Y')}</div></td>"
+        f"<td class=small>" + (
+            f"""<form class=act method=post action="/admin/tenant/{e(owner)}/credits/{g['id']}/revoke">
+              {csrf}<input name=reason placeholder="reason" minlength=10 required style="width:8rem">
+              <button type=submit class=danger style="margin-top:.3rem">Revoke</button></form>"""
+            if g["status"] == "active" else '<span class="muted">—</span>')
+        + "</td></tr>"
+        for g in grants)
+
+    credits_card = f"""
+<div class="card">
+  <h2>Reward minutes</h2>
+  <p class="small muted" style="margin:-.3rem 0 .8rem">
+    Free minutes on top of whatever the plan includes. Live on this account's
+    very next call — nothing to restart, no invoice, no payment record.
+    <b>Validity is a pool, not an allowance</b>: 1,000 minutes for 3 months means
+    1,000 minutes to spend at any point in those 3 months, not 1,000 every month.
+    Each closed month draws down whatever the account spent beyond its own plan.</p>
+  {f'''<div class="flash ok" style="margin:0 0 .8rem">
+      <b>{num(reward["minutes_remaining"])} reward minutes</b> left of
+      {num(reward["minutes_granted"])} granted
+      {(" · first expiry " + when(reward["expires_at"], "%d %b %Y")) if reward["expires_at"] else ""}
+    </div>''' if reward["grants"] else ''}
+  <form class="act" method=post action="/admin/tenant/{e(owner)}/credits">
+    {csrf}
+    <div class="grid two">
+      <div><label>Credit minutes</label>
+        <input name=minutes type=number min=1 max=100000 required placeholder="e.g. 1000"></div>
+      <div><label>Valid for (months)</label>
+        <input name=valid_months type=number min=1 max=60 value=1 required></div>
+    </div>
+    <label>Reason — shown in the credit history and audited (min 10 chars)</label>
+    <input name=reason required minlength=10
+           placeholder="e.g. goodwill credit for the 12 Aug outage">
+    <button type=submit>Grant credit</button>
+  </form>
+  {f'''<table style="margin-top:1rem">
+    <thead><tr><th class=num>Granted</th><th class=num>Left</th><th>Expires</th>
+      <th>State</th><th>Reason</th><th></th></tr></thead>
+    <tbody>{grant_rows}</tbody></table>''' if grants else
+   '<p class="small muted" style="margin-top:.8rem">No credits granted to this account yet.</p>'}
 </div>"""
 
     # ---- invoicing ----------------------------------------------------
@@ -579,7 +656,7 @@ def tenant_page(owner: str, request: Request):
 <h1>{e(owner)}</h1>
 <p class="sub"><a href="/admin">← all tenants</a></p>
 <div class="grid side">
-  <div>{overview}</div>
+  <div>{overview}{credits_card}</div>
   <div>{actions}</div>
 </div>
 <div class="grid two">
@@ -704,6 +781,47 @@ def ui_pilot_reset(owner: str, request: Request, csrf: str = Form(""),
                    (reason, owner))
     audit(request, "tenant.pilot_reset", owner, {"reason": reason})
     return _back(owner, "ok", "Pilot claim released — they can buy the trial again.")
+
+
+@ui.post("/tenant/{owner}/credits")
+def ui_grant_credit(owner: str, request: Request, csrf: str = Form(""),
+                    minutes: str = Form(""), valid_months: str = Form("1"),
+                    reason: str = Form("")):
+    """Reward a tenant with free minutes for a number of months.
+
+    No payment row and no invoice: this is not money changing hands, and
+    inventing a ₹0 receipt would put a fake sale in the GST series.
+    """
+    reason = _guard(request, csrf, reason)
+    from admin_app import audit
+    from shared.billing.credits import CreditError, grant_minutes
+    try:
+        grant = grant_minutes(owner, minutes, valid_months,
+                              actor="admin-ui", note=reason)
+    except CreditError as exc:
+        return _back(owner, "err", str(exc))
+    audit(request, "tenant.credit.grant", owner,
+          {"reason": reason, "grant": grant})
+    return _back(owner, "ok",
+                 f"{int(grant['minutes']):,} minutes credited, valid until "
+                 f"{str(grant['period_end'])[:10]}. Live on their next call.")
+
+
+@ui.post("/tenant/{owner}/credits/{grant_id}/revoke")
+def ui_revoke_credit(owner: str, grant_id: int, request: Request,
+                     csrf: str = Form(""), reason: str = Form("")):
+    reason = _guard(request, csrf, reason)
+    from admin_app import audit
+    from shared.billing.credits import CreditError, revoke_grant
+    try:
+        grant = revoke_grant(grant_id, actor="admin-ui", reason=reason)
+    except CreditError as exc:
+        return _back(owner, "err", str(exc))
+    audit(request, "tenant.credit.revoke", owner,
+          {"reason": reason, "grant_id": grant_id, "grant": grant})
+    return _back(owner, "ok",
+                 f"Credit withdrawn — {int(grant['minutes_remaining']):,} unused "
+                 f"minutes removed from their allowance. Minutes already spent stand.")
 
 
 @ui.post("/tenant/{owner}/reconcile")

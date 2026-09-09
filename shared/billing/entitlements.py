@@ -232,11 +232,19 @@ def get_entitlements(owner: str) -> dict:
             return {**_free_defaults(), "owner": owner, "expired_from": ent["plan_code"]}
 
         # (1) active top-ups for the current period.
+        #
+        # What is left of each pool, not what it was sold at. A purchased
+        # top-up expires with the period it was bought in, so `minutes_consumed`
+        # is 0 for its whole life and this reads exactly as it always did. An
+        # ADMIN CREDIT can be valid for months, and its consumed part is
+        # settled month by month (shared/billing/credits.py) — summing the
+        # granted amount instead would refill the reward at every rollover and
+        # give away `minutes x months`.
         topup = 0
         if ent.get("minutes_limit") is not None:
             trow = db.execute(
-                "SELECT COALESCE(SUM(minutes),0) AS m FROM minute_topups "
-                "WHERE owner=? AND status='active' "
+                "SELECT COALESCE(SUM(GREATEST(minutes - minutes_consumed, 0)),0) AS m "
+                "FROM minute_topups WHERE owner=? AND status='active' "
                 "AND (period_end IS NULL OR period_end > CURRENT_TIMESTAMP)",
                 (owner,)).fetchone()
             topup = int((trow or {}).get("m") or 0)

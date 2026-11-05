@@ -408,6 +408,41 @@ def test_originate_carries_the_dialled_number(accounts):
     assert "sofia/gateway/gw1/919876543210" in cmd
 
 
+def test_a_ten_digit_number_is_dialled_with_its_country_code(accounts):
+    """2026-09-09: a phone-book row held "7359800826". FreeSWITCH INVITEd the
+    gateway with exactly that, the carrier replied SIP 404 and the leg hung up
+    UNALLOCATED_NUMBER — which the operator saw only as "declined", four times
+    in two minutes. The number is national-format Indian; the country code is
+    the whole difference between a call and a 404."""
+    from shared.fs_originate import originate_cmd
+    cmd = originate_cmd("7359800826", agent_slug="a1",
+                        caller_id="918031339140", gateway_name="gw1")
+    assert "sofia/gateway/gw1/917359800826" in cmd
+    assert "lescall_dest=917359800826" in cmd
+
+
+def test_the_dialled_number_on_the_channel_matches_the_number_dialled(accounts):
+    """lescall_dest is what the bridge matches a contact's identity against
+    (RUNBOOK §33). If normalization reached the dial string but not the channel
+    variable, an outbound leg would carry a destination it never called."""
+    from shared.fs_originate import originate_cmd
+    for raw in ("7359800826", "07359800826", "+91 73598-00826", "917359800826"):
+        cmd = originate_cmd(raw, gateway_name="gw1")
+        assert "lescall_dest=917359800826" in cmd, raw
+        assert "sofia/gateway/gw1/917359800826 " in cmd, raw
+
+
+def test_normalizing_never_makes_a_dialable_string_undialable(accounts):
+    """A destination `to_e164` cannot place keeps its own digits. This function
+    is here to repair numbers, and must not be the reason a short internal
+    extension or an already-international number stops connecting."""
+    from shared.fs_originate import dialable_destination
+    assert dialable_destination("1234") == "1234"          # too short for E.164
+    assert dialable_destination("442071838750") == "442071838750"   # UK, 12 digits
+    assert dialable_destination("+1 415 555 0132") == "14155550132"
+    assert dialable_destination("") == ""
+
+
 def test_test_call_needs_a_real_destination(accounts):
     from shared.telephony_admin import TelephonyAdminError, test_call
     slug = _real_agent_slugs(1)[0]

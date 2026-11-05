@@ -16,6 +16,8 @@ import asyncio
 import time
 import types
 
+import pytest
+
 from app.agent_definition.schema import AgentDefinition
 from app.voice.conversation import ConversationRouter
 
@@ -146,6 +148,7 @@ def _pipeline_state(**over):
         _tts_queue=asyncio.Queue(),
         sink=types.SimpleNamespace(playback_busy_until=0.0),
         _tts_end_time=0.0, _last_voice_activity=0.0, _last_reprompt_ts=0.0,
+        _last_heard_activity=0.0,
         _silence_hangup_fired=False, _maxdur_fired=False, _call_start_ts=0.0,
     )
     # The decision methods share helpers on the class — bind them so the
@@ -172,13 +175,27 @@ def test_watchdog_fires_after_quiet_period():
 def test_watchdog_respects_activity_and_playback():
     now = 1000.0
     assert _due(_pipeline_state(_tts_end_time=now - 7.0,
-                                _last_voice_activity=now - 2.0), now) is False
+                                _last_heard_activity=now - 2.0), now) is False
     assert _due(_pipeline_state(_tts_end_time=now - 7.0,
                                 _tts_playing=True), now) is False
     ns = _pipeline_state(_tts_end_time=now - 7.0)
     ns.sink.playback_busy_until = now + 3.0
     assert _due(ns, now) is False
     assert _due(_pipeline_state(_tts_end_time=now - 3.0), now) is False
+
+
+def test_discarded_audio_does_not_count_as_activity():
+    """2026-08-17: the anchor read _last_voice_activity, bumped by every raw
+    VAD frame — including frames whose segment was then thrown away by the
+    SNR guard. On ffbdc517 that made the pipeline believe the caller was
+    talking for 14 straight seconds while discarding every word, so dead-air
+    repair never came due. Audio we dropped is the failure this watchdog
+    exists to repair, not evidence against it."""
+    now = 1000.0
+    ns = _pipeline_state(_tts_end_time=now - 7.0,
+                         _last_voice_activity=now - 0.1,   # VAD saw "speech"
+                         _last_heard_activity=0.0)          # nothing reached STT
+    assert _due(ns, now) is True
 
 
 def test_watchdog_never_fires_before_agent_spoke_or_after_cap_or_closing():
@@ -211,3 +228,188 @@ def test_watchdog_skips_when_turn_in_flight():
     task = types.SimpleNamespace(done=lambda: False)
     assert _due(_pipeline_state(_tts_end_time=now - 7.0,
                                 _current_generation_task=task), now) is False
+
+
+# ---------------------------------------------------------------------------
+# connect intro on speech ONSET (2026-08-17, call ffbdc517)
+#
+# The transcript-driven fast path is correct but arrives too late to help when
+# the transcript itself never comes: five hellos in a row were discarded
+# before STT and the caller heard 14s of dead air while the answer sat ready
+# (it went out in 1ms the moment a transcript finally landed). Inside the
+# connect window the second beat does not depend on WHAT the caller said, so
+# the pipeline fires it on VAD onset and the conversation absorbs the
+# transcript that follows.
+# ---------------------------------------------------------------------------
+
+def _bare_hello_agent(**over):
+    """An agent whose opening is itself a bare 'Hello' — the only shape where
+    an intro (rather than a replay) is the right repair."""
+    over.setdefault("response_bank", {"opening_greeting": "Hello"})
+    return make_router(**over)
+
+
+def test_onset_line_is_available_before_any_transcript():
+    r = _bare_hello_agent()
+    asyncio.run(r.generate_opening())
+    line = r.connect_onset_line()
+    assert line, "the intro must be speakable without waiting for STT"
+    assert not r._is_bare_hello_text(line)
+
+
+def test_onset_line_is_a_pure_query():
+    """It runs on the VAD frame path — calling it must change nothing."""
+    r = _bare_hello_agent()
+    asyncio.run(r.generate_opening())
+    before = (r._intro_delivered, r.last_agent_response, r.state.turn_count)
+    for _ in range(3):
+        assert r.connect_onset_line()
+    assert (r._intro_delivered, r.last_agent_response,
+            r.state.turn_count) == before
+
+
+def test_onset_line_withheld_when_a_real_opening_was_spoken():
+    """A greeting with content may simply have been missed — replay, not
+    intro, is that call's repair. Unchanged from the transcript path."""
+    r = make_router()      # opening is a full sentence
+    asyncio.run(r.generate_opening())
+    assert r.connect_onset_line() == ""
+
+
+def test_onset_line_withheld_after_the_conversation_starts():
+    r = _bare_hello_agent()
+    asyncio.run(r.generate_opening())
+    drive(r, "I am looking for a three bhk in Bopal")
+    assert r.connect_onset_line() == ""
+
+
+def test_onset_line_honours_the_per_agent_opt_out():
+    r = _bare_hello_agent(call_flow={
+        "stages": [{"id": "S1", "order": 0, "goal": "one",
+                    "turns_until_advance": 8}],
+        "connect": {"hello_fastpath": False},
+    })
+    asyncio.run(r.generate_opening())
+    assert r.connect_onset_line() == ""
+
+
+def test_the_triggering_hello_is_absorbed_not_answered_twice():
+    """THE regression this pairing exists to prevent: the onset intro and the
+    transcript of the very hello that triggered it are ONE exchange."""
+    r = _bare_hello_agent()
+    asyncio.run(r.generate_opening())
+    intro = r.connect_onset_line()
+    r.note_connect_intro_spoken(intro)
+
+    assert drive(r, "hello") == "", "one caller hello, one agent line"
+    assert drive(r, "hello?") == "", "and the repeats behind it"
+    assert r.last_agent_response == intro
+
+
+def test_absorb_only_swallows_bare_hellos(stub_llm):
+    """Anything with content is a real turn and must be answered."""
+    r = _bare_hello_agent()
+    asyncio.run(r.generate_opening())
+    r.note_connect_intro_spoken(r.connect_onset_line())
+    assert drive(r, "haan yes this is Rohan speaking")
+
+
+def test_absorb_expires():
+    r = _bare_hello_agent()
+    asyncio.run(r.generate_opening())
+    r.note_connect_intro_spoken(r.connect_onset_line())
+    r._connect_onset_absorb_until = time.monotonic() - 0.01
+    assert drive(r, "hello?"), "a much later hello is a real repair signal"
+
+
+def test_intro_fires_once_across_both_paths():
+    """Onset delivery must close the transcript fast path, or a caller whose
+    hello DOES transcribe hears the identity line twice."""
+    r = _bare_hello_agent()
+    asyncio.run(r.generate_opening())
+    r.note_connect_intro_spoken(r.connect_onset_line())
+    r._connect_onset_absorb_until = 0.0        # past the absorb window
+    assert r._intro_delivered is True
+    assert r.connect_onset_line() == ""
+
+
+@pytest.fixture
+def onset_on(monkeypatch):
+    """The trigger is telephony-only by default (CONNECT_ONSET_TRIGGER reads
+    TELEPHONY_MODE at import); tests run in CLI mode, so switch it on."""
+    import app.voice.pipeline as pl
+    monkeypatch.setattr(pl, "CONNECT_ONSET_TRIGGER", True)
+
+
+def _onset_pipeline(router, **over):
+    """Minimal stand-in carrying just what _maybe_connect_onset touches."""
+    from app.voice.pipeline import VoicePipeline
+
+    ns = types.SimpleNamespace(
+        _connect_onset_fired=False, _raw_speech_ms=0.0,
+        _call_start_ts=time.monotonic(), _tts_playing=False,
+        conversation=router, _tts_queue=asyncio.Queue(), _hub=None,
+    )
+    for helper in ("_maybe_connect_onset", "_queue_watchdog_line",
+                   "_emit_agent_line"):
+        setattr(ns, helper, types.MethodType(getattr(VoicePipeline, helper), ns))
+    for k, v in over.items():
+        setattr(ns, k, v)
+    return ns
+
+
+def test_pipeline_fires_the_intro_on_onset_without_a_transcript(onset_on):
+    import app.voice.pipeline as pl
+
+    r = _bare_hello_agent()
+    asyncio.run(r.generate_opening())
+    ns = _onset_pipeline(r)
+
+    # A frame or two of speech is not a turn — nothing yet.
+    ns._raw_speech_ms = 40.0
+    ns._maybe_connect_onset()
+    assert ns._tts_queue.empty()
+
+    # ...but sustained onset speaks, with no transcript anywhere in sight.
+    ns._raw_speech_ms = pl.CONNECT_ONSET_MS
+    ns._maybe_connect_onset()
+    assert ns._tts_queue.qsize() == 1
+    spoken = ns._tts_queue.get_nowait()
+    assert spoken.text == r.last_agent_response
+    assert spoken.protected is True, "a caller mid-hello must not cut it off"
+    assert r._intro_delivered is True
+
+
+def test_onset_intro_fires_at_most_once(onset_on):
+    import app.voice.pipeline as pl
+
+    r = _bare_hello_agent()
+    asyncio.run(r.generate_opening())
+    ns = _onset_pipeline(r, _raw_speech_ms=pl.CONNECT_ONSET_MS)
+    for _ in range(5):
+        ns._maybe_connect_onset()
+    assert ns._tts_queue.qsize() == 1
+
+
+def test_onset_intro_does_not_fire_over_agent_audio(onset_on):
+    import app.voice.pipeline as pl
+
+    r = _bare_hello_agent()
+    asyncio.run(r.generate_opening())
+    ns = _onset_pipeline(r, _raw_speech_ms=pl.CONNECT_ONSET_MS,
+                         _tts_playing=True)
+    ns._maybe_connect_onset()
+    assert ns._tts_queue.empty()
+
+
+def test_onset_intro_latches_off_past_the_connect_window(onset_on):
+    import app.voice.pipeline as pl
+
+    r = _bare_hello_agent()
+    asyncio.run(r.generate_opening())
+    ns = _onset_pipeline(
+        r, _raw_speech_ms=pl.CONNECT_ONSET_MS,
+        _call_start_ts=time.monotonic() - pl.CONNECT_WINDOW_S - 1.0)
+    ns._maybe_connect_onset()
+    assert ns._tts_queue.empty()
+    assert ns._connect_onset_fired is True, "stop re-checking on every frame"

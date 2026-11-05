@@ -21,6 +21,10 @@
   --accent-2: #4f46e5;
   --shadow: 0 4px 30px rgba(15, 23, 42, 0.05), 0 1px 2px rgba(15, 23, 42, 0.04);
   --spotlight: rgba(16, 185, 129, 0.07);
+  /* Tells the browser which palette to paint native UI with: <select> popups,
+     scrollbars, date pickers, autofill. Without it every popup is painted on a
+     white canvas regardless of theme — see the `option` rule below. */
+  color-scheme: light;
 }
 
 .dark {
@@ -39,6 +43,7 @@
   --accent-2: #8b85ff;
   --shadow: 0 18px 60px -20px rgba(0, 0, 0, 0.7), 0 2px 10px rgba(0, 0, 0, 0.4);
   --spotlight: rgba(0, 245, 160, 0.055);
+  color-scheme: dark;
 }
 
 /**
@@ -96,6 +101,24 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 99px; border: 3px solid transparent; background-clip: content-box; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); background-clip: content-box; }
+
+/* Native <select> popups.
+
+   The dropdown list is painted by the OS, not by us, so it does not inherit the
+   control's Tailwind classes. In dark mode that left --text (near-white) as the
+   inherited option colour on the browser's default white popup canvas: white on
+   white, legible only under the hover highlight.
+
+   color-scheme (set on :root/.dark above) fixes this on its own wherever the
+   platform honours it. These rules are the belt-and-braces half, because they
+   must be OPAQUE: --surface-2 is rgba(255,255,255,0.05) in dark mode, and a
+   translucent option background composites straight back to white. */
+option,
+optgroup {
+  background-color: var(--surface-solid);
+  color: var(--text);
+}
+option:disabled { color: var(--text-dim); }
 
 @layer components {
   /* Translucent, blurred surface — the name means what it says again. */
@@ -300,4 +323,64 @@ html.lenis, html.lenis body { height: auto; }
     --sidebar-border: 0 0% 100% / 0.09;
     --sidebar-ring: 240 4.9% 83.9%;
   }
+}
+
+/* ---------------------------------------------------------------------------
+   PRINT — the API reference at /api-docs is a document people are expected to
+   save as a PDF and send to a CRM vendor, so it needs a real print treatment.
+   Scoped to `body.printing-doc`, which only ApiDocs sets while it is mounted:
+   printing any other panel keeps the browser's default behaviour.
+
+   The visibility trick (hide everything, re-show the marked subtree) is used
+   instead of `display:none` on the shell because the sidebar and topbar are
+   ancestors-of-siblings in a Tailwind layout whose class names are arbitrary
+   values — matching them in CSS would break the first time one is edited.
+--------------------------------------------------------------------------- */
+@media print {
+  body.printing-doc {
+    /* Ink, not screen: the mesh gradient and dark theme both waste toner and
+       lose contrast on paper. */
+    background: #fff !important;
+    color: #101014 !important;
+  }
+  body.printing-doc * { visibility: hidden; }
+  body.printing-doc [data-print-root],
+  body.printing-doc [data-print-root] * { visibility: visible; }
+  body.printing-doc [data-print-root] {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    padding: 0;
+  }
+  body.printing-doc [data-print-hide],
+  body.printing-doc [data-print-hide] * { display: none !important; }
+
+  /* Force the light palette regardless of the reader's theme. */
+  body.printing-doc [data-print-root] {
+    --bg: #fff; --surface: #fff; --surface-solid: #fff; --surface-2: #f4f6f8;
+    --text: #101014; --text-soft: #33363f; --text-dim: #5d6270;
+    --border: #d9dde3; --border-strong: #c3c9d2;
+  }
+  body.printing-doc [data-print-root] * {
+    background-image: none !important;   /* the mesh gradient wastes toner */
+    box-shadow: none !important;
+  }
+  /* Deliberately NOT `color: inherit` on every node — that would flatten the
+     hierarchy the tokens above already remapped to ink, and would grey out the
+     colour-coded HTTP verb chips that make the endpoint list scannable. */
+
+  /* Keep a heading with the text it introduces, and never split a code block,
+     a callout or an endpoint card across a page. */
+  body.printing-doc h1,
+  body.printing-doc h2,
+  body.printing-doc h3 { break-after: avoid-page; }
+  body.printing-doc section { break-inside: auto; }
+  body.printing-doc pre,
+  body.printing-doc table,
+  body.printing-doc .break-inside-avoid { break-inside: avoid; }
+  body.printing-doc tr { break-inside: avoid; }
+  body.printing-doc a[href^="http"]::after { content: ""; }  /* no URL noise */
+
+  @page { margin: 16mm 14mm; }
 }

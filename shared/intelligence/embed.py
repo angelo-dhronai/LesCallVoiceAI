@@ -20,8 +20,19 @@ from typing import Any
 from shared.db.database import get_db
 from shared.intelligence import config
 
-_TURN_RE = re.compile(r"\[(\d{2}:\d{2}(?:\.\d{3})?)\]\s*\n(Agent|Caller):\s*(.+?)(?=\n\[|\Z)",
-                      re.S)
+# A turn header is an elapsed stamp plus any annotations call_audit.py appends
+# in brackets — today "[spoke 7.26-9.98s]", the live-VAD span written for CALLER
+# turns only (commit bacbd82, 2026-08-04). Those groups MUST stay optional and
+# repeatable: this is a finditer, so a header it fails to match is not an error
+# anywhere, the turn is simply skipped. When the span shipped, that silently
+# deleted 76-99% of caller turns per call from the Intelligence transcript, the
+# embeddings and semantic search, while agent turns (which carry no span) stayed
+# intact — so every affected call read as an agent answering nothing.
+# Minutes are \d+ because a call past 99 minutes writes three digits.
+_TURN_RE = re.compile(
+    r"\[(\d+:\d{2}(?:\.\d{3})?)\](?:[ \t]*\[[^\]]*\])*[ \t]*\n"
+    r"(Agent|Caller):\s*(.+?)(?=\n\[|\Z)",
+    re.S)
 
 # chars ≈ 4 × tokens
 _CHUNK_CHARS = 4 * 600

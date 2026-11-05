@@ -54,10 +54,10 @@ def test_failure_names_the_broken_stage(monkeypatch):
     """A stage-goal bug is attributed to THAT stage, not the first one."""
     real = pb.match_rules_block
 
-    def _boom_on_recommend(agent_def, state, stage_role):
+    def _boom_on_recommend(agent_def, state, stage_role, **kw):
         if stage_role == "recommend":
             raise TypeError("boom in recommend")
-        return real(agent_def, state, stage_role)
+        return real(agent_def, state, stage_role, **kw)
 
     monkeypatch.setattr(pb, "match_rules_block", _boom_on_recommend)
     assert preflight_agent(_agent()) == "preflight_failed:RECOMMEND"

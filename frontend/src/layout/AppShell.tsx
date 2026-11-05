@@ -11,6 +11,9 @@ import type { ReactNode } from 'react'
 // Longest-prefix match so sub-routes (/build/agents/new, /build/agents/:name)
 // inherit their parent panel's title instead of falling back to "Overview".
 function titleFor(path: string) {
+  // Pages that are deliberately absent from the sidebar still need a name in
+  // the tab title and the topbar.
+  if (path.startsWith('/developers/reference')) return 'API reference'
   let best = ''
   let label = 'Overview'
   for (const g of NAV) for (const i of g.items) {

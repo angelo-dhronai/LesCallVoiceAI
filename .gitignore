@@ -20,6 +20,9 @@ credit_log/
 
 # Audio
 recordings/
+# Local staging copies of generated .xlsx exports; the durable copy is in GCS
+# (shared/export_store.py) and the DB row records where it lives.
+exports/
 *.wav
 *.mp3
 # …except the pre-generated TTS voice previews (product assets — each
@@ -78,3 +81,14 @@ data/sentinel_status.json
 core
 agent.yaml
 calling-agent/agents/**/agent.yaml
+
+# Agent LLM context-cache registry (runtime state, RUNBOOK §62)
+data/llm_context_cache.json
+data/llm_context_cache.tmp
+
+# Third-party tool checkout + its generated output (regenerable; 21 MB+ of cache)
+graphify/
+graphify-out/
+
+# WhatsApp media uploaded by tenants (customer files, 244 MB; backed up encrypted)
+data/whatsapp/media/

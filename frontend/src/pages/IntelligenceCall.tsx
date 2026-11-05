@@ -14,10 +14,12 @@ import { useGet, useRefresh } from '../api/hooks/useApi'
 import { patch, post } from '../api/mutate'
 import type { IntelDetail } from '../api/intel'
 import { Badge, Button, Card, EmptyState, IconButton, SectionHead, cx } from '../components/ui'
-import { AsyncState, PageHeader, SearchInput, StatusBadge } from '../components/kit'
+import { AsyncState, ContactLabel, PageHeader, SearchInput, StatusBadge } from '../components/kit'
 import { Chips, CommitmentCard, ScoreRingRow, TimelineList } from '../components/insight'
 import { AudioPlayer } from '../components/AudioPlayer'
+import { CallPager, useCallSequence } from '../components/CallPager'
 import { useToast } from '../components/Toast'
+import { fmtDate, fmtDateTime } from '../lib/format'
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -34,6 +36,9 @@ export default function IntelligenceCall() {
   const toast = useToast()
   const refresh = useRefresh()
   const q = useGet<IntelDetail>(['intel-call', callKey], `/intel/calls/${callKey}`)
+  // The list this call was opened from, if any: Previous/Next walk it, and
+  // the breadcrumb returns to it with its filter and page intact.
+  const pager = useCallSequence(callKey)
 
   const [tSearch, setTSearch] = useState('')
   const [matchCursor, setMatchCursor] = useState(-1) // -1 = not yet jumped
@@ -103,11 +108,16 @@ export default function IntelligenceCall() {
 
   return (
     <div className="space-y-6">
+      {/* Saved contacts are headlined by name; the number then belongs in the
+          sub-line, where it stays visible without being the whole identity. */}
       <PageHeader detail
-        crumbs={[{ label: 'Intelligence', to: '/intelligence' }]}
-        title={d?.call.phone ?? callKey}
+        /* Was a bare '/intelligence', which threw away every filter the user
+           had set — including the AI one — on the way back. */
+        crumbs={[{ label: 'Intelligence', to: pager.listUrl }]}
+        title={d?.call.contact_name || d?.call.phone || callKey}
         sub={d
-          ? `${d.call.direction} · ${d.call.started_at?.slice(0, 16).replace('T', ' ') ?? '—'}`
+          ? (d.call.contact_name && d.call.phone ? `${d.call.phone} · ` : '')
+            + `${d.call.direction} · ${fmtDateTime(d.call.started_at)}`
             + ` · ${Math.round(d.call.duration_s ?? 0)}s · ${d.call.agent_slug ?? '—'}`
           : undefined}
         actions={
@@ -116,6 +126,10 @@ export default function IntelligenceCall() {
             <Button variant="ghost" size="sm" onClick={reanalyze} title="Run the pipeline again">
               <RefreshCw size={14} /> Reanalyze
             </Button>
+            {/* Last, so it is the outermost control: its Next button keeps the
+                same screen position from call to call whether or not a given
+                call has a recording to play. */}
+            <CallPager pager={pager} />
           </>
         }
       />
@@ -285,7 +299,7 @@ export default function IntelligenceCall() {
                     </div>
                     {d.followup.scheduled_at && (
                       <div className="font-semibold">
-                        {d.followup.scheduled_at.slice(0, 16).replace('T', ' ')}
+                        {fmtDateTime(d.followup.scheduled_at)}
                         {d.followup.auto_scheduled ? (
                           <span className="ml-1.5 text-2xs font-normal text-dim">(AI-picked time)</span>
                         ) : null}
@@ -334,7 +348,7 @@ export default function IntelligenceCall() {
                             <div className="text-soft">{a.description}</div>
                             <div className="text-2xs text-dim">
                               <StatusBadge value={a.priority} />
-                              {a.due_at && <span className="ml-1.5">due {a.due_at.slice(0, 10)}</span>}
+                              {a.due_at && <span className="ml-1.5">due {fmtDate(a.due_at)}</span>}
                             </div>
                           </div>
                         </li>

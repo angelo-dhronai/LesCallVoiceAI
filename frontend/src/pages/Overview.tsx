@@ -4,7 +4,7 @@ import {
   ArrowRight, BookUser, Bot, CheckCircle2, Circle, Flame, MessageCircle,
   PhoneCall, PhoneForwarded, Radio, Timer,
 } from 'lucide-react'
-import { PageHeader, AsyncState, StatusBadge } from '../components/kit'
+import { PageHeader, AsyncState, ContactLabel, StatusBadge } from '../components/kit'
 import { Card, Badge, Button, EmptyState, LiveDot, cx } from '../components/ui'
 import { BorderBeam } from '../components/motion'
 import { Sparkline } from '../components/charts'
@@ -26,6 +26,8 @@ type OverviewT = {
 
 type HotCall = {
   call_key?: string; customer_name?: string; phone?: string
+  /** Saved phone-book name, resolved server-side ('' when not a saved contact). */
+  contact_name?: string
   lead_score?: number; summary?: string; started_at?: string
 }
 
@@ -167,7 +169,7 @@ export default function Overview() {
                     <button type="button" onClick={() => nav(`/intelligence/${r.call_key}`)}
                       className="w-full rounded-xl px-3 py-2 text-left transition-colors hover:bg-[var(--surface-2)]">
                       <div className="flex items-center justify-between gap-2">
-                        <span className="truncate text-sm font-medium">{r.customer_name || r.phone || 'Unknown caller'}</span>
+                        <ContactLabel name={r.contact_name || r.customer_name} phone={r.phone} />
                         <Badge tone="mint">{r.lead_score}</Badge>
                       </div>
                       {r.summary && <div className="mt-0.5 line-clamp-1 text-xs text-dim">{r.summary}</div>}

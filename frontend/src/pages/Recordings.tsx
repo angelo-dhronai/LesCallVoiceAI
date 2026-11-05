@@ -6,6 +6,7 @@ import { Badge, Button, Card, EmptyState, IconButton, Spinner, cx } from '../com
 import { PageHeader, Table, THead, TH, TR, TD, Pagination, SearchInput, AsyncState, ContactLabel } from '../components/kit'
 import { AudioPlayer } from '../components/AudioPlayer'
 import { useDebounced, useUrlNumber, useUrlParam, useUrlPatch } from '../lib/hooks'
+import { fmtDayLabel, fmtFull, fmtTime, parseTs } from '../lib/format'
 
 /** The shared Button skin (ghost · sm · rounded-md) as a class string, for the
  *  two link-shaped actions below — ui.Button only renders a <button>, but a
@@ -33,25 +34,8 @@ type RecordingsResponse = {
   pages: number
 }
 
-function parseDate(dt: string | null | undefined): Date | null {
-  if (!dt) return null
-  const d = new Date(dt)
-  return isNaN(d.getTime()) ? null : d
-}
-
-/** 'Today' / 'Yesterday' / '12 Jul' (with year when it isn't the current one). */
-function formatDay(d: Date): string {
-  const now = new Date()
-  const startOf = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime()
-  const diffDays = Math.round((startOf(now) - startOf(d)) / 86400000)
-  if (diffDays === 0) return 'Today'
-  if (diffDays === 1) return 'Yesterday'
-  return d.toLocaleDateString('en-IN', {
-    day: 'numeric',
-    month: 'short',
-    ...(d.getFullYear() !== now.getFullYear() ? { year: 'numeric' as const } : {}),
-  })
-}
+/* Day labelling and instant parsing are shared with every other call surface —
+   see lib/format.ts for why folder_dt cannot go straight into `new Date()`. */
 
 export default function Recordings() {
   // Search + page live in the URL — deep links like /recordings?q=<call id>
@@ -164,17 +148,15 @@ export default function Recordings() {
                     // Prefer the public tokenized link (works without a
                     // session and survives local-file cleanup after GCS sync).
                     const downloadUrl = r?.download_url || `${audioUrl}?download=1`
-                    const d = parseDate(r?.folder_dt)
+                    const d = parseTs(r?.folder_dt)
                     return (
                       <TR key={folder || r?.call_id || Math.random()} className="group">
                         <TD><ContactLabel name={r?.contact_name} phone={r?.caller} /></TD>
-                        <TD className="whitespace-nowrap tabular-nums" title={d ? d.toLocaleString() : undefined}>
+                        <TD className="whitespace-nowrap tabular-nums" title={d ? fmtFull(d) : undefined}>
                           {d ? (
                             <>
-                              <span className="text-[var(--text)]">{formatDay(d)}</span>{' '}
-                              <span className="text-dim">
-                                {d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                              </span>
+                              <span className="text-[var(--text)]">{fmtDayLabel(d)}</span>{' '}
+                              <span className="text-dim">{fmtTime(d)}</span>
                             </>
                           ) : (
                             <span className="text-dim">{r?.folder_dt || '—'}</span>

@@ -14,7 +14,7 @@ import { patch, post } from '../api/mutate'
 import type { Followup } from '../api/intel'
 import { Badge, Button, Card, cx, IconButton, Spinner } from '../components/ui'
 import {
-  AsyncState, Field, Input, PageHeader, Pagination, Segmented, Select,
+  AsyncState, ContactLabel, Field, Input, PageHeader, Pagination, Segmented, Select,
   StatusBadge, Table, TD, TH, THead, TR, Textarea,
 } from '../components/kit'
 import { Modal } from '../components/Modal'
@@ -22,6 +22,7 @@ import { FollowupReview, ReviewCallsButton } from '../components/FollowupReview'
 import { useToast } from '../components/Toast'
 import { useConfirm } from '../components/confirm'
 import { useUrlNumber, useUrlParam } from '../lib/hooks'
+import { fmtDateTime, parseTs } from '../lib/format'
 
 const LIMIT = 50
 type Bucket = 'today' | 'upcoming' | 'overdue' | 'review' | 'done' | 'archived'
@@ -42,9 +43,21 @@ const EMPTY_LABEL: Record<Bucket, string> = {
    by row count but contain nothing to act on. */
 const PRIORITY_ORDER: Bucket[] = ['today', 'overdue', 'review', 'upcoming']
 
+/** Instant -> the "YYYY-MM-DDTHH:mm" a datetime-local input wants.
+ *
+ *  Rendered in IST on purpose: the save paths below write the picked wall clock
+ *  back with an explicit +05:30, so the picker has to show the same zone or the
+ *  round-trip is lossy. It used to slice the stored UTC clock straight into the
+ *  field, which meant re-saving an untouched follow-up moved it 5h30m earlier. */
 function toLocalInput(ts?: string | null) {
-  if (!ts) return ''
-  return ts.slice(0, 16).replace(' ', 'T')
+  const d = parseTs(ts)
+  if (!d) return ''
+  const p: Record<string, string> = {}
+  for (const part of new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(d)) p[part.type] = part.value
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`
 }
 
 /** Who a row is about — icon buttons need a name, not four identical "Edit"s. */
@@ -299,15 +312,13 @@ export default function FollowUps() {
                 {items.map((f) => (
                   <TR key={f.id}>
                     <TD>
-                      <div className="font-medium text-[var(--text)]">
-                        {f.contact_name || f.phone || '—'}
-                      </div>
+                      <ContactLabel name={f.contact_name} phone={f.dial_phone || f.phone} />
                       <div className="text-2xs text-dim">
                         {f.source === 'manual' ? 'manual' : `AI · conf ${(f.confidence ?? 0).toFixed(2)}`}
                       </div>
                     </TD>
                     <TD className="whitespace-nowrap tabular-nums">
-                      {f.scheduled_at ? f.scheduled_at.slice(0, 16).replace('T', ' ') : '—'}
+                      {fmtDateTime(f.scheduled_at)}
                       {f.auto_scheduled ? (
                         <div className="text-2xs text-dim">AI-picked</div>
                       ) : null}
@@ -360,10 +371,10 @@ export default function FollowUps() {
                         <span className="mt-1 block text-2xs text-dim">
                           Auto-called {f.attempts}×
                           {f.last_attempt_at
-                            ? ` · last ${f.last_attempt_at.slice(0, 16).replace('T', ' ')}` : ''}
+                            ? ` · last ${fmtDateTime(f.last_attempt_at)}` : ''}
                           {f.execution_outcome ? ` · ${f.execution_outcome.replace(/_/g, ' ')}` : ''}
                           {f.next_attempt_at && !['completed', 'cancelled'].includes(f.status)
-                            ? ` · next try ${f.next_attempt_at.slice(5, 16).replace('T', ' ')}` : ''}
+                            ? ` · next try ${fmtDateTime(f.next_attempt_at)}` : ''}
                         </span>
                       )}
                     </TD>
@@ -478,7 +489,7 @@ export default function FollowUps() {
               <div className="eyebrow mb-1">Notes</div>
               <ul className="max-h-28 space-y-1 overflow-y-auto text-xs text-dim">
                 {editing.notes.map((n, i) => (
-                  <li key={i}>{n.at.slice(0, 16).replace('T', ' ')} — {n.text}</li>
+                  <li key={i}>{fmtDateTime(n.at)} — {n.text}</li>
                 ))}
               </ul>
             </div>

@@ -159,3 +159,107 @@ def test_gemini_thought_signature_round_trip(cop):
                for m in groq for tc in (m.get("tool_calls") or []))
 
     assert history == snapshot  # session store never mutated
+
+
+# ---------------------------------------------------------------------------
+# Token accounting (2026-09-12)
+#
+# Before this, _chat_completion() read completion.choices[0].message and threw
+# completion.usage away — the platform had no idea what the copilot cost. The
+# turn counter that stood in for it counts SEND PRESSES, and one press runs a
+# tool loop of up to _MAX_TOOL_ROUNDS full requests.
+# ---------------------------------------------------------------------------
+
+def _usage_client(calls: list, usage_per_call=(1000, 200, 1500)):
+    """A client that answers once with no tool calls and reports usage."""
+    class _Usage:
+        prompt_tokens, completion_tokens, total_tokens = usage_per_call
+
+    class _Completions:
+        async def create(self, **kw):
+            calls.append(kw["model"])
+            class _Msg:
+                content = "ok"
+                tool_calls = None
+            class _Choice:
+                message = _Msg()
+            class _Completion:
+                choices = [_Choice()]
+                usage = _Usage()
+            return _Completion()
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    return _Client()
+
+
+def test_every_provider_round_is_charged(cop, monkeypatch):
+    """Including the nudged retries and the fallback walk. Those are real
+    requests against the shared model quota; a budget that only counted the
+    successful one would let a tenant provoking malformed tool calls spend
+    three times what it records."""
+    import asyncio
+    charged: list[tuple] = []
+    monkeypatch.setattr(cop, "_charge_tokens",
+                        lambda owner, usage: (charged.append(
+                            (owner, getattr(usage, "total_tokens", 0))), 1500)[1])
+    calls: list[str] = []
+    spend: dict = {}
+    asyncio.run(cop._chat_completion(
+        _usage_client(calls), "m",
+        [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+        owner="who@example.com", spend=spend))
+    assert charged == [("who@example.com", 1500)]
+    assert spend["tokens"] == 1500
+
+
+def test_charge_is_skipped_when_the_provider_reports_nothing(cop):
+    """A missing usage block costs a count, never a reply."""
+    assert cop._charge_tokens("who@example.com", None) == 0
+    assert cop._charge_tokens(None, object()) == 0
+
+
+def test_charge_trusts_the_providers_total(cop, monkeypatch):
+    """Gemini folds reasoning tokens into total_tokens without showing them in
+    completion_tokens. Summing the visible parts under-counts the expensive
+    half of every request."""
+    seen: dict = {}
+    import shared.billing.entitlements as ent
+    monkeypatch.setattr(ent, "record_copilot_tokens",
+                        lambda owner, **kw: seen.update(kw))
+
+    class _Usage:
+        prompt_tokens, completion_tokens, total_tokens = 1000, 100, 9000
+
+    assert cop._charge_tokens("who@example.com", _Usage()) == 9000
+    assert seen["total_tokens"] == 9000
+
+
+def test_remaining_tokens_is_none_when_nothing_caps_the_tenant(cop, monkeypatch):
+    """None means "do not run the mid-turn guard", and it is also what every
+    failure degrades to — a budget that cannot be read must not become a wall
+    in the middle of someone's work."""
+    import shared.billing.entitlements as ent
+    monkeypatch.setattr(ent, "effective_limits",
+                        lambda o: {"copilot_tokens_per_day": None})
+    assert cop._remaining_tokens("who@example.com") is None
+
+    def _boom(_):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(ent, "effective_limits", _boom)
+    assert cop._remaining_tokens("who@example.com") is None
+    assert cop._remaining_tokens(None) is None
+
+
+def test_remaining_tokens_subtracts_todays_spend(cop, monkeypatch):
+    import shared.billing.entitlements as ent
+    monkeypatch.setattr(ent, "effective_limits",
+                        lambda o: {"copilot_tokens_per_day": 150_000})
+    monkeypatch.setattr(ent, "copilot_tokens_used", lambda o: 120_000)
+    assert cop._remaining_tokens("who@example.com") == 30_000
+    monkeypatch.setattr(ent, "copilot_tokens_used", lambda o: 900_000)
+    assert cop._remaining_tokens("who@example.com") == 0   # never negative

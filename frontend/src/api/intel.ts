@@ -16,6 +16,43 @@ export type IntelCallRow = {
   followup_status: string | null; followup_at: string | null
   followup_priority: string | null
   snippet?: string; score?: number
+  /** 'verified' = an AI judge read this call and it satisfied every
+   *  requirement; 'exact' = an identifier lookup; 'semantic' = retrieval
+   *  ranking only (verification off or unavailable). */
+  match?: 'verified' | 'exact' | 'semantic'
+  /** Present on verified rows: how sure the judge was, the verbatim line from
+   *  the transcript that qualified the call, and why. Shown in the UI and
+   *  carried into the Excel export so a filtered list can be audited. */
+  match_confidence?: number
+  match_evidence?: string
+  match_reason?: string
+}
+
+/** What the smart filter actually did — surfaced so the UI can say it. */
+export type Verification = {
+  enabled: boolean
+  model: string | null
+  /** Calls retrieved and offered to the judge. */
+  candidates: number
+  /** Calls the judge decided on (cached verdicts included). */
+  examined: number
+  cached: number
+  matched: number
+  /** Rows actually returned to this client (matched, capped by `limit`). */
+  returned?: number
+  /** Retrieval filled its whole candidate pool, so further matches may exist
+   *  that were never offered to the judge. `matched` is then a floor, not a
+   *  total, and the UI must not present it as a complete count. */
+  pool_full?: boolean
+  /** The time budget ran out before every candidate was judged. */
+  truncated: boolean
+  identifier_lookup: boolean
+  criterion: {
+    restated: string | null
+    requirements: string[]
+    excludes: string[]
+    planned: boolean
+  } | null
 }
 
 export type Commitment = {
@@ -144,12 +181,87 @@ export type ContactHubPayload = {
   grants: { id: number; grantee_email: string; access: string; created_at: string }[]
 }
 
-export const searchIntel = (q: string, limit = 25) =>
-  api<{ items: IntelCallRow[]; degraded: boolean; query: string }>(
-    `/intel/search?q=${encodeURIComponent(q)}&limit=${limit}`)
+/** `limit` is the number of MATCHED calls to return, not a page size — the
+ *  Intelligence table paginates what comes back. It was 50, and a filter whose
+ *  true answer was 98 calls returned exactly 50 with nothing saying so, so the
+ *  Excel export built from it was short by 47 calls (2026-08-29). */
+export const searchIntel = (q: string, limit = 25, agent = '') =>
+  api<{
+    items: IntelCallRow[]; degraded: boolean; query: string
+    /** True when every returned row was individually judged against the
+     *  query. False means the judge could not run — the rows are retrieval
+     *  ranking and the UI must NOT present them as filtered. */
+    verified?: boolean
+    verification?: Verification
+    /** What the server actually filtered on — the agent may have been named
+     *  inside the sentence rather than picked from the dropdown, and `query`
+     *  is the phrase left after that constraint was lifted out. Surfaced so
+     *  the UI can say what it did instead of silently reinterpreting. */
+    applied?: { agent: string; query: string }
+  }>(
+    `/intel/search?q=${encodeURIComponent(q)}&limit=${limit}`
+    + (agent ? `&agent=${encodeURIComponent(agent)}` : ''))
+
+/** Every call id matching the CURRENT list filter, not just the page on
+ *  screen. The list is server-paged at 50 and Export/Report can only send
+ *  ticked ids, so "select all" meant one screen: a 246-call filter exported
+ *  as 50. `capped` means the set hit the server ceiling and is a floor. */
+export const callIdsMatching = (qs: string) =>
+  api<{ call_ids: number[]; count: number; capped: boolean; max: number }>(
+    `/intel/calls/ids${qs ? `?${qs}` : ''}`)
+
+/**
+ * Which calls a report covers. Either an explicit `call_ids` selection (the
+ * Intelligence page's tick-the-rows flow) or a `filters` object the server
+ * resolves with the SAME predicates the Intelligence list uses — so a report
+ * built from a filter covers exactly what that filter showed.
+ */
+export type ReportFilters = {
+  days?: number; search?: string; sentiment?: string; decision?: string
+  direction?: string; min_lead?: number; limit?: number
+}
 
 export const createReport = (body: {
-  title?: string; query_prompt?: string; call_ids: number[]
+  title?: string; query_prompt?: string
+  call_ids?: number[]; filters?: ReportFilters
 }) => api<{ ok: boolean; id: number }>('/intel/reports', {
   method: 'POST', body: JSON.stringify(body),
 })
+
+/** How many analyzed calls a filter would pull in, before committing to a
+ *  background generation job. */
+export const previewReport = (filters: ReportFilters) =>
+  api<{ ok: boolean; call_count: number; capped: boolean }>('/intel/reports/preview', {
+    method: 'POST', body: JSON.stringify({ filters }),
+  })
+
+
+/**
+ * One generated .xlsx workbook of a call selection, living in the tenant's
+ * Google Cloud Storage bucket. `url` is a tokenized link (the bucket is
+ * private; the 256-bit token in the path is the credential), so it works for
+ * a colleague with no dashboard login.
+ */
+export type CallExport = {
+  id: number; title: string; query: string
+  call_count: number; contact_count: number; number_count?: number
+  filename: string; size_bytes: number | null
+  /** 'gcs' once it is in the bucket, 'local' if the upload failed and it is
+   *  being served off the VM — never silently one or the other. */
+  storage: 'gcs' | 'local' | 'pending'
+  gcs_uri: string | null; gcs_object: string | null
+  gcs_console_url: string | null
+  uploaded_at: string | null; upload_error: string | null
+  url: string; created_at: string; created_by: string | null
+}
+
+export const createExport = (body: {
+  title?: string; query?: string
+  call_ids?: number[]; filters?: ReportFilters
+  criterion?: Record<string, unknown>
+}) => api<CallExport & { ok: boolean }>('/intel/exports', {
+  method: 'POST', body: JSON.stringify(body),
+})
+
+export const listExports = () =>
+  api<{ items: CallExport[] }>('/intel/exports?limit=10')

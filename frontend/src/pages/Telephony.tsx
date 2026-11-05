@@ -13,13 +13,17 @@ import {
   PageHeader, Table, THead, TH, TR, TD, Select, Input, Field, AsyncState,
 } from '../components/kit'
 import { Modal } from '../components/Modal'
+import { fmtDateTime } from '../lib/format'
+import {
+  ForwardPhonesCard, ForwardedCallsCard, NumberForwarding, useForwardPhones, type ForwardNumber,
+} from '../components/CallForwarding'
 
 type Trunk = {
   id: number; name: string; provider: string; sip_domain: string
   username?: string; caller_id?: string; provider_ips?: string
   config_status: string; last_applied_at?: string | null
 }
-type PhoneNumber = {
+type PhoneNumber = ForwardNumber & {
   id: number; number: string; sig_digits: string; trunk_id?: number | null
   inbound_agent_slug?: string | null; outbound_agent_slug?: string | null
   direction: string; label?: string
@@ -44,12 +48,7 @@ function statusTone(s?: string): 'mint' | 'amber' | 'rose' | 'neutral' {
   if (s === 'error') return 'rose'
   return 'neutral'
 }
-function fmtDate(dt?: string | null) {
-  if (!dt) return '—'
-  const d = new Date(dt)
-  return isNaN(d.getTime()) ? dt
-    : d.toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })
-}
+const fmtDate = (dt?: string | null) => fmtDateTime(dt)
 const digits = (s: string) => s.replace(/\D/g, '')
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
 
@@ -177,6 +176,10 @@ export default function Telephony() {
   const numbersQ = useGet<{ numbers: PhoneNumber[] }>(['telephony', 'numbers'], '/numbers')
   const infoQ = useGet<ServerInfo>(['telephony', 'server-info'], '/telephony/server-info')
   const agentsQ = useGet<AgentsResponse>(['agents'], '/agents')
+  // Conditional call forwarding (RUNBOOK §84): the owner's own phones.
+  const fwdQ = useForwardPhones()
+  const fwdPhones = fwdQ.data?.contacts ?? []
+  const fwdReady = fwdQ.data?.server_ready !== false
   // Same source Settings edits — shows where "Test call" actually rings.
   const profileQ = useGet<Profile>(['profile'], '/auth/profile')
   const testPhone = profileQ.data?.phone ? `+${profileQ.data.phone}` : ''
@@ -694,6 +697,15 @@ export default function Telephony() {
                       </div>
                     </TD>
                   </TR>
+                  {applied && (
+                    <TR>
+                      <TD colSpan={5} className="!py-2">
+                        <div className="sticky left-0 max-w-[calc(100vw-6rem)]">
+                          <NumberForwarding n={n} phones={fwdPhones} serverReady={fwdReady} />
+                        </div>
+                      </TD>
+                    </TR>
+                  )}
                   {!callable && (
                     <TR>
                       <TD colSpan={5} className="!py-2">
@@ -751,6 +763,10 @@ export default function Telephony() {
           )}
         </AsyncState>
       </Card>
+
+      {/* ------------------- call forwarding (RUNBOOK §84) ------------------- */}
+      {numbers.length > 0 && <ForwardPhonesCard />}
+      {numbers.length > 0 && <ForwardedCallsCard />}
 
       {/* --------------------------- advanced --------------------------- */}
       <button className="flex items-center gap-1.5 text-xs font-medium text-dim hover:text-soft"

@@ -63,6 +63,11 @@ class CallSession:
         # classifier-pattern bookkeeping
         self._speech_run_ms = 0.0
         self._had_exchange = False   # caller and agent have both spoken
+        # Confirmed mailbox beeps (audio_events.on_beep, RUNBOOK §83). The
+        # pipeline watchdog reads last_beep; whether it ENDS the call is the
+        # engine's decision (outbound leg, nobody has spoken yet).
+        self.beep_count = 0
+        self.last_beep: dict | None = None
 
     # ── transitions pushed by the pipeline ───────────────────────────
 
@@ -109,6 +114,22 @@ class CallSession:
         elif label in ("RINGBACK", "BUSY", "FAX", "DTMF"):
             logger.info("[SESSION] tone observed: %s (state=%s)",
                         label, self.state)
+
+    def on_beep(self, duration_ms: float, freq_hz: float, at_ms: float) -> None:
+        """A confirmed single-frequency tone burst that STOPPED — the shape of
+        a mailbox's record cue. Called from the FSMN worker thread: record it
+        and nothing else; the pipeline watchdog decides on the event loop."""
+        self.beep_count += 1
+        self.last_beep = {
+            "at_ms": at_ms, "at_mono": time.monotonic(),
+            "duration_ms": duration_ms, "freq_hz": freq_hz,
+            "state": self.state, "had_exchange": self._had_exchange,
+        }
+        logger.info("[SESSION] beep %.0fms @%.0fHz (state=%s, exchange=%s)",
+                    duration_ms, freq_hz, self.state, self._had_exchange)
+        if (self.direction == "outbound" and not self._had_exchange
+                and self.state == IVR_SUSPECT):
+            self.set(VOICEMAIL_SUSPECT, "beep after monologue")
 
     def on_speech_run(self, run_ms: float) -> None:
         """Continuous FSMN-speech length, ticked by the pipeline. An

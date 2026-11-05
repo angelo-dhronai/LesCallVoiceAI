@@ -19,6 +19,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import socket
 from pathlib import Path
 
@@ -267,13 +268,44 @@ def _key_files() -> dict:
     """
     out = {}
     for name in ("api_key_pool", "api_key_state", "sarvam_key_status",
-                 "sarvam_dead_keys", "sarvam_credits"):
-        try:
-            out[name] = json.loads(
-                (REPO / "dashboard" / f"{name}.json").read_text(encoding="utf-8"))
-        except Exception:
-            out[name] = None
+                 "sarvam_dead_keys", "sarvam_credits", "sarvam_key_master"):
+        out[name] = _read_key_json(name)
     return out
+
+
+def _read_key_json(name: str):
+    try:
+        return json.loads(
+            (REPO / "dashboard" / f"{name}.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_key_json(name: str, data) -> None:
+    """Atomic, owner-only write. These files hold LIVE API keys, so the mode is
+    set on the temp file BEFORE the rename — the key is never world-readable,
+    not even for the instant in between. Identical contract to
+    sarvam_key_watchdog._write_json, which writes the same files from the
+    other side."""
+    path = REPO / "dashboard" / f"{name}.json"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def _active_key() -> str:
+    """The key the pipeline is using right now. calling-agent/.env is the
+    single source of truth for "current" — both rotation paths (the in-process
+    key_rotator and the watchdog service) write it there and re-read it per
+    request."""
+    try:
+        m = re.search(r"^SARVAM_API_KEY=(.*)$",
+                      (REPO / "calling-agent" / ".env").read_text(encoding="utf-8"),
+                      re.MULTILINE)
+        return m.group(1).strip() if m else ""
+    except Exception:
+        return ""
 
 
 def _unwrap(data, key: str) -> list:
@@ -305,67 +337,102 @@ def keys_page(request: Request):
     status = f.get("sarvam_key_status") or {}
     pool = _unwrap(f.get("api_key_pool"), "pool")
     dead = _unwrap(f.get("sarvam_dead_keys"), "dead")
-    credits = f.get("sarvam_credits") or {}
+    master = _unwrap(f.get("sarvam_key_master"), "keys")
 
-    exhausted = bool(status.get("all_exhausted"))
-    remaining = int(status.get("pool_remaining") or len(pool))
-    tone = "rose" if exhausted or remaining <= 2 else (
-        "amber" if remaining <= 5 else "mint")
+    # ONE table over the master list, because that is the list an operator just
+    # added to. The pool table alone could never show a freshly added key: the
+    # pool is "master - dead - ACTIVE", and a new key usually becomes the active
+    # one, so it was excluded from the only visible list by construction and
+    # read as "my key did not go in" (asked 2026-08-31, twice).
+    active = _active_key()
+    dead_set = set(dead)
 
-    pool_rows = "".join(
-        f"<tr><td><code>{e(_mask(k))}</code></td>"
-        f"<td>{pill('active', 'mint') if str(k).startswith(str(status.get('active_key','') or '')[:8]) and status.get('active_key') else ''}</td>"
-        f"</tr>" for k in pool)
-    dead_rows = "".join(f"<tr><td><code>{e(_mask(k))}</code></td>"
-                        f"<td>{pill('exhausted', 'rose')}</td></tr>" for k in dead)
+    # The headline number must include the key CURRENTLY SERVING CALLS. The
+    # pool is "master - dead - active", so it excludes that key by
+    # construction; reporting it as "keys remaining: 0 usable" told an operator
+    # the platform was dry while a funded key was happily running every call
+    # (asked 2026-08-31). Standby and working are different numbers, so the
+    # page now shows both and never calls the standby count "remaining".
+    standby = len(pool)
+    in_use_ok = bool(active) and active not in dead_set
+    working = standby + (1 if in_use_ok else 0)
+    tone = "rose" if working == 0 else ("amber" if working <= 3 else "mint")
+
+    def _state(k: str) -> tuple[str, str, int]:
+        if k and k == active:
+            return ("in use", "mint", 0)
+        if k in dead_set:
+            return ("exhausted", "rose", 2)
+        return ("usable", "sky", 1)
+
+    all_keys = list(master)
+    if active and active not in all_keys:
+        # .env edited by hand, or a key retired off the master list. Show it
+        # rather than rendering a table that omits the key serving calls.
+        all_keys.append(active)
+    all_keys.sort(key=lambda k: _state(k)[2])   # stable: master order within a state
+
+    key_rows = "".join(
+        f"<tr><td><code>{e(_mask(k))}</code></td><td>{pill(label, tone)}</td>"
+        f"<td class=small muted>{'not on the master list' if k not in master else ''}</td></tr>"
+        for k, (label, tone, _) in ((k, _state(k)) for k in all_keys))
     csrf = _csrf_field(request)
 
     return page("API keys", f"""
-<h1>Sarvam API key pool</h1>
+<h1>Sarvam API keys</h1>
 <p class="sub">Speech-to-text and text-to-speech for every call on the
-   platform. When the pool runs dry, <b>every tenant's calls go silent</b> —
-   this is the single highest-impact number on the platform.</p>
+   platform. One key serves calls at a time; the rest stand by. When the key in
+   use runs out and no standby is left, <b>every tenant's calls go silent</b>.</p>
 
-{'<div class="flash err">Every key is exhausted. Calls are failing right now. Add credit-loaded keys below.</div>' if exhausted else ''}
+{'<div class="flash err">No working key. Calls are failing right now — add a credit-loaded key below.</div>' if working == 0 else ''}
+{f'<div class="flash warn">Running on the last key. {e(_mask(active))} is serving every call and there is no standby: when its credit runs out, calls stop. Add another key.</div>' if working == 1 and in_use_ok else ''}
 
 <div class="grid two"><div>
 <div class="card">
   <h2>Status</h2>
   <dl>
-    <dt>Active key</dt><dd><code>{e(status.get('active_key') or '—')}</code></dd>
-    <dt>Keys remaining</dt><dd>{pill(f'{remaining} usable', tone)}</dd>
-    <dt>Exhausted</dt><dd>{num(status.get('dead_count') or len(dead))}</dd>
+    <dt>In use</dt><dd><code>{e(_mask(active) or '—')}</code>
+        {'' if in_use_ok else pill('marked exhausted', 'rose')}</dd>
+    <dt>Working keys</dt><dd>{pill(f'{working}', tone)}
+        <span class="small muted">{1 if in_use_ok else 0} in use + {standby} standby</span></dd>
+    <dt>Exhausted</dt><dd>{num(len(dead))} of {num(len(master))} on the master list</dd>
     <dt>Last change</dt><dd class="small">{e(status.get('updated') or '—')}</dd>
-    <dt>Credits (tracked)</dt><dd class="small">{e(json.dumps(credits)[:120])}</dd>
   </dl>
-  <p class="small muted">Rotation is automatic on HTTP 429 — a key is retired
-     and the next one is picked up. This page is for topping the pool up
-     BEFORE that runs out.</p>
+  <p class="small muted">Rotation is automatic on <b>HTTP 402</b> (out of
+     credits): the key is retired and a standby takes over mid-call, no
+     restart. This page is for adding keys BEFORE the standby count reaches
+     zero. Sarvam publishes no balance API, so "exhausted" means the key
+     actually 402'd on a live call — it is never predicted.</p>
 </div>
 
 <div class="card">
-  <h2>Add keys to the pool</h2>
+  <h2>Add keys</h2>
   <form class="act" method=post action="/admin/keys/add">
     {csrf}
     <label>One key per line (<code>sk_…</code>)</label>
     <textarea name=keys rows=5 required placeholder="sk_xxxxxxxx&#10;sk_yyyyyyyy"></textarea>
     <label>Reason (audited, min 10 chars)</label>
     <input name=reason required minlength=10 placeholder="e.g. topped up 5 keys, invoice #123">
-    <button type=submit>Add to pool</button>
+    <button type=submit>Add keys</button>
   </form>
-  <p class="small muted">Keys are appended, never replacing the active one.
-     Nothing restarts; the pool is re-read per call.</p>
+  <p class="small muted">Keys go on the <b>master list</b> — the only durable
+     store. Standby is recomputed from it immediately, so a new key is live on
+     the next call; nothing restarts. Re-adding a key that is currently
+     exhausted restores it, for when you have topped its credit up on Sarvam.
+     A key already in use stays in use — that is a no-op, not a failure.</p>
 </div>
 </div><div>
 
 <div class="card">
-  <h2>Pool ({len(pool)})</h2>
-  <table><tbody>{pool_rows or '<tr><td class=muted>Pool is empty.</td></tr>'}</tbody></table>
-</div>
-
-<div class="card">
-  <h2>Exhausted ({len(dead)})</h2>
-  <table><tbody>{dead_rows or '<tr><td class=muted>None.</td></tr>'}</tbody></table>
+  <h2>All keys ({len(all_keys)})</h2>
+  <p class="small muted"><b>in use</b> is the single key serving calls right
+     now. <b>usable</b> is the standby pool the pipeline rotates into on a 402
+     — derived every 3s as <code>master − exhausted − in&nbsp;use</code>, so a
+     key you add appears here only if it is not already the one in use.
+     <b>exhausted</b> keys stay listed: re-adding one restores it, for when you
+     have topped its credit up.</p>
+  <table><thead><tr><th>Key</th><th>State</th><th></th></tr></thead>
+    <tbody>{key_rows or '<tr><td class=muted>No keys at all — calls cannot run.</td></tr>'}</tbody></table>
 </div>
 </div></div>""", _flash(request))
 
@@ -389,27 +456,63 @@ def keys_add(request: Request, csrf: str = Form(""), keys: str = Form(""),
                          "No usable keys found — they should look like sk_… "
                          "and be at least 20 characters.")
 
-    # Reuse the dashboard's own reader/writer rather than touching the file
-    # directly. api_key_pool.json is {"pool": [...]}, and THREE other consumers
-    # depend on that shape: sarvam_key_watchdog.py, key_rotator.py (which runs
-    # in the live call path and rotates on HTTP 429) and server.py itself.
-    # Writing a bare list here would have silently broken all of them.
-    from server import _load_api_key_pool, _save_api_key_pool
-    existing = _load_api_key_pool()
-    added = [k for k in good if k not in existing]
-    _save_api_key_pool(existing + added)
+    # A key is added to the MASTER list, never to the pool.
+    #
+    # api_key_pool.json is DERIVED, not stored: sarvam-key-watchdog.service
+    # rewrites it every 3 seconds to exactly "master - dead - active". This
+    # used to append to the pool, so the form reported "Added 1 key(s)" and the
+    # watchdog erased it before the operator could refresh the page - three
+    # keys were added and lost that way on 2026-08-31, while 22 of 25 keys were
+    # already exhausted and live calls were rotating every few minutes.
+    master = _unwrap(_read_key_json("sarvam_key_master"), "keys")
+    dead = set(_unwrap(_read_key_json("sarvam_dead_keys"), "dead"))
+    active = _active_key()
+
+    added = [k for k in good if k not in master]
+    # Re-adding an exhausted key is the "I topped this one up" case, and it is
+    # the ONLY way back out of the dead list - leave it there and the key can
+    # never be used again however much credit it holds. Reported, not silent:
+    # if it was not actually topped up the pipeline retires it on the next 402.
+    revived = [k for k in good if k in dead]
+
+    _write_key_json("sarvam_key_master", {"keys": master + added})
+    if revived:
+        _write_key_json("sarvam_dead_keys", {"dead": sorted(dead - set(good))})
+        dead -= set(good)
+
+    # Reconcile the pool here too, by the watchdog's own rule, so a new key is
+    # usable on the very next call even if the watchdog service is down.
+    pool = [k for k in master + added if k and k != active and k not in dead]
+    _write_key_json("api_key_pool", {"pool": pool})
 
     audit(request, "keys.add", f"{len(added)} key(s)",
           {"reason": reason, "added": len(added), "rejected": len(bad),
+           "revived": len(revived), "pool": len(pool),
            "masked": [_mask(k) for k in added]})
-    logger.warning("[admin] %d Sarvam key(s) added to the pool :: %s",
-                   len(added), reason)
-    note = f"Added {len(added)} key(s) to the pool."
+    logger.warning("[admin] %d Sarvam key(s) added to the master list "
+                   "(%d revived, pool now %d) :: %s",
+                   len(added), len(revived), len(pool), reason)
+    # Report the outcome PER KEY. "Added 0 key(s). 0 usable in the pool. 1
+    # already present." was the true summary of pasting a perfectly good key
+    # that happened to already be the active one, and it read as a failure
+    # (2026-08-31). A no-op has to say which key and why.
+    parts = []
+    if added:
+        parts.append(f"Added {len(added)} key(s).")
+    if revived:
+        parts.append(f"Restored {len(revived)} key(s) from the exhausted list — "
+                     "retired again on the next 402 if the credit was not "
+                     "actually topped up.")
+    unchanged = [k for k in good if k not in added and k not in revived]
+    if active in unchanged:
+        parts.append(f"{_mask(active)} is already the key in use — nothing to change.")
+    others = [k for k in unchanged if k != active]
+    if others:
+        parts.append(f"{len(others)} key(s) already on the master list and on standby.")
     if bad:
-        note += f" {len(bad)} line(s) ignored (not sk_… or too short)."
-    if len(added) < len(good):
-        note += f" {len(good) - len(added)} already present."
-    return _ops_back("/admin/keys", "ok", note)
+        parts.append(f"{len(bad)} line(s) ignored (not sk_… or too short).")
+    parts.append(f"{len(pool)} key(s) now on standby.")
+    return _ops_back("/admin/keys", "ok", " ".join(parts))
 
 
 def _ops_back(path: str, kind: str, text: str) -> RedirectResponse:

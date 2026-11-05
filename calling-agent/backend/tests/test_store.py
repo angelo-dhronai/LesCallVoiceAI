@@ -29,12 +29,16 @@ def test_write_agent_round_trip_and_revisions(env):
     from app.agent_definition import store
 
     data, rev = store.read_agent("pramukh", env)
+    # One more than the copied file carried — NOT a literal 1. The fixture is
+    # a copy of the LIVE pramukh YAML, which has carried revision 1 since the
+    # 2026-09-11 §42 migration; the literal has failed on every run since.
+    before = int(data.get("revision") or 0)
     data["identity"]["company_tagline"] = "New tagline for testing"
     result = store.write_agent(
         "pramukh", data, actor="tester:copilot", base_rev=rev,
         reason="tagline edit", agents_dir=env,
         expected_paths={"identity.company_tagline"})
-    assert result["revision"] == 1
+    assert result["revision"] == before + 1
     assert result["effective"] == "next_call"
 
     data2, rev2 = store.read_agent("pramukh", env)

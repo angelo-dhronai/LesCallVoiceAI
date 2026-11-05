@@ -179,7 +179,9 @@ def test_half_hour_phrase():
 def test_vague_relative_ask_gets_minutes_flavoured_question():
     r = make_router()
     resp = drive(r, "thodi der baad call karna")
-    assert "?" in resp and "minute" in resp.lower()
+    # The Hinglish line switches the router to Hindi, whose bank is now
+    # Devanagari (RUNBOOK §77): "कितने मिनट" is the minutes flavour.
+    assert "?" in resp and ("minute" in resp.lower() or "मिनट" in resp)
     assert r._pending_clarify is not None
 
 

@@ -32,13 +32,48 @@ import uuid
 
 from shared.billing.errors import (
     CODE_ACCOUNT_LOCKED, CODE_CAP_AGENTS, CODE_CAP_CONCURRENCY,
-    CODE_PLAN_REQUIRED, CODE_QUOTA_COPILOT, CODE_QUOTA_MINUTES,
-    CODE_UNATTRIBUTED, Decision,
+    CODE_PLAN_REQUIRED, CODE_QUOTA_COPILOT, CODE_QUOTA_COPILOT_TOKENS,
+    CODE_QUOTA_MINUTES, CODE_UNATTRIBUTED, Decision,
 )
 
 log = logging.getLogger("billing.entitlements")
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+# ---------------------------------------------------------------------------
+# THE TRIAL FLOOR — the one set of limits the enforcement switch cannot turn off
+#
+# Everything else in this module begins `if not enforcement_enabled(): return
+# Decision.ok()`. That switch is a BUSINESS decision: flipping it on starts
+# refusing phone calls on minute quotas, locking accounts and hiding paid
+# features, and it has deliberately been off since 2026-08-01. The consequence
+# nobody intended is that a signed-up-this-minute Free account has no ceiling
+# on anything either — it can mint agents without limit and drive the copilot
+# as hard as it likes, and the copilot's model quota is SHARED with live phone
+# calls (COPILOT_LLM_TPM, plus the provider's daily ceiling). So the cheapest
+# account on the platform can degrade every paying tenant's calls.
+#
+# These three limits are therefore ANTI-ABUSE, not product tiering, and they
+# apply to trial tenants whatever the switch says. They are a FLOOR: they only
+# ever tighten. When enforcement is on and a tenant's own entitlement is
+# stricter (an admin override, a locked account), the stricter one wins —
+# min() below, never max().
+#
+# Scope is `free` ONLY (owner decision, 2026-09-12). Pilot is a PAID trial
+# (Rs 2,999, 7 days) and keeps the 3 agents it was sold; capping it here would
+# be a pricing change wearing a security fix's clothes.
+# ---------------------------------------------------------------------------
+TRIAL_PLANS = frozenset({"free"})
+
+TRIAL_MAX_AGENT_FAMILIES = 1
+TRIAL_COPILOT_TURNS_PER_DAY = 20
+TRIAL_COPILOT_TOKENS_PER_DAY = 150_000
+
+# A single request that cannot possibly be a question. The daily budget alone
+# does not stop one 400k-token paste from consuming it in one shot — and worse,
+# that request is SENT before the budget notices, so the shared model quota is
+# already spent. Bounded here, before the LLM call.
+TRIAL_COPILOT_MAX_REQUEST_TOKENS = 25_000
 
 # How long a dial reservation stands before it expires on its own. Comfortably
 # longer than originate_timeout (45s) plus a long call, so a live call is never
@@ -180,7 +215,7 @@ def billing_owner(routing: dict | None) -> str:
 
 _FEATURES = ("recordings", "summaries", "transcripts", "intelligence",
              "conversation_analytics", "advanced_analytics", "autocall",
-             "telephony")
+             "telephony", "api_access")
 
 
 def _free_defaults() -> dict:
@@ -191,6 +226,7 @@ def _free_defaults() -> dict:
         "minutes_limit": 30, "minutes_included": 30, "minutes_topup": 0,
         "max_agent_families": 1, "max_concurrent_calls": 1,
         "copilot_turns_per_day": 20,
+        "copilot_tokens_per_day": TRIAL_COPILOT_TOKENS_PER_DAY,
         # Every capability off — including `telephony`, so a brand-new signup
         # with no entitlements row yet cannot register a number.
         **{f: 0 for f in _FEATURES},
@@ -218,7 +254,13 @@ def get_entitlements(owner: str) -> dict:
         row = db.execute(
             "SELECT e.*, p.name AS plan_name, p.period AS plan_period, "
             "       p.duration_days, p.topup_allowed, p.topup_pack_minutes, "
-            "       p.topup_rate_paise, p.price_paise "
+            "       p.topup_rate_paise, p.price_paise, "
+            # Migration 0028 adds the column NULL on every existing row, and
+            # resolve_entitlements() only fills it the next time it runs. Read
+            # the plan's number through until then, or the token budget would
+            # be silently unlimited for every tenant already on the platform —
+            # exactly the group the cap exists for.
+            "       p.copilot_tokens_per_day AS plan_copilot_tokens_per_day "
             "FROM entitlements e JOIN plans p ON p.code = e.plan_code "
             "WHERE e.owner=?", (owner,)).fetchone()
         if row is None:
@@ -252,10 +294,72 @@ def get_entitlements(owner: str) -> dict:
     ent["minutes_topup"] = topup
     if ent.get("minutes_included") is not None and ent.get("minutes_limit") is not None:
         ent["minutes_limit"] = int(ent["minutes_included"] or 0) + topup
+    if ent.get("copilot_tokens_per_day") is None:
+        ent["copilot_tokens_per_day"] = ent.get("plan_copilot_tokens_per_day")
     ent["provisional"] = False
     for f in _FEATURES:
         ent[f] = int(ent.get(f) or 0)
     return ent
+
+
+# ---------------------------------------------------------------------------
+# the trial floor
+# ---------------------------------------------------------------------------
+
+def is_trial(ent: dict) -> bool:
+    """Is this tenant on a non-paying trial?
+
+    Reads the RESOLVED plan, which matters in two cases that a
+    `plan_code == 'free'` comparison at the call site would get wrong:
+    an account with no entitlements row at all (a signup from thirty seconds
+    ago — `_free_defaults()` stamps plan_code='free'), and a Pilot whose window
+    elapsed, which get_entitlements() demotes to Free on READ rather than
+    waiting for the sync worker.
+    """
+    return str(ent.get("plan_code") or "free").strip().lower() in TRIAL_PLANS
+
+
+def _floor(ent: dict, field: str, ceiling: int) -> int | None:
+    """The stricter of the tenant's own limit and the trial ceiling.
+
+    NULL in this schema means UNLIMITED, so it is the loosest possible value,
+    not the tightest — `min(None, 1)` is a TypeError and `None or 1` reads
+    backwards. Written out because getting it upside down here would hand a
+    trial account an unlimited budget and look like a typo in review.
+    """
+    if not is_trial(ent):
+        return ent.get(field)
+    own = ent.get(field)
+    if own is None:
+        return ceiling
+    try:
+        return min(int(own), ceiling)
+    except (TypeError, ValueError):
+        return ceiling
+
+
+def effective_limits(owner_or_ent) -> dict:
+    """The caps that actually apply right now, trial floor included.
+
+    Every gate below and every meter the SPA draws reads THIS, so a limit can
+    never be enforced at one number and displayed at another. Accepts an owner
+    string or an already-loaded entitlement dict — the gates have one in hand
+    and must not pay for a second query.
+    """
+    ent = (get_entitlements(owner_or_ent) if isinstance(owner_or_ent, str)
+           else (owner_or_ent or {}))
+    return {
+        "plan_code": ent.get("plan_code") or "free",
+        "trial": is_trial(ent),
+        "max_agent_families": _floor(
+            ent, "max_agent_families", TRIAL_MAX_AGENT_FAMILIES),
+        "copilot_turns_per_day": _floor(
+            ent, "copilot_turns_per_day", TRIAL_COPILOT_TURNS_PER_DAY),
+        "copilot_tokens_per_day": _floor(
+            ent, "copilot_tokens_per_day", TRIAL_COPILOT_TOKENS_PER_DAY),
+        "copilot_max_request_tokens": (
+            TRIAL_COPILOT_MAX_REQUEST_TOKENS if is_trial(ent) else None),
+    }
 
 
 def period_bounds(ent: dict) -> tuple[dt.datetime, dt.datetime]:
@@ -319,6 +423,13 @@ def usage_summary(owner: str) -> dict:
     except Exception as exc:
         log.warning("usage summary failed for %s: %r", owner, exc)
     limit = ent.get("minutes_limit")
+    # The caps the GATES use, not the raw plan row. Before the trial floor
+    # these were the same thing; now a Free tenant's displayed cap has to be
+    # the floored one or the meter says "1 of 1 agents" while the button stays
+    # enabled — the exact mismatch that makes a limit look like a bug.
+    limits = effective_limits(ent)
+    copilot_tokens_limit = limits["copilot_tokens_per_day"]
+    copilot_tokens_used_today = copilot_tokens_used(owner) if owner else 0
     return {
         "plan_code": ent.get("plan_code"),
         "plan_name": ent.get("plan_name"),
@@ -332,9 +443,19 @@ def usage_summary(owner: str) -> dict:
         "calls_in_flight": calls,
         "period_start": _iso(start),
         "period_end": _iso(end),
-        "max_agent_families": ent.get("max_agent_families"),
+        "max_agent_families": limits["max_agent_families"],
         "max_concurrent_calls": ent.get("max_concurrent_calls"),
-        "copilot_turns_per_day": ent.get("copilot_turns_per_day"),
+        "copilot_turns_per_day": limits["copilot_turns_per_day"],
+        "copilot_tokens_per_day": copilot_tokens_limit,
+        "copilot_tokens_used": copilot_tokens_used_today,
+        "copilot_tokens_remaining": (
+            None if copilot_tokens_limit is None
+            else max(0, int(copilot_tokens_limit) - copilot_tokens_used_today)),
+        # True when the limits above bind regardless of the global enforcement
+        # switch. The SPA needs this: it currently hides every cap behind
+        # `enforcement`, which would make a binding trial cap invisible right
+        # up to the 402.
+        "trial": limits["trial"],
         "features": {f: bool(ent.get(f)) for f in _FEATURES},
     }
 
@@ -489,21 +610,57 @@ def agent_families_used(owner: str) -> int:
     return len(families)
 
 
+def agent_cap(owner: str) -> tuple[int | None, bool]:
+    """(cap, is_trial) for this owner — the number the gate and the UI share.
+
+    Returns (None, False) when nothing applies, so a caller can tell
+    "unlimited" from "one" without re-deriving the trial rule.
+    """
+    ent = get_entitlements(owner)
+    limits = effective_limits(ent)
+    if not limits["trial"] and not enforcement_enabled():
+        return None, False
+    return limits["max_agent_families"], limits["trial"]
+
+
+def agent_cap_message(cap: int, used: int, trial: bool) -> str:
+    if trial:
+        # Do not say "your plan includes 1 agent" to someone who never chose a
+        # plan. The free tier is the default state of a signup, so the sentence
+        # has to explain the rule and the way out in one breath, or it reads as
+        # the product being broken.
+        return (f"The free plan includes {cap} agent"
+                f"{'s' if cap != 1 else ''} and you have {used}. "
+                f"Archive it to build a different one, or upgrade for more.")
+    return (f"Your plan includes {cap} agent{'s' if cap != 1 else ''} "
+            f"and you have {used}. Archive one to free a slot, or upgrade.")
+
+
 def check_agent_create(owner: str, family: str = "") -> Decision:
     """May `owner` create one more agent family?
 
     `family` is the base name being created: re-creating a half of a pair the
     tenant already owns is not a new family and must not be refused.
+
+    Note the missing `if not enforcement_enabled(): return ok()` that every
+    other gate opens with. It is deliberate, and it is the point of this
+    change: the cap has to bind for trial tenants while the global switch stays
+    off. `agent_cap()` puts the switch back in play for everyone else.
     """
-    if not enforcement_enabled():
-        return Decision.ok()
     if not owner:
         return Decision.deny(CODE_PLAN_REQUIRED, "No account for this request.")
     try:
         ent = get_entitlements(owner)
-        if (denial := _locked(ent)) is not None:
+        limits = effective_limits(ent)
+        trial = limits["trial"]
+        # A locked account is an administrative act and outranks everything,
+        # but only where enforcement is live — locking is not an anti-abuse
+        # measure and must not start biting because of this change.
+        if (enforcement_enabled() and (denial := _locked(ent)) is not None):
             return denial
-        cap = ent.get("max_agent_families")
+        if not trial and not enforcement_enabled():
+            return Decision.ok()
+        cap = limits["max_agent_families"]
         if cap is None:
             return Decision.ok()
         used = agent_families_used(owner)
@@ -519,10 +676,8 @@ def check_agent_create(owner: str, family: str = "") -> Decision:
                 return Decision.ok()
         if used >= int(cap):
             return Decision.deny(
-                CODE_CAP_AGENTS,
-                f"Your plan includes {cap} agent{'s' if int(cap) != 1 else ''} "
-                f"and you have {used}. Archive one to free a slot, or upgrade.",
-                agents_used=used, agents_limit=int(cap))
+                CODE_CAP_AGENTS, agent_cap_message(int(cap), used, trial),
+                agents_used=used, agents_limit=int(cap), trial=trial)
         return Decision.ok()
     except Exception as exc:
         log.error("[billing] agent-cap check failed for %s: %r", owner, exc)
@@ -536,17 +691,23 @@ def check_copilot_turn(owner: str, cost: int = 1) -> Decision:
     These are unmetered today, and the copilot's model quota is SHARED with
     live calls (COPILOT_LLM_TPM, and the provider's daily ceiling). So one Free
     tenant looping the copilot degrades paying tenants' phone calls at zero
-    cost to themselves. This is an abuse ceiling, not a product limit.
+    cost to themselves. This is an abuse ceiling, not a product limit — which
+    is why, for a trial tenant, it binds whether or not billing enforcement is
+    switched on.
+
+    Counts MESSAGES. `check_copilot_tokens` counts the work those messages
+    cause, and the two are checked together (see `check_copilot_budget`).
     """
-    if not enforcement_enabled():
-        return Decision.ok()
     if not owner:
         return Decision.deny(CODE_PLAN_REQUIRED, "No account for this request.")
     try:
         ent = get_entitlements(owner)
-        if (denial := _locked(ent)) is not None:
+        limits = effective_limits(ent)
+        if enforcement_enabled() and (denial := _locked(ent)) is not None:
             return denial
-        cap = ent.get("copilot_turns_per_day")
+        if not limits["trial"] and not enforcement_enabled():
+            return Decision.ok()
+        cap = limits["copilot_turns_per_day"]
         if cap is None:
             return Decision.ok()
         start, _ = _ist_day_bounds()
@@ -570,6 +731,111 @@ def check_copilot_turn(owner: str, cost: int = 1) -> Decision:
         return Decision.ok(check="error")
 
 
+# ---------------------------------------------------------------------------
+# copilot TOKEN budget
+#
+# The turn cap counts how often someone pressed send. This counts what the
+# platform actually spent answering — which is the number that matters, because
+# one chat turn runs an agentic tool loop of up to _MAX_TOOL_ROUNDS (20) full
+# LLM requests, each carrying the system prompt, the tool schemas and the
+# fitted history. Twenty polite messages and twenty adversarial ones are the
+# same number to the old counter and two orders of magnitude apart in cost.
+# ---------------------------------------------------------------------------
+
+def _ist_day_key(at: dt.datetime | None = None) -> str:
+    """The IST calendar date the budget is keyed on, as YYYY-MM-DD.
+
+    Same boundary as `_ist_day_bounds`, on purpose: two budgets that reset at
+    different midnights produce support tickets nobody can reproduce.
+    """
+    return (at or now_utc()).astimezone(IST).strftime("%Y-%m-%d")
+
+
+def copilot_tokens_used(owner: str, at: dt.datetime | None = None) -> int:
+    """Tokens this owner has spent on LLM surfaces today (IST). 0 on any error
+    — a counter that cannot be read must not become a wall."""
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            row = db.execute(
+                "SELECT total_tokens FROM copilot_token_usage "
+                "WHERE owner=? AND day=?", (owner, _ist_day_key(at))).fetchone()
+        return int((row or {}).get("total_tokens") or 0)
+    except Exception as exc:
+        log.debug("[billing] copilot token read failed for %s: %r", owner, exc)
+        return 0
+
+
+def check_copilot_tokens(owner: str, request_tokens: int = 0) -> Decision:
+    """May `owner` spend more LLM tokens today?
+
+    Two ceilings, and they stop different things:
+
+      * the DAILY budget, checked as `used >= cap` rather than
+        `used + estimate > cap`. A turn is allowed to cross the line and
+        finish; the next one is refused. Pre-charging an estimate would mean
+        guessing how many tool rounds a turn will take, and guessing high
+        refuses legitimate work while guessing low is the same as not
+        checking. Overshoot is bounded by the second ceiling.
+
+      * the PER-REQUEST ceiling, which is what actually bounds that overshoot
+        and is the only thing standing between a 400k-token paste and the
+        shared model quota. The daily budget cannot stop it: by the time the
+        counter moves, the request has already been sent.
+    """
+    if not owner:
+        return Decision.deny(CODE_PLAN_REQUIRED, "No account for this request.")
+    try:
+        ent = get_entitlements(owner)
+        limits = effective_limits(ent)
+        if enforcement_enabled() and (denial := _locked(ent)) is not None:
+            return denial
+        if not limits["trial"] and not enforcement_enabled():
+            return Decision.ok()
+
+        per_request = limits["copilot_max_request_tokens"]
+        if per_request is not None and request_tokens > int(per_request):
+            _note_copilot_refusal(owner)
+            return Decision.deny(
+                CODE_QUOTA_COPILOT_TOKENS,
+                f"That message is too large for the free plan "
+                f"(about {request_tokens:,} tokens; the limit is "
+                f"{int(per_request):,} per message). Split it into smaller "
+                f"parts, upload it as a document, or upgrade.",
+                copilot_request_tokens=int(request_tokens),
+                copilot_request_limit=int(per_request))
+
+        cap = limits["copilot_tokens_per_day"]
+        if cap is None:
+            return Decision.ok()
+        used = copilot_tokens_used(owner)
+        if used >= int(cap):
+            _note_copilot_refusal(owner)
+            return Decision.deny(
+                CODE_QUOTA_COPILOT_TOKENS,
+                f"You have used today's AI-assistant allowance "
+                f"({used:,} of {int(cap):,} tokens). It resets at midnight "
+                f"IST, or upgrade for a higher allowance.",
+                copilot_tokens_used=used, copilot_tokens_limit=int(cap))
+        return Decision.ok()
+    except Exception as exc:
+        log.error("[billing] copilot token check failed for %s: %r", owner, exc)
+        return Decision.ok(check="error")
+
+
+def check_copilot_budget(owner: str, request_tokens: int = 0) -> Decision:
+    """Both copilot ceilings, first refusal wins.
+
+    One function so a new LLM surface cannot wire up half the budget. The turn
+    cap goes first: when a tenant is out of both, "you have used today's 20
+    messages" is the more actionable sentence.
+    """
+    turns = check_copilot_turn(owner)
+    if not turns:
+        return turns
+    return check_copilot_tokens(owner, request_tokens)
+
+
 def record_copilot_turn(owner: str, surface: str = "chat") -> None:
     """Count one LLM turn against the daily budget. Best-effort by design: a
     dropped count costs one free turn, a raised exception costs a chat reply."""
@@ -578,6 +844,66 @@ def record_copilot_turn(owner: str, surface: str = "chat") -> None:
         record(owner, "copilot_turn", surface)
     except Exception as exc:
         log.debug("copilot turn not recorded for %s: %r", owner, exc)
+
+
+def record_copilot_tokens(owner: str, prompt_tokens: int = 0,
+                          completion_tokens: int = 0,
+                          total_tokens: int | None = None,
+                          requests: int = 1) -> None:
+    """Add one LLM request's usage to today's counter. Never raises.
+
+    `total_tokens` is taken from the provider when it reports one rather than
+    recomputed, because on Gemini the parts do NOT add up: reasoning tokens are
+    billed at the output rate and are folded into the total without appearing
+    in `completion_tokens` (see prompt_cache.py and the 2026-09-12 attribution
+    note). Summing the two visible numbers would under-count the expensive half
+    of every request by ~29%.
+    """
+    if not owner:
+        return
+    prompt_tokens = max(0, int(prompt_tokens or 0))
+    completion_tokens = max(0, int(completion_tokens or 0))
+    total = int(total_tokens) if total_tokens else prompt_tokens + completion_tokens
+    total = max(total, prompt_tokens + completion_tokens)
+    if total <= 0 and requests <= 0:
+        return
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            db.execute(
+                "INSERT INTO copilot_token_usage "
+                "  (owner, day, prompt_tokens, completion_tokens, total_tokens, "
+                "   requests, updated_at) "
+                "VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP) "
+                "ON CONFLICT (owner, day) DO UPDATE SET "
+                "  prompt_tokens = copilot_token_usage.prompt_tokens + excluded.prompt_tokens, "
+                "  completion_tokens = copilot_token_usage.completion_tokens + excluded.completion_tokens, "
+                "  total_tokens = copilot_token_usage.total_tokens + excluded.total_tokens, "
+                "  requests = copilot_token_usage.requests + excluded.requests, "
+                "  updated_at = CURRENT_TIMESTAMP",
+                (owner, _ist_day_key(), prompt_tokens, completion_tokens,
+                 total, max(0, int(requests))))
+    except Exception as exc:
+        # A dropped count costs the platform some tokens. A raised exception
+        # costs the user their reply, mid-turn, after the model already ran.
+        log.warning("[billing] copilot tokens not recorded for %s: %r", owner, exc)
+
+
+def _note_copilot_refusal(owner: str) -> None:
+    """Count a refusal on today's row so the operator view can tell a tenant
+    who hit the ceiling once from one hammering it."""
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            db.execute(
+                "INSERT INTO copilot_token_usage (owner, day, refusals, updated_at) "
+                "VALUES (?,?,1,CURRENT_TIMESTAMP) "
+                "ON CONFLICT (owner, day) DO UPDATE SET "
+                "  refusals = copilot_token_usage.refusals + 1, "
+                "  updated_at = CURRENT_TIMESTAMP",
+                (owner, _ist_day_key()))
+    except Exception as exc:
+        log.debug("[billing] copilot refusal not recorded for %s: %r", owner, exc)
 
 
 def _ist_day_bounds(at: dt.datetime | None = None) -> tuple[dt.datetime, dt.datetime]:
@@ -760,6 +1086,7 @@ def resolve_entitlements(owner: str, actor: str = "system") -> dict:
             "max_agent_families": pick("max_agent_families"),
             "max_concurrent_calls": pick("max_concurrent_calls"),
             "copilot_turns_per_day": pick("copilot_turns_per_day"),
+            "copilot_tokens_per_day": pick("copilot_tokens_per_day"),
             "recordings": int(bool(pick("recordings", "recordings_enabled"))),
             "summaries": int(bool(pick("summaries", "summaries_enabled"))),
             "transcripts": int(bool(pick("transcripts", "transcripts_enabled"))),
@@ -768,6 +1095,7 @@ def resolve_entitlements(owner: str, actor: str = "system") -> dict:
             "advanced_analytics": int(bool(pick("advanced_analytics"))),
             "autocall": int(bool(pick("autocall", "autocall_enabled"))),
             "telephony": int(bool(pick("telephony", "telephony_enabled"))),
+            "api_access": int(bool(pick("api_access", "api_access_enabled"))),
             "period_start": _iso(p_start),
             "period_end": _iso(p_end),
             "status": status,

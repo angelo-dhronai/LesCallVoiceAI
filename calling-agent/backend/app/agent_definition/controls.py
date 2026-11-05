@@ -38,7 +38,15 @@ KNOWN_LEAF_KEYS: dict[str, frozenset[str]] = {
         "hello_fastpath", "delivery_guard", "intro_line"}),
     "call_flow.termination": frozenset({
         "llm_end_call", "confirm_before_end", "end_conditions",
-        "farewell_patterns", "silence_hangup", "max_call_minutes"}),
+        "farewell_patterns", "silence_hangup", "max_call_minutes",
+        # RUNBOOK §75: the owner's "anything else before I go?" line
+        # ({lang: str}), asked before every goodbye.
+        "pre_close_question"}),
+    # RUNBOOK §78: per-agent turn-taking (pause hold, back-channel guard,
+    # deferred-barge override, tail cut).
+    "call_flow.turn_taking": frozenset({
+        "pause_hold_ms", "max_merged_fragments", "backchannel_guard",
+        "sustained_barge_ms", "tail_barge_in"}),
     "call_flow.completed_when": frozenset({
         "required_slots", "require_appointment", "all_collect_filled"}),
     "call_flow.scheduling": frozenset({
@@ -49,12 +57,16 @@ KNOWN_LEAF_KEYS: dict[str, frozenset[str]] = {
         "max_offers", "capture_exact_time"}),
     "knowledge_base.pricing_policy": frozenset({
         "mode", "disclose", "responses", "escalate_to", "defer_line",
-        "topics"}),
+        "topics", "second_ask_approx", "approx_line"}),
     "knowledge_base.fact_policy": frozenset({
         "mode", "unknown_response", "allow_inference", "defer_line",
         "topics"}),
     "knowledge_base.product_lock": frozenset({
         "enabled", "lock_after", "scope"}),
+    # The ONE catalogue item pitched proactively (RUNBOOK §55). `mode` is
+    # exclusive|lead; `reason` is the clause the MATCH RULES band quotes.
+    "knowledge_base.primary_project": frozenset({
+        "id", "mode", "reason", "budget_switch"}),
     "guardrails.honesty": frozenset({
         "never_claim_human", "disclose_ai_when_asked", "responses",
         "unknown_answer_policy", "knowledge_grounding",
@@ -62,20 +74,35 @@ KNOWN_LEAF_KEYS: dict[str, frozenset[str]] = {
     "guardrails.compliance": frozenset({
         "dnd_honour", "recording_disclosure", "responses",
         "disclaimers", "consent_line", "restricted_topics"}),
+    # `action` and `handoff_message` are READ by prompt_blocks.firm_rules_block
+    # (the ━━ ESCALATION ━━ band) and documented on GuardrailsConfig; they were
+    # missing here, so the first agent to use the band failed the live-agent
+    # fence (Prakhar, 2026-09-24).
     "guardrails.escalation": frozenset({
-        "enabled", "triggers", "responses", "transfer_to"}),
+        "enabled", "triggers", "responses", "transfer_to", "action",
+        "handoff_message"}),
     "follow_up.whatsapp_promise": frozenset({
-        "enabled", "responses", "capture_slot", "assets", "promise_line"}),
+        "enabled", "responses", "capture_slot", "assets", "promise_line",
+        "track_projects", "offer_from_roles"}),
+    # `default_delay_hours` is the spelling the Copilot is TOLD to write
+    # (agent_copilot_api build prompt) and FollowUpConfig documents; nothing
+    # at runtime reads either spelling yet, but a key the builder emits must
+    # not read as a typo.
     "follow_up.callback": frozenset({
-        "enabled", "responses", "capture_slot", "default_delay_minutes"}),
+        "enabled", "responses", "capture_slot", "default_delay_minutes",
+        "default_delay_hours"}),
     "follow_up.clarify_commitments": frozenset({
         "enabled", "responses", "max_asks"}),
     "follow_up.auto_execute": frozenset({
         "enabled", "mode", "max_attempts"}),
     "post_call.success_definition": frozenset({
         "required_slots", "require_appointment", "intents"}),
+    # criteria_prompt / score_labels are what shared/intelligence/extract.py
+    # and the dashboard actually read (and what the Copilot's own prompt
+    # tells the model to write); "weights"/"thresholds" are read by nothing.
     "post_call.scoring": frozenset({
-        "enabled", "weights", "thresholds"}),
+        "enabled", "auto_run", "criteria_prompt", "score_labels",
+        "weights", "thresholds"}),
     "post_call.lead_profile": frozenset({
         "fields", "summary_template"}),
 }

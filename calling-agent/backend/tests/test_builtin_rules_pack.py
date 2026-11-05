@@ -44,8 +44,12 @@ def make_agent(**over) -> AgentDefinition:
 
 UNIVERSAL_LINES = [
     "✓ Use contractions: I'll, I'm, we've, it's, don't, can't — always",
-    "✓ Open each turn with a varied natural acknowledgment "
-    "(Got it / Sure / Right / Absolutely — never twice in a row)",
+    # Replaced 2026-09-18 (RUNBOOK §51): the old line ORDERED an opening
+    # acknowledgment every turn ("Got it / Sure / Right / Absolutely"), which
+    # the style band forbids — and the model obeyed the more specific one.
+    "✓ React to WHAT the caller said, not with a stock word. Most turns need "
+    "no opening acknowledgment at all; when one fits, make it specific to "
+    "their words, and never open two turns in a row the same way",
     "✗ NEVER ask for information that is already marked ✓ in CONVERSATION STATE",
 ]
 

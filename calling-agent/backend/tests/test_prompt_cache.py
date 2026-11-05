@@ -123,14 +123,16 @@ def test_prompt_without_marker_claims_no_cacheable_prefix():
 
 
 def test_token_estimator_matches_measured_api_count():
-    """±10% of the 3,236 tokens the live API reported for this exact file.
+    """±10% of the 3,666 tokens the live API reported for this exact file.
 
-    Pins the Latin/Indic split. A regression to a naive len/4 would understate
-    the Hindi and Gujarati prompts by roughly a third.
+    Re-measured 2026-09-08 after the SCRIPT FIDELITY block (RUNBOOK §36)
+    added ~430 tokens to every prompt (was 3,236 tokens / 2,900-3,560
+    bounds). Pins the Latin/Indic split. A regression to a naive len/4
+    would understate the Hindi and Gujarati prompts by roughly a third.
     """
     prompt = (FIXTURE_DIR / "pramukh__DISCOVERY__en__inbound.txt").read_text(
         encoding="utf-8")
-    assert 2900 <= prompt_cache.estimate_tokens(prompt) <= 3560
+    assert 3300 <= prompt_cache.estimate_tokens(prompt) <= 4040
 
 
 # --- cost accounting -------------------------------------------------------
@@ -155,7 +157,9 @@ def test_cached_tokens_cannot_exceed_input_tokens():
 
 def test_tier_variants_are_not_priced_as_their_base_model():
     """`-lite` is a different model, not a release suffix of `-flash`."""
-    assert ai_pricing.llm_rate("gemini-3.5-flash-lite") is None
+    lite = ai_pricing.llm_rate("gemini-3.5-flash-lite")
+    assert lite is not None and lite != ai_pricing.llm_rate("gemini-3.5-flash")
+    assert lite["in"] == 0.30 and lite["out"] == 2.50
     assert ai_pricing.llm_rate("gemini-3.5-flash-preview-09-2026") == \
         ai_pricing.llm_rate("gemini-3.5-flash")
 

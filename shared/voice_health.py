@@ -118,7 +118,7 @@ def _api_key() -> str:
 
 def _timed_post(post) -> tuple[str, int]:
     """Run one probe callable → (verdict, elapsed_ms).
-    verdict: ok | hung | server-error | auth-error | net-error"""
+    verdict: ok | hung | server-error | auth-error | no-credits | net-error"""
     t0 = time.monotonic()
     try:
         status = post()
@@ -131,6 +131,13 @@ def _timed_post(post) -> tuple[str, int]:
         return "server-error", ms
     if status in (401, 403):
         return "auth-error", ms
+    # 402 = "No credits available". This used to fall through to "ok"
+    # because only 5xx/401/403 were checked, so the sentinel reported the
+    # voice stack HEALTHY from 2026-08-31 to 09-08 while every single call
+    # went out mute — the loudest possible failure, invisible to the one
+    # watcher built to catch it (RUNBOOK §34).
+    if status == 402:
+        return "no-credits", ms
     if ms >= PROBE_BAD_MS:
         return "hung", ms
     return "ok", ms
@@ -258,10 +265,24 @@ def check_voice(state, cycle: int, alert_fn) -> dict:
     if cycle % max(probe_every, 1) == 0:
         probe = probe_sarvam()
         probes = d.get("vh:probes", [])
-        bad = (probe["stt"] in ("hung", "server-error")
-               or probe["tts"] in ("hung", "server-error"))
+        bad = (probe["stt"] in ("hung", "server-error", "no-credits")
+               or probe["tts"] in ("hung", "server-error", "no-credits"))
         probes.append([now, bad, probe["stt_ms"], probe["tts_ms"]])
         d["vh:probes"] = probes[-10:]
+        if probe["stt"] == "no-credits" or probe["tts"] == "no-credits":
+            # The active key cannot synthesize or transcribe. Every call
+            # placed from here on connects, bills telephony and plays
+            # SILENCE. Alert on the first probe, not after a rolling window.
+            alert_fn(state, "voice-probe-credits",
+                     "Sarvam key out of credits — calls are going out MUTE",
+                     "api.sarvam.ai returned HTTP 402 for the live "
+                     "SARVAM_API_KEY. The agent cannot speak and the caller "
+                     "hears dead air, while the call is still billed and is "
+                     "recorded as 'empty / no caller speech'. Check "
+                     "dashboard/sarvam_key_status.json — if pool_remaining "
+                     "is 0 the key watchdog has nothing left to rotate to "
+                     "and credits must be refilled or keys added to "
+                     "sarvam_key_master.json.")
         if probe["stt"] == "auth-error" or probe["tts"] == "auth-error":
             alert_fn(state, "voice-probe-auth",
                      "Sarvam probe rejected (401/403)",

@@ -74,7 +74,64 @@ export const copilotChat = (session_id: string, message: string, attachments?: s
   })
 
 export const copilotSession = (session_id: string) =>
-  api<{ session_id: string; transcript: TranscriptMsg[] }>(`/copilot/sessions/${session_id}`)
+  api<{
+    session_id: string
+    transcript: TranscriptMsg[]
+    session?: SessionSummary
+    interview?: InterviewProgress
+    pending_changes?: PendingChange[]
+  }>(`/copilot/sessions/${session_id}`)
+
+/* ───────────────── quick controls: voice + speed by click ───────────────── */
+export type RosterVoice = {
+  speaker: string
+  gender: 'male' | 'female' | ''
+  /** Pre-generated stock sample; null → preview is synthesized live. */
+  sample_url: string | null
+  recommended_for: string[]
+}
+
+export type QuickState = {
+  languages: { code: string; name: string }[]
+  default_language: string
+  speaker: string | null
+  mixed_speakers: boolean
+  gender: 'male' | 'female' | ''
+  pronouns: string
+  model: string
+  pace: Record<string, number>
+}
+
+export type QuickTarget = {
+  kind: 'agent' | 'draft' | 'none'
+  slug: string | null
+  twin: string | null
+  display_name: string
+}
+
+export type QuickControls = {
+  target: QuickTarget
+  state: QuickState | Record<string, never>
+  roster: RosterVoice[]
+  pace_range: { min: number; max: number; step: number; default: number }
+}
+
+export type QuickApplyResult = {
+  target: QuickTarget
+  state: QuickState
+  revision?: number
+  twin_write?: { applied: boolean; slug?: string; reason?: string }
+  interview?: InterviewProgress
+  pending_changes?: PendingChange[]
+}
+
+export const copilotQuickControls = (session_id: string) =>
+  api<QuickControls>(`/copilot/sessions/${session_id}/quick-controls`)
+
+export const applyQuickControls = (
+  session_id: string,
+  body: { speaker?: string; pace?: number | Record<string, number>; both_directions?: boolean },
+) => post<QuickApplyResult>(`/copilot/sessions/${session_id}/quick-controls`, body)
 
 export const copilotSessions = () =>
   api<{ sessions: SessionSummary[] }>('/copilot/sessions')

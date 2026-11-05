@@ -101,10 +101,11 @@ def estimate_tokens(text: str) -> int:
     Latin at ~4 chars/token, Devanagari and Gujarati at ~1.7 — Indic scripts
     tokenize far worse than English and treating the prompt as uniformly
     English understates a Hindi prompt by a third. Calibrated against the live
-    endpoint on 2026-08-11: this estimator gives 3,260 for the English Pramukh
-    prompt where the API reported 3,236 (+0.7%). Good enough for a threshold
-    warning; never used to compute money, which only ever comes from
-    provider-reported counts.
+    endpoint on 2026-08-11 (re-verified 2026-09-08 after the SCRIPT FIDELITY
+    block, RUNBOOK §36, grew every prompt by ~430 tokens): this estimator
+    gives 3,700 for the English Pramukh prompt where the API reported 3,666
+    (+0.9%). Good enough for a threshold warning; never used to compute
+    money, which only ever comes from provider-reported counts.
     """
     if not text:
         return 0
@@ -180,10 +181,13 @@ async def probe_cache_capability(
         # the two call for opposite fixes.
         filler = ("You are a helpful assistant for a real estate call centre. "
                   * 400)
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
+        # The key rides in a header, never `?key=`: httpx logs every request
+        # URL at INFO, which wrote the live Gemini key into the runtime log
+        # on every process start.
+        async with httpx.AsyncClient(timeout=timeout_s,
+                                     headers={"x-goog-api-key": api_key}) as client:
             resp = await client.post(
                 f"{root}/cachedContents",
-                params={"key": api_key},
                 json={
                     "model": f"models/{model}",
                     "systemInstruction": {"parts": [{"text": filler}]},
@@ -195,8 +199,7 @@ async def probe_cache_capability(
                 name = resp.json().get("name", "")
                 if name:
                     try:
-                        await client.delete(f"{root}/{name}",
-                                            params={"key": api_key})
+                        await client.delete(f"{root}/{name}")
                     except Exception:
                         pass  # 60s TTL reaps it anyway
                 return CacheCapability(

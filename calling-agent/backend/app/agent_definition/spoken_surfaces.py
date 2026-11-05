@@ -79,9 +79,15 @@ def _beats(agent: AgentDefinition, direction: str, lang: str) -> tuple[str, str]
     this returns _LLM_DRIVEN rather than firing a live request from what is
     supposed to be a read-only preview.
     """
-    from ..voice.conversation import ConversationRouter
+    from ..voice.conversation import (
+        HONORIFIC_PREVIEW_GENDER, HONORIFIC_PREVIEW_WORD, TITLE_PREVIEW_WORD,
+        ConversationRouter)
 
     router = ConversationRouter(agent_def=agent, default_language=lang)
+    # A preview names THE authored opening and which field produced it; the
+    # per-call random pick among opening_variants would make that answer (and
+    # the clear-a-field-and-rerun source attribution below) flip between runs.
+    router.vary_per_call = False
     # Deterministic calendar — live bookings must never influence resolution
     # (same guard as boot_check).
     router._available_calendar_slots = (
@@ -110,6 +116,10 @@ def _beats(agent: AgentDefinition, direction: str, lang: str) -> tuple[str, str]
     if direction == "outbound":
         router.outbound_contact_name = _NAME_SENTINEL
         router.outbound_contact_phone = "9999999999"
+    # Both directions: a preview stands for every contact, including the ones
+    # that DO carry a gender, so {honorific}/{title} must survive resolution as
+    # themselves rather than vanishing the way they will for a contact with none.
+    router.outbound_contact_gender = HONORIFIC_PREVIEW_GENDER
 
     async def _drive() -> tuple[str, str]:
         first = getattr(await router.generate_opening(), "text", "") or ""
@@ -125,8 +135,13 @@ def _beats(agent: AgentDefinition, direction: str, lang: str) -> tuple[str, str]
         return "", ""
     if _llm_used["hit"] and not second:
         second = _LLM_DRIVEN
-    return (first.replace(_NAME_SENTINEL, "{contact_name}"),
-            second.replace(_NAME_SENTINEL, "{contact_name}"))
+
+    def _detokenize(t: str) -> str:
+        return (t.replace(_NAME_SENTINEL, "{contact_name}")
+                 .replace(HONORIFIC_PREVIEW_WORD, "{honorific}")
+                 .replace(TITLE_PREVIEW_WORD, "{title}"))
+
+    return _detokenize(first), _detokenize(second)
 
 
 def _opening_line(agent: AgentDefinition, direction: str, lang: str) -> str:

@@ -39,10 +39,13 @@ deployment can correct one number without restating the table.
              which Gemini bills at the output rate and which the OpenAI-compat
              endpoint does not report separately (see prompt_cache.py)
 
-Sources (checked 2026-08-11):
-  gemini-3.5-flash       $1.50 / $0.15 cached / $9.00   devtk.ai, metacto.com
-  gemini-3.1-flash-lite  $0.25 / —              / $1.50 devtk.ai
-  gpt-4o-mini            $0.15 / $0.075 cached  / $0.60 OpenAI published card
+Sources (checked 2026-08-11; Gemini rows re-checked 2026-09-11 against
+ai.google.dev/gemini-api/docs/pricing, and 3.5-flash against the August 2026
+invoice, which matches it to the cent at ~₹95.65/$):
+  gemini-3.5-flash       $1.50 / $0.15 cached  / $9.00
+  gemini-3.5-flash-lite  $0.30 / $0.03 cached  / $2.50
+  gemini-3.1-flash-lite  $0.25 / $0.025 cached / $1.50
+  gpt-4o-mini            $0.15 / $0.075 cached / $0.60 OpenAI published card
 """
 
 from __future__ import annotations
@@ -70,15 +73,18 @@ _DEFAULT_LLM_RATES: dict[str, dict[str, float]] = {
     # setting is not a zero-cost one.
     "gemini-3.5-flash": {"in": 1.50, "cached_in": 0.15, "out": 9.00},
     # What 78% of the last 30 days' calls actually ran, via per-agent override.
-    "gemini-3.1-flash-lite": {"in": 0.25, "out": 1.50},
+    "gemini-3.1-flash-lite": {"in": 0.25, "cached_in": 0.025, "out": 1.50},
+    # The Flash-Lite tier: 80% cheaper input than 3.5-flash, 72% cheaper output.
+    "gemini-3.5-flash-lite": {"in": 0.30, "cached_in": 0.03, "out": 2.50},
     # LLM_FALLBACK / legacy default.
     "gpt-4o-mini": {"in": 0.15, "cached_in": 0.075, "out": 0.60},
 }
 
-# Deliberately absent (no vendor page checked as of 2026-08-11): gemini-3.6-flash
-# (COPILOT_LLM_MODEL), gemini-3.5-flash-lite (COPILOT_LLM_FALLBACK_MODEL),
-# gemini-2.5-flash (INTEL_LLM_MODEL default), gemini-embedding-001. Their tokens
-# are counted and reported as unpriced until someone adds a sourced rate.
+# Deliberately absent: gemini-3.6-flash (COPILOT_LLM_MODEL — its $0.75/$3.75
+# card is a promotion that doubles on 2027-01-01, a date a hardcoded rate would
+# silently outlive), gemini-2.5-flash (INTEL_LLM_MODEL default),
+# gemini-embedding-001. Their tokens are counted and reported as unpriced until
+# someone adds a sourced rate.
 
 
 # --- embedding rate card (USD per 1M input tokens) --------------------------
@@ -92,17 +98,21 @@ _DEFAULT_LLM_RATES: dict[str, dict[str, float]] = {
 # None, its tokens are still counted, and the report names it rather than
 # inventing a rate.
 #
-# Sources (checked 2026-08-12):
+# Sources (checked 2026-08-12; gemini-embedding-2 checked 2026-09-25 against
+# ai.google.dev/gemini-api/docs/pricing, "Standard" tier, text input):
 #   text-embedding-3-small  $0.02 / 1M   OpenAI published card
 #   text-embedding-3-large  $0.13 / 1M   OpenAI published card
 #   text-embedding-ada-002  $0.10 / 1M   OpenAI published card (legacy)
+#   gemini-embedding-2      $0.20 / 1M   Google published card (RAG_EMBED_MODEL since §57)
 _DEFAULT_EMBED_RATES: dict[str, float] = {
     "text-embedding-3-small": 0.02,
     "text-embedding-3-large": 0.13,
     "text-embedding-ada-002": 0.10,
+    "gemini-embedding-2": 0.20,
 }
-# gemini-embedding-001 (INTEL_EMBED_MODEL) is deliberately absent — same reason
-# as its LLM siblings above: no vendor page checked.
+# gemini-embedding-001 (INTEL_EMBED_MODEL) is deliberately absent — it is no
+# longer on Google's pricing page (checked 2026-09-25), so there is no sourced
+# rate to record; its tokens are counted and reported as unpriced.
 
 
 def _load_embed_overrides() -> dict[str, float]:

@@ -782,9 +782,16 @@ app.include_router(_ui_router)
 from admin_ops import ops as _ops_router  # noqa: E402
 app.include_router(_ops_router)
 
-# Telephony plane — which account owns which number, which of THAT account's
-# agents answers it, and whether it is in service. Mounted AFTER `router` so its
+# Integration API plane — per-tenant client-IP allowlist, rate ceilings and the
+# key inventory for the customer-facing /v1 API. Mounted AFTER `router` so its
 # HTML routes cannot shadow the bearer-only /admin/api/* JSON namespace.
+from admin_api_console import api_console as _api_console_router  # noqa: E402
+app.include_router(_api_console_router)
+
+# Telephony plane — which account owns which number, which of THAT account's
+# agents answers it, and whether it is in service. Mounted after `router` for
+# the same reason as the integration console: its HTML routes must not shadow
+# the bearer-only /admin/api/* JSON namespace.
 from admin_telephony import telephony as _telephony_router  # noqa: E402
 app.include_router(_telephony_router)
 

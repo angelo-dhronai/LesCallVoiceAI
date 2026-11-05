@@ -25,6 +25,14 @@ CODE_QUOTA_MINUTES = "quota_minutes"
 CODE_CAP_AGENTS = "cap_agents"
 CODE_CAP_CONCURRENCY = "cap_concurrency"
 CODE_QUOTA_COPILOT = "quota_copilot"
+# Distinct from CODE_QUOTA_COPILOT on purpose. Both refuse the same button, but
+# they mean different things to the person reading the message and to whoever
+# reads the logs afterwards: `quota_copilot` is "you have sent today's
+# messages", `quota_copilot_tokens` is "your messages did today's WORK" — a
+# tenant can hit the second on the fourth message of the day by driving long
+# tool loops. Collapsing them into one code would have made an 8-message day
+# report as "you have used today's 20 messages", which is simply false.
+CODE_QUOTA_COPILOT_TOKENS = "quota_copilot_tokens"
 CODE_PLAN_REQUIRED = "plan_required"
 CODE_ACCOUNT_LOCKED = "account_locked"
 CODE_UNATTRIBUTED = "unattributed"
@@ -33,7 +41,8 @@ CODE_UNATTRIBUTED = "unattributed"
 # retry, and the force-dial path must not present itself as a way through.
 NON_RETRYABLE = frozenset({
     CODE_QUOTA_MINUTES, CODE_CAP_AGENTS, CODE_CAP_CONCURRENCY,
-    CODE_QUOTA_COPILOT, CODE_PLAN_REQUIRED, CODE_ACCOUNT_LOCKED,
+    CODE_QUOTA_COPILOT, CODE_QUOTA_COPILOT_TOKENS, CODE_PLAN_REQUIRED,
+    CODE_ACCOUNT_LOCKED,
 })
 
 

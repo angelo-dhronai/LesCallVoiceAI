@@ -1,5 +1,7 @@
 # Conversation State Management Layer
 
+> **Status (2026-10-18):** the mechanism described here is current, but the LLM names are historical: extraction and generation now run on Gemini via `LLM_BASE_URL` / `LLM_MODEL` (RUNBOOK §43), tool-mode values pass `_drop_non_values` (RUNBOOK §50), and slots gained `ask_gated`, `merge_policy`, `max_asks` and retirement via `retire_slots` (RUNBOOK §56, §61, §75). Current agent model: `docs/PLATFORM.md` §5.
+
 **Module:** `app/voice/state_manager.py` · **Integrated into:** `app/voice/conversation.py`, `conversation_call_bridge.py`, `app/agent_definition/schema.py` · **Tests:** `tests/test_state_manager.py` (28 cases)
 
 ## The problem it solves

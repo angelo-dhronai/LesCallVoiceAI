@@ -39,7 +39,12 @@ logger = logging.getLogger(__name__)
 _AGENTS_DIR_DEFAULT = Path(__file__).resolve().parents[3] / "agents"
 
 # Paths the store itself mutates — always allowed by the scoping proof.
-SERVER_MANAGED_PATHS = {"revision", "updated_at", "updated_by"}
+# The pronoun pair is DERIVED from the selected voice by
+# AgentDefinition.from_dict (RUNBOOK §42): a write that changes only
+# languages.tts_voices legitimately moves them too, and the scope proof must
+# not roll that voice change back as collateral.
+SERVER_MANAGED_PATHS = {"revision", "updated_at", "updated_by",
+                        "identity.pronouns", "personality.pronouns"}
 
 REVISION_RETENTION = 50
 
@@ -64,6 +69,60 @@ class ScopeError(Exception):
 
 class OwnerMismatch(Exception):
     """Actor's owner does not own this slug."""
+
+
+# ── direction is IDENTITY for a twin slug (RUNBOOK §60) ─────────────────────
+# `acme-inbound` / `acme-outbound` are one family, and the suffix is what the
+# Agents card, the number-binding slots, the Copilot's twin mirror and the
+# "Add <direction> version" affordance all key on. A YAML whose call_direction
+# contradicts its own suffix makes the family show two rows of one direction,
+# computes as its OWN counterpart (so the missing version can never be
+# offered), and — bound to the slot its name promises — speaks the other
+# direction's opening (conversation.py reads `_def.call_direction` for the
+# identity-confirm line and the opening). Standalone, pre-twin slugs carry no
+# suffix and are unconstrained.
+DIRECTIONS = ("inbound", "outbound")
+
+
+def slug_direction(slug: str) -> Optional[str]:
+    """The direction a twin slug's suffix promises, or None for a standalone slug."""
+    for d in DIRECTIONS:
+        if slug.endswith(f"-{d}"):
+            return d
+    return None
+
+
+def twin_of_slug(slug: str) -> Optional[str]:
+    """The opposite-direction slug of a twin, or None for a standalone slug."""
+    have = slug_direction(slug)
+    if have is None:
+        return None
+    other = "outbound" if have == "inbound" else "inbound"
+    return slug[: -len(have)] + other
+
+
+class DirectionLocked(ValueError):
+    """The definition's call_direction contradicts the slug's own suffix."""
+
+
+def assert_direction_matches_slug(slug: str, definition: dict) -> None:
+    """Refuse a twin definition whose call_direction contradicts its slug.
+
+    Every write path (Copilot update/rollback, Builder PUT, twin create,
+    share import) funnels through here, so the invariant holds no matter
+    which door the flip comes through. The message names the twin to edit
+    instead — it is what the Copilot reads to route the edit correctly."""
+    want = slug_direction(slug)
+    if want is None:
+        return
+    have = str((definition or {}).get("call_direction") or "inbound").strip().lower()
+    if have == want:
+        return
+    raise DirectionLocked(
+        f"'{slug}' is the {want} version of this agent: its call type is fixed "
+        f"by its name and cannot become {have}. To work on the {have} version, "
+        f"edit '{twin_of_slug(slug)}' instead (create it with 'Add {have} "
+        "version' if it does not exist yet).")
 
 
 def _yaml_path(slug: str, agents_dir: Optional[Path] = None) -> Path:
@@ -192,6 +251,15 @@ def write_agent(
         raise ConflictError(
             f"Agent '{slug}' changed since it was loaded (rev mismatch)",
             current=current_dict, current_rev=current_sha)
+
+    # (b2) direction is identity for a twin slug (RUNBOOK §60). Checked BEFORE
+    # the snapshot so a refused write leaves no revision row behind. A missing
+    # field is filled from the slug rather than refused — absent, the schema
+    # would default it to inbound, which is the very corruption this guards.
+    new_dict = dict(new_dict)
+    if slug_direction(slug) and not new_dict.get("call_direction"):
+        new_dict["call_direction"] = slug_direction(slug)
+    assert_direction_matches_slug(slug, new_dict)
 
     # (c) snapshot the PRE-write YAML text (retracted if the scope check
     # rolls the write back — see below)

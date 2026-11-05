@@ -349,6 +349,8 @@ def remove_number(number_id: int, actor: str = "admin") -> dict:
     """
     from shared.db.database import get_db
     num = number_or_404(number_id)
+    from shared import call_forwarding as cf
+    cf.remove_forward_file(num, reload=False)
     fs = fsc.remove_inbound_dialplan(num, reload=True)
     with get_db() as db:
         db.execute("DELETE FROM phone_numbers WHERE id=?", (int(number_id),))
@@ -421,6 +423,8 @@ def connect_number(number_id: int, actor: str = "admin") -> dict:
         db.execute("UPDATE phone_numbers SET config_status=?, "
                    "last_applied_at=CURRENT_TIMESTAMP WHERE trunk_id=?",
                    (status, int(num["trunk_id"])))
+    from shared import call_forwarding as cf
+    result["forwarding"] = cf.sync_numbers([n["id"] for n in numbers])
     log.info("[admin-tel] %s connected %s (%s)", actor, num["number"], status)
     return {"status": status, "number": num["number"], **result}
 
@@ -434,6 +438,8 @@ def disconnect_number(number_id: int, actor: str = "admin") -> dict:
     """
     from shared.db.database import get_db
     num = number_or_404(number_id)
+    from shared import call_forwarding as cf
+    cf.remove_forward_file(num, reload=False)
     fs = fsc.remove_inbound_dialplan(num, reload=True)
     with get_db() as db:
         db.execute("UPDATE phone_numbers SET config_status='disconnected' WHERE id=?",
@@ -618,6 +624,10 @@ def transfer_number(number_id: int, new_owner: str, move_trunk: bool = True,
         # agent left behind, is worse than a transfer that did not happen.
         db.execute("UPDATE phone_numbers SET owner=? WHERE id=?",
                    (new_owner, int(number_id)))
+        # A forwarding number would otherwise keep ringing the PREVIOUS
+        # owner's phone — the new account's callers reaching a stranger.
+        db.execute("UPDATE phone_numbers SET forward_mode='agent', "
+                   "forward_contact_id=NULL WHERE id=?", (int(number_id),))
         if trunk is not None:
             new_name = trunk["name"]
             if rename_trunk:
@@ -636,6 +646,8 @@ def transfer_number(number_id: int, new_owner: str, move_trunk: bool = True,
 
     # FreeSWITCH last: the DB is now the truth, and a reload failure here is
     # recoverable with Connect rather than leaving a half-moved number.
+    from shared import call_forwarding as cf
+    moved["forwarding"] = cf.remove_forward_file(num, reload=True)
     if moved["trunk"] and moved["trunk"]["now"] != moved["trunk"]["was"]:
         with get_db() as db:
             new_trunk = _trunk_row(db, int(moved["trunk"]["id"]))

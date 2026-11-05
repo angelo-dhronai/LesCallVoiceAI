@@ -62,13 +62,18 @@ def test_intro_fastpath_on_bare_opening():
     assert not r._is_bare_hello_text(resp)
 
 
-def test_intro_fastpath_then_replay_repeats_it():
-    """After the intro, further hellos replay it via the normal repair."""
+def test_intro_fastpath_then_hello_is_a_presence_check():
+    """After the intro a further hello is a presence check (RUNBOOK §63):
+    "I can hear you" + the question — not the whole intro verbatim again —
+    and a second one in a row says who we are."""
     r = hello_router("Hello")
     first = drive(r, "hello")
     second = drive(r, "hello")
-    assert second == first
-    assert r._hello_replays == 1
+    assert second.startswith("Yes, I can hear you.")
+    assert second.endswith(first.split(". ")[-1])
+    assert r._hello_replays == 0
+    third = drive(r, "hello")
+    assert "Asha" in third and "TestCo" in third
 
 
 def test_intro_fastpath_agent_optout():
@@ -266,9 +271,21 @@ def test_no_defer_once_enough_played(_guard_enabled):
     assert ns._connect_barge_defer(now) is False
 
 
-def test_no_defer_outside_window_unprotected(_guard_enabled):
+def test_no_defer_outside_window_unprotected(_guard_enabled, monkeypatch):
+    """Legacy scope (BARGE_GUARD_ALL_REPLIES=false): connect window only."""
+    import app.voice.pipeline as _pl
+    monkeypatch.setattr(_pl, "BARGE_GUARD_ALL_REPLIES", False)
     ns, now = _guard_state(make_router(), _call_start_ts=1000.0 - 60.0)
     assert ns._connect_barge_defer(now) is False
+
+
+def test_unheard_reply_deferred_any_time(_guard_enabled, monkeypatch):
+    """RUNBOOK §70 (call 1033): a reply the caller has not heard yet is
+    protected at ANY point of the call, not only in the connect window."""
+    import app.voice.pipeline as _pl
+    monkeypatch.setattr(_pl, "BARGE_GUARD_ALL_REPLIES", True)
+    ns, now = _guard_state(make_router(), _call_start_ts=1000.0 - 60.0)
+    assert ns._connect_barge_defer(now) is True
 
 
 def test_defer_for_protected_utterance_any_age(_guard_enabled):

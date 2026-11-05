@@ -393,6 +393,7 @@ async def handle_connection(websocket, path: str, args):
     dialed_did = ""
     campaign_id = None
     agent_slug = ""
+    dialed_number = ""
     _rejected_agent_slug = ""
 
     try:
@@ -448,6 +449,15 @@ async def handle_connection(websocket, path: str, args):
                 # legacy resolution picked, with zero trace of why.
                 _rejected_agent_slug = s
 
+        # Sixth segment: the number this OUTBOUND leg dialled, from the
+        # lescall_dest channel variable. This is the only first-hand statement
+        # about who an originated call actually reached — the channel's caller
+        # id is our own DID and Caller-Destination-Number is the dialplan
+        # extension. Without it the bridge had to guess from recent dial
+        # timestamps, and during a campaign burst it guessed wrong (§33).
+        if len(parts) > 5 and parts[5].strip().isdigit():
+            dialed_number = parts[5].strip()
+
     except Exception as exc:
 
         # LOUD routing: log the parse failure BEFORE zeroing everything —
@@ -464,6 +474,7 @@ async def handle_connection(websocket, path: str, args):
         dialed_did = ""
         campaign_id = None
         agent_slug = ""
+        dialed_number = ""
         _rejected_agent_slug = ""
 
     conn_id = fs_uuid if fs_uuid else uuidlib.uuid4().hex[:8]
@@ -504,6 +515,7 @@ async def handle_connection(websocket, path: str, args):
             conn_id,
             TARGET_SR,
             caller_number=caller_number,
+            dialed_number=dialed_number,
             did=dialed_did,
             campaign_id=campaign_id,
             agent_slug=agent_slug,

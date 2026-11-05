@@ -1,16 +1,17 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import { useGet, useRefresh } from '../../api/hooks/useApi'
 import {
   getAgent, updateAgent, agentToWizardData, mergeWizardIntoDefinition,
   getRawYaml, putRawYaml, validateRaw, getRouting, putRouting,
-  uploadDoc, deleteDoc, extractYaml, applyYaml, deleteBooking,
-  archiveAgent, ttsPreviewUrl,
+  uploadDoc, deleteDoc, extractYaml, applyYaml, deleteBooking, reindexDocs,
+  DOC_ACCEPT, DOC_MAX_MB, DOC_TYPES_HUMAN, docSupported,
+  archiveAgent, archiveConfirmCopy, ttsPreviewUrl,
   listRevisions, rollbackAgent, patchAgentOps,
-  type Routing, type AgentDoc, type WizardData, type MissingField, type Booking,
+  type Routing, type DocsList, type WizardData, type MissingField, type Booking,
   type AgentRevision, type AgentOp,
 } from '../../api/agents'
-import { Card, Button, Badge, Spinner, cx, EmptyState } from '../../components/ui'
+import { Card, Button, Badge, Spinner, IconButton, cx, EmptyState } from '../../components/ui'
 import { PageHeader, Field, Input, Select, Textarea, AsyncState } from '../../components/kit'
 import { useToast } from '../../components/Toast'
 import { useConfirm, usePrompt } from '../../components/confirm'
@@ -27,7 +28,9 @@ import {
   Radio, Archive, ArrowLeft, Save, CheckCircle2, AlertTriangle, Volume2,
   Upload, Trash2, FileText, Sparkles, Code2, Network, Files, SlidersHorizontal,
   CalendarDays, History, ListOrdered, ArrowUp, ArrowDown, Plus, RotateCcw,
+  RefreshCw, FileUp, X,
 } from 'lucide-react'
+import { fmtDateTime } from '../../lib/format'
 
 type Tab = 'settings' | 'stages' | 'yaml' | 'routing' | 'documents' | 'voice' | 'history'
 const BCP47: Record<string, string> = { en: 'en-IN', hi: 'hi-IN', gu: 'gu-IN', mr: 'hi-IN' }
@@ -82,7 +85,7 @@ export default function EditAgent() {
   const onArchive = async () => {
     const ok = await confirm({
       title: `Archive "${name}"?`,
-      description: 'The agent is moved to agents/_archived and stops being selectable.',
+      description: archiveConfirmCopy(name),
       confirmLabel: 'Archive',
       destructive: true,
     })
@@ -286,7 +289,7 @@ function SettingsTab({ name, onSaved, onDirtyChange }: { name: string; onSaved: 
           </nav>
 
           <div id="sec-basics" className={cardCls('sec-basics')}>{sectionHead('sec-basics', 'Basics')}<BasicsSection d={d} set={set} showSlug={false} showErrors={showErrors} /></div>
-          <div id="sec-call-type" className="card p-4 sm:p-6 scroll-mt-24"><div className="eyebrow mb-4">Call Type</div><CallDirectionSection d={d} set={set} /></div>
+          <div id="sec-call-type" className="card p-4 sm:p-6 scroll-mt-24"><div className="eyebrow mb-4">Call Type</div><CallDirectionSection d={d} set={set} locked={/-(inbound|outbound)$/.test(name)} /></div>
           <div id="sec-languages" className={cardCls('sec-languages')}>
             {sectionHead('sec-languages', 'Languages & Voice')}
             <LanguagesSection d={d} set={set} />
@@ -351,7 +354,7 @@ function BookingsList({ name }: { name: string }) {
           <div key={`${b.conn_id}-${i}`} className="flex flex-wrap items-center gap-3 rounded-lg bg-[var(--surface-2)] px-3 py-2 ring-1 ring-[var(--border)]">
             <span className="text-sm font-semibold">{b.appointment_time}</span>
             <span className="text-xs text-soft">{b.caller_name || 'Unknown caller'}{b.caller_phone ? ` · ${b.caller_phone}` : ''}</span>
-            <span className="ml-auto text-2xs text-dim">{b.booked_at?.slice(0, 16).replace('T', ' ') || ''}</span>
+            <span className="ml-auto text-2xs text-dim">{b.booked_at ? fmtDateTime(b.booked_at) : ''}</span>
             <Button variant="ghost" size="sm" onClick={() => void onFree(i)} title="Free this slot — the agent will offer it again"><Trash2 size={13} /></Button>
           </div>
         ))}
@@ -491,29 +494,85 @@ function RoutingTab({ name }: { name: string }) {
 }
 
 /* ───────────────────────── Documents tab ───────────────────────── */
+/* Index state → what the user reads. `ok` is searchable by meaning; the rest
+ * are keyword-only until a re-index succeeds, and the row's `detail` says why
+ * (the provider's own sentence — "HTTP 429 …", "index built with X"). */
+const INDEX_STATE: Record<string, { label: string; tone: 'mint' | 'amber' | 'rose' | 'neutral' }> = {
+  ok: { label: 'Indexed', tone: 'mint' },
+  stale: { label: 'Needs re-index', tone: 'amber' },
+  unlabelled: { label: 'Needs re-index', tone: 'amber' },
+  not_embedded: { label: 'Keyword search only', tone: 'rose' },
+  unreadable: { label: 'Index unreadable', tone: 'rose' },
+}
+
+const fmtMB = (bytes: number) => `${(bytes / 1048576).toFixed(bytes < 1048576 ? 2 : 1)} MB`
+
 function DocumentsTab({ name }: { name: string }) {
   const toast = useToast()
   const confirm = useConfirm()
-  const { data, isLoading, error } = useGet<{ documents: AgentDoc[] }>(['docs', name], `/agents/${name}/documents`)
+  const { data, isLoading, error } = useGet<DocsList>(['docs', name], `/agents/${name}/documents`)
   const refresh = useRefresh()
   const [busy, setBusy] = useState(false)
+  const [reindexing, setReindexing] = useState(false)
   const [extractingId, setExtractingId] = useState<string | null>(null)
   const [diff, setDiff] = useState<{ docId: string; fields: any; missing: MissingField[] } | null>(null)
+  // No <form>: the design-system Button always renders type="button", so a
+  // submit-driven upload never fired. The click is the upload.
+  const [file, setFile] = useState<File | null>(null)
+  const [orgName, setOrgName] = useState('')
+  const [docType, setDocType] = useState('General')
+  const [description, setDescription] = useState('')
+  const [dragging, setDragging] = useState(false)
+  const fileRef = useRef<HTMLInputElement>(null)
 
-  const onUpload = async (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault()
-    const formEl = e.currentTarget
-    const form = new FormData(formEl)
-    if (!(form.get('file') as File)?.size) { toast('Choose a file first', 'error'); return }
+  const clearFile = () => { setFile(null); if (fileRef.current) fileRef.current.value = '' }
+  const pickFile = (f: File | null | undefined) => {
+    if (!f) return
+    if (!docSupported(f.name)) { toast(`${f.name}: unsupported type — upload ${DOC_TYPES_HUMAN}`, 'error'); clearFile(); return }
+    if (f.size > DOC_MAX_MB * 1048576) { toast(`${f.name} is ${fmtMB(f.size)} — the limit is ${DOC_MAX_MB} MB`, 'error'); clearFile(); return }
+    setFile(f)
+  }
+
+  const onUpload = async () => {
+    if (!file) { toast('Choose a file first', 'error'); return }
+    const form = new FormData()
+    form.set('file', file)
+    form.set('org_name', orgName.trim())
+    form.set('doc_type', docType.trim() || 'General')
+    form.set('description', description.trim())
     setBusy(true)
-    try { await uploadDoc(name, form); toast('Uploaded & embedded', 'success'); refresh(['docs', name]); formEl.reset() }
-    catch (e: any) { toast(`Upload failed: ${e.message || e}`, 'error') }
+    try {
+      const res = await uploadDoc(name, form)
+      if (res.status === 'duplicate') {
+        toast(`Already uploaded as "${res.meta?.filename || res.doc_id}" — nothing added`, 'warn')
+      } else if (res.embedded) {
+        toast(`Uploaded & indexed — ${res.meta?.chunk_count ?? 0} chunk${res.meta?.chunk_count === 1 ? '' : 's'}`, 'success')
+      } else {
+        toast(`Uploaded, but keyword search only — ${res.index_state?.detail || 'the vector index could not be built'}. Use Re-index to retry.`, 'warn')
+      }
+      refresh(['docs', name])
+      clearFile(); setDescription('')
+    } catch (e: any) { toast(`Upload failed: ${e.message || e}`, 'error') }
     finally { setBusy(false) }
+  }
+  const onReindex = async () => {
+    setReindexing(true)
+    try {
+      const r = await reindexDocs(name)
+      const failed = r.failed?.length ?? 0
+      const n = r.reindexed?.length ?? 0
+      toast(
+        failed ? `Re-indexed ${n}, ${failed} failed — each document's status says why` : `Re-indexed ${n} document${n === 1 ? '' : 's'}`,
+        failed ? 'warn' : 'success',
+      )
+      refresh(['docs', name])
+    } catch (e: any) { toast(`Re-index failed: ${e.message || e}`, 'error') }
+    finally { setReindexing(false) }
   }
   const onDelete = async (docId: string, filename?: string) => {
     const ok = await confirm({
       title: `Delete "${filename || docId}"?`,
-      description: 'The document and its embeddings are removed — the agent can no longer draw on it during calls.',
+      description: 'The document and its index are removed — the agent can no longer draw on it during calls.',
       destructive: true,
     })
     if (!ok) return
@@ -525,7 +584,7 @@ function DocumentsTab({ name }: { name: string }) {
     setExtractingId(docId)
     try {
       const res = await extractYaml(name, docId)
-      setDiff({ docId, fields: res.fields ?? (res as any).extracted ?? res, missing: res.missing ?? [] })
+      setDiff({ docId, fields: res.fields ?? {}, missing: res.missing ?? [] })
     }
     catch (e: any) { toast(`Extract failed: ${e.message || e}`, 'error') }
     finally { setBusy(false); setExtractingId(null) }
@@ -539,53 +598,140 @@ function DocumentsTab({ name }: { name: string }) {
   }
 
   const docs = data?.documents ?? []
+  const index = data?.index
+  const stateOf = (docId: string) => index?.documents.find((r) => r.doc_id === docId)
+  const needs = index?.needs_reindex ?? []
+  const noCredentials = index?.runtime?.available === false
+
   return (
     <div className="space-y-4">
       <Card className="p-5">
-        <div className="eyebrow mb-3">Upload knowledge document (PDF / DOCX / TXT)</div>
-        <form onSubmit={onUpload} className="grid gap-3 sm:grid-cols-2">
-          <Field label="Document file">
-            <input name="file" type="file" accept=".pdf,.docx,.txt" className="w-full text-sm text-soft file:mr-3 file:rounded-md file:border-0 file:bg-[var(--surface-2)] file:px-3 file:py-1.5 file:text-xs file:font-semibold" />
-          </Field>
+        <div className="eyebrow mb-3">Upload knowledge document</div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div
+            className={cx(
+              'flex flex-wrap items-center gap-3 rounded-2xl border border-dashed border-[var(--ui-border)] p-4 transition sm:col-span-2',
+              dragging && 'ring-2 ring-mint-400/40',
+            )}
+            onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={(e) => { e.preventDefault(); setDragging(false); if (!busy) pickFile(e.dataTransfer.files?.[0]) }}
+          >
+            <FileUp size={18} className="shrink-0 text-mint-500" />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm font-semibold text-[var(--text)]">
+                {file ? file.name : 'Drop a document here, or choose a file'}
+              </div>
+              <div className="text-2xs text-dim">
+                {file ? `${fmtMB(file.size)} · ready to upload` : `${DOC_TYPES_HUMAN} · up to ${DOC_MAX_MB} MB`}
+              </div>
+            </div>
+            <input
+              ref={fileRef}
+              type="file"
+              accept={DOC_ACCEPT}
+              className="hidden"
+              onChange={(e) => pickFile(e.target.files?.[0])}
+            />
+            <Button variant="soft" size="sm" onClick={() => fileRef.current?.click()} disabled={busy}>Choose file</Button>
+            {file && (
+              <IconButton label={`Remove ${file.name}`} onClick={clearFile} disabled={busy}><X size={14} /></IconButton>
+            )}
+          </div>
           <Field label="Organisation name">
-            <Input name="org_name" placeholder="Organisation name" />
+            <Input value={orgName} onChange={(e) => setOrgName(e.target.value)} placeholder="Organisation name" />
           </Field>
           <Field label="Document type">
-            <Input name="doc_type" placeholder="Type (e.g. Brochure)" defaultValue="General" />
+            <Input value={docType} onChange={(e) => setDocType(e.target.value)} placeholder="Brochure, price list, FAQ…" />
           </Field>
           <Field label="Short description">
-            <Input name="description" placeholder="Short description" />
+            <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What the agent should use this for" />
           </Field>
-          <div className="sm:col-span-2"><Button variant="primary" disabled={busy}><Upload size={14} /> {busy ? 'Uploading & embedding…' : 'Upload'}</Button></div>
-        </form>
-        <p className="mt-2 text-2xs text-dim">Text is extracted, chunked and embedded for in-call RAG. "Extract YAML" then proposes agent fields from a document.</p>
+          <div className="flex items-end">
+            <Button variant="primary" onClick={() => void onUpload()} disabled={busy || !file}>
+              {busy && !extractingId ? <><Spinner className="h-3.5 w-3.5" /> Uploading & indexing…</> : <><Upload size={14} /> Upload</>}
+            </Button>
+          </div>
+        </div>
+        <p className="mt-2 text-2xs text-dim">
+          Text is extracted, chunked and indexed so the agent can quote it on calls. "Extract fields" then proposes agent settings from the document.
+        </p>
       </Card>
+
+      {index && (noCredentials || needs.length > 0) && (
+        <div className="flex flex-wrap items-center gap-3 rounded-xl bg-amber-500/10 px-4 py-3 text-xs text-amber-700 ring-1 ring-amber-500/20 dark:text-amber-300">
+          <AlertTriangle size={14} className="shrink-0" />
+          <span className="min-w-0 flex-1">
+            {noCredentials
+              ? `No embedding credentials configured (${index.runtime?.key_env || 'API key'}) — documents are keyword-searchable only.`
+              : needs.length === 1
+                ? '1 document is not in the vector index — the agent can only keyword-match it on calls.'
+                : `${needs.length} documents are not in the vector index — the agent can only keyword-match them on calls.`}
+          </span>
+          {!noCredentials && (
+            <Button size="sm" variant="soft" onClick={() => void onReindex()} disabled={reindexing || busy}>
+              {reindexing ? <><Spinner className="h-3.5 w-3.5" /> Re-indexing…</> : <><RefreshCw size={13} /> Re-index {needs.length}</>}
+            </Button>
+          )}
+        </div>
+      )}
 
       <AsyncState loading={isLoading} error={error}>
         {docs.length === 0 ? (
-          <EmptyState icon={<FileText size={20} />} title="No documents yet" hint="Upload a brochure or fact sheet to power RAG and field extraction." />
+          <EmptyState
+            icon={<FileText size={20} />}
+            title="No documents yet"
+            hint="Upload a brochure, price list or FAQ — the agent quotes it on calls, and Extract fields turns it into agent settings."
+          />
         ) : (
           <div className="space-y-2">
-            {docs.map((doc) => (
-              <Card key={doc.doc_id} className="flex flex-wrap items-center gap-3 p-4">
-                <FileText size={16} className="text-indigo-400" />
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-semibold text-[var(--text)]">{doc.filename || doc.doc_id}</div>
-                  <div className="text-2xs text-dim">{doc.doc_type || 'General'}{doc.org_name ? ` · ${doc.org_name}` : ''}{doc.chunks ? ` · ${doc.chunks} chunks` : ''}</div>
-                </div>
-                <div className="ml-auto flex items-center gap-2">
-                  <Button variant="ghost" onClick={() => onExtract(doc.doc_id)} disabled={busy}>
-                    {extractingId === doc.doc_id
-                      ? <><Spinner className="h-3.5 w-3.5" /> Extracting…</>
-                      : <><Sparkles size={14} /> Extract YAML</>}
-                  </Button>
-                  <Button variant="ghost" title={`Delete ${doc.filename || 'document'}`} onClick={() => void onDelete(doc.doc_id, doc.filename)}><Trash2 size={14} /></Button>
-                </div>
-              </Card>
-            ))}
+            {docs.map((doc) => {
+              const st = stateOf(doc.doc_id)
+              const badge = st ? (INDEX_STATE[st.state] ?? INDEX_STATE.not_embedded) : null
+              const meta = [
+                doc.doc_type || 'General',
+                doc.org_name,
+                doc.chunk_count ? `${doc.chunk_count} chunk${doc.chunk_count === 1 ? '' : 's'}` : '',
+                doc.uploaded_at,
+              ].filter(Boolean).join(' · ')
+              return (
+                <Card key={doc.doc_id} className="flex flex-wrap items-center gap-3 p-4">
+                  <FileText size={16} className="shrink-0 text-indigo-400" />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="truncate text-sm font-semibold text-[var(--text)]">{doc.filename || doc.doc_id}</span>
+                      {badge && (
+                        <span title={st?.state === 'ok' ? `${st.model || ''}${st.dim ? ` · ${st.dim} dimensions` : ''}` : st?.detail || ''}>
+                          <Badge tone={badge.tone} soft>{badge.label}</Badge>
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-2xs text-dim">{meta}</div>
+                    {st && st.state !== 'ok' && st.detail && (
+                      <div className="mt-1 text-2xs text-amber-700 dark:text-amber-300">{st.detail}</div>
+                    )}
+                  </div>
+                  <div className="ml-auto flex items-center gap-1">
+                    <Button variant="ghost" size="sm" onClick={() => void onExtract(doc.doc_id)} disabled={busy}>
+                      {extractingId === doc.doc_id
+                        ? <><Spinner className="h-3.5 w-3.5" /> Extracting…</>
+                        : <><Sparkles size={14} /> Extract fields</>}
+                    </Button>
+                    <IconButton label={`Delete ${doc.filename || 'document'}`} onClick={() => void onDelete(doc.doc_id, doc.filename)} disabled={busy}>
+                      <Trash2 size={14} />
+                    </IconButton>
+                  </div>
+                </Card>
+              )
+            })}
           </div>
         )}
       </AsyncState>
+      {index?.runtime?.model && docs.length > 0 && (
+        <p className="text-2xs text-dim">
+          Vector index: {index.runtime.model}{index.runtime.dim ? ` · ${index.runtime.dim} dimensions` : ''}.
+        </p>
+      )}
 
       {diff && (
         <ExtractReview
@@ -1007,7 +1153,7 @@ function HistoryTab({ name, onChanged }: { name: string; onChanged: () => void }
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-semibold">{r.reason || 'edit'}</div>
                 <div className="text-2xs text-dim">
-                  {r.actor || 'unknown'} · {String(r.created_at).slice(0, 16).replace('T', ' ')}
+                  {r.actor || 'unknown'} · {fmtDateTime(String(r.created_at))}
                 </div>
               </div>
               <Button variant="ghost" size="sm" disabled={busy} onClick={() => void onRollback(r)}

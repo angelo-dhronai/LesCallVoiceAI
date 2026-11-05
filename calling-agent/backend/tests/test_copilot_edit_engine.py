@@ -73,7 +73,12 @@ def test_propose_apply_rollback_scoped(copilot):
     res2, _s, ok2, mutated2 = _run(cop._execute_tool("apply_update",
                                                      {"change_id": change_id}, guard))
     assert ok2 and mutated2
-    assert res2["revision"] == 1
+    # One more than whatever the copied agent file carried. This asserted a
+    # literal 1 — true only while the live pramukh YAML had never been
+    # written; the 2026-09-11 §42 migration stamped it revision 1 and the
+    # test has failed on every run since.
+    import yaml as _y
+    assert res2["revision"] == int(_y.safe_load(before).get("revision") or 0) + 1
 
     # 3. Prove scoping: ONLY the tagline (+ server-managed fields) changed.
     from backend.app.agent_definition import store, diff as diffmod

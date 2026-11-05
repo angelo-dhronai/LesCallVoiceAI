@@ -9,6 +9,10 @@ from .base import AudioSink
 
 logger = logging.getLogger(__name__)
 
+# _validate_wav rejects anything under 100ms; flush() pads up to this so a
+# short real fragment is played rather than discarded. 20ms of headroom.
+_MIN_PLAYABLE_S = 0.12
+
 class TelephonySink(AudioSink):
     """
     Telephony output sink.
@@ -121,6 +125,21 @@ class TelephonySink(AudioSink):
         raw_filepath = os.path.join(self._tmp_dir, raw_filename)
         
         try:
+            # A real but very short piece of speech (the tail of an utterance,
+            # a one-word sentence) used to be written, fail _validate_wav's
+            # 100ms floor, and be DELETED — the caller simply never heard
+            # those words. Measured live 2026-09-16: four drops in one day,
+            # one of them 0.07s out of the middle of the agent's opening.
+            # Trailing silence is inaudible; losing speech is not.
+            _floor = int(self._sample_rate * 2 * _MIN_PLAYABLE_S)
+            if 0 < len(self._pcm_buffer) < _floor:
+                logger.info(
+                    "[%s] [TelephonySink] padding %.0fms fragment to %.0fms "
+                    "so it is played instead of dropped", self._conn_id,
+                    len(self._pcm_buffer) / (2 * self._sample_rate) * 1000,
+                    _MIN_PLAYABLE_S * 1000)
+                self._pcm_buffer.extend(b"\x00" * (_floor - len(self._pcm_buffer)))
+
             # Phase A: Write initial WAV
             with wave.open(raw_filepath, 'wb') as wf:
                 wf.setnchannels(1)

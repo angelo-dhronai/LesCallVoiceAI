@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -53,6 +54,7 @@ except Exception:  # pragma: no cover
 
 from backend.app.agent_definition.schema import AgentDefinition   # noqa: E402
 from backend.app.agent_definition.registry import agent_registry  # noqa: E402
+from backend.app.agent_definition import store as agent_store       # noqa: E402
 
 _AGENTS_DIR = _CALLING_AGENT / "agents"
 _ACTIVE_FILE = _AGENTS_DIR / "active_agent.json"
@@ -108,6 +110,14 @@ def _claim_slug(slug: str, owner: str, display_name: str = "") -> None:
             "ON CONFLICT (slug) DO NOTHING", (slug, owner, display_name or None))
         db.execute("UPDATE agents SET owner=? WHERE slug=? AND owner IS NULL",
                    (owner, slug))
+        # Re-creating a slug you archived makes it LIVE again. The INSERT above
+        # is a no-op when the archived row still exists, so without this the
+        # new agent kept its old archived_at: on disk and answering calls, but
+        # invisible to the plan cap (a free extra agent) and to sharing (404).
+        # Owner-scoped, and after the guard, so it can neither resurrect
+        # another tenant's archive nor step around the cap.
+        db.execute("UPDATE agents SET archived_at=NULL WHERE slug=? AND owner=? "
+                   "AND archived_at IS NOT NULL", (slug, owner))
 
 
 def _billing_claim_guard(db, owner: str, slug: str) -> None:
@@ -117,22 +127,28 @@ def _billing_claim_guard(db, owner: str, slug: str) -> None:
     so a crashed request cannot leave a tenant permanently unable to create.
     """
     try:
-        from shared.billing.entitlements import (
-            agent_families_used, enforcement_enabled, get_entitlements)
+        from shared.billing.entitlements import agent_cap, agent_families_used
         from shared.billing.errors import BillingRefusal, CODE_CAP_AGENTS
     except Exception:
         return
-    if not enforcement_enabled():
+    # No `if not enforcement_enabled(): return` here any more. agent_cap()
+    # owns that decision now, because the trial floor has to bind while the
+    # global switch stays off — and this guard, not the pre-check, is the one
+    # that runs inside the INSERT's transaction. Leaving the short-circuit
+    # would have made the cap a race away from bypassable: two concurrent
+    # creates both pass _assert_agent_quota, and nothing downstream says no.
+    try:
+        cap, trial = agent_cap(owner)
+    except Exception as exc:
+        logger.error("[builder] agent cap lookup failed for %s: %r", owner, exc)
+        return
+    if cap is None:
         return
     try:
         db.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (owner,))
     except Exception:
         pass  # sqlite dev fallback has no advisory locks
     try:
-        ent = get_entitlements(owner)
-        cap = ent.get("max_agent_families")
-        if cap is None:
-            return
         family = agent_family(slug)
         existing = db.execute(
             "SELECT 1 FROM agents WHERE owner=? AND archived_at IS NULL "
@@ -147,10 +163,13 @@ def _billing_claim_guard(db, owner: str, slug: str) -> None:
         logger.error("[builder] agent cap re-check failed for %s: %r", owner, exc)
         return
     if used >= int(cap):
+        # Same sentence the pre-check produces — a user who hits the race
+        # must not be told something different from a user who does not.
+        from shared.billing.entitlements import agent_cap_message
         raise BillingRefusal(
-            f"Your plan includes {cap} agent{'s' if int(cap) != 1 else ''} and "
-            f"you have {used}. Archive one to free a slot, or upgrade.",
-            CODE_CAP_AGENTS, agents_used=used, agents_limit=int(cap))
+            agent_cap_message(int(cap), used, trial),
+            CODE_CAP_AGENTS, agents_used=used, agents_limit=int(cap),
+            trial=trial)
 
 
 def _billing_llm_gate(owner: str, surface: str) -> None:
@@ -158,12 +177,20 @@ def _billing_llm_gate(owner: str, surface: str) -> None:
 
     Raises BillingRefusal (402) when the budget is spent; records the turn
     otherwise. Never blocks on a billing outage — the check itself fails open.
+
+    Both ceilings, via check_copilot_budget: messages per day AND tokens per
+    day. These surfaces (document extraction, YAML filling, reindex) do not
+    report usage back, so they spend the turn budget and are bounded by the
+    token budget the chat surface fills — which is the right way round, since
+    a tenant who has already burned the day's tokens in chat should not then
+    get an unmetered extraction pipeline.
     """
     try:
-        from shared.billing.entitlements import check_copilot_turn, record_copilot_turn
+        from shared.billing.entitlements import (
+            check_copilot_budget, record_copilot_turn)
     except Exception:
         return
-    check_copilot_turn(owner).raise_for_http()
+    check_copilot_budget(owner).raise_for_http()
     record_copilot_turn(owner, surface)
 
 
@@ -452,9 +479,17 @@ async def list_agents() -> dict:
             # against every slug on disk (not just visible ones) so a name
             # collision with another tenant's agent surfaces as "taken" rather
             # than offering a create that would 409.
-            direction = summary.get("call_direction") or "inbound"
-            other = "outbound" if direction == "inbound" else "inbound"
-            twin = twin_slug(name, other)
+            # The SLUG is the identity: a twin's counterpart is the other
+            # suffix, whatever its YAML says. Derived from the data, a
+            # mis-directed twin (RUNBOOK §60) computed as its OWN counterpart
+            # and the family could never be offered its missing version.
+            twin = counterpart_of(name)
+            if twin is None:  # standalone (pre-twin) slug: only the data can say
+                direction = summary.get("call_direction") or "inbound"
+                other = "outbound" if direction == "inbound" else "inbound"
+                twin = twin_slug(name, other)
+            else:
+                other = "outbound" if name.endswith("-inbound") else "inbound"
             summary["counterpart"] = twin
             summary["counterpart_direction"] = other
             summary["has_counterpart"] = twin in on_disk
@@ -496,6 +531,12 @@ def write_agent_dir(name: str, spec: dict, owner: str) -> AgentDefinition:
     directory — the caller is responsible for unwinding earlier siblings.
     """
     target_dir = _AGENTS_DIR / name
+    # A twin's direction is its slug (RUNBOOK §60) — the same check every
+    # update goes through in store.write_agent, applied at creation too.
+    try:
+        agent_store.assert_direction_matches_slug(name, spec)
+    except agent_store.DirectionLocked as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     try:
         agent = AgentDefinition.from_dict(spec)
     except Exception as exc:
@@ -715,6 +756,10 @@ async def update_agent(name: str, request: Request) -> dict:
             "current_rev": exc.current_rev})
     except agent_store.OwnerMismatch as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except agent_store.DirectionLocked as exc:
+        # Not a schema problem: the form tried to flip a twin's call type.
+        # The message names the version to edit instead.
+        raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Schema validation failed: {exc}")
     logger.info("[builder] updated agent '%s' rev=%s", name, result["revision"])
@@ -908,6 +953,68 @@ async def update_routing(name: str, request: Request) -> dict:
     return {"status": "updated"}
 
 
+# ── document uploads: one gate for every surface ───────────────────────────
+#
+# nginx caps the whole request at 25m (deploy/nginx-agent.lescall.conf); 20 MB
+# here leaves room for the multipart envelope. Before this cap the endpoint
+# read the entire body into memory unconditionally (the Copilot's upload had
+# 15 MB; the Builder's had none).
+_DOC_MAX_BYTES = int(os.environ.get("DOC_UPLOAD_MAX_MB", "20") or 20) * 1024 * 1024
+
+
+async def _read_document_upload(file: UploadFile) -> tuple[bytes, str]:
+    """Body + filename of an uploaded document, or the refusal that names what
+    is wrong: a type we cannot read (415, with the way out — "save as .docx"),
+    empty (400), too big (413 with the limit)."""
+    from backend.app.documents.extractor import unsupported_reason
+    filename = file.filename or "document.txt"
+    reason = unsupported_reason(filename)
+    if reason:
+        raise HTTPException(status_code=415, detail=reason)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    if len(content) > _DOC_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(f"{filename} is {len(content) / 1048576:.1f} MB — the limit is "
+                    f"{_DOC_MAX_BYTES // 1048576} MB. Split it, or export a smaller PDF."))
+    return content, filename
+
+
+async def _extract_document_text(content: bytes, filename: str) -> str:
+    """Text of the document, off the event loop.
+
+    Parsing a PDF, and above all the Gemini OCR fallback for a scanned one
+    (a network call of up to two minutes), used to run INLINE in the async
+    handler — the same defect that took every endpoint of this API down on
+    2026-07-20 when the Copilot's ingest did it (RUNBOOK, copilot upload 502).
+    """
+    from backend.app.documents.extractor import extract_text
+    try:
+        extracted = await asyncio.to_thread(extract_text, content, filename)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Text extraction failed: {exc}")
+    if not extracted.strip():
+        raise HTTPException(
+            status_code=422,
+            detail=("No text could be extracted from this file. If it is a scanned "
+                    "document, make sure the pages are legible; if it is an image, "
+                    "make sure it contains text."))
+    return extracted
+
+
+async def _extract_fields(extracted: str) -> dict:
+    """LLM field extraction off the event loop; an error is a 502 that carries
+    the extractor's own sentence (quota, key, unreachable) instead of a
+    generic 'Extraction failed'."""
+    from backend.app.documents.yaml_filler import extract_fields_from_text
+    result = await asyncio.to_thread(extract_fields_from_text, extracted)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=502, detail=result.get("error", "Extraction failed"))
+    return result
+
+
 # ── stateless document extraction (Create-agent flow) ──────────────────────
 @router.post("/api/agent-tools/extract-document")
 async def extract_from_document(file: UploadFile = File(...)) -> dict:
@@ -915,25 +1022,14 @@ async def extract_from_document(file: UploadFile = File(...)) -> dict:
     existing agent — used by the Create wizard to prefill the form. Returns
     {"fields": {...}, "missing": [{key,label,hint}...]} so the UI can ask the
     user for everything the document lacked."""
-    content = await file.read()
-    if len(content) == 0:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
-    try:
-        from backend.app.documents.extractor import extract_text
-        extracted = extract_text(content, file.filename or "upload.txt")
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Text extraction failed: {exc}")
-    if not extracted.strip():
-        raise HTTPException(status_code=422, detail="No text could be extracted from this file")
+    content, filename = await _read_document_upload(file)
+    extracted = await _extract_document_text(content, filename)
     # E11 — LLM extraction on a tenant-uploaded file. Unmetered today, and the
     # model quota it draws on is SHARED with live calls, so an upload loop is a
     # way to degrade other tenants' phone calls at no cost to yourself.
     _billing_llm_gate(_ctx_owner(), "extract-document")
-    from backend.app.documents.yaml_filler import extract_fields_from_text
-    result = extract_fields_from_text(extracted)
-    if result.get("status") == "error":
-        raise HTTPException(status_code=502, detail=result.get("error", "Extraction failed"))
-    result["filename"] = file.filename
+    result = await _extract_fields(extracted)
+    result["filename"] = filename
     result["char_count"] = len(extracted)
     return result
 
@@ -966,35 +1062,49 @@ async def upload_document(
     doc_type: str = Form("General"),
     description: str = Form(""),
 ) -> dict:
-    """Upload a document: extract text, chunk, embed (for in-call RAG)."""
+    """Upload a document: extract text, chunk, embed (for in-call RAG).
+
+    The response says what actually happened. `embedded` is whether the
+    vector index was built; when it is False, `index_state.detail` carries the
+    provider's reason and the document is keyword-searchable until a
+    re-index succeeds. The old reply said "uploaded" either way, and the UI
+    toasted "Uploaded & embedded" over fourteen days of failed embeds.
+
+    A byte-identical file already on this agent is answered with THAT
+    document (`status: duplicate`) rather than a second copy — two copies of
+    one brochure compete with each other for the three evidence slots.
+    """
     if not (_AGENTS_DIR / name).exists():
         raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
-    content = await file.read()
-    if len(content) == 0:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    content, filename = await _read_document_upload(file)
+    from backend.app.documents.embeddings import embed_document, index_status
+    from backend.app.documents.store import find_document_by_hash, save_document
+
+    def _state(status: dict, doc_id: str) -> dict | None:
+        return next((r for r in status.get("documents", []) if r.get("doc_id") == doc_id), None)
+
+    existing = find_document_by_hash(name, hashlib.sha256(content).hexdigest())
+    if existing:
+        status = index_status(name)
+        row = _state(status, existing["doc_id"])
+        return {"status": "duplicate", "doc_id": existing["doc_id"], "meta": existing,
+                "embedded": bool(row and row.get("embedded")),
+                "index_state": row, "index": status}
+
+    extracted = await _extract_document_text(content, filename)
+    meta = await asyncio.to_thread(
+        save_document, agent_folder=name, filename=filename, content=content,
+        extracted_text=extracted, org_name=org_name, doc_type=doc_type,
+        description=description)
+    embedded = False
     try:
-        from backend.app.documents.extractor import extract_text
-        extracted = extract_text(content, file.filename or "upload.txt")
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Text extraction failed: {exc}")
-    if not extracted.strip():
-        raise HTTPException(status_code=422, detail="No text could be extracted from this file")
-    from backend.app.documents.store import save_document
-    meta = save_document(
-        agent_folder=name,
-        filename=file.filename or "document.txt",
-        content=content,
-        extracted_text=extracted,
-        org_name=org_name,
-        doc_type=doc_type,
-        description=description,
-    )
-    try:
-        from backend.app.documents.embeddings import embed_document
-        embed_document(name, meta["doc_id"])
+        embedded = bool(await asyncio.to_thread(embed_document, name, meta["doc_id"]))
     except Exception as exc:
         logger.warning("[builder/docs] embedding failed for %s/%s: %s", name, meta["doc_id"], exc)
-    return {"status": "uploaded", "doc_id": meta["doc_id"], "meta": meta}
+    status = index_status(name)
+    return {"status": "uploaded", "doc_id": meta["doc_id"], "meta": meta,
+            "embedded": embedded, "index_state": _state(status, meta["doc_id"]),
+            "index": status}
 
 
 @router.get("/api/agents/{name}/documents")
@@ -1110,8 +1220,9 @@ async def extract_yaml_from_document(name: str, doc_id: str) -> dict:
     if not text:
         raise HTTPException(status_code=404, detail="Document text not found")
     _billing_llm_gate(_ctx_owner(), "extract-yaml")   # E11
-    from backend.app.documents.yaml_filler import extract_fields_from_text
-    result = extract_fields_from_text(text)
+    # Off the loop, and an error is a 502 — this used to return the error dict
+    # with a 200, and the review dialog opened on a payload with no fields.
+    result = await _extract_fields(text)
     result["agent_folder"] = name
     result["doc_id"] = doc_id
     return result
@@ -1141,10 +1252,18 @@ async def tts_voice_preview(speaker: str, model: str = "bulbul:v3", language: st
     api_key = os.environ.get("SARVAM_API_KEY", "")
     if not api_key:
         raise HTTPException(status_code=503, detail="SARVAM_API_KEY not configured")
+    # The sample speaks in the voice's own gender — a male voice reading
+    # "मैं आपकी AI सहायक हूँ … सकती हूँ" previewed a mismatch no call has.
+    from backend.app.agent_definition.voice_catalog import speaker_gender
+    _male = speaker_gender(speaker) == "male"
     preview_text = {
         "en-IN": "Hi there! I'm your AI assistant. How can I help you today?",
-        "hi-IN": "नमस्ते! मैं आपकी AI सहायक हूँ। आज मैं आपकी कैसे मदद कर सकती हूँ?",
-        "gu-IN": "નમસ્તે! હું તમારી AI સહાયક છું. આજે હું તમને કેવી રીતે મદદ કરી શકું?",
+        "hi-IN": ("नमस्ते! मैं आपका AI सहायक हूँ। आज मैं आपकी कैसे मदद कर सकता हूँ?"
+                  if _male else
+                  "नमस्ते! मैं आपकी AI सहायक हूँ। आज मैं आपकी कैसे मदद कर सकती हूँ?"),
+        "gu-IN": ("નમસ્તે! હું તમારો AI સહાયક છું. આજે હું તમને કેવી રીતે મદદ કરી શકું?"
+                  if _male else
+                  "નમસ્તે! હું તમારી AI સહાયક છું. આજે હું તમને કેવી રીતે મદદ કરી શકું?"),
     }
     text = preview_text.get(language, preview_text["en-IN"])
     payload = {

@@ -36,6 +36,12 @@ _NAME_TRAILING = {
     "che", "chhe", "cho", "chu",
 }
 
+# Words that END a name — what follows is the company, the place or the
+# rest of the sentence. The capture takes up to two words, so "i'm rakesh
+# from shah polymers" became the name "Rakesh From" and the agent greeted
+# "Amit From" by it (Dechcept sims 2026-09-25 and 2026-09-28).
+_NAME_STOP = {"from", "at", "with", "and", "of", "in", "for", "se", "ka", "ki", "ke"}
+
 
 @dataclass
 class Turn:
@@ -168,9 +174,14 @@ class QATracker:
         self._answered: dict[str, str] = {} # field -> user answer text (may be raw STT)
         # Per-agent field signals; fall back to the class-level built-in default.
         self._active_signals = field_signals if field_signals else self._FIELD_SIGNALS
+        # The field the agent's MOST RECENT line asked about (None when it
+        # asked nothing recognisable) — read by the engine to reconcile the
+        # slot ask budget with what was actually voiced.
+        self.last_asked_field: str | None = None
 
     def observe_agent_turn(self, agent_text: str, turn_index: int) -> None:
         """Detect which field the agent just asked about."""
+        self.last_asked_field = None
         lower = agent_text.lower()
         has_question = "?" in agent_text or any(
             w in lower for w in [
@@ -182,18 +193,46 @@ class QATracker:
         )
         if not has_question:
             return
+        best: tuple[int, int, str] | None = None   # (position, length, field)
         for field, signals in self._active_signals.items():
-            if field not in self._answered and any(s in lower for s in signals):
-                if field not in self._asked:
-                    self._asked[field] = turn_index
-                    logger.info("[QA] Agent asked about %r at turn %d", field, turn_index)
+            if field in self._answered:
+                continue
+            hits = [(lower.rfind(s) + len(s), len(s)) for s in signals
+                    if s and s in lower]
+            if not hits:
+                continue
+            # The question sits at the END of the line: the field whose
+            # signal ENDS furthest right is the one asked; at the same end
+            # the longer signal (a slot's own question text beats a shared
+            # keyword). Call 1074 (2026-10-12): "₹1.20 करोड़ के बजट में … 4 BHK
+            # … — सबसे ज़रूरी क्या है…?" was credited to the first dict entry
+            # that matched anywhere, and the factor's ask was un-noted.
+            pos_len = max(hits)
+            if best is None or pos_len > (best[0], best[1]):
+                best = (pos_len[0], pos_len[1], field)
+            if field not in self._asked:
+                self._asked[field] = turn_index
+                logger.info("[QA] Agent asked about %r at turn %d", field, turn_index)
+        if best is not None:
+            self.last_asked_field = best[2]
 
-    def observe_user_turn(self, user_text: str, turn_index: int) -> None:
-        """Mark pending asked-fields as answered by this user turn."""
+    def observe_user_turn(self, user_text: str, turn_index: int,
+                          only_fields: set[str] | None = None) -> None:
+        """Mark pending asked-fields as answered by this user turn.
+        `only_fields` limits which fields this turn CAN answer (a bare
+        "okay" answers a yes/no, not "what kind of business do you run?")."""
         for field, asked_at in list(self._asked.items()):
+            if only_fields is not None and field not in only_fields:
+                continue
             if field not in self._answered and turn_index > asked_at:
                 self._answered[field] = user_text[:100]
                 logger.info("[QA] Field %r answered: %r", field, user_text[:50])
+
+    def asks_field(self, field: str, agent_text: str) -> bool:
+        """Does `agent_text` carry one of `field`'s signals?"""
+        lower = (agent_text or "").lower()
+        return any(s and s in lower
+                   for s in self._active_signals.get(field, []) or [])
 
     def mark_extracted(self, field: str, value: str) -> None:
         """Override answer with the successfully extracted canonical value."""
@@ -234,6 +273,11 @@ class ConversationMemory:
         self.booking = BookingData()
         self.call_state = CallState()
         self.qa_tracker = QATracker(field_signals=field_signals or None)
+        # Set by the engine: the same rule its spoken output passes through
+        # (gendered address, the agent's own agreement — RUNBOOK §42), so the
+        # history the model reads back is what the caller actually heard. A
+        # model shown its own "Sir" to a woman one turn ago says it again.
+        self.spoken_filter = None
 
     @property
     def turns(self) -> list[Turn]:
@@ -249,12 +293,24 @@ class ConversationMemory:
         self._trim()
 
     def add_assistant(self, text: str, language: str = "") -> None:
+        if self.spoken_filter is not None and text:
+            try:
+                text = self.spoken_filter(text) or text
+            except Exception:  # history must never cost the call
+                pass
         self._turns.append(Turn(role="assistant", text=text, language=language))
         self._trim()
 
     def restore_turns(self, turns: list[Turn]) -> None:
         """Replace the turn list wholesale (turn-transaction rollback)."""
         self._turns = list(turns)
+
+    def recent_assistant_texts(self, n: int = 3) -> list[str]:
+        """The agent's last `n` spoken lines, oldest first — what the per-turn
+        repetition guards (name fatigue, confirmed-visit restating; RUNBOOK
+        §55.5) compare the next reply against."""
+        out = [t.text for t in self._turns if t.role == "assistant" and t.text]
+        return out[-n:] if n > 0 else []
 
     def get_history_for_llm(self) -> list[dict[str, str]]:
         return [{"role": t.role, "content": t.text} for t in self._turns]
@@ -360,6 +416,10 @@ class ConversationMemory:
                     name = match.group(1).strip()
                     raw = [re.sub(r"[^a-z]", "", t) for t in name.split()]
                     raw = [t for t in raw if t]
+                    for _i, _t in enumerate(raw):
+                        if _i and _t in _NAME_STOP:
+                            raw = raw[:_i]
+                            break
                     # Trailing self-intro verbs are part of the SENTENCE, not
                     # the name: "this is sunita speaking" -> Sunita. Stripped
                     # before the all-or-nothing check below so they don't

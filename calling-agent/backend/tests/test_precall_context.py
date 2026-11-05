@@ -149,3 +149,88 @@ def test_bridge_fetch_reads_precomputed_digest(pg_test_db):
         assert ctx2 == ctx
     finally:
         os.environ["LESCALL_DB_URL"] = old
+
+
+# ── RUNBOOK §77: a primary-project agent is not shown other projects ────────
+# customer_memory is per owner + contact and shared by every agent of that
+# owner. Call 1047 (Green County agent) switched the pitch to Swarit on a
+# ₹2.5 Cr budget; the memory then said "Interested in: Pramukh Swarit
+# bungalows (primary)" and calls 1060/1061 opened with "you showed interest
+# in our Pramukh Swarit bungalows". The band is scoped; the row is not.
+GC = {"id": "pramukh-green-county", "name": "Pramukh Green County",
+      "aliases": ["Green County"], "location": "Chharwada, Vapi",
+      "configurations": ["3 BHK", "4 BHK"], "price_range": "about ₹78–85 lakh"}
+SWARIT = {"id": "pramukh-swarit", "name": "Pramukh Swarit",
+          "aliases": ["Swarit", "Swarit Bungalows"], "location": "New Chala, Vapi",
+          "configurations": ["4 BHK", "5 BHK"], "price_range": "about ₹2.15 Cr"}
+KB = {"known_projects": {}, "locations": ["Vapi"], "portfolio_prompt_text": "",
+      "catalog": [GC, SWARIT], "match_rules": []}
+DIGEST_1060 = (
+    "1 previous call(s). Last intent: Book a site visit.. Prefers Hindi. "
+    "Interested in: Pramukh Swarit bungalows (primary); investment. "
+    "Open promises: customer: Customer will visit Pramukh Swarit on Wednesday "
+    "14th October at 4 PM. (2026-10-09); agent: send the brochure (2026-10-09). "
+    "Past objections: budget mismatch (Pramukh Green County). "
+    "Decision makers: Shubhangi.")
+
+
+def _primary_router(primary: bool = True) -> ConversationRouter:
+    kb = dict(KB)
+    if primary:
+        kb["primary_project"] = {"id": "pramukh-green-county", "mode": "exclusive"}
+    return make_router(knowledge_base=kb)
+
+
+def _band(prompt: str) -> str:
+    i = prompt.find("━━ KNOWN CUSTOMER ━━")
+    assert i >= 0
+    j = prompt.find("\n━━", i + 1)
+    return prompt[i:j if j > 0 else None]
+
+
+def test_scope_digest_drops_only_items_naming_other_projects():
+    from app.voice.prompt_blocks import scope_digest_to_primary
+    r = _primary_router()
+    scoped, dropped = scope_digest_to_primary(DIGEST_1060, r._def.knowledge_base)
+    assert "Swarit" not in scoped
+    for kept in ("1 previous call(s).", "Last intent: Book a site visit..",
+                 "Prefers Hindi.", "Interested in: investment.",
+                 "Open promises: agent: send the brochure (2026-10-09).",
+                 "Past objections: budget mismatch (Pramukh Green County).",
+                 "Decision makers: Shubhangi."):
+        assert kept in scoped, kept
+    assert dropped == [
+        "Pramukh Swarit bungalows (primary)",
+        "customer: Customer will visit Pramukh Swarit on Wednesday 14th "
+        "October at 4 PM. (2026-10-09)",
+    ]
+
+
+def test_known_customer_band_is_scoped_for_a_primary_project_agent():
+    r = _primary_router()
+    r.set_customer_context(dict(CTX, digest=DIGEST_1060))
+    band = _band(r._build_system_prompt())
+    assert "Swarit" not in band
+    assert "▸ This call is about Pramukh Green County." in band
+    assert "Interested in: investment." in band
+    assert "Do NOT re-ask what you already know here" in band
+
+
+def test_without_a_primary_the_band_is_byte_identical():
+    from app.voice import prompt_blocks as pb
+    a = _primary_router(primary=False)
+    a.set_customer_context(dict(CTX, digest=DIGEST_1060))
+    b = make_router()
+    b.set_customer_context(dict(CTX, digest=DIGEST_1060))
+    assert (pb.customer_context_block(a.customer_context, a._def)
+            == pb.customer_context_block(b.customer_context))
+    assert "Swarit" in "\n".join(pb.customer_context_block(a.customer_context, a._def))
+
+
+def test_nothing_to_drop_leaves_the_digest_untouched():
+    from app.voice.prompt_blocks import scope_digest_to_primary
+    r = _primary_router()
+    d = ("2 previous call(s). Interested in: 3 BHK; Pramukh Green County. "
+         "Decision makers: Shubhangi.")
+    assert scope_digest_to_primary(d, r._def.knowledge_base) == (d, [])
+    assert scope_digest_to_primary("", r._def.knowledge_base) == ("", [])

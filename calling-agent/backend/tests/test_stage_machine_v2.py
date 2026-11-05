@@ -168,7 +168,22 @@ def test_max_asks_skip():
     r.state_mgr.observe_user("hmm let me think")   # next turn
     r.state_mgr.note_asked("budget")
     gaps = r.state_mgr.detect_missing_slots()
+    # The LAST permitted ask has just been chosen: the slot is no longer
+    # askable and already counts as satisfied — but it is not `skipped` yet.
+    # It stays `awaiting` (an extraction target) until the caller has had a
+    # turn to answer (RUNBOOK §61, call 971: the answers to every max_asks=1
+    # question were heard and never stored because the slot left `missing`
+    # the moment the question was chosen).
+    assert "budget" not in gaps["missing"]
+    assert "budget" in gaps["awaiting"]
+    assert "budget" not in gaps["skipped"]
+    assert r.state_mgr.collect_satisfied(["budget"]) is True
+    r.state_mgr.observe_user("no idea really")     # the caller's answer turn
+    assert "budget" in r.state_mgr.detect_missing_slots()["awaiting"]
+    r.state_mgr.observe_user("what else")           # one more turn, still unanswered
+    gaps = r.state_mgr.detect_missing_slots()
     assert "budget" in gaps["skipped"]
+    assert "budget" not in gaps["awaiting"]
     assert "budget" not in gaps["missing"]
     # skipped counts as satisfied for advancement
     assert r.state_mgr.collect_satisfied(["budget"]) is True
@@ -204,12 +219,18 @@ def test_dnd_immediate_end():
 
 
 def test_wrong_number_close():
+    """RUNBOOK §73: the wrong-number phrase is re-confirmed once; the
+    caller's yes to that closes the call with the authored line."""
     import asyncio
     r = _router()
     r.state.stage = "OPENING"
-    async def _run():
-        return [res async for res in r.process_stream("sorry wrong number lag gaya")]
-    results = asyncio.run(_run())
+    async def _run(text):
+        return [res async for res in r.process_stream(text)]
+    results = asyncio.run(_run("sorry wrong number lag gaya"))
+    assert not r.state.is_closing
+    assert r._wrong_number_pending == 1
+    assert results and "confirmation" in results[0].text
+    results = asyncio.run(_run("haan"))
     assert r.state.is_closing
     assert r.call_outcome == "wrong_number"
     assert results and "गलत नंबर" in results[0].text

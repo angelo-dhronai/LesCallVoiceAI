@@ -108,10 +108,10 @@ def _harness(pattern, energy=1500.0, mute_until=0.0, endpointer=True,
         _audio_buffer=bytearray(),
         _speech_duration_ms=0.0,
         _raw_speech_ms=0.0,
-        _speech_energy_sum=0.0,
-        _speech_energy_n=0,
-        _noise_energy_sum=0.0,
-        _noise_energy_n=0,
+        _speech_total_ms=0.0,
+        _energy_window=__import__("collections").deque(
+            maxlen=pl.SNR_AMBIENT_WINDOW_FRAMES),
+        _frames_since_segment=0,
         _shadow_frames=[],
         _shadow_speech_ms=0.0,
         _shadow_started_ts=0.0,
@@ -129,6 +129,10 @@ def _harness(pattern, energy=1500.0, mute_until=0.0, endpointer=True,
         _segments_created=0,
         _segments_sent_to_stt=0,
         _segments_dropped_no_speech=0,
+        _segments_dropped_snr=0,
+        _snr_drop_streak=0,
+        _connect_onset_fired=False,
+        _last_heard_activity=0.0,
         _stt_queue=asyncio.Queue(maxsize=16),
         _speech_frame_streak=0,
         conversation=None,
@@ -136,8 +140,17 @@ def _harness(pattern, energy=1500.0, mute_until=0.0, endpointer=True,
     for name in ("_process_vad_frame", "_min_speech_ms", "_min_real_speech_ms",
                  "_endpoint_hint_text", "_claim_shadow", "_drop_shadow",
                  "_shadow_capture", "_reset_vad_state", "_segment_snr",
-                 "_reset_segment_energy"):
+                 "_reset_segment_energy", "_segment_speech_energy",
+                 "_ambient_energy", "_segment_is_loud",
+                 "_maybe_connect_onset"):
         setattr(ns, name, types.MethodType(getattr(pl.VoicePipeline, name), ns))
+    return ns
+
+
+def _harness_energies(energies, truth, lag):
+    """Same harness, driven by a VAD whose labels lag its own energy."""
+    ns = _harness([])
+    ns.vad = _LaggingVad(energies, truth, lag)
     return ns
 
 
@@ -259,6 +272,123 @@ def test_noisy_line_with_real_speech_still_passes():
     asyncio.run(_drive(ns, 85))
 
     assert ns._segments_sent_to_stt == 1
+
+
+# ── Defect 1c: the SNR guard must not be inverted by VAD label lag ──────────
+# (2026-08-17, call ffbdc517 — five consecutive "hello"s discarded, 14s of
+#  dead air, and two other calls that day where the caller was never heard.)
+
+
+class _LaggingVad:
+    """FSMN as it actually behaves: last_energy is THIS frame, but is_speech()
+    reports the worker's state, which opens ~250ms after the audio and (via
+    FSMN_MAX_END_SIL_MS) closes late too. Replaying real recordings through
+    the live stack measured the label window 200-280ms behind the burst."""
+
+    def __init__(self, energies, truth, lag_frames):
+        self._energies = list(energies)
+        self._truth = list(truth)
+        self._lag = lag_frames
+        self._i = 0
+        self.calibrated = True
+        self.threshold = 260.0
+        self.barge_in_threshold = 520.0
+        self.last_energy = 0.0
+
+    def is_speech(self, frame):
+        i = self._i
+        self._i += 1
+        self.last_energy = (self._energies[i] if i < len(self._energies)
+                            else self._energies[-1])
+        j = i - self._lag
+        return bool(self._truth[j]) if 0 <= j < len(self._truth) else False
+
+
+# Frames of continuous silence the endpointer waits out before flushing.
+_FLUSH_SIL = 10
+
+
+def _dtx_hello(speech_frames=17, lag=13, loud=3000.0, comfort=8.0, lead=30):
+    """A bare "hello" on a silence-suppressed line: an abrupt burst with no
+    ramp, sitting in DTX comfort fill of a single constant value.
+
+    `lead` is the gap since the previous flush — deliberately short, because
+    the old estimator reset its buckets at every flush and that concentration
+    is half the defect."""
+    truth = [False] * lead + [True] * speech_frames + [False] * 100
+    energies = [comfort] * lead + [loud] * speech_frames + [comfort] * 100
+    return energies, truth, lag
+
+
+def _old_style_snr(energies, truth, lag, lead=30, speech_frames=17):
+    """What the pre-fix estimator computed on the same frames: mean over the
+    frames the MODEL labelled speech, over mean of the rest, both reset at the
+    previous flush. Kept in the suite because it IS the defect — if this ever
+    stops coming out below the floor, the test below has stopped exercising
+    the bug it was written for."""
+    upto = lead + lag + speech_frames + _FLUSH_SIL
+    lab = [bool(0 <= i - lag < len(truth) and truth[i - lag])
+           for i in range(upto)]
+    sp = [e for e, v in zip(energies, lab) if v]
+    no = [e for e, v in zip(energies, lab) if not v]
+    return (sum(sp) / len(sp)) / (sum(no) / len(no))
+
+
+def test_the_defect_is_real_the_old_estimator_inverts():
+    """Guard on the guard. With the label window shifted 260ms late, the
+    caller's burst lands in the NOISE bucket and the DTX comfort fill after it
+    lands in the SPEECH bucket — so the old ratio comes out BELOW the reject
+    floor on audio that is 375x its own line noise."""
+    import app.voice.pipeline as pl
+
+    energies, truth, lag = _dtx_hello()
+    assert _old_style_snr(energies, truth, lag) < pl.MIN_SPEECH_SNR
+    # ...while the honest measurement is nowhere near the floor.
+    assert max(energies) / min(energies) > 100
+
+
+def test_lagged_labels_no_longer_deafen_the_call():
+    """THE regression. A 340ms hello, 375x above its own line floor, labelled
+    260ms late by the model. It must reach STT."""
+    energies, truth, lag = _dtx_hello()
+    ns = _harness_energies(energies, truth, lag)
+    asyncio.run(_drive(ns, len(energies)))
+
+    assert ns._segments_sent_to_stt == 1, "a loud hello must never be dropped"
+    assert ns._segments_dropped_snr == 0
+
+
+def test_ambient_floor_is_not_dragged_up_by_the_speech_it_measures():
+    """The floor is a percentile of recent frame energy, so a burst — a small
+    slice of any multi-second window — cannot raise it. The old per-segment
+    mean could be dominated by a handful of loud frames."""
+    energies, truth, lag = _dtx_hello()
+    ns = _harness_energies(energies, truth, lag)
+    asyncio.run(_drive(ns, len(energies)))
+    assert ns._ambient_energy() == 8.0
+
+
+def test_loud_backstop_survives_a_poisoned_floor():
+    """Even if the floor estimate is wrong, absolute loudness is not: a
+    segment above barge-in level is never judged on a ratio."""
+    energies, truth, lag = _dtx_hello(loud=3000.0, comfort=3000.0)
+    ns = _harness_energies(energies, truth, lag)
+    asyncio.run(_drive(ns, len(energies)))
+    # Floor == speech everywhere, so the ratio is 1.0 and the guard would
+    # reject; the absolute backstop is the only thing that saves this call.
+    assert ns._ambient_energy() == 3000.0
+    assert ns._segments_sent_to_stt == 1
+    assert ns._segments_dropped_snr == 0
+
+
+def test_quiet_blip_on_a_real_line_is_still_rejected():
+    """The guard's original job, unchanged: a short blip that never rises
+    above the line's own noise still costs no paid STT call — lag or not."""
+    energies, truth, lag = _dtx_hello(speech_frames=12, loud=15.0, comfort=14.0)
+    ns = _harness_energies(energies, truth, lag)
+    asyncio.run(_drive(ns, len(energies)))
+    assert ns._segments_sent_to_stt == 0
+    assert ns._segments_dropped_no_speech == 1
 
 
 # ── Defect 2: echo gate must not exit on the model verdict alone ─────────────

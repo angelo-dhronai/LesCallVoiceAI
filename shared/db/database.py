@@ -17,6 +17,7 @@ belongs to the caller (see resolve_agent_slug).
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import sqlite3
@@ -141,6 +142,135 @@ def _schema_sql(url: str) -> str:
     return raw.replace("{PK}", _PK_POSTGRES if _is_postgres(url) else _PK_SQLITE)
 
 
+# ---------------------------------------------------------------------------
+# qmark -> psycopg translation
+#
+# `sql.replace("?", "%s")` was wrong in a way that had not bitten yet but was
+# a landmine under every future query: it rewrites question marks INSIDE STRING
+# LITERALS too. `WHERE label = 'why?'` became `WHERE label = 'why%s'`, which
+# psycopg then reads as a placeholder — so the statement either raises
+# "the query has 2 placeholders but 1 parameters were passed" or, worse,
+# silently consumes the NEXT bind value in the wrong position and runs a
+# perfectly valid query against the wrong data. The same applies to a `?`
+# inside a quoted identifier, a comment, or a dollar-quoted body (Postgres
+# operators `?`, `?|`, `?&` on jsonb are the same hazard from the other side:
+# they would be turned into placeholders that nothing binds).
+#
+# So: a scanner that knows where SQL text is and where it is not. It is not a
+# full parser and does not need to be — it only has to know when it is inside
+# something the server will read literally.
+#
+# `%` is deliberately NOT touched. Callers that need a literal one already
+# write `%%` (see shared/intelligence/search.py's pg_trgm `%%` operator), and
+# silently doubling them here would turn those into `%%%%`.
+# ---------------------------------------------------------------------------
+
+def _translate_qmarks(sql: str) -> str:
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "'" or ch == '"':
+            # Standard SQL literals/identifiers. The closing quote may be
+            # doubled to escape itself ('it''s'), which this handles by simply
+            # not treating the pair as a close.
+            quote = ch
+            out.append(ch)
+            i += 1
+            while i < n:
+                if sql[i] == quote:
+                    if i + 1 < n and sql[i + 1] == quote:
+                        out.append(sql[i:i + 2])
+                        i += 2
+                        continue
+                    out.append(sql[i])
+                    i += 1
+                    break
+                out.append(sql[i])
+                i += 1
+            continue
+        if ch == "$":
+            # Dollar quoting: $$...$$ or $tag$...$tag$. Used by every DO block
+            # and function body in the migrations.
+            m = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", sql[i:])
+            if m:
+                tag = m.group(0)
+                end = sql.find(tag, i + len(tag))
+                end = n if end == -1 else end + len(tag)
+                out.append(sql[i:end])
+                i = end
+                continue
+        if ch == "-" and sql.startswith("--", i):
+            end = sql.find("\n", i)
+            end = n if end == -1 else end + 1
+            out.append(sql[i:end])
+            i = end
+            continue
+        if ch == "/" and sql.startswith("/*", i):
+            # Postgres block comments NEST, unlike C's.
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if sql.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif sql.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            out.append(sql[i:j])
+            i = j
+            continue
+        out.append("%s" if ch == "?" else ch)
+        i += 1
+    return "".join(out)
+
+
+# SQL strings in this codebase are literals in the source, so the same handful
+# of thousands recur for the life of the process.
+_translate_qmarks = functools.lru_cache(maxsize=4096)(_translate_qmarks)
+
+
+def _scrub_params(params):
+    """Strip NUL bytes from string parameters.
+
+    Postgres text columns CANNOT hold a 0x00 byte. psycopg does not truncate
+    or escape it — it raises `DataError: PostgreSQL text fields cannot contain
+    NUL (0x00) bytes`, which surfaces as a 500 for what is plainly a bad
+    input. A 500 any caller can trigger at will (`?q=%00`, a `\\u0000` in a
+    JSON name, a control byte in an uploaded CSV) is a denial of service with
+    extra steps. That exact hazard was closed for the public API at its own
+    boundary (shared/public_api/sanitize.py) and left open everywhere else:
+    the dashboard's /api surface, CSV upload, the intelligence pipeline, and
+    every background worker.
+
+    Fixing it HERE rather than in a request middleware is deliberate. This is
+    the one place every writer passes through, HTTP or not, so a new endpoint
+    or a new worker cannot forget to opt in — and a middleware could not cover
+    the non-HTTP writers at all.
+
+    Only NUL is removed, and only from `str`. Nothing else is touched: `bytes`
+    are binary and a NUL in them is legitimate, and the wider control-character
+    hygiene that `sanitize.py` applies is a product decision that belongs at an
+    API boundary, not a silent rewrite of everything the platform stores.
+    """
+    if not params:
+        return params
+    def _one(v):
+        if isinstance(v, str) and "\x00" in v:
+            return v.replace("\x00", "")
+        if isinstance(v, (list, tuple)):
+            # psycopg maps a Python list to a Postgres array (`= ANY(?)`), so
+            # its elements land in text columns exactly like scalars do.
+            scrubbed = [_one(x) for x in v]
+            return type(v)(scrubbed) if isinstance(v, list) else tuple(scrubbed)
+        return v
+    if isinstance(params, dict):
+        return {k: _one(v) for k, v in params.items()}
+    if isinstance(params, (list, tuple)):
+        scrubbed = [_one(v) for v in params]
+        return scrubbed if isinstance(params, list) else tuple(scrubbed)
+    return params
+
+
 class _QmarkPgConnection:
     """Adapts psycopg so callers can keep sqlite-style "?" placeholders."""
 
@@ -148,7 +278,7 @@ class _QmarkPgConnection:
         self._conn = conn
 
     def execute(self, sql: str, params=()):
-        return self._conn.execute(sql.replace("?", "%s"), params)
+        return self._conn.execute(_translate_qmarks(sql), _scrub_params(params))
 
     def executescript(self, sql: str):
         return self._conn.execute(sql)

@@ -37,11 +37,14 @@ const Contacts = lazy(() => import('./pages/Contacts'))
 const ContactHub = lazy(() => import('./pages/ContactHub'))
 const Telephony = lazy(() => import('./pages/Telephony'))
 const Settings = lazy(() => import('./pages/Settings'))
+const Developers = lazy(() => import('./pages/Developers'))
+const ApiReference = lazy(() => import('./pages/ApiReference'))
 // Lazy like every other route: the billing page pulls in the plan grid, the
 // invoice view and (on demand) Razorpay's checkout.js — none of which belong
 // in the entry bundle for a user who never opens it.
 const Billing = lazy(() => import('./pages/Billing'))
 const Receipt = lazy(() => import('./pages/Receipt'))
+const WhatsApp = lazy(() => import('./pages/integrations/WhatsApp'))
 const AgentsList = lazy(() => import('./pages/agents/AgentsList'))
 const CreateAgent = lazy(() => import('./pages/agents/CreateAgent'))
 const EditAgent = lazy(() => import('./pages/agents/EditAgent'))
@@ -84,6 +87,10 @@ export default function App() {
           {/* Manual AI Analysis is retired: analysis is automatic now */}
           <Route path="/ai-analysis" element={<Navigate to="/intelligence" replace />} />
           <Route path="/conv-analytics" element={<ConvAnalytics />} />
+          {/* Integrations — channels that act on what a call produced. Only
+              WhatsApp today; /integrations lands on it until there is a hub. */}
+          <Route path="/integrations" element={<Navigate to="/integrations/whatsapp" replace />} />
+          <Route path="/integrations/whatsapp" element={<WhatsApp />} />
           <Route path="/outbound" element={<Outbound />} />
           <Route path="/contacts" element={<Contacts />} />
           {/* Customer Intelligence Hub — per-contact relationship workspace */}
@@ -92,6 +99,13 @@ export default function App() {
           <Route path="/telephony" element={<Telephony />} />
           {/* Account settings — profile details (test-call destination phone) */}
           <Route path="/settings" element={<Settings />} />
+          {/* The integration surface is a destination, not a Settings tab:
+              /developers is where keys are minted, /developers/reference is the
+              printable manual. The old /api-docs URL is kept as a redirect —
+              it may already be in someone's bookmarks or an email. */}
+          <Route path="/developers" element={<Developers />} />
+          <Route path="/developers/reference" element={<ApiReference />} />
+          <Route path="/api-docs" element={<Navigate to="/developers/reference" replace />} />
           {/* Plan, minutes, invoices (deploy/PLAN-razorpay-subscriptions.md) */}
           <Route path="/billing" element={<Billing />} />
           <Route path="/billing/receipt/:paymentId" element={<Receipt />} />

@@ -7,6 +7,8 @@ identity:
     · RERA Registered
   role_description: inbound residential leasing consultant
   contact: +91 98200 12345
+  pronouns: he
+  role_line: ''
 languages:
   supported:
   - hi
@@ -17,12 +19,18 @@ languages:
     hi:
       model: bulbul:v3
       speaker: shubh
+      pace: 1.0
+      gender: ''
     en:
       model: bulbul:v3
       speaker: shubh
+      pace: 1.0
+      gender: ''
     mr:
       model: bulbul:v3
       speaker: shubh
+      pace: 1.0
+      gender: ''
   register_notes:
     hi: 'Use natural, friendly conversational Hindi. Code-switch freely to English
       words common in Mumbai real estate: ''flat'', ''rent'', ''deposit'', ''furnishing'',
@@ -39,26 +47,15 @@ languages:
       terms: ''flat'', ''rent'', ''society'', ''deposit''. Avoid overly formal Marathi.
 
       '
-calendar:
-  type: mock
-  mock_slots:
-  - day: Tomorrow
-    time: 11:00 AM
-  - day: Tomorrow
-    time: 4:00 PM
-  - day: This Saturday
-    time: 10:00 AM
-  - day: This Saturday
-    time: 2:00 PM
-  - day: This Sunday
-    time: 11:00 AM
-  slots_text:
-    en: Tomorrow at 11:00 AM, Tomorrow at 4:00 PM, or This Saturday at 10:00 AM
-    hi: कल सुबह 11 बजे, कल शाम 4 बजे, या इस शनिवार सुबह 10 बजे
-    mr: उद्या सकाळी 11 वाजता, उद्या संध्याकाळी 4 वाजता, किंवा या शनिवारी सकाळी 10
-      वाजता
+  stt_forced_language: ''
+  allow_code_mixing: false
+  tts_lang_from_text: true
+  evidence_switch: true
+  auto_switch: true
+  greeting_language: ''
+  bilingual_greeting: false
+  closing_language_policy: ''
 call_flow:
-  decline_threshold: 2
   stages:
   - id: GREETING
     order: 0
@@ -67,6 +64,11 @@ call_flow:
 
       '
     turns_until_advance: 1
+    role: ''
+    label: ''
+    collect: []
+    advance_when: {}
+    branches: []
   - id: DISCOVERY
     order: 1
     goal: "You are a helpful residential leasing consultant. Your goal: understand\
@@ -80,6 +82,11 @@ call_flow:
       \ / unfurnished)\n  6. Move-in timeline (immediate / 1 month / flexible)\n \
       \ 7. WhatsApp number\n"
     turns_until_advance: 7
+    role: ''
+    label: ''
+    collect: []
+    advance_when: {}
+    branches: []
   - id: PROJECT_MATCH
     order: 2
     goal: 'You have enough information. Pick EXACTLY ONE property that fits the caller''s
@@ -89,6 +96,11 @@ call_flow:
 
       '
     turns_until_advance: 5
+    role: ''
+    label: ''
+    collect: []
+    advance_when: {}
+    branches: []
   - id: INVITE_VISIT
     order: 3
     goal: 'Your only goal now: schedule a property inspection visit. Offer EXACTLY
@@ -98,6 +110,11 @@ call_flow:
 
       '
     turns_until_advance: 99
+    role: ''
+    label: ''
+    collect: []
+    advance_when: {}
+    branches: []
   - id: CONFIRMATION
     order: 4
     goal: 'Confirm the inspection details: property name, date, time, and caller''s
@@ -106,6 +123,11 @@ call_flow:
 
       '
     turns_until_advance: 99
+    role: ''
+    label: ''
+    collect: []
+    advance_when: {}
+    branches: []
   - id: CLOSING
     order: 5
     goal: 'Warm, genuine close. Use caller''s name. Express that you look forward
@@ -113,11 +135,20 @@ call_flow:
 
       '
     turns_until_advance: 99
+    role: ''
+    label: ''
+    collect: []
+    advance_when: {}
+    branches: []
+  decline_threshold: 2
+  call_goal: ''
+  completed_when: {}
+  scheduling: {}
+  recommend_before_schedule: auto
+  callback_policy: {}
+  termination: {}
+  connect: {}
 knowledge_base:
-  locations:
-  - Mumbai
-  - Pune
-  - Thane
   known_projects:
     skyline residency:
     - Skyline Residency
@@ -143,6 +174,10 @@ knowledge_base:
     harmony heights:
     - Harmony Heights
     - Thane
+  locations:
+  - Mumbai
+  - Pune
+  - Thane
   portfolio_prompt_text: 'MUMBAI: Skyline Residency (2+3BHK fully furnished ₹45-85k/mo,
     Powai),
 
@@ -167,6 +202,7 @@ knowledge_base:
     Furnished+Mumbai→Skyline/Sunset | Near station→Orchid Gardens
 
     '
+  portfolio_section_label: PROPERTY LISTINGS
   location_aliases:
   - mumbai
   - pune
@@ -191,6 +227,7 @@ knowledge_base:
   - fursat nahi
   - nako
   - nahi chahiye
+  objection_patterns_mode: replace
   time_patterns:
   - morning
   - afternoon
@@ -263,7 +300,12 @@ knowledge_base:
       sight visit: site visit
     project_name_corrections:
       urban nest pune: urban nest
-  portfolio_section_label: PROPERTY LISTINGS
+    use_builtin_tables: true
+  catalog: []
+  match_rules: []
+  pricing_policy: {}
+  fact_policy: {}
+  product_lock: {}
 response_bank:
   opening_greeting: Hello! This is Rahul Mehta calling from Horizon Homes. I hope
     I'm not calling at a bad time — do you have just two minutes?
@@ -316,6 +358,7 @@ response_bank:
     hi: हाँ बिल्कुल, हिंदी में बात करते हैं। बताइए, मैं कैसे help कर सकता हूँ?
     en: Sure, let's switch to English. How can I help you?
     mr: हो, मराठीत बोलूया. सांगा, मी कशी मदत करू शकतो?
+  lang_unsupported_responses: {}
   lang_fallbacks:
     hi: माफ़ कीजिए, क्या आप दोबारा बोल सकते हैं?
     en: Sorry, could you say that again?
@@ -324,6 +367,7 @@ response_bank:
     en: Let me look that up for you.
     hi: मैं देखकर बताता हूँ।
     mr: मी बघून सांगतो.
+  tool_ack_fallbacks: {}
   response_fallback: Sorry, could you repeat that?
   graceful_close:
     en: 'Thank you for your time! If you''d like to explore rental options later,
@@ -371,6 +415,34 @@ response_bank:
       en: Would you like to schedule a property inspection? We have slots available.
       hi: क्या हम property inspection schedule कर सकते हैं? कुछ slots available हैं।
       mr: आपण property inspection schedule करायची का? काही slots available आहेत.
+  decline_responses: {}
+  slots_prompt: {}
+  objection_playbook: []
+  closing_responses: {}
+  canned_phrases: []
+  ai_disclosure_responses: {}
+  enable_greeting_shortcut: false
+calendar:
+  type: mock
+  mock_slots:
+  - day: Tomorrow
+    time: 11:00 AM
+  - day: Tomorrow
+    time: 4:00 PM
+  - day: This Saturday
+    time: 10:00 AM
+  - day: This Saturday
+    time: 2:00 PM
+  - day: This Sunday
+    time: 11:00 AM
+  slots_text:
+    en: Tomorrow at 11:00 AM, Tomorrow at 4:00 PM, or This Saturday at 10:00 AM
+    hi: कल सुबह 11 बजे, कल शाम 4 बजे, या इस शनिवार सुबह 10 बजे
+    mr: उद्या सकाळी 11 वाजता, उद्या संध्याकाळी 4 वाजता, किंवा या शनिवारी सकाळी 10
+      वाजता
+  day_synonyms: {}
+  timezone: Asia/Kolkata
+  booking_confirmation_line: {}
 llm_config:
   model: gpt-4o-mini
   max_tokens: 160
@@ -379,8 +451,64 @@ llm_config:
   filler_timeout_s: 1.0
   intent_classify_timeout_s: 1.0
   max_response_length: 400
+  filler_min_gap_turns: 0
+  filler_max_per_call: 0
+  filler_ack_extended: false
+  enable_tools: shadow
   extra_never_rules: []
   extra_always_rules: []
+personality:
+  pronouns: he
+  energy: medium
+  tone: conversational
+  style: natural
+  lingo: ''
+  custom_instructions: ''
+  traits: []
+  energy_mirroring: true
+  ai_disclosure: deflect
+  verbosity_max_sentences: 3
+slots: []
+call_direction: inbound
+brand:
+  spoken_company_name: ''
+  positioning_tagline: ''
+  credibility_markers: []
+  trust_proofs: []
+  regions_served: []
+  contact_phone: ''
+  whatsapp_number: ''
+outbound:
+  identity_confirm_line: {}
+  good_time_check_line: {}
+  pitch: {}
+  wrong_person_response: {}
+  busy_response: {}
+  wrong_number_close: {}
+  wrong_number_patterns: []
+  opening_greeting: {}
+  direction_brief: ''
 guardrails:
-  builtin_rules_pack: real_estate
   use_builtin_rules: true
+  builtin_rules_pack: real_estate
+  never_rules: []
+  always_rules: []
+  honesty: {}
+  compliance: {}
+  escalation: {}
+follow_up:
+  whatsapp_promise: {}
+  callback: {}
+  clarify_commitments:
+    enabled: true
+  auto_execute:
+    enabled: true
+post_call:
+  success_definition: {}
+  outcomes: []
+  scoring: {}
+  lead_profile: {}
+memory: {}
+revision: 1
+updated_at: '2026-09-11T07:08:34Z'
+updated_by: platform:runbook-42

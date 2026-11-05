@@ -78,6 +78,19 @@ def _as_dict(d: dict, key: str) -> dict:
     return dict(v) if isinstance(v, dict) else {}
 
 
+def _as_variants(d: dict, key: str) -> dict[str, list[str]]:
+    """{lang: [non-empty str, …]} — a bare string becomes a one-item list."""
+    out: dict[str, list[str]] = {}
+    for lang, lines in _as_dict(d, key).items():
+        if isinstance(lines, str):
+            lines = [lines]
+        if isinstance(lines, (list, tuple)):
+            clean = [str(x).strip() for x in lines if str(x or "").strip()]
+            if clean:
+                out[str(lang)] = clean
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Identity
 # ---------------------------------------------------------------------------
@@ -115,6 +128,13 @@ class PersonalityConfig:
     # "You are NOT reading a script" line, no disclosure behaviour change.
     ai_disclosure: str = "deflect"
     verbosity_max_sentences: int = 3   # "N sentences max per response" prompt rule
+    # Per-call variety. ONE of these is picked at random when a call starts
+    # and rendered as ━━ THIS CALL ━━ for the whole call — a conversational
+    # angle ("lead with curiosity about their trade", "be brisk, they are
+    # busy"). Without it every call is the same prompt at the same
+    # temperature, and an owner test-calling their own agent hears the same
+    # script each time (reported 2026-09-18). [] = no band, prompt unchanged.
+    style_variants: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +226,17 @@ class LanguageConfig:
     # agents where auto-detect misfires (e.g. Hindi mis-tagged as Punjabi/
     # Tamil/Malayalam). Empty string = auto-detect (default behaviour).
     stt_forced_language: str = ""
+    # RUNBOOK §81: with STT locked, a short answer to an ENUM question that
+    # matches none of its values is re-transcribed once WITHOUT the lock,
+    # and the re-read is used only if it names a value. English option
+    # words under hi-IN ("Amenities" → "हमें देखिए", call 1092). Off by default.
+    stt_enum_recheck: bool = False
+    # RUNBOOK §82: every figure written in DIGITS is spoken in English
+    # ("fifty to fifty five lakh", "two point one five crore") — Bulbul read
+    # "₹50-55 लाख" digit by digit in Hindi and voiced the hyphen. Only the
+    # text handed to TTS changes (voice.spoken_numbers); the transcript and
+    # the rest of the line are untouched. Off by default.
+    tts_numbers_english: bool = False
     # When True, the LLM is told to reply in natural Hinglish (Hindi freely
     # code-mixed with everyday English words) instead of being forced into a
     # single pure language. Makes phone conversations sound human. Default
@@ -290,11 +321,31 @@ class StageDefinition:
     label: str = ""                     # human display label
     collect: list[str] = field(default_factory=list)   # slot names captured here
     # {all_collect_filled: bool, slots: [...], min_turns: int, intent: str,
-    #  appointment_captured: bool} — {} = turn-count-only advancement.
+    #  appointment_captured: bool, max_turns: int, goto: STAGE_ID}
+    #  — {} = turn-count-only advancement.
+    # `goto` names where this stage's advancement LANDS. Without it,
+    # advancement is list-adjacency, so a stage that exists to catch ONE
+    # early-exit path escapes into whatever happens to sit next in the YAML.
+    # Two stages that both converge on the same closing stage cannot both be
+    # adjacent to it; `goto` is how the second one says so (RUNBOOK §37).
     advance_when: dict = field(default_factory=dict)
-    # [{when_intent: ..., when_slot: {name, equals}, goto: STAGE_ID,
-    #   max_takes: 1, actions: [...]}] — [] = no branching.
+    # [{when_intent: ..., when_slot: {name, equals?}, goto: STAGE_ID,
+    #   max_takes: 1, actions: [...]}] — [] = no branching. `equals` omitted
+    # on when_slot means "this slot has ANY answer" — the gate for a
+    # free-text follow-up (a reason, a challenge) that has no fixed
+    # vocabulary to match a value against (RUNBOOK §35).
     branches: list[dict] = field(default_factory=list)
+    # RUNBOOK §75 — a SCRIPTED stage the engine holds to its lines, after
+    # the model's reply (the model is told the lines too; this is the floor):
+    #   ask_verbatim: true → when the directive asked slot X and the reply
+    #     did not ask it (no question about X in it), X's authored question
+    #     is spoken after the reply, word for word;
+    #   after_answer: {lang: line} → spoken after every reply of the stage
+    #     unless the reply already asks it, asks a permission-to-close
+    #     question, or carries one of the `unless` lines;
+    #   unless: [str] — lines (any language) whose presence suppresses it.
+    #   {} = nothing (every pre-existing agent).
+    script: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -319,6 +370,10 @@ class SlotDefinition:
     extract_patterns: list[str] = field(default_factory=list)
     depends_on: list[str] = field(default_factory=list)   # never ASKED before these fill
     merge_policy: str = "free"                  # free|correction_gated|confirm
+    # RUNBOOK §75: written ONLY as the answer to its own question (or on an
+    # explicit correction) — for a vocabulary of everyday domain words that
+    # callers also say in questions ("location बताओ", "amenities क्या हैं").
+    ask_gated: bool = False
     confirm_readback: str = ""                  # ''|verbatim|digit_groups_2
     max_asks: int = 0                           # 0 = unlimited (legacy)
     reask_question: dict[str, str] = field(default_factory=dict)
@@ -338,6 +393,13 @@ class CallFlowConfig:
     completed_when: dict = field(default_factory=dict)
     # {offer_count: 2, style: exact_n|flexible, allow_caller_proposed: bool}
     scheduling: dict = field(default_factory=dict)
+    # auto|on|off — may the agent propose an appointment before it has named
+    # a specific catalogue item to this caller? 'auto' (default) says no
+    # whenever the flow declares a recommendation stage (role: recommend, or
+    # the legacy PROJECT_MATCH id) AND the catalogue is non-empty; 'on'
+    # enforces it for any agent with a catalogue; 'off' disables the gate.
+    # See ConversationRouter._recommendation_gate_open.
+    recommend_before_schedule: str = "auto"
     # {enabled: false, capture_slot: callback_time, responses: {lang: str},
     #  counts_as_decline: true}
     callback_policy: dict = field(default_factory=dict)
@@ -371,12 +433,35 @@ class CallFlowConfig:
     #     the interruption was more than a "hello?".
     #   intro_line: {lang: str} (or a bare string) — THE SECOND BEAT. The
     #     exact sentence the caller hears the moment they first respond,
-    #     after a short opening like "Hello". {contact_name} and
-    #     {current_time} ARE substituted here, exactly as in the opening
-    #     greeting. Empty (the default) = the platform composes a line from
+    #     after a short opening like "Hello". {contact_name},
+    #     {current_time} and {honorific} ARE substituted here, exactly as in
+    #     the opening greeting ({honorific} resolving to nothing when the
+    #     contact carries no gender).
+    #     Empty (the default) = the platform composes a line from
     #     identity.agent_name + identity.company_name. A value that is
     #     itself a bare hello is ignored (it would re-open the parrot loop).
     connect: dict = field(default_factory=dict)
+    # Turn-taking overrides (all keys optional; {} = platform defaults, every
+    # other agent byte-identical). RUNBOOK §78 — a scripted agent that must
+    # never answer half a sentence and never talk over the caller:
+    #   pause_hold_ms: number — EVERY caller pause is held at least this long
+    #     before the turn is concluded, so a sentence split by a long or
+    #     unnatural pause is answered ONCE (the platform holds only narrative
+    #     / splitter callers). Costs that much latency on every reply; the
+    #     hold ends early the moment the caller resumes.
+    #   max_merged_fragments: int — pieces one utterance may be rebuilt from
+    #     inside that hold (platform default 4).
+    #   backchannel_guard: bool — a bare acknowledgement ("हाँ", "जी", "हम्म",
+    #     "okay") spoken while the agent's audio still has ≥1 s to play is a
+    #     listener's back-channel: dropped, never a turn, never a stage
+    #     advance.
+    #   sustained_barge_ms: number — a barge-in the delivery guard deferred
+    #     (reply not yet heard) is carried out anyway once the caller's
+    #     speech has gone on this long (a "hello?" is under 400 ms).
+    #   tail_barge_in: bool — caller speech that is NOT a back-channel,
+    #     arriving while the agent's audio is still playing after synthesis
+    #     finished, stops that audio instead of queueing the reply behind it.
+    turn_taking: dict = field(default_factory=dict)
 
     # Convenience accessors -------------------------------------------------
 
@@ -474,6 +559,14 @@ class ResponseBank:
     # a default-on shortcut would change its live hi/gu "hello" turns).
     enable_greeting_shortcut: bool = False
 
+    # ALTERNATIVE opening lines, {lang: [line, …]}. At call start the engine
+    # picks at random among opening_greeting and these, so the first thing a
+    # contact hears is not identical on every call. A separate field on
+    # purpose: opening_greeting stays the single string the Builder, the
+    # Copilot normalizer ("was a list — kept the first line only") and every
+    # preview already understand. {} = exactly one opening, as before.
+    opening_variants: dict[str, list[str]] = field(default_factory=dict)
+
 
 # ---------------------------------------------------------------------------
 # Knowledge Base
@@ -543,6 +636,17 @@ class KnowledgeBase:
     pricing_policy / fact_policy / product_lock (v2):
         {} = today's exact behaviour (pricing on request; no fact lines;
         set-once product lock).
+
+    primary_project (v3 — 2026-09-24, RUNBOOK §55):
+        {id: <catalog id>, mode: exclusive|lead, reason: '...'} — the ONE
+        catalogue item the agent pitches proactively. `exclusive` (the
+        default once an id is set): the recommendation band carries only
+        this item; every other catalogue entry is INFORMATION, answered
+        exactly as written when the caller asks and never volunteered.
+        `lead`: this item is always the first candidate and the match rules
+        may follow it. An id the catalogue does not carry is ignored — a
+        primary that cannot be rendered must not silently demote the rest.
+        {} = no primary (today: match rules alone decide).
     """
     known_projects: dict[str, tuple[str, str]]  # key -> (canonical_name, location)
     locations: list[str]                         # e.g. ["Surat", "Vapi", "Silvassa"]
@@ -567,6 +671,8 @@ class KnowledgeBase:
     pricing_policy: dict = field(default_factory=dict)
     fact_policy: dict = field(default_factory=dict)
     product_lock: dict = field(default_factory=dict)
+    # {id, mode: exclusive|lead, reason} — see the class docstring.
+    primary_project: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -585,8 +691,15 @@ class OutboundConfig:
     busy_response: dict[str, str] = field(default_factory=dict)
     wrong_number_close: dict[str, str] = field(default_factory=dict)
     wrong_number_patterns: list[str] = field(default_factory=list)
+    # RUNBOOK §73: asked ONCE after a "no" / "wrong number" to the identity
+    # question, before the call is closed with wrong_number_close. {} = the
+    # platform's built-in question in the call's language.
+    wrong_number_reconfirm_line: dict[str, str] = field(default_factory=dict)
     opening_greeting: dict[str, str] = field(default_factory=dict)  # outbound variant
     direction_brief: str = ""
+    # Alternatives to outbound.opening_greeting — see
+    # ResponseBank.opening_variants. {lang: [line, …]}; {} = one opening.
+    opening_variants: dict[str, list[str]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +825,16 @@ class LLMConfig:
     # see the aliasing note in from_dict; activation is a P7 flagged change.)
     extra_never_rules: list[str] = field(default_factory=list)
     extra_always_rules: list[str] = field(default_factory=list)
+    # Whether record_customer_details is offered on the MAIN (spoken) LLM
+    # call in tools "on" mode. True = today. With it on the roster the model
+    # answers most turns with the tool call and NO words, and the engine has
+    # to ask again for the sentence: measured over 518 live turns 2026-09-15/16
+    # that second request ran on 77% of turns at a median 1,223 ms — of a
+    # median 3,030 ms the caller waits in silence. False takes it off the
+    # spoken path for this agent: action tools (book / callback / do-not-call
+    # / end) stay, and details are captured by the background extractor,
+    # which runs concurrently and costs the caller nothing.
+    record_details_on_main_call: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -842,6 +965,8 @@ class AgentDefinition:
             tts_voices=tts_voices,
             register_notes=_as_dict(lang_d, "register_notes"),
             stt_forced_language=_as_str(lang_d, "stt_forced_language"),
+            stt_enum_recheck=_as_bool(lang_d, "stt_enum_recheck", False),
+            tts_numbers_english=_as_bool(lang_d, "tts_numbers_english", False),
             allow_code_mixing=_as_bool(lang_d, "allow_code_mixing", False),
             tts_lang_from_text=_as_bool(lang_d, "tts_lang_from_text", True),
             evidence_switch=_as_bool(lang_d, "evidence_switch", True),
@@ -884,6 +1009,7 @@ class AgentDefinition:
                 collect=[str(x) for x in _as_list(s, "collect")],
                 advance_when=_as_dict(s, "advance_when"),
                 branches=[b for b in _as_list(s, "branches") if isinstance(b, dict)],
+                script=_as_dict(s, "script"),
             ))
         call_flow = CallFlowConfig(
             stages=stages,
@@ -894,6 +1020,9 @@ class AgentDefinition:
             callback_policy=_as_dict(cf_d, "callback_policy"),
             termination=_as_dict(cf_d, "termination"),
             connect=_as_dict(cf_d, "connect"),
+            turn_taking=_as_dict(cf_d, "turn_taking"),
+            recommend_before_schedule=_as_str(
+                cf_d, "recommend_before_schedule", "auto") or "auto",
         )
 
         kb_d = _as_dict(d, "knowledge_base")
@@ -928,6 +1057,7 @@ class AgentDefinition:
             pricing_policy=_as_dict(kb_d, "pricing_policy"),
             fact_policy=_as_dict(kb_d, "fact_policy"),
             product_lock=_as_dict(kb_d, "product_lock"),
+            primary_project=_as_dict(kb_d, "primary_project"),
         )
 
         rb_d = _as_dict(d, "response_bank")
@@ -956,6 +1086,7 @@ class AgentDefinition:
                             if isinstance(c, dict)],
             ai_disclosure_responses=_as_dict(rb_d, "ai_disclosure_responses"),
             enable_greeting_shortcut=_as_bool(rb_d, "enable_greeting_shortcut", False),
+            opening_variants=_as_variants(rb_d, "opening_variants"),
         )
 
         llm_d = _as_dict(d, "llm_config")
@@ -975,6 +1106,8 @@ class AgentDefinition:
             extra_always_rules=[str(x) for x in _as_list(llm_d, "extra_always_rules")],
             enable_tools=(lambda m: m if m in ("off", "shadow", "on") else "shadow")(
                 (_as_str(llm_d, "enable_tools", "shadow") or "shadow").lower()),
+            record_details_on_main_call=_as_bool(
+                llm_d, "record_details_on_main_call", True),
         )
 
         _MERGE_POLICIES = ("free", "correction_gated", "confirm")
@@ -1010,6 +1143,7 @@ class AgentDefinition:
                 extract_patterns=[str(x) for x in _as_list(s, "extract_patterns")],
                 depends_on=[str(x) for x in _as_list(s, "depends_on")],
                 merge_policy=merge_policy,
+                ask_gated=_as_bool(s, "ask_gated", False),
                 confirm_readback=readback,
                 max_asks=_as_int(s, "max_asks", 0),
                 reask_question=_as_dict(s, "reask_question"),
@@ -1033,6 +1167,8 @@ class AgentDefinition:
             energy_mirroring=_as_bool(pers_d, "energy_mirroring", True),
             ai_disclosure=_ai_disc,
             verbosity_max_sentences=_as_int(pers_d, "verbosity_max_sentences", 3),
+            style_variants=[str(x).strip() for x in _as_list(pers_d, "style_variants")
+                            if str(x or "").strip()],
         )
 
         brand_d = _as_dict(d, "brand")
@@ -1055,8 +1191,10 @@ class AgentDefinition:
             busy_response=_as_dict(ob_d, "busy_response"),
             wrong_number_close=_as_dict(ob_d, "wrong_number_close"),
             wrong_number_patterns=[str(x) for x in _as_list(ob_d, "wrong_number_patterns")],
+            wrong_number_reconfirm_line=_as_dict(ob_d, "wrong_number_reconfirm_line"),
             opening_greeting=_as_dict(ob_d, "opening_greeting"),
             direction_brief=_as_str(ob_d, "direction_brief"),
+            opening_variants=_as_variants(ob_d, "opening_variants"),
         )
 
         gr_d = _as_dict(d, "guardrails")
@@ -1095,6 +1233,22 @@ class AgentDefinition:
             clarify_commitments=_clarify,
             auto_execute=_auto_exec,
         )
+
+        # The agent's own gender is the VOICE's (RUNBOOK §42). The pronoun
+        # fields were set independently of the voice and drifted: seven
+        # shubh-voiced agents carried "she" (several by the schema default
+        # alone), and a caller heard Vishal Patel say "बात कर रही हूँ". Every
+        # load now derives them from the voice this agent actually speaks with
+        # — the default language's speaker, else the platform default — so the
+        # dashboard, the Copilot and the runtime all read the same answer, and
+        # every save persists it. A speaker the catalog cannot classify leaves
+        # the stored value alone.
+        _dv = tts_voices.get(default_lang)
+        _vg = (speaker_gender(_dv.speaker) or (_dv.gender or "").strip().lower()
+               if _dv is not None else speaker_gender(DEFAULT_TTS_SPEAKER))
+        if _vg in ("male", "female"):
+            identity.pronouns = personality.pronouns = (
+                "he" if _vg == "male" else "she")
 
         pc_d = _as_dict(d, "post_call")
         post_call = PostCallConfig(

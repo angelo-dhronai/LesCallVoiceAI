@@ -23,6 +23,7 @@ import logging
 import os
 import time
 import wave
+from collections import deque
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
@@ -86,6 +87,16 @@ class CallAuditSession:
         # Transcript counter for elapsed-time calculation
         self._transcript_count = 0
 
+        # Last entry written, so a line the caller never heard can be taken
+        # back off the transcript (see drop_last_event).
+        self._last_entry_offset: int = -1
+        self._last_entry_speaker: str = ""
+        self._last_entry_text: str = ""
+        # The last few entries (offset, speaker, text), so the pieces of a
+        # turn the engine re-transcribed whole can be replaced by that text
+        # (replace_last_events, RUNBOOK §78).
+        self._recent_entries: deque = deque(maxlen=16)
+
         # Metadata fields populated at close()
         self._language_detected: str = "unknown"
         self._stt_provider: str = "sarvam"
@@ -124,11 +135,108 @@ class CallAuditSession:
             timestamp_str += f" [spoke {span[0]:.2f}-{span[1]:.2f}s]"
         entry = f"{timestamp_str}\n{speaker}: {text}\n\n"
         try:
+            self._last_entry_offset = self._txt_file.tell()
             self._txt_file.write(entry)
             self._txt_file.flush()
+            self._last_entry_speaker = speaker
+            self._last_entry_text = text
+            self._recent().append((self._last_entry_offset, speaker, text))
         except Exception as exc:
             logger.warning("[AUDIT] Transcript write failed: %r", exc)
+            self._last_entry_offset = -1
         self._transcript_count += 1
+
+    def drop_last_event(self, speaker: str, text: str) -> bool:
+        """Take the last entry back off the transcript.
+
+        Used for an agent line the caller never heard: the engine finished
+        generating it, the caller was still mid-sentence, and the platform cut
+        it before a single frame reached the wire. Recording it anyway is how
+        a clean call reads back as the agent repeating itself — the owner's
+        2026-09-16 report of "asked the same question six times" was a call
+        where the caller heard the question ONCE and the other five were
+        cancelled replies written to this file.
+
+        Only ever removes the entry it is handed, and only while that entry is
+        still the last one — a later write makes the retraction a no-op rather
+        than corrupting the file.
+        """
+        if (self._last_entry_offset < 0
+                or self._last_entry_speaker != speaker
+                or self._last_entry_text != text):
+            return False
+        try:
+            self._txt_file.flush()
+            self._txt_file.close()
+            with open(self._txt_path, "r+", encoding="utf-8") as f:
+                f.truncate(self._last_entry_offset)
+            self._txt_file = open(self._txt_path, "a", encoding="utf-8")
+        except Exception as exc:
+            logger.warning("[AUDIT] Transcript retraction failed: %r", exc)
+            try:
+                self._txt_file = open(self._txt_path, "a", encoding="utf-8")
+            except Exception:
+                pass
+            return False
+        self._last_entry_offset = -1
+        self._last_entry_speaker = ""
+        self._last_entry_text = ""
+        if self._recent():
+            self._recent().pop()
+        self._transcript_count = max(0, self._transcript_count - 1)
+        logger.info("[AUDIT] Retracted unheard %s line: %r", speaker, text[:60])
+        return True
+
+    def _recent(self) -> deque:
+        """The recent-entries ring, created lazily — tests build sessions
+        with __new__ and set only the fields they need."""
+        return self.__dict__.setdefault("_recent_entries", deque(maxlen=16))
+
+    def replace_last_events(self, speaker: str, texts: list, new_text: str,
+                            span: "tuple[float, float] | None" = None) -> bool:
+        """Replace the last entries for `speaker` — exactly `texts`, in
+        order — with ONE entry `new_text` (RUNBOOK §78).
+
+        The pieces of a split turn are written as they are heard; the engine
+        then re-transcribes the joined audio and acts on THAT text. The owner
+        read the pieces on call b5452b23 ("…परिष्टों में इंटरेस्ट है।") and
+        concluded "4 BHK" was never heard — the joined pass had it. Only ever
+        replaces the entries it is handed, and only while they are still the
+        last ones; anything written since makes this a no-op.
+        """
+        if not texts or not new_text:
+            return False
+        recent = list(self._recent())
+        n = len(texts)
+        if len(recent) < n:
+            return False
+        tail = recent[-n:]
+        if any(sp != speaker or tx != want
+               for (_, sp, tx), want in zip(tail, texts)):
+            return False
+        offset = tail[0][0]
+        if offset < 0:
+            return False
+        try:
+            self._txt_file.flush()
+            self._txt_file.close()
+            with open(self._txt_path, "r+", encoding="utf-8") as f:
+                f.truncate(offset)
+            self._txt_file = open(self._txt_path, "a", encoding="utf-8")
+        except Exception as exc:
+            logger.warning("[AUDIT] Transcript replace failed: %r", exc)
+            try:
+                self._txt_file = open(self._txt_path, "a", encoding="utf-8")
+            except Exception:
+                pass
+            return False
+        for _ in range(n):
+            self._recent().pop()
+        self._transcript_count = max(0, self._transcript_count - n)
+        self.add_event(speaker, new_text, span=span)
+        logger.info("[AUDIT] Replaced %d %s piece(s) with the joined turn: %r",
+                    n, speaker, new_text[:60])
+        return True
 
     async def close(
         self,
@@ -251,6 +359,24 @@ class CallAuditManager:
         session = self._sessions.get(call_id)
         if session is not None:
             session.add_event(speaker, text, span=span)
+
+    def drop_last_event(self, call_id: str, speaker: str, text: str) -> bool:
+        if not ENABLE_CALL_AUDIT:
+            return False
+        session = self._sessions.get(call_id)
+        if session is None:
+            return False
+        return session.drop_last_event(speaker, text)
+
+    def replace_last_events(self, call_id: str, speaker: str, texts: list,
+                            new_text: str,
+                            span: "tuple[float, float] | None" = None) -> bool:
+        if not ENABLE_CALL_AUDIT:
+            return False
+        session = self._sessions.get(call_id)
+        if session is None:
+            return False
+        return session.replace_last_events(speaker, texts, new_text, span=span)
 
     async def close(
         self,

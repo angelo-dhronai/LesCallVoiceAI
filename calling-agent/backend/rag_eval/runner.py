@@ -23,6 +23,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
+
 _HERE = Path(__file__).resolve().parent
 if str(_HERE.parent) not in sys.path:          # calling-agent/backend
     sys.path.insert(0, str(_HERE.parent))
@@ -70,20 +72,22 @@ class _LiveEmbedFn:
     def __init__(self, model: str):
         self.model = model
         self.last_tokens = 0
-        self._client = None
+        self._provider = None
 
     def __call__(self, texts: list[str]):
-        import openai
-        key = os.environ.get("OPENAI_API_KEY", "")
-        if not key:
-            raise RuntimeError("--live needs OPENAI_API_KEY")
-        if self._client is None:
-            self._client = openai.OpenAI(api_key=key)
-        resp = self._client.embeddings.create(model=self.model, input=texts)
-        usage = getattr(resp, "usage", None)
-        self.last_tokens = int(getattr(usage, "prompt_tokens", 0) or
-                               getattr(usage, "total_tokens", 0) or 0)
-        return [e.embedding for e in resp.data]
+        if self._provider is None:
+            # The production provider for this model — Gemini for
+            # `gemini-embedding-*`, OpenAI for `text-embedding-*` — so a live
+            # run measures the same client the ingestion path uses.
+            from app.documents import embeddings as emb
+            self._provider = emb.build_provider(model=self.model)
+            if not emb.provider_available(self._provider):
+                raise RuntimeError(
+                    f"--live needs credentials for the {self._provider.provider} "
+                    f"embedding provider ({self.model})")
+        vectors = self._provider.embed(texts)
+        self.last_tokens = int(getattr(self._provider, "last_tokens", 0) or 0)
+        return [np.asarray(v, dtype=np.float32) for v in vectors]
 
 
 # ---------------------------------------------------------------------------
@@ -528,8 +532,11 @@ def main(argv=None) -> int:
     ap.add_argument("--dataset", default=str(ds.DEFAULT_DATASET))
     ap.add_argument("--corpus", default=str(CORPUS_DIR))
     ap.add_argument("--vector-cache", default=str(VECTOR_CACHE))
+    # The platform default since RUNBOOK §57. The frozen cache holds vectors
+    # for BOTH models, so `--embed-model text-embedding-3-small` still runs
+    # offline for a rollback comparison.
     ap.add_argument("--embed-model", default=os.environ.get(
-        "RAG_EMBED_MODEL", "text-embedding-3-small"))
+        "RAG_EMBED_MODEL", "gemini-embedding-2"))
     ap.add_argument("--retriever", choices=("current", "legacy"), default="current")
     ap.add_argument("--live", action="store_true",
                     help="call the real embedding API on cache misses")

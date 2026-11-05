@@ -109,13 +109,37 @@ def per_call_key_provider(conn_id: str = ""):
     return _get
 
 
-def rotate() -> str | None:
+def rotate(failed_key: str | None = None) -> str | None:
     """
     Promote the first key from the backup pool to active.
     Updates os.environ and .env in place.
     Returns the new key string, or None if the pool is empty.
+
+    ``failed_key`` is the key that just returned 402 and is what makes this
+    safe under concurrency. One dead key produces a BURST of 402s — the STT
+    router alone fires up to four requests per segment (primary, its retry,
+    the 0.6s race and its retry) and TTS runs alongside them. Each used to
+    call rotate(), and each pop promoted-and-abandoned a key nobody had
+    tried: on 2026-08-31 three live keys were consumed in six seconds and
+    the watchdog buried all three (RUNBOOK §34). A pop now happens only when
+    the caller's failed key is still the ACTIVE one:
+
+    * failed_key == active  → this is the first report; rotate for real.
+    * failed_key != active  → either a peer already rotated off it (return
+      their key, so the retry uses a live one), or the failure was on a
+      per-call LEASED key, which mark_exhausted() already handles and which
+      must never cost the pool a key.
     """
     with _lock:
+        active = current_key()
+        if failed_key and active and failed_key != active:
+            logger.info(
+                "[KEY-ROTATOR] 402 on %s…%s but active is already %s…%s — "
+                "adopting it instead of burning a pool key",
+                failed_key[:8], failed_key[-4:], active[:8], active[-4:],
+            )
+            return active
+
         pool = _load_pool()
         if not pool:
             logger.warning("[KEY-ROTATOR] Backup pool is empty — cannot auto-rotate")
@@ -132,6 +156,19 @@ def rotate() -> str | None:
             masked, len(pool),
         )
         return new_key
+
+
+def retire(failed_key: str) -> str | None:
+    """A 402 on `failed_key`: rotate if it is the active key, THEN stop
+    leasing it — in that order. mark_exhausted() refuses to blacklist the
+    ACTIVE key, so marking before rotating left the dead key looking active
+    for that instant and the per-call lease handed it straight back to the
+    retry: call 1072 (2026-10-12) sent both STT attempts to the dead key,
+    the caller's first answer was lost, and the identity line was asked
+    twice. Returns what rotate() returns."""
+    new_key = rotate(failed_key)
+    mark_exhausted(failed_key)
+    return new_key
 
 
 def _load_pool() -> list[str]:

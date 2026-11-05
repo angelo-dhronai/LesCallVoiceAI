@@ -47,15 +47,53 @@ def resolve_tools_mode(agent_def) -> str:
     return mode if mode in _MODES else MODE_SHADOW
 
 
-def build_tool_declarations(slot_names: list[str]) -> list[dict]:
+_SLOT_HINT_MAX_CHARS = 160
+
+
+def build_tool_declarations(slot_names: list[str],
+                            slot_hints: dict[str, str] | None = None,
+                            include_record: bool = True,
+                            include_book: bool = True) -> list[dict]:
     """OpenAI tools schema. Minimal on purpose — every description line is
     prompt tokens on every turn (P0 measured ~flat TTFT with this roster).
 
     record_customer_details takes the AGENT'S slot names, so the runtime
     stays domain-free: a real-estate agent exposes budget/bhk, a clinic
     exposes symptom/insurer, purely from its YAML slots.
+
+    `slot_hints` says what each slot MEANS, in the business's own words (its
+    question, else its label). A bare name makes the model guess from the
+    name, and it fills whatever is still empty: measured 2026-09-18, a caller
+    saying "mostly references" had BOTH customer_channel and business_type
+    recorded as 'Referrals', and the real business ("furniture showroom", one
+    turn later) was then refused by the fill-only merge. The json extractor
+    was given these hints on 2026-09-16 for exactly this reason; the tool
+    roster — the path production actually runs — never was.
     """
-    slot_props = {name: {"type": "string"} for name in slot_names[:12]}
+    hints = slot_hints or {}
+    slot_props: dict[str, dict] = {}
+    for name in slot_names[:12]:
+        prop: dict = {"type": "string"}
+        hint = " ".join(str(hints.get(name) or "").split())
+        if hint:
+            prop["description"] = hint[:_SLOT_HINT_MAX_CHARS]
+        slot_props[name] = prop
+    decls = _all_tool_declarations(slot_props)
+    # include_record=False: see LLMConfig.record_details_on_main_call.
+    # include_book=False: the visit is already fixed or the call is closing —
+    # every book_appointment the model issues now is refused by the legality
+    # gate, and a refused tool-only turn costs a text re-ask whose goodbye
+    # was then ignored: call 909 (2026-09-24, RUNBOOK §55.5) re-proposed the
+    # same booking on FIVE consecutive closing turns and could not hang up.
+    drop: set[str] = set()
+    if not include_record:
+        drop.add("record_customer_details")
+    if not include_book:
+        drop.add("book_appointment")
+    return [d for d in decls if d["function"]["name"] not in drop]
+
+
+def _all_tool_declarations(slot_props: dict) -> list[dict]:
     return [
         {"type": "function", "function": {
             "name": "record_customer_details",
@@ -154,11 +192,67 @@ class ToolCallAccumulator:
         return out
 
 
+# What a model writes into a field when it has nothing to write. Stored, each
+# of these reads as an ANSWER: measured 2026-09-18, the model recorded
+# consultation_time='unscheduled' while merely OFFERING a call, a when_slot
+# gate took that as "the caller named a time", and the conversation jumped to
+# its closing stage; 'Pending' and 'pending confirmation' followed on the next
+# two runs. A placeholder must leave the slot empty so it is still asked.
+PLACEHOLDER_VALUES = frozenset({
+    "null", "none", "unknown", "n/a", "nil", "-", "--", "tbd", "tba",
+    "pending", "pending confirmation", "unscheduled", "not scheduled",
+    "not yet scheduled", "not provided", "not specified", "not mentioned",
+    "not stated", "not given", "not available", "unspecified", "undecided",
+    "not decided", "to be decided", "to be confirmed", "no answer",
+    "not answered", "not applicable",
+    # A ROLE is not a name. Live 2026-09-24 (calls 903/904, Prakhar): the
+    # tool wrote caller_name='caller' and 'Caller' on the turn the caller
+    # had NOT given a name; the slot read as filled, the agent stopped
+    # asking, and "Welcome, Baki!" went to a person whose name it never
+    # actually had. Same for the honorific a model reaches for when it has
+    # nothing else.
+    "caller", "the caller", "customer", "the customer", "client",
+    "the client", "user", "the user", "unknown caller", "anonymous",
+    "sir", "madam", "ma'am", "maam", "no name", "unknown name",
+})
+
+# "Go ahead" is not an answer. The commonest first words on an outbound call
+# are "हाँ जी बताओ" / "haan boliye" — yes, tell me. They carry no information,
+# but said straight after a question they were stored as that question's
+# answer (customer_channel='haan ji batao'), which then suppressed the real
+# question. Yes/no words are deliberately NOT here: "No" is a real value for
+# "are you happy with your leads?".
+GO_AHEAD_TOKENS = frozenset({
+    "batao", "bataiye", "bataiyega", "bataye", "batayein", "bolo", "boliye",
+    "boliyega", "bole", "bolie", "kahiye", "kahie", "kaho",
+    "बताओ", "बताइए", "बताइये", "बताएं", "बताएँ", "बताइएगा", "बोलो", "बोलिए",
+    "बोलिये", "बोले", "बोलें", "कहिए", "कहिये", "कहो",
+    "બોલો", "કહો", "બતાવો",
+})
+
+
+# Words that ride along with a go-ahead without adding information: "हाँ
+# जल्दी बताओ थोड़ा" (yes, tell me quickly) was stored as
+# customer_channel='abhi jaldi batao thoda' — the verb was recognised, the
+# adverbs around it were not. Only ever consulted TOGETHER with a go-ahead
+# verb, so "abhi" or "kya" on their own never make a value disappear.
+GO_AHEAD_FILLERS = frozenset({
+    "jaldi", "jldi", "jaldi se", "thoda", "thora", "zara", "jara", "abhi",
+    "fatafat", "aap", "aage", "phir", "kya", "kuch",
+    "जल्दी", "थोड़ा", "थोडा", "ज़रा", "जरा", "अभी", "फटाफट", "आप", "आगे",
+    "फिर", "क्या", "कुछ",
+})
+
+
+def is_placeholder_value(value) -> bool:
+    return " ".join(str(value or "").lower().split()).strip(" .") in PLACEHOLDER_VALUES
+
+
 def clean_slot_args(args: dict) -> dict:
     """Same null-filtering discipline as the legacy json extractor."""
     return {k: str(v).strip() for k, v in args.items()
             if isinstance(v, (str, int, float)) and str(v).strip()
-            and str(v).strip().lower() not in ("null", "none", "unknown", "n/a")}
+            and not is_placeholder_value(v)}
 
 
 # Deterministic spoken confirmations for tool-only turns ("on" mode). The
@@ -190,11 +284,38 @@ CONFIRM_LINES: dict[str, dict[str, str]] = {
 }
 
 
+_MONTHS = ("January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December")
+
+
+def _speakable_when(value: str) -> str:
+    """Machine date/time → words a TTS voice can say.
+
+    The model hands book_appointment ISO strings, and this canned line read
+    them to the caller verbatim: "जी, 2025-09-19 को 16:00 नोट कर लिया।"
+    (measured 2026-09-18). Anything that is not ISO passes through untouched —
+    "Tuesday" and "3pm" were already speakable.
+    """
+    import re as _re
+    v = str(value or "").strip()
+    m = _re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", v)
+    if m and 1 <= int(m[2]) <= 12:
+        return f"{int(m[3])} {_MONTHS[int(m[2]) - 1]}"
+    m = _re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?", v)
+    if m:
+        h, mins = int(m[1]), m[2]
+        suffix = "AM" if h < 12 else "PM"
+        h12 = h % 12 or 12
+        return f"{h12} {suffix}" if mins == "00" else f"{h12}:{mins} {suffix}"
+    return v
+
+
 def confirm_line(name: str, lang: str, args: dict) -> str:
     lines = CONFIRM_LINES.get(name) or {}
     template = lines.get((lang or "en")[:2]) or lines.get("en") or ""
     try:
-        return template.format(**{k: str(v) for k, v in args.items()})
+        return template.format(**{k: _speakable_when(v) if k in ("date", "time")
+                                  else str(v) for k, v in args.items()})
     except (KeyError, IndexError):
         return template.replace("{date}", "").replace("{time}", "").replace(
             "{when}", "").strip(" —-")

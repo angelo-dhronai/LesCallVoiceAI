@@ -48,6 +48,11 @@ _AGENTS_DIR = Path(__file__).resolve().parents[3] / "agents"
 INDEX_META_FILE = "index_meta.json"
 EMBEDDINGS_FILE = "embeddings.npy"
 CHUNKS_FILE = "chunks.json"
+# Why the last embed of this document failed, if it did. Written next to the
+# chunks so `index_status` can say "keyword search only: HTTP 429 …" instead of
+# a bare `not_embedded` — the difference between an operator re-indexing and
+# an operator filing a bug. Removed by the next successful embed.
+EMBED_ERROR_FILE = "embed_error.json"
 
 # Bumped when the on-disk index layout or the normalisation contract changes in
 # a way that makes existing files unreadable-as-intended. Part of the identity
@@ -118,12 +123,17 @@ class OpenAIEmbeddingProvider:
         """
         self._client = None
 
-    def embed(self, texts: list[str]) -> np.ndarray:
+    def embed(self, texts: list[str], timeout: float | None = None) -> np.ndarray:
         if not self.available():
             raise RuntimeError(
                 f"no embedding credentials ({config.EMBED_API_KEY_ENV} unset)")
         try:
-            resp = self._get_client().embeddings.create(model=self.model, input=texts)
+            # Ingestion gets the long deadline; `embed_queries` passes the
+            # short one. The client default used to be the 2 s query cap for
+            # both, which timed out any document over a few dozen chunks.
+            resp = self._get_client().embeddings.create(
+                model=self.model, input=texts,
+                timeout=timeout if timeout is not None else config.EMBED_INGEST_TIMEOUT_S)
         except Exception:
             self.reset()
             raise
@@ -135,14 +145,159 @@ class OpenAIEmbeddingProvider:
                                getattr(usage, "total_tokens", 0) or 0)
         return np.asarray([e.embedding for e in resp.data], dtype=np.float32)
 
+    def embed_queries(self, texts: list[str]) -> np.ndarray:
+        return self.embed(texts, timeout=self._timeout)
+
+
+def _error_excerpt(resp) -> str:
+    """The provider's own sentence from an error body, or the first bytes."""
+    try:
+        err = (resp.json() or {}).get("error") or {}
+        msg = err.get("message") or ""
+        if msg:
+            return str(msg).strip()[:300]
+    except Exception:
+        pass
+    return (getattr(resp, "text", "") or "")[:300]
+
+
+class GeminiEmbeddingProvider:
+    """Google's native embedContent API — the production provider since
+    2026-09-25 (`gemini-embedding-2`, RUNBOOK §57).
+
+    Native REST rather than the OpenAI-compat `/embeddings` route the
+    intelligence module uses, for three things that route does not carry:
+
+      * usage — the compat response has `usage: null`, so the ledger would
+        record every request as 0 tokens. `usageMetadata.promptTokenCount` is
+        the provider's own number, the only kind the ledger accepts;
+      * task type — documents are embedded as RETRIEVAL_DOCUMENT and the
+        caller's question as RETRIEVAL_QUERY. The model is trained on that
+        asymmetry and the compat route cannot express it;
+      * ordering — the compat route returns `index: null` on every row and
+        the caller has to trust response order.
+
+    One httpx client, reused: TLS once, not once per voice turn. A failed or
+    timed-out request drops it, same as the STT layer — a hung connection that
+    is reused stays hung.
+    """
+
+    def __init__(self, model: str | None = None, dim: int | None = None,
+                 api_key: str | None = None, base_url: str | None = None,
+                 timeout: float | None = None, ingest_timeout: float | None = None,
+                 batch_size: int | None = None):
+        self.provider = "gemini"
+        self.model = model or config.EMBED_MODEL
+        self.dim = int(dim or config.EMBED_DIM)
+        self._api_key = api_key
+        self._base_url = (base_url or config.EMBED_BASE_URL
+                          or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+        self._timeout = timeout if timeout is not None else config.EMBED_TIMEOUT_S
+        self._ingest_timeout = (ingest_timeout if ingest_timeout is not None
+                                else config.EMBED_INGEST_TIMEOUT_S)
+        self._batch = max(1, min(int(batch_size or config.EMBED_BATCH_SIZE), 100))
+        self._client = None
+        self.last_tokens = 0
+
+    def _key(self) -> str:
+        if self._api_key:
+            return self._api_key
+        # The configured variable first; then the two names the OCR step
+        # already reads, so one funded Gemini key serves every document stage.
+        for name in (config.EMBED_API_KEY_ENV, "GEMINI_API_KEY", "LLM_API_KEY"):
+            value = os.environ.get(name, "").strip()
+            if value:
+                return value
+        return ""
+
+    def available(self) -> bool:
+        return bool(self._key())
+
+    def _get_client(self):
+        if self._client is None:
+            import httpx
+            self._client = httpx.Client(timeout=self._ingest_timeout)
+        return self._client
+
+    def reset(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def embed(self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT",
+              timeout: float | None = None) -> np.ndarray:
+        if not self.available():
+            raise RuntimeError(
+                f"no embedding credentials ({config.EMBED_API_KEY_ENV} unset)")
+        if not texts:
+            self.last_tokens = 0
+            return np.zeros((0, self.dim), dtype=np.float32)
+        url = f"{self._base_url}/models/{self.model}:batchEmbedContents"
+        rows: list[list[float]] = []
+        tokens = 0
+        for start in range(0, len(texts), self._batch):
+            batch = texts[start:start + self._batch]
+            payload = {"requests": [{
+                "model": f"models/{self.model}",
+                # An empty part is a 400; a chunk is never empty in practice
+                # but a caller turn of pure punctuation can be.
+                "content": {"parts": [{"text": t if t.strip() else " "}]},
+                "taskType": task_type,
+                "outputDimensionality": self.dim,
+            } for t in batch]}
+            try:
+                resp = self._get_client().post(
+                    url, json=payload, headers={"x-goog-api-key": self._key()},
+                    timeout=timeout if timeout is not None else self._ingest_timeout)
+            except Exception:
+                self.reset()
+                raise
+            if resp.status_code != 200:
+                self.reset()
+                raise RuntimeError(
+                    f"gemini embeddings HTTP {resp.status_code}: {_error_excerpt(resp)}")
+            data = resp.json() or {}
+            embs = data.get("embeddings") or []
+            if len(embs) != len(batch):
+                raise RuntimeError(
+                    f"gemini embeddings returned {len(embs)} vectors for {len(batch)} texts")
+            rows.extend(list(e.get("values") or []) for e in embs)
+            usage = data.get("usageMetadata") or {}
+            tokens += int(usage.get("promptTokenCount") or usage.get("totalTokenCount") or 0)
+        self.last_tokens = tokens
+        return np.asarray(rows, dtype=np.float32)
+
+    def embed_queries(self, texts: list[str]) -> np.ndarray:
+        return self.embed(texts, task_type="RETRIEVAL_QUERY", timeout=self._timeout)
+
 
 _provider: EmbeddingProvider | None = None
+
+
+def build_provider(model: str | None = None, dim: int | None = None,
+                   provider_name: str | None = None) -> EmbeddingProvider:
+    """The provider the configuration names — or the one the MODEL implies,
+    so `--embed-model text-embedding-3-small` still builds an OpenAI client
+    while the platform default is Gemini."""
+    name = (provider_name or "").strip().lower()
+    if not name and model:
+        if model.startswith("text-embedding"):
+            name = "openai"
+        elif model.startswith("gemini"):
+            name = "gemini"
+    name = name or config.EMBED_PROVIDER
+    if name == "gemini":
+        return GeminiEmbeddingProvider(model=model, dim=dim)
+    return OpenAIEmbeddingProvider(model=model, dim=dim)
 
 
 def get_provider() -> EmbeddingProvider | None:
     global _provider
     if _provider is None:
-        _provider = OpenAIEmbeddingProvider()
+        _provider = build_provider()
     return _provider
 
 
@@ -275,12 +430,18 @@ def embed_document(agent_folder: str, doc_id: str,
         logger.warning("[docs/emb] embedding failed for %s/%s: %s — document "
                        "stays retrievable by lexical search only, re-index to fix",
                        agent_folder, doc_id, exc)
+        _write_embed_error(doc_dir, provider, f"{exc.__class__.__name__}: {exc}")
         return False
     if vectors is None or not len(vectors):
+        _write_embed_error(doc_dir, provider, "provider returned no vectors")
         return False
 
     vectors = _normalize_rows(np.asarray(vectors, dtype=np.float32))
     np.save(str(doc_dir / EMBEDDINGS_FILE), vectors)
+    try:
+        (doc_dir / EMBED_ERROR_FILE).unlink(missing_ok=True)
+    except Exception:
+        pass
     meta = IndexMeta(
         provider=getattr(provider, "provider", "unknown"),
         model=getattr(provider, "model", "unknown"),
@@ -307,6 +468,29 @@ def _embed_batch(texts: list[str],
     if provider is None:
         return None
     return provider.embed(texts)
+
+
+def _write_embed_error(doc_dir: Path, provider, reason: str) -> None:
+    try:
+        (doc_dir / EMBED_ERROR_FILE).write_text(json.dumps({
+            "error": reason[:500],
+            "provider": getattr(provider, "provider", None),
+            "model": getattr(provider, "model", None),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }, indent=2), encoding="utf-8")
+    except Exception:  # the reason is a courtesy, never a second failure
+        pass
+
+
+def embed_error(agent_folder: str, doc_id: str) -> dict | None:
+    """The recorded reason a document is not embedded, or None."""
+    path = _docs_dir(agent_folder) / doc_id / EMBED_ERROR_FILE
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 def _store_geometry() -> tuple[int, int]:
@@ -502,11 +686,20 @@ def index_status(agent_folder: str,
         elif row["embedded"]:
             row["state"] = "unlabelled"
             row["detail"] = "built before index metadata existed"
+        if row["state"] == "not_embedded":
+            err = embed_error(agent_folder, doc["doc_id"])
+            if err:
+                row["detail"] = str(err.get("error") or "")
+                row["failed_at"] = err.get("at")
         out.append(row)
     return {"documents": out,
             "runtime": {"provider": getattr(provider, "provider", None),
                         "model": getattr(provider, "model", None),
-                        "dim": getattr(provider, "dim", None)},
+                        "dim": getattr(provider, "dim", None),
+                        # False = every upload will be keyword-only, and the
+                        # UI should say so before the user hits Re-index.
+                        "available": provider_available(provider) if provider else False,
+                        "key_env": config.EMBED_API_KEY_ENV},
             "needs_reindex": [r["doc_id"] for r in out
                               if r["state"] in ("stale", "not_embedded", "unlabelled")]}
 
@@ -517,9 +710,15 @@ def index_status(agent_folder: str,
 
 def embed_query(text: str, provider: EmbeddingProvider | None = None
                 ) -> tuple[np.ndarray, int]:
-    """Embed one query. Returns (unit vector, provider-reported tokens)."""
+    """Embed one query. Returns (unit vector, provider-reported tokens).
+
+    A provider that distinguishes queries from documents (task type, the
+    short live-turn deadline) exposes `embed_queries`; the fake providers in
+    the tests and the eval harness only have `embed`, and both are fine.
+    """
     provider = provider or get_provider()
-    vecs = provider.embed([text])
+    fn = getattr(provider, "embed_queries", None)
+    vecs = fn([text]) if callable(fn) else provider.embed([text])
     tokens = int(getattr(provider, "last_tokens", 0) or 0)
     return _normalize_rows(np.asarray(vecs, dtype=np.float32))[0], tokens
 

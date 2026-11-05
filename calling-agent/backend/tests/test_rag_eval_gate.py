@@ -36,7 +36,7 @@ def _run_eval(**overrides):
     args = argparse.Namespace(
         dataset=str(runner.ds.DEFAULT_DATASET), corpus=str(runner.CORPUS_DIR),
         vector_cache=str(runner.VECTOR_CACHE),
-        embed_model=os.environ.get("RAG_EMBED_MODEL", "text-embedding-3-small"),
+        embed_model=os.environ.get("RAG_EMBED_MODEL", "gemini-embedding-2"),
         retriever="current", live=False, fresh=False, generate=False, judge=False,
         gen_model=None, judge_model=None, gen_provider="llm", judge_provider=None,
         chunk_words=None, top_k=None, final_k=None, rerank=None, abstention=None,

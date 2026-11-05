@@ -295,7 +295,9 @@ class SarvamWSTTS(StreamingTTS):
                             code, msg_text,
                         )
                         from .key_rotator import rotate as _rotate_key
-                        new_key = _rotate_key()
+                        # Same-key guard as the HTTP path: one dead key must
+                        # cost the pool one key (see key_rotator.rotate).
+                        new_key = _rotate_key(self._api_key)
                         if new_key:
                             self._api_key = new_key
                             self._sarvam_client = None

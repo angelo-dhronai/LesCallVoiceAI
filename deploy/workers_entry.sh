@@ -39,6 +39,10 @@ i=0
 echo "workers loop up (tick=${TICK}s)"
 while true; do
     python -m shared.usage_metering --once           || echo "WARN metering pass failed"
+    # Forwarded calls (RUNBOOK §84): CDR → forwarded_calls. These calls never
+    # reach the AI, so this is their only record (and their minutes, counted
+    # separately from AI minutes). A no-op until migration 0032 is applied.
+    python -m shared.call_forwarding --sync          || echo "WARN forwarding sync failed"
     python -m shared.outbox_worker --once >/dev/null || echo "WARN outbox pass failed"
     if (( i % 3 == 0 )); then
         python -m shared.recording_storage --once    || echo "WARN recsync pass failed"

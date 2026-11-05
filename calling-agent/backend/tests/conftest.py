@@ -102,3 +102,40 @@ def _isolate_credit_ledger(tmp_path_factory, monkeypatch):
         return
     monkeypatch.setattr(credit_tracker, "_CREDIT_LOG_DIR",
                         tmp_path_factory.mktemp("credit_log"), raising=False)
+
+
+@pytest.fixture()
+def whole_minute():
+    """Give the test a rate-limit window it cannot fall out of mid-way.
+
+    `/v1` rate windows are WALL-CLOCK minute buckets — `ratelimit.window_starts`
+    does `now.replace(second=0)`, not a sliding window. So a test that spends
+    its per-minute budget and then asserts the next request is refused sees a
+    200 instead of a 429 whenever those requests straddle a minute boundary:
+    the counter reset underneath it. That flake failed two of three full-suite
+    runs on 2026-08-29 while passing alone every time, which is the worst kind
+    — a suite that cries wolf stops being usable as evidence.
+
+    Waiting out the tail of the minute rather than freezing the clock is
+    deliberate: `ratelimit._remember_block` caches a refusal for 30 REAL
+    seconds keyed by subject, so a frozen clock would keep one test's block
+    alive into the next test.
+    """
+    import datetime as _dt
+    import time as _time
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    if now.second > 45:
+        _time.sleep(61 - now.second)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_provider_context_cache(monkeypatch, tmp_path_factory):
+    """The agent context cache (RUNBOOK §62) talks to the provider in the
+    background. Off for every test and pointed at a throwaway state file;
+    tests/test_context_cache.py switches it back on with the network stubbed."""
+    from app.voice import context_cache as _cc
+    monkeypatch.setattr(_cc, "ENABLED", False)
+    monkeypatch.setattr(_cc, "REGISTRY", _cc.ContextCacheRegistry(
+        state_path=tmp_path_factory.mktemp("ctxcache") / "state.json"))

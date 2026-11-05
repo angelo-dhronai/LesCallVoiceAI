@@ -72,14 +72,37 @@ ENABLED = _flag("RAG_ENABLED", True)
 # Provider/model/dimension are recorded INTO the index at build time and
 # re-checked at query time; changing them here does not silently reinterpret
 # vectors built with something else (see embeddings.IndexMeta).
-EMBED_PROVIDER = os.environ.get("RAG_EMBED_PROVIDER", "openai")
-EMBED_MODEL = os.environ.get("RAG_EMBED_MODEL", "text-embedding-3-small")
-EMBED_DIM = _int("RAG_EMBED_DIM", 1536)
-EMBED_API_KEY_ENV = os.environ.get("RAG_EMBED_API_KEY_ENV", "OPENAI_API_KEY")
+#
+# SWITCHED 2026-09-25: openai/text-embedding-3-small -> gemini/gemini-embedding-2
+# (RUNBOOK §57). The OpenAI key ran out of credit on 2026-09-11; from then on
+# every upload embedded nothing and the document was searchable by keyword
+# only — reported by index_status, seen by nobody, because the Documents tab
+# never rendered it. gemini-embedding-2 is GA, lives on the platform's funded
+# LLM key, reports its own token count (the OpenAI-compat /embeddings route
+# returns `usage: null`) and takes a task type, so documents are embedded as
+# RETRIEVAL_DOCUMENT and the caller's turn as RETRIEVAL_QUERY. 768 of its
+# 3,072 Matryoshka dimensions (the model normalises truncated vectors itself).
+# `RAG_EMBED_PROVIDER=openai` rolls back; every index then reports `stale`
+# until re-indexed — never a silent mismatch.
+EMBED_PROVIDER = (os.environ.get("RAG_EMBED_PROVIDER", "gemini") or "gemini").strip().lower()
+_GEMINI = EMBED_PROVIDER == "gemini"
+EMBED_MODEL = os.environ.get(
+    "RAG_EMBED_MODEL", "gemini-embedding-2" if _GEMINI else "text-embedding-3-small")
+EMBED_DIM = _int("RAG_EMBED_DIM", 768 if _GEMINI else 1536)
+EMBED_API_KEY_ENV = os.environ.get(
+    "RAG_EMBED_API_KEY_ENV", "LLM_API_KEY" if _GEMINI else "OPENAI_API_KEY")
 EMBED_BASE_URL = os.environ.get("RAG_EMBED_BASE_URL", "")
-# Hard cap on the query embedding. A live call cannot wait: past this the turn
+# One Gemini batchEmbedContents request takes at most 100 texts (probed
+# 2026-09-25: 101 -> 400 INVALID_ARGUMENT). Larger documents are sent in
+# consecutive batches by the provider.
+EMBED_BATCH_SIZE = _int("RAG_EMBED_BATCH_SIZE", 100)
+# Hard cap on the QUERY embedding. A live call cannot wait: past this the turn
 # proceeds on the lexical arm alone rather than holding the caller in silence.
 EMBED_TIMEOUT_S = _float("RAG_EMBED_TIMEOUT_S", 2.0)
+# Ingestion is not a live turn. A 100-chunk batch takes seconds, it happens
+# once per document, and the old code applied the 2 s query deadline to it —
+# so a long brochure could time out at upload and stay keyword-only for good.
+EMBED_INGEST_TIMEOUT_S = _float("RAG_EMBED_INGEST_TIMEOUT_S", 60.0)
 EMBED_MAX_RETRIES = _int("RAG_EMBED_MAX_RETRIES", 1)
 
 # --- chunking --------------------------------------------------------------
@@ -177,7 +200,23 @@ ABSTAIN_ON_ZERO_OVERLAP = _flag("RAG_ABSTENTION_ZERO_OVERLAP", True)
 # different city, AND a Nintendo console catalogue — the third arrived purely
 # because K had a slot free. That is the "agent quotes console prices on a
 # real-estate call" failure, and it is the one worth spending precision on.
-RELATIVE_FLOOR = _float("RAG_RELATIVE_FLOOR", 0.6)
+#
+# 0.85 for gemini-embedding-2 (RUNBOOK §57). Its cosine scores sit in a much
+# narrower band than text-embedding-3-small's — the absolute floor never fires
+# on the golden set at any value up to 0.55 — so the 0.6 measured for OpenAI
+# pruned almost nothing and contamination came back at 0.21. Re-swept on the
+# same 37 questions with the Gemini vectors (offline, cached):
+#
+#     floor  Recall@1  Recall@3  MRR    NDCG@5  Precision@3  contamination
+#      0.60    0.79      1.00    0.905   0.913     0.43          0.21
+#      0.80    0.79      1.00    0.905   0.913     0.49          0.16
+#      0.85    0.79      1.00    0.905   0.913     0.52          0.13
+#      0.90    0.79      0.98    0.905   0.895     0.55          0.10
+#
+# 0.85 is the last point where nothing else moves; 0.90 starts paying recall.
+# Over-abstention stayed 0.00 at every point. The OpenAI value is kept for the
+# rollback path so `RAG_EMBED_PROVIDER=openai` reproduces §28 byte-for-byte.
+RELATIVE_FLOOR = _float("RAG_RELATIVE_FLOOR", 0.85 if _GEMINI else 0.6)
 
 # --- context assembly ------------------------------------------------------
 # Cap on the evidence block. Context is ~98% of the LLM bill on this platform

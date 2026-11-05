@@ -3,7 +3,7 @@ import {
   MessagesSquare, BrainCircuit, Microscope, PhoneOutgoing,
   Boxes, CalendarClock, FileText, LayoutDashboard,
   MessageCircle, PhoneForwarded, Settings as SettingsIcon, BookUser,
-  CreditCard,
+  CreditCard, Braces, MessageSquareShare,
 } from 'lucide-react'
 
 // Every user sees the same navigation — roles are flattened; there is no
@@ -11,7 +11,9 @@ import {
 //
 // Group order follows the tenant journey: set up (Build → Numbers →
 // Campaigns), then operate (Monitoring), then learn (Intelligence).
-export type NavItem = { to: string; label: string; icon: any; badge?: boolean }
+/** `badge` names the counter an item shows: 'live' = calls in progress (the
+ *  urgent pulsing pill), 'wa' = WhatsApp messages waiting for approval. */
+export type NavItem = { to: string; label: string; icon: any; badge?: 'live' | 'wa' }
 export type NavGroup = { title: string; items: NavItem[] }
 
 export const NAV: NavGroup[] = [
@@ -41,7 +43,7 @@ export const NAV: NavGroup[] = [
   {
     title: 'Monitoring',
     items: [
-      { to: '/live', label: 'Live Calls', icon: Radio, badge: true },
+      { to: '/live', label: 'Live Calls', icon: Radio, badge: 'live' },
       { to: '/activity', label: 'Call Activity', icon: ListChecks },
       { to: '/recordings', label: 'Recordings', icon: Mic2 },
       { to: '/transcripts', label: 'Call Transcripts', icon: MessagesSquare },
@@ -60,8 +62,21 @@ export const NAV: NavGroup[] = [
     ],
   },
   {
+    // Channels that act on what a call produced. WhatsApp first: a caller who
+    // agreed on the call gets the brochure / form the agent promised.
+    title: 'Integrations',
+    items: [
+      { to: '/integrations/whatsapp', label: 'WhatsApp', icon: MessageSquareShare, badge: 'wa' },
+    ],
+  },
+  {
+    // The integration surface is its own destination, not a tab inside
+    // Settings. It is where a customer's engineer lives while they wire up a
+    // CRM, and burying the reference two clicks deep inside an account page
+    // made it read as an afterthought.
     title: 'Account',
     items: [
+      { to: '/developers', label: 'Developers', icon: Braces },
       { to: '/billing', label: 'Billing', icon: CreditCard },
       { to: '/settings', label: 'Settings', icon: SettingsIcon },
     ],

@@ -36,6 +36,17 @@ What is deliberately NOT copied
 Everything else (agent.yaml, and the uploaded knowledge-base documents with
 their embeddings) travels, because otherwise the imported agent references
 knowledge it does not have and reads as broken.
+
+Opening a link you have already imported
+----------------------------------------
+Sharing is how one person builds an agent FOR another account, and they keep
+improving it and re-send the same link. So a second open is a CHOICE, not a
+refusal: REPLACE a copy you hold with the shared version as it is now, or
+import it again as a NEW agent. Replace is still a one-off copy — it creates
+no link between the two agents, the rule above is untouched — and it keeps
+everything that is the recipient's rather than the sharer's: the slug, the
+agent_id, routing.yaml, bookings.json, is_active, the revision history (the
+overwritten version is one rollback away) and their own uploaded documents.
 """
 from __future__ import annotations
 
@@ -127,13 +138,18 @@ def _assert_shares_ready() -> None:
         from shared.db.database import get_db
         with get_db() as db:
             db.execute("SELECT 1 FROM agent_shares LIMIT 1").fetchone()
+            # copy_no arrives with 0029. Probed separately so the message names
+            # the migration that is actually missing.
+            db.execute("SELECT copy_no FROM agent_share_imports LIMIT 1").fetchone()
         _TABLES_READY = True
     except Exception as exc:
-        if re.search(r"does not exist|no such table|undefined", str(exc), re.I):
+        if re.search(r"does not exist|no such (table|column)|undefined",
+                     str(exc), re.I):
+            missing = "0029" if "copy_no" in str(exc) else "0017"
             raise HTTPException(
                 status_code=503,
                 detail="Agent sharing is not enabled on this server yet "
-                       "(migration 0017 has not been applied).")
+                       f"(migration {missing} has not been applied).")
         raise
 
 
@@ -155,6 +171,26 @@ def _assert_slug_shape(slug: str) -> str:
 
 def _family_of(slug: str) -> str:
     return builder.agent_family(_assert_slug_shape(slug))
+
+
+def _variant_key(slug: str, family: str) -> str:
+    """Which member of `family` a slug is: 'inbound', 'outbound', or '' for the
+    bare pre-twin slug.
+
+    Source and copy are matched up by this key, never by position in a list: a
+    recipient may have archived one half, and a standalone agent may have
+    gained a twin since the link was made. (The import used to derive the
+    direction from the suffix alone, so a bare slug travelling alongside a twin
+    would have been written as `<family>-None`.)
+    """
+    for d in builder.DIRECTIONS:
+        if slug == f"{family}-{d}":
+            return d
+    return ""
+
+
+def _variant_slug(family: str, key: str) -> str:
+    return f"{family}-{key}" if key else family
 
 
 def _family_slugs_on_disk(family: str) -> list[str]:
@@ -319,6 +355,10 @@ def _copy_documents(src_slug: str, dst_slug: str) -> int:
     dst = _AGENTS_DIR / dst_slug / "documents"
     try:
         shutil.copytree(src, dst, dirs_exist_ok=True)
+        # ALWAYS rewritten, never inherited: when the source is itself an
+        # imported copy, the tree copy just brought ITS manifest along.
+        _write_shared_manifest(
+            dst_slug, {d["doc_id"] for d in _read_doc_index(dst_slug)})
         index = dst / "index.json"
         if index.exists():
             return len(json.loads(index.read_text(encoding="utf-8")) or [])
@@ -328,6 +368,136 @@ def _copy_documents(src_slug: str, dst_slug: str) -> int:
                        src_slug, dst_slug, exc)
         shutil.rmtree(dst, ignore_errors=True)
         return 0
+
+
+def _read_doc_index(slug: str) -> list[dict]:
+    index = _AGENTS_DIR / slug / "documents" / "index.json"
+    if not index.exists():
+        return []
+    try:
+        data = json.loads(index.read_text(encoding="utf-8")) or []
+    except Exception:
+        return []
+    return [d for d in data if isinstance(d, dict) and d.get("doc_id")]
+
+
+# Which documents in a copy came FROM the share, as opposed to being uploaded
+# by the recipient afterwards. A dotfile next to index.json: everything in the
+# document pipeline reads index.json or walks sub-DIRECTORIES, so it is inert.
+_SHARED_MANIFEST = ".shared.json"
+
+
+def _shared_doc_ids(slug: str) -> set[str] | None:
+    """None = no record (a copy imported before replace existed)."""
+    path = _AGENTS_DIR / slug / "documents" / _SHARED_MANIFEST
+    try:
+        return {str(x) for x in json.loads(path.read_text(encoding="utf-8"))}
+    except Exception:
+        return None
+
+
+def _write_shared_manifest(slug: str, doc_ids: set[str]) -> None:
+    path = _AGENTS_DIR / slug / "documents" / _SHARED_MANIFEST
+    path.write_text(json.dumps(sorted(doc_ids)), encoding="utf-8")
+
+
+def _doc_uploaded_at(entry: dict):
+    """documents/store stamps `uploaded_at` as '2026-06-26 06:37 UTC'. None when
+    it is absent or in any other shape — and None must mean KEEP, never drop."""
+    try:
+        return dt.datetime.strptime(
+            str(entry.get("uploaded_at") or ""), "%Y-%m-%d %H:%M UTC"
+        ).replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def _sync_documents(src_slug: str, dst_slug: str, imported_at) -> dict:
+    """Bring a copy's knowledge base up to the shared version WITHOUT eating
+    the recipient's own uploads.
+
+    Three kinds of document can be sitting in the copy, and they need three
+    different answers:
+
+      in the source            → take the source's bytes (new or changed)
+      came from the share, no
+        longer in the source   → the sharer removed it — remove it. Leaving it
+                                 is the dangerous choice: a retired price list
+                                 keeps being quoted on calls and nothing in the
+                                 UI says why.
+      uploaded by the recipient → keep it. "Replace with the shared version" is
+                                 a statement about the shared agent; it is not
+                                 consent to delete their files.
+
+    The manifest (_SHARED_MANIFEST) tells the last two apart. A copy imported
+    before it existed has none, so for that FIRST replace only, `uploaded_at`
+    stands in: a tree copy preserves the sharer's stamp, which necessarily
+    predates the import, and an upload cannot land in a copy before the copy
+    exists. That stamp is NOT good enough after a replace — a document the
+    sharer added and later withdrew would carry a post-import stamp and read as
+    the recipient's — which is why the manifest is written here and is what
+    every later replace reads. An unreadable stamp counts as the recipient's.
+
+    Best-effort like _copy_documents: a failure is logged and leaves the copy's
+    documents exactly as they were, because a half-merged index is worse than a
+    stale one.
+    """
+    out = {"updated": 0, "removed": 0, "kept": 0}
+    src_dir = _AGENTS_DIR / src_slug / "documents"
+    dst_dir = _AGENTS_DIR / dst_slug / "documents"
+    src_index = _read_doc_index(src_slug)
+    dst_index = _read_doc_index(dst_slug)
+    if not src_index and not dst_index:
+        return out
+
+    cutoff = _as_dt(imported_at)
+    shared_ids = _shared_doc_ids(dst_slug)
+    src_ids = {d["doc_id"] for d in src_index}
+    keep, drop = [], []
+    for entry in dst_index:
+        if entry["doc_id"] in src_ids:
+            continue                      # superseded by the source's copy
+        if shared_ids is not None:
+            from_share = entry["doc_id"] in shared_ids
+        else:
+            stamp = _doc_uploaded_at(entry)
+            from_share = bool(cutoff and stamp and
+                              stamp < cutoff.replace(second=0, microsecond=0))
+        (drop if from_share else keep).append(entry)
+
+    try:
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for entry in src_index:
+            doc_src = src_dir / entry["doc_id"]
+            if not doc_src.is_dir():
+                continue
+            doc_dst = dst_dir / entry["doc_id"]
+            staged = dst_dir / f".incoming-{entry['doc_id']}"
+            shutil.rmtree(staged, ignore_errors=True)
+            shutil.copytree(doc_src, staged)
+            shutil.rmtree(doc_dst, ignore_errors=True)
+            staged.rename(doc_dst)
+            out["updated"] += 1
+        merged = [e for e in src_index if (dst_dir / e["doc_id"]).is_dir()] + keep
+        (dst_dir / "index.json").write_text(
+            json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_shared_manifest(
+            dst_slug, {e["doc_id"] for e in merged if e["doc_id"] in src_ids})
+        # Only once the index no longer references them.
+        for entry in drop:
+            shutil.rmtree(dst_dir / entry["doc_id"], ignore_errors=True)
+        out["removed"], out["kept"] = len(drop), len(keep)
+    except Exception as exc:
+        logger.warning("[share] document sync %s -> %s failed: %r",
+                       src_slug, dst_slug, exc)
+        return {"updated": 0, "removed": 0, "kept": len(dst_index), "failed": True}
+
+    try:  # frees the in-process index now rather than at TTL; never required
+        from backend.app.documents.store import _invalidate
+        _invalidate(dst_slug)
+    except Exception:
+        pass
+    return out
 
 
 def _doc_count(slug: str) -> int:
@@ -599,21 +769,63 @@ def _sharer_identity(email: str) -> dict:
     return {"email": email, "name": name}
 
 
-def _previous_import(share_id: int, importer: str) -> dict | None:
+# A reservation row whose slugs are still "[]" is an import that is running
+# right now — or one whose process died mid-copy. Young means running.
+_RESERVATION_GRACE_S = 300
+
+
+def _copies(share_id: int, importer: str) -> list[dict]:
+    """Every import of this link into this account, oldest first.
+
+    `live` is what decides everything downstream: a copy with no live slug is
+    one the recipient archived, and it neither blocks a fresh import nor can
+    be replaced. `pending` marks a reservation still being filled in.
+    """
     from shared.db.database import get_db
     with get_db() as db:
-        row = db.execute(
-            "SELECT * FROM agent_share_imports WHERE share_id=? AND importer=?",
-            (share_id, importer)).fetchone()
-    if not row:
+        rows = db.execute(
+            "SELECT * FROM agent_share_imports WHERE share_id=? AND importer=? "
+            "ORDER BY copy_no", (share_id, importer)).fetchall()
+    out = []
+    for row in rows:
+        try:
+            slugs = json.loads(row["new_slugs"] or "[]")
+        except Exception:
+            slugs = []
+        created = _as_dt(row["created_at"])
+        pending = (not slugs and created is not None and
+                   (_now() - created).total_seconds() < _RESERVATION_GRACE_S)
+        out.append({
+            "id": row["id"], "copy_no": int(row["copy_no"] or 1),
+            "family": row["new_family"], "slugs": slugs,
+            "live": [s for s in slugs if _slug_is_live_for(s, importer)],
+            "created_at": row["created_at"], "synced_at": row["synced_at"],
+            "pending": pending,
+        })
+    return out
+
+
+def _copy_payload(copy: dict) -> dict:
+    return {"family": copy["family"], "slugs": copy["live"],
+            "primary": copy["live"][0], "imported_at": copy["created_at"],
+            "replaced_at": copy["synced_at"]}
+
+
+def _source_updated_at(slugs: list[str]) -> str | None:
+    """When the sharer last changed the agent — the newest agent.yaml mtime.
+
+    mtime rather than the YAML's own `updated_at`, which only the store stamps;
+    a hand edit or a Copilot rebuild that bypasses it would read as unchanged.
+    """
+    newest = 0.0
+    for slug in slugs:
+        try:
+            newest = max(newest, (_AGENTS_DIR / slug / "agent.yaml").stat().st_mtime)
+        except OSError:
+            pass
+    if not newest:
         return None
-    try:
-        slugs = json.loads(row["new_slugs"] or "[]")
-    except Exception:
-        slugs = []
-    live = [s for s in slugs if _slug_is_live_for(s, importer)]
-    return {"id": row["id"], "created_at": row["created_at"],
-            "new_family": row["new_family"], "slugs": slugs, "live": live}
+    return dt.datetime.fromtimestamp(newest, dt.timezone.utc).isoformat()
 
 
 def _imports_today(importer: str) -> int:
@@ -666,9 +878,13 @@ async def preview_share(token: str, request: Request) -> dict:
     """What the import popup renders. Never mutates anything.
 
     Deliberately reports refusals in the BODY (can_import=false + reason)
-    rather than as an HTTP error for the two cases the user can act on — at
-    plan cap, and already imported — because the popup has to render the
+    rather than as an HTTP error for the cases the user can act on — at plan
+    cap, over the daily import ceiling — because the popup has to render the
     agent's details alongside the explanation. Dead links stay HTTP errors.
+
+    `copies` lists the live agents in THIS account that came from this link.
+    When it is non-empty the popup offers a choice instead of one button:
+    replace one of them, or (if can_import) take another copy.
     """
     _assert_shares_ready()
     importer = _owner(request)
@@ -693,42 +909,118 @@ async def preview_share(token: str, request: Request) -> dict:
         logger.warning("[share] entitlement preview failed for %s: %r",
                        importer, exc)
 
-    previous = _previous_import(share["id"], importer)
-    if previous and previous["live"] and can_import:
-        can_import = False
-        code = "already_imported"
-        reason = (f"You already imported this agent as "
-                  f"“{previous['live'][0]}”. Open it from your agents list.")
-
     if can_import and _imports_today(importer) >= MAX_IMPORTS_PER_DAY:
         can_import, code = False, "rate_limited"
         reason = (f"You have imported {MAX_IMPORTS_PER_DAY} agents in the last "
                   f"24 hours. Try again later.")
+
+    # `can_import` answers ONE question: may this account take a NEW copy?
+    # Already holding a copy no longer makes that false — it makes REPLACE
+    # available as well, and replace needs neither a plan slot nor import
+    # budget, so an account at its cap (every free account with one agent) can
+    # still bring its copy up to date.
+    copies = [c for c in _copies(share["id"], importer) if c["live"]]
 
     return {
         "token": token,
         "agent": summary,
         "shared_by": _sharer_identity(share["owner"]),
         "expires_at": share["expires_at"],
+        "source_updated_at": _source_updated_at(slugs),
         "can_import": can_import,
         "reason": reason,
         "code": code,
         "billing": billing,
-        "already_imported": ({"slugs": previous["live"],
-                              "at": previous["created_at"]}
-                             if previous and previous["live"] else None),
+        "copies": [_copy_payload(c) for c in copies],
+        # Kept for a dashboard tab that was open across the deploy.
+        "already_imported": ({"slugs": copies[-1]["live"],
+                              "at": copies[-1]["created_at"]}
+                             if copies else None),
     }
+
+
+async def _import_options(request: Request) -> tuple[str, str]:
+    """(mode, target) from the optional JSON body. No body at all is the
+    original contract and stays valid: it means "import it", full stop."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        body = {}
+    mode = str(body.get("mode") or "").strip().lower()
+    if mode not in ("", "new", "replace"):
+        raise HTTPException(status_code=400,
+                            detail="'mode' must be 'new' or 'replace'")
+    return mode, str(body.get("target") or "").strip()
 
 
 @router.post("/api/share/{token}/import")
 async def import_share(token: str, request: Request) -> dict:
+    """Bring the shared agent into MY account.
+
+    Body (optional): {"mode": "new" | "replace", "target": "<my family>"}
+
+      no mode   the first import. Refused with 409 `already_imported` once the
+                account holds a live copy — the caller then has to SAY which of
+                the two things below it wants; guessing either one is wrong.
+      new       another independent copy under a fresh name.
+      replace   overwrite a copy I already hold with the shared version,
+                keeping its name, phone-number bindings, bookings and calls.
+
+    Either way the result is mine alone: nothing here links the two agents, and
+    a replace is a one-off copy, not a subscription to the sharer's edits.
+    """
+    _assert_shares_ready()
+    importer = _owner(request)
+    share, source_slugs = _resolve_for_import(token, importer)
+    mode, target = await _import_options(request)
+
+    copies = _copies(share["id"], importer)
+    live = [c for c in copies if c["live"]]
+
+    if mode == "replace":
+        if not live:
+            raise HTTPException(
+                status_code=409,
+                detail="You no longer have a copy of this agent to replace. "
+                       "Import it as a new agent instead.")
+        if target:
+            match = [c for c in live if c["family"] == target]
+        else:
+            # Unambiguous only when there is exactly one. Picking "the newest"
+            # for the caller would overwrite an agent they never pointed at.
+            match = live if len(live) == 1 else []
+        if not match:
+            # `reason` is the key the SPA's error unwrapping reads; without
+            # it a structured detail surfaces as a bare "400 Bad Request".
+            raise HTTPException(status_code=400, detail={
+                "error": "target_required",
+                "copies": [_copy_payload(c) for c in live],
+                "reason": "Say which of your copies to replace."})
+        return _replace_copy(share, source_slugs, match[0], importer, request)
+
+    if live and mode != "new":
+        sentence = (f"You already imported this agent as "
+                    f"“{live[-1]['live'][0]}”. Replace that copy, "
+                    f"or import it again as a new agent.")
+        raise HTTPException(status_code=409, detail={
+            "error": "already_imported",
+            "slugs": live[-1]["live"],
+            "copies": [_copy_payload(c) for c in live],
+            "reason": sentence, "message": sentence})
+    return _import_new(share, source_slugs, copies, importer, request)
+
+
+def _import_new(share: dict, source_slugs: list[str], copies: list[dict],
+                importer: str, request: Request) -> dict:
     """Copy the shared agent into MY account as a brand-new, unrelated agent.
 
     Ordering matters and is not arbitrary:
 
       1. validate the link, then the plan cap, BEFORE any filesystem write
-      2. RESERVE the (share_id, importer) row — the unique index on that pair
-         is what makes a double-clicked button, a reloaded tab and two browser
+      2. RESERVE the next copy_no — the unique index on (share_id, importer,
+         copy_no) is what makes a double-clicked button and two browser
          windows converge on one copy instead of three
       3. create the folders + ownership rows, rolling every one of them back
          together if any single step fails (half an imported twin pair is
@@ -736,17 +1028,15 @@ async def import_share(token: str, request: Request) -> dict:
          wrong-direction prompts)
       4. only then record what it became and bump the counter
     """
-    _assert_shares_ready()
-    importer = _owner(request)
-    share, source_slugs = _resolve_for_import(token, importer)
-
-    previous = _previous_import(share["id"], importer)
-    if previous and previous["live"]:
-        raise HTTPException(status_code=409, detail={
-            "error": "already_imported",
-            "slugs": previous["live"],
-            "message": f"You already imported this agent as "
-                       f"“{previous['live'][0]}”."})
+    # Step 2 only catches two requests that reach the INSERT together. A second
+    # click that lands after the first one's reservation has committed would
+    # compute the NEXT number and sail through — so a reservation that is still
+    # being filled in refuses everyone else outright.
+    if any(c["pending"] for c in copies):
+        raise HTTPException(
+            status_code=409,
+            detail="This agent is already being imported into your "
+                   "account. Refresh your agents list.")
     if _imports_today(importer) >= MAX_IMPORTS_PER_DAY:
         raise HTTPException(
             status_code=429,
@@ -763,20 +1053,19 @@ async def import_share(token: str, request: Request) -> dict:
     builder._assert_agent_quota(importer)
 
     new_family = _mint_family(share["family"])
-    standalone = len(source_slugs) == 1 and source_slugs[0] == share["family"]
+    # Never reused: rows for archived copies stay as the trail, and they keep
+    # counting toward MAX_IMPORTS_PER_DAY.
+    copy_no = max([c["copy_no"] for c in copies], default=0) + 1
 
     from shared.db.database import get_db
     with get_db() as db:
-        if previous:  # stale row: the earlier copy is archived or gone
-            db.execute("DELETE FROM agent_share_imports WHERE id=?",
-                       (previous["id"],))
         try:
             db.execute(
                 "INSERT INTO agent_share_imports (share_id, importer, "
-                "source_owner, source_family, new_family, new_slugs) "
-                "VALUES (?,?,?,?,?,?)",
+                "source_owner, source_family, new_family, new_slugs, copy_no) "
+                "VALUES (?,?,?,?,?,?,?)",
                 (share["id"], importer, share["owner"], share["family"],
-                 new_family, "[]"))
+                 new_family, "[]", copy_no))
         except Exception as exc:
             if re.search(r"unique|duplicate", str(exc), re.I):
                 raise HTTPException(
@@ -789,11 +1078,8 @@ async def import_share(token: str, request: Request) -> dict:
     taken_ids = _existing_agent_ids()
     try:
         for src in source_slugs:
-            direction = None
-            for d in builder.DIRECTIONS:
-                if src.endswith(f"-{d}"):
-                    direction = d
-            new_slug = new_family if standalone else f"{new_family}-{direction}"
+            new_slug = _variant_slug(new_family,
+                                     _variant_key(src, share["family"]))
             spec = _prepare_spec(_AGENTS_DIR / src / "agent.yaml", new_slug,
                                  taken_ids)
             builder.write_agent_dir(new_slug, spec, importer)
@@ -816,17 +1102,18 @@ async def import_share(token: str, request: Request) -> dict:
         try:
             with get_db() as db:
                 db.execute("DELETE FROM agent_share_imports WHERE share_id=? "
-                           "AND importer=?", (share["id"], importer))
+                           "AND importer=? AND copy_no=?",
+                           (share["id"], importer, copy_no))
         except Exception as exc:
             logger.error("[share] could not release import reservation "
-                         "(%s -> %s): %r", token, importer, exc)
+                         "(%s -> %s): %r", share["token"], importer, exc)
         raise
 
     with get_db() as db:
         db.execute(
             "UPDATE agent_share_imports SET new_family=?, new_slugs=? "
-            "WHERE share_id=? AND importer=?",
-            (new_family, json.dumps(created), share["id"], importer))
+            "WHERE share_id=? AND importer=? AND copy_no=?",
+            (new_family, json.dumps(created), share["id"], importer, copy_no))
         db.execute("UPDATE agent_shares SET import_count=import_count+1 "
                    "WHERE id=?", (share["id"],))
 
@@ -834,7 +1121,8 @@ async def import_share(token: str, request: Request) -> dict:
         from shared.audit import record
         record(importer, "agent_share_imported", target=new_family,
                meta={"source_owner": share["owner"],
-                     "source_family": share["family"], "slugs": created},
+                     "source_family": share["family"], "slugs": created,
+                     "copy_no": copy_no},
                ip=_client_ip(request))
     except Exception:
         pass
@@ -845,3 +1133,210 @@ async def import_share(token: str, request: Request) -> dict:
                 ", ".join(created))
     return {"status": "imported", "family": new_family, "slugs": created,
             "primary": primary}
+
+
+# ── replace ─────────────────────────────────────────────────────────────────
+
+def _restorable(slug: str, owner: str) -> bool:
+    """May `owner` have `slug` (re)created as part of a family they hold?
+
+    Yes for a half they archived (their row, no live folder) and for a name
+    nothing has ever held. No — and FAIL CLOSED on a DB error — for anything
+    else: a row belonging to someone else, or an archive folder nobody owns.
+    """
+    if (_AGENTS_DIR / slug).exists():
+        return False
+    from shared.db.database import get_db
+    with get_db() as db:
+        row = db.execute("SELECT owner FROM agents WHERE slug=?",
+                         (slug,)).fetchone()
+    if row is None:
+        return not (_ARCHIVE_DIR / slug).exists()
+    return row["owner"] == owner
+
+
+def _replace_spec(source_yaml: Path, keep_agent_id: str) -> dict:
+    """The shared definition, wearing the COPY's identity.
+
+    agent_id stays the copy's own. It is what resolves the document folder
+    (documents/store.get_folder_by_agent_id returns the FIRST match platform
+    wide), so taking the source's id would point this tenant's RAG lookups at
+    the sharer's knowledge base — the exact hazard the import remints to avoid.
+    revision/updated_* are left to the store, which stamps them.
+    """
+    spec = yaml.safe_load(source_yaml.read_text(encoding="utf-8")) or {}
+    if not isinstance(spec, dict):
+        raise HTTPException(status_code=422,
+                            detail="The shared agent's definition is not readable.")
+    for field in _HISTORY_FIELDS:
+        spec.pop(field, None)
+    spec["agent_id"] = keep_agent_id
+    return spec
+
+
+def _replace_copy(share: dict, source_slugs: list[str], copy: dict,
+                  importer: str, request: Request) -> dict:
+    """Overwrite one of MY copies with the shared agent as it is right now.
+
+    What changes: the definition (script, stages, voice, knowledge) of every
+    direction the shared agent has. What does NOT: the slug, the agent_id,
+    routing.yaml (MY phone-number binding), bookings.json (MY customers),
+    is_active, call history, campaigns — everything that hangs off the slug
+    and is mine rather than the sharer's.
+
+    Per direction:
+      live in my copy          → versioned overwrite through the store, so the
+                                 version I had is one click away in the
+                                 agent's revision history
+      archived / never existed → created from the shared version. Replacing
+                                 "my copy" means the whole agent; silently
+                                 leaving a direction behind would hand back
+                                 half of what was shared, and the only other
+                                 way to get it is a twin ADAPTED from the wrong
+                                 script.
+      in my copy, not shared   → left exactly as it is
+
+    All validation happens before the first write, and every write is undone
+    if a later one fails: a pair running two different versions of a script is
+    the state this exists to get people out of.
+    """
+    from backend.app.agent_definition import store as agent_store
+
+    family = copy["family"]
+    _summarize(source_slugs)                 # every source definition loads
+    taken_ids = _existing_agent_ids()
+
+    plan: list[dict] = []
+    for src in source_slugs:
+        key = _variant_key(src, share["family"])
+        dst = _variant_slug(family, key)
+        src_yaml = _AGENTS_DIR / src / "agent.yaml"
+        if dst in copy["live"]:
+            current, _ = agent_store.read_agent(dst, agents_dir=_AGENTS_DIR)
+            spec = _replace_spec(src_yaml, str(current.get("agent_id") or "")
+                                 or _unique_agent_id(f"{dst}-v1", taken_ids))
+            action = "replaced"
+        elif _restorable(dst, importer):
+            spec = _prepare_spec(src_yaml, dst, taken_ids)
+            action = "added"
+        else:
+            plan.append({"src": src, "dst": dst, "action": "skipped"})
+            continue
+        try:
+            AgentDefinition.from_dict(dict(spec))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"The shared agent has a configuration error and "
+                       f"cannot be imported: {exc}")
+        plan.append({"src": src, "dst": dst, "action": action, "spec": spec})
+
+    if not any(p["action"] == "replaced" for p in plan):
+        # Nothing of the shared agent lines up with anything live here (the
+        # sharer archived the only direction this copy still has). Adding
+        # directions to it would be an import wearing a replace's name.
+        raise HTTPException(
+            status_code=409,
+            detail="The shared agent no longer has the version you hold, so "
+                   "there is nothing to replace. Import it as a new agent "
+                   "instead.")
+    if any(p["action"] == "added" for p in plan):
+        # Completing a family I already hold — passes at cap by design.
+        builder._assert_agent_quota(importer, family)
+
+    actor = f"{importer}:share"
+    reason = f"replaced with the version shared by {share['owner']}"
+    undo: list = []
+    docs = {"updated": 0, "removed": 0, "kept": 0}
+    try:
+        for step in plan:
+            dst = step["dst"]
+            if step["action"] == "replaced":
+                path = _AGENTS_DIR / dst / "agent.yaml"
+                before = path.read_text(encoding="utf-8")
+                agent_store.write_agent(
+                    dst, step["spec"], actor=actor, reason=reason,
+                    owner=importer, agents_dir=_AGENTS_DIR)
+
+                def _restore(path=path, before=before, dst=dst):
+                    path.write_text(before, encoding="utf-8")
+                    agent_registry.invalidate(dst)
+                undo.append(_restore)
+                moved = _sync_documents(step["src"], dst, copy["created_at"])
+                for k in docs:
+                    docs[k] += int(moved.get(k) or 0)
+            elif step["action"] == "added":
+                builder.write_agent_dir(dst, step["spec"], importer)
+
+                def _remove(dst=dst):
+                    shutil.rmtree(_AGENTS_DIR / dst, ignore_errors=True)
+                    agent_registry.invalidate(dst)
+                    _rearchive(dst, importer)
+                undo.append(_remove)
+                if builder._slug_owner(dst) != importer or \
+                        not _slug_is_live_for(dst, importer):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="That agent name was taken while importing. "
+                               "Try again.")
+                _deactivate(dst)
+                docs["updated"] += _copy_documents(step["src"], dst)
+    except agent_store.OwnerMismatch:
+        _run_undo(undo)
+        raise HTTPException(status_code=404, detail="Agent not found")
+    except Exception:
+        _run_undo(undo)
+        raise
+
+    touched = [p["dst"] for p in plan if p["action"] in ("replaced", "added")]
+    slugs = list(dict.fromkeys(list(copy["slugs"]) + touched))
+    from shared.db.database import get_db
+    try:
+        with get_db() as db:
+            db.execute(
+                "UPDATE agent_share_imports SET new_slugs=?, "
+                "synced_at=CURRENT_TIMESTAMP, sync_count=sync_count+1 "
+                "WHERE id=?", (json.dumps(slugs), copy["id"]))
+    except Exception as exc:   # the agent IS replaced; this is bookkeeping
+        logger.error("[share] could not stamp replace on import %s: %r",
+                     copy["id"], exc)
+
+    outcome = {a: [p["dst"] for p in plan if p["action"] == a]
+               for a in ("replaced", "added", "skipped")}
+    try:
+        from shared.audit import record
+        record(importer, "agent_share_replaced", target=family,
+               meta={"source_owner": share["owner"],
+                     "source_family": share["family"], **outcome},
+               ip=_client_ip(request))
+    except Exception:
+        pass
+    logger.info("[share] %s replaced %s with %s from %s (replaced=%s added=%s "
+                "skipped=%s)", importer, family, share["family"],
+                share["owner"], outcome["replaced"], outcome["added"],
+                outcome["skipped"])
+    return {"status": "replaced", "family": family, "slugs": touched,
+            "primary": touched[0], "documents": docs, **outcome}
+
+
+def _rearchive(slug: str, owner: str) -> None:
+    """Undo for an 'added' direction. The row may have existed before (the
+    archived half) or been created by this request; re-stamping archived_at
+    returns both to a state every reader already treats as gone, without
+    deleting a row that calls or revisions may reference."""
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            db.execute("UPDATE agents SET archived_at=CURRENT_TIMESTAMP "
+                       "WHERE slug=? AND owner=? AND archived_at IS NULL",
+                       (slug, owner))
+    except Exception as exc:
+        logger.error("[share] could not re-archive %s: %r", slug, exc)
+
+
+def _run_undo(undo: list) -> None:
+    for step in reversed(undo):
+        try:
+            step()
+        except Exception as exc:
+            logger.error("[share] replace rollback step failed: %r", exc)

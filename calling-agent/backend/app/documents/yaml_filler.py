@@ -118,8 +118,80 @@ def compute_missing(fields: dict) -> list[dict]:
     return missing
 
 
-_CHUNK_CHARS = 12000
-_MAX_CHUNKS = 4
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+# 60k chars (~15k tokens) per pass, up to six passes. The old 12k × 4 was
+# sized for gpt-4o-mini's patience and silently dropped everything past 48k
+# chars — a 30-page brochure lost its price list and its closing script. The
+# platform's Gemini models read a million tokens; the cap now exists only to
+# bound the spend on a pathological upload, and the result says when it bit
+# (`truncated`).
+_CHUNK_CHARS = _env_int("DOC_EXTRACT_CHUNK_CHARS", 60_000)
+_MAX_CHUNKS = _env_int("DOC_EXTRACT_MAX_CHUNKS", 6)
+# Gemini's thinking tokens count against max_tokens on the OpenAI-compatible
+# endpoint — a tight budget returns truncated JSON, not a shorter answer (the
+# intelligence extractor learned this first). Generous budget, low effort.
+_MAX_OUTPUT_TOKENS = _env_int("DOC_EXTRACT_MAX_OUTPUT_TOKENS", 16_000)
+
+_DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+
+
+def resolve_llm() -> dict:
+    """Which endpoint, key and model the extractor uses — decided in one place
+    so the API can report it and a test can pin it.
+
+    Since 2026-09-25 (RUNBOOK §57) the extractor runs on the platform's own
+    LLM endpoint (`LLM_BASE_URL` / `LLM_API_KEY`: Gemini through its
+    OpenAI-compatible route) instead of a hardcoded `openai.OpenAI(OPENAI_API_KEY)`
+    — that key ran out of credit on 2026-09-11 and every client document
+    uploaded since came back "429 insufficient_quota". The model defaults to
+    the Copilot's (`COPILOT_LLM_MODEL`): reading a client's brief is part of
+    building their agent, so it shares the agent-building quota bucket and
+    never the live-call one. `DOC_EXTRACT_MODEL` / `DOC_EXTRACT_BASE_URL` /
+    `DOC_EXTRACT_API_KEY` override each part; `OPENAI_API_KEY` is the last
+    resort, exactly as before.
+    """
+    def _env(name: str) -> str:
+        return (os.environ.get(name) or "").strip()
+
+    base_url = _env("DOC_EXTRACT_BASE_URL") or _env("LLM_BASE_URL")
+    api_key = _env("DOC_EXTRACT_API_KEY") or (_env("LLM_API_KEY") if base_url else "")
+    model = _env("DOC_EXTRACT_MODEL")
+    if base_url and api_key:
+        if not model:
+            model = _env("COPILOT_LLM_MODEL") or _env("LLM_MODEL") or _DEFAULT_GEMINI_MODEL
+        provider = "gemini" if "googleapis.com" in base_url else "compat"
+    else:
+        base_url, api_key = "", _env("OPENAI_API_KEY")
+        model = model or "gpt-4o-mini"
+        provider = "openai"
+    effort = _env("DOC_EXTRACT_REASONING_EFFORT") or "low"
+    return {"base_url": base_url, "api_key": api_key, "model": model,
+            "provider": provider, "reasoning_effort": effort if provider != "openai" else ""}
+
+
+def _friendly_error(exc: Exception, model: str) -> tuple[str, str]:
+    """(code, sentence for the user) for the failures a document upload meets."""
+    text = str(exc)
+    low = text.lower()
+    status = getattr(exc, "status_code", None)
+    if status == 429 or "insufficient_quota" in low or "no credits" in low \
+            or "credit balance" in low or "rate limit" in low or "resource_exhausted" in low:
+        return "llm_quota", (f"The extraction model ({model}) is out of quota or rate-limited "
+                             "right now — try again in a minute. If it keeps happening the "
+                             "API key needs credit.")
+    if status in (401, 403) or "authentication" in low or "api key" in low:
+        return "llm_auth", f"The extraction model ({model}) rejected the API key — check LLM_API_KEY."
+    if status == 404 or "not found" in low and "model" in low:
+        return "llm_model", f"The extraction model '{model}' is not available on this endpoint."
+    if "timeout" in low or "timed out" in low or "connection" in low:
+        return "llm_unreachable", "Couldn't reach the extraction model — try again."
+    return "llm_error", f"Extraction failed: {text[:300]}"
 
 
 def _merge_chunk_fields(base: dict, extra: dict) -> dict:
@@ -138,22 +210,60 @@ def _merge_chunk_fields(base: dict, extra: dict) -> dict:
     return base
 
 
-def _extract_one(client, model: str, text: str, prompt_template: str = _PROMPT) -> dict:
+def _parse_json_object(raw: str):
+    """The JSON the model returned, tolerating fences and a sentence around
+    the object — the cheapest possible repair before a paid retry."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        raw = "\n".join(lines[1:] if lines[-1].strip() == "```" else lines[1:-1]).strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(raw[start:end + 1])
+        raise
+
+
+def _chat(client, model: str, prompt: str, *, reasoning_effort: str = "",
+          json_mode: bool = True) -> str:
+    """One completion. JSON mode and the reasoning knob are dropped, once, if
+    the endpoint rejects them as parameters — a parameter rejection is a 400
+    that names the field, and it is about the endpoint, not the document."""
+    kwargs: dict = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": _MAX_OUTPUT_TOKENS,
+        "temperature": 0,
+    }
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    if reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
+    try:
+        resp = client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        if status in (400, 422) and (json_mode or reasoning_effort):
+            logger.warning("[docs/yaml_filler] endpoint rejected a parameter (%s); "
+                           "retrying plain", str(exc)[:120])
+            kwargs.pop("response_format", None)
+            kwargs.pop("reasoning_effort", None)
+            resp = client.chat.completions.create(**kwargs)
+        else:
+            raise
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _extract_one(client, model: str, text: str, prompt_template: str = _PROMPT,
+                 reasoning_effort: str = "") -> dict:
     """One extraction call with a single deterministic retry on bad JSON."""
     for attempt in range(2):
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt_template.format(document_text=text)}],
-            max_tokens=3500,
-            temperature=0,
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-        if raw.startswith("```"):
-            lines = raw.splitlines()
-            raw = "\n".join(lines[1:] if lines[-1].strip() == "```" else lines[1:-1])
-            raw = raw.strip()
+        raw = _chat(client, model, prompt_template.format(document_text=text),
+                    reasoning_effort=reasoning_effort)
         try:
-            fields = json.loads(raw)
+            fields = _parse_json_object(raw)
         except json.JSONDecodeError as exc:
             logger.warning("[docs/yaml_filler] JSON parse error (attempt %d): %s | raw=%r",
                            attempt + 1, exc, raw[:200])
@@ -175,25 +285,31 @@ def extract_fields_from_text(document_text: str) -> dict:
     Call LLM to extract YAML-fillable fields. Long texts are chunked
     (~12k chars, up to 4 chunks) and the per-chunk results merged, so a long
     brochure no longer loses its tail to truncation.
-    Returns {"fields": {...}, "missing": [...], "status": "ok"}
-    or {"error": "...", "status": "error"}.
+    Returns {"fields": {...}, "missing": [...], "status": "ok", "model": ...,
+    "chunks": n, "truncated": bool}
+    or {"error": "...", "code": "...", "status": "error"}.
     """
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        return {"status": "error", "error": "OPENAI_API_KEY not configured"}
-    model = os.environ.get("DOC_EXTRACT_MODEL", "gpt-4o-mini")
+    llm = resolve_llm()
+    model = llm["model"]
+    if not llm["api_key"]:
+        return {"status": "error", "code": "llm_unconfigured", "model": model,
+                "error": ("No extraction model is configured — set LLM_BASE_URL and "
+                          "LLM_API_KEY (or OPENAI_API_KEY).")}
 
     text = document_text.strip()
+    limit = _CHUNK_CHARS * _MAX_CHUNKS
     chunks = [text[i:i + _CHUNK_CHARS]
-              for i in range(0, min(len(text), _CHUNK_CHARS * _MAX_CHUNKS), _CHUNK_CHARS)]
-    if len(text) > _CHUNK_CHARS * _MAX_CHUNKS:
+              for i in range(0, min(len(text), limit), _CHUNK_CHARS)]
+    truncated = len(text) > limit
+    if truncated:
         logger.warning("[docs/yaml_filler] text truncated at %d chars (%d given)",
-                       _CHUNK_CHARS * _MAX_CHUNKS, len(text))
+                       limit, len(text))
 
     try:
         from concurrent.futures import ThreadPoolExecutor
         import openai
-        client = openai.OpenAI(api_key=api_key)
+        client = openai.OpenAI(api_key=llm["api_key"], base_url=llm["base_url"] or None,
+                               timeout=120.0, max_retries=2)
         fields: dict = {}
         groups = list(_GROUP_FIELDS)
         for chunk in chunks:
@@ -201,17 +317,23 @@ def extract_fields_from_text(document_text: str) -> dict:
             # made the model skip half the fields on unlabeled documents
             with ThreadPoolExecutor(max_workers=len(groups)) as pool:
                 results = list(pool.map(
-                    lambda g: _extract_one(client, model, chunk, _group_prompt(g)),
+                    lambda g: _extract_one(client, model, chunk, _group_prompt(g),
+                                           reasoning_effort=llm["reasoning_effort"]),
                     groups))
             for r in results:
                 fields = _merge_chunk_fields(fields, r)
-        return {"status": "ok", "fields": fields, "missing": compute_missing(fields)}
+        logger.info("[docs/yaml_filler] extracted %d field(s) from %d chars via %s "
+                    "(%d chunk(s)%s)", len(fields), len(text), model, len(chunks),
+                    ", truncated" if truncated else "")
+        return {"status": "ok", "fields": fields, "missing": compute_missing(fields),
+                "model": model, "chunks": len(chunks), "truncated": truncated}
     except json.JSONDecodeError:
-        return {"status": "error",
-                "error": "LLM returned invalid JSON — try again or upload a different document."}
+        return {"status": "error", "code": "llm_bad_json", "model": model,
+                "error": "The extraction model returned invalid JSON — try again or upload a different document."}
     except Exception as exc:
-        logger.error("[docs/yaml_filler] Extraction error: %s", exc)
-        return {"status": "error", "error": str(exc)}
+        logger.error("[docs/yaml_filler] Extraction error (%s): %s", model, exc)
+        code, message = _friendly_error(exc, model)
+        return {"status": "error", "code": code, "model": model, "error": message}
 
 
 def apply_fields(agent_folder: str, fields: dict) -> dict:

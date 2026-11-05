@@ -39,8 +39,54 @@ export type AgentDoc = {
   org_name?: string
   doc_type?: string
   description?: string
-  chunks?: number
+  chunk_count?: number
+  char_count?: number
+  size_bytes?: number
+  sha256?: string
   uploaded_at?: string
+}
+
+/** Per-document health of the vector index (GET /documents → `index`).
+ *  `ok` is searchable by meaning; everything else is keyword-only until a
+ *  re-index succeeds, and `detail` says why. */
+export type DocIndexRow = {
+  doc_id: string
+  filename?: string
+  embedded: boolean
+  state: 'ok' | 'stale' | 'not_embedded' | 'unlabelled' | 'unreadable'
+  detail?: string
+  model?: string
+  dim?: number
+  built_at?: string
+  chunks?: number
+  failed_at?: string
+}
+export type DocIndex = {
+  documents: DocIndexRow[]
+  runtime: { provider?: string | null; model?: string | null; dim?: number | null; available?: boolean; key_env?: string }
+  needs_reindex: string[]
+}
+export type DocsList = { documents: AgentDoc[]; index?: DocIndex }
+export type UploadDocResult = {
+  status: 'uploaded' | 'duplicate'
+  doc_id: string
+  meta?: AgentDoc
+  embedded: boolean
+  index_state?: DocIndexRow | null
+  index?: DocIndex
+}
+export type ReindexResult = { reindexed: string[]; rechunked: string[]; failed: string[]; index?: DocIndex }
+
+/* What a document picker offers — mirrors backend/app/documents/extractor.py
+ * SUPPORTED. The server is the authority (a 415 names the way out for the
+ * rest); this only keeps the picker and the sentence next to it honest. */
+export const DOC_ACCEPT =
+  '.pdf,.docx,.xlsx,.xlsm,.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.png,.jpg,.jpeg,.webp,.gif'
+export const DOC_TYPES_HUMAN = 'PDF, Word (.docx), Excel (.xlsx), TXT, Markdown, CSV or an image'
+export const DOC_MAX_MB = 20
+export const docSupported = (filename: string) => {
+  const m = /\.[^.]+$/.exec(filename.toLowerCase())
+  return !!m && DOC_ACCEPT.split(',').includes(m[0])
 }
 
 export type MissingField = { key: string; label: string; hint: string }
@@ -71,7 +117,7 @@ export const getRawYaml = (name: string) =>
   api<string>(`/agents/${name}/raw`, { headers: { Accept: 'text/plain' } })
 export const getRouting = (name: string) => api<Routing>(`/agents/${name}/routing`)
 export const listDocs = (name: string) =>
-  api<{ documents: AgentDoc[] }>(`/agents/${name}/documents`)
+  api<DocsList>(`/agents/${name}/documents`)
 
 /* ───────────────────────── writes ───────────────────────── */
 /** Creating an agent creates a PAIR — `<base>-inbound` and `<base>-outbound`.
@@ -95,6 +141,37 @@ export const updateAgent = (name: string, payload: any, rev?: string) =>
     headers: rev ? { 'If-Match': rev } : undefined,
   })
 export const archiveAgent = (name: string) => del(`/agents/${name}`)
+
+/**
+ * What the confirm dialog says before archiving. One source, because both
+ * places that offer Archive have to answer the same two questions people
+ * actually ask:
+ *
+ *   "Is there no Delete?"  There is not — Archive IS how an agent is removed.
+ *   It used to say "moved to agents/_archived", a server path that tells a
+ *   tenant nothing about whether the agent is gone.
+ *
+ *   "Why is it still there?"  An agent is usually a PAIR and this archives one
+ *   direction. Someone clearing out an imported agent archived one half, the
+ *   other half kept the agent alive, and nothing had told them so.
+ *
+ * It does not promise a restore: there is no un-archive in the product.
+ */
+export function archiveConfirmCopy(name: string, sibling?: string): string {
+  const direction = /-(inbound|outbound)$/.exec(name)?.[1]
+  // The plan counts AGENTS (pairs), so the slot is only freed when the last
+  // direction goes. Saying "frees a slot" with a sibling still live is false.
+  const plan = sibling
+    ? `This archives only the ${direction ?? 'selected'} version — “${sibling}” stays in your list, and the agent keeps its plan slot, until you archive that too.`
+    : direction
+      ? `This archives only the ${direction} version. If the agent has another direction it stays, and the plan slot is freed only once both are archived.`
+      : 'It no longer counts toward your plan.'
+  return 'Archiving is how you delete an agent — there is no separate Delete. '
+    + 'It leaves your list, stops taking calls, and any number connected to it is left without an agent. '
+    + 'Its call history is kept. It cannot be restored from the dashboard. '
+    + plan
+}
+
 
 /** Create the opposite-direction counterpart of an existing agent. The copy is
  *  adapted server-side (greeting, opening stage, name slot, objections) — the
@@ -158,9 +235,13 @@ export const putRouting = (name: string, body: Routing) =>
   api(`/agents/${name}/routing`, { method: 'PUT', body: JSON.stringify(body) })
 
 export const uploadDoc = (name: string, form: FormData) =>
-  postForm(`/agents/${name}/documents`, form)
+  postForm<UploadDocResult>(`/agents/${name}/documents`, form)
 export const deleteDoc = (name: string, docId: string) =>
   del(`/agents/${name}/documents/${docId}`)
+/** Re-chunk + re-embed every document — the repair for a `stale` /
+ *  `not_embedded` index. Spends embedding tokens; an operator's click. */
+export const reindexDocs = (name: string) =>
+  post<ReindexResult>(`/agents/${name}/documents/reindex`)
 export const extractYaml = (name: string, docId: string) =>
   post<ExtractResult>(`/agents/${name}/documents/${docId}/extract-yaml`)
 export const applyYaml = (name: string, docId: string, fields: any) =>
@@ -250,14 +331,41 @@ function compileProducts(products: WizardData['products']) {
   return { portfolioText, knownProjects }
 }
 
-/** Compile wizard stage rows into call_flow.stages entries. */
-const compileStages = (stages: WizardData['stages']) =>
-  stages.map((s, i) => ({
-    id: s.id.toUpperCase().replace(/[^A-Z0-9_]/g, '_'),
-    order: i,
-    goal: s.goal,
-    turns_until_advance: parseInt(s.turns) || 8,
-  }))
+/** Compile wizard stage rows into call_flow.stages entries, MERGED onto the
+ * stages already on disk (matched by id) rather than rebuilt from scratch.
+ *
+ * This form only ever showed {id, goal, turns} — it has no fields for
+ * `role` / `collect` / `advance_when` / `branches` / `label`, all of which
+ * the Copilot chat builder and the Stages tab's surgical ops (PATCH
+ * .../ops) write and depend on for deterministic stage transitions. A plain
+ * `stages.map(...)` here silently reconstructs every stage from just those
+ * three fields, so ANY Settings-tab save — even one that never touches the
+ * Call Script section — erased that wiring platform-wide. On 2026-09-08
+ * that turned a Copilot-built agent's slot-driven, branch-aware call flow
+ * back into pure turn-count pacing on its very first Builder save, and the
+ * live call that followed had nothing to stop the LLM improvising a
+ * "should we end here?" line instead of the scripted close (RUNBOOK §35).
+ * Merging by id keeps everything the form doesn't model; a brand-new id
+ * (added in this session) still gets a fresh, unwired stage — there is
+ * nothing on disk to merge it onto. */
+const compileStages = (stages: WizardData['stages'], existing: any[] = []) => {
+  const byId = new Map<string, any>(
+    (existing ?? [])
+      .filter((s) => s && typeof s === 'object' && s.id)
+      .map((s) => [String(s.id).toUpperCase(), s]),
+  )
+  return stages.map((s, i) => {
+    const id = s.id.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
+    const prior = byId.get(id)
+    return {
+      ...(prior ?? {}),
+      id,
+      order: i,
+      goal: s.goal,
+      turns_until_advance: parseInt(s.turns) || 8,
+    }
+  })
+}
 
 /** Compile the calendar slot rows into the definition's calendar block. */
 function compileCalendar(d: WizardData): any {
@@ -604,8 +712,12 @@ export function mergeWizardIntoDefinition(current: any, d: WizardData, initial: 
   }
   out.knowledge_base = kb
 
-  // call_flow — stages fully modeled; decline_threshold preserved
-  out.call_flow = { ...(out.call_flow ?? {}), stages: compileStages(d.stages) }
+  // call_flow — goal/turns are form-modeled; role/collect/advance_when/
+  // branches/label are NOT and must survive (see compileStages).
+  out.call_flow = {
+    ...(out.call_flow ?? {}),
+    stages: compileStages(d.stages, out.call_flow?.stages),
+  }
 
   // response_bank — opening_greeting always; en/hi objection responses only
   // when changed (the form shows just the FIRST response per language, so

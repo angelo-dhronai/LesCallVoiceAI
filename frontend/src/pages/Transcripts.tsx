@@ -7,7 +7,7 @@ import { useGet, useRefresh } from '../api/hooks/useApi'
 import { Card, Badge, Button, Spinner, EmptyState, cx } from '../components/ui'
 import { PageHeader, SearchInput, AsyncState, Field } from '../components/kit'
 import { useDebounced, useUrlParam } from '../lib/hooks'
-import { dur } from '../lib/format'
+import { dur, parseTs } from '../lib/format'
 
 /** The shared Button skin (ghost · sm · rounded-md) for a real router Link —
  *  ui.Button only renders <button>, and the cross-link to the intelligence
@@ -21,6 +21,8 @@ interface Recording {
   folder: string
   call_id?: string
   caller?: string
+  /** Saved phone-book name for `caller`, resolved server-side ('' if unknown). */
+  contact_name?: string
   folder_dt?: string
 }
 interface RecordingsResp {
@@ -42,8 +44,8 @@ interface TranscriptResp {
 
 function fmtDate(s: string | undefined | null): string {
   if (!s) return '—'
-  const d = new Date(s)
-  if (isNaN(d.getTime())) return String(s)
+  const d = parseTs(s)
+  if (!d) return String(s)
   return d.toLocaleString('en-IN', {
     day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
   })
@@ -51,8 +53,8 @@ function fmtDate(s: string | undefined | null): string {
 
 /** Message timestamps arrive in whatever shape the backend logged — show a clean time when parseable. */
 function fmtMsgTime(s: string): string {
-  const d = new Date(s)
-  if (isNaN(d.getTime())) return s
+  const d = parseTs(s)
+  if (!d) return s
   return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
@@ -91,9 +93,9 @@ function fmtMetaValue(key: string, value: unknown): string {
   if (/duration/i.test(key) && Number.isFinite(Number(value))) return dur(Number(value))
   const s = String(value)
   // Raw ISO datetimes (start_time, end_time, …) read as machine noise — humanize them.
-  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
-    const d = new Date(s)
-    if (!isNaN(d.getTime())) {
+  if (/^\d{4}-\d{2}-\d{2}[T ]/.test(s)) {
+    const d = parseTs(s)
+    if (d) {
       return d.toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' })
     }
   }
@@ -205,8 +207,11 @@ function TranscriptPanel({ recording, highlight }: { recording: Recording | null
         <div className="flex flex-wrap items-center gap-2">
           <div className="min-w-0">
             <div className="truncate font-display text-base font-bold">
-              {recording?.caller || recording?.call_id || folder}
+              {recording?.contact_name || recording?.caller || recording?.call_id || folder}
             </div>
+            {recording?.contact_name && recording?.caller && (
+              <div className="truncate font-mono text-2xs text-dim">{recording.caller}</div>
+            )}
             <div className="text-xs tabular-nums text-dim">{fmtDate(recording?.folder_dt)}</div>
           </div>
           <div className="ml-auto flex flex-wrap items-center gap-2">
@@ -325,7 +330,8 @@ export default function Transcripts() {
   // Client-side caller filter
   const filter = callerFilter.trim().toLowerCase()
   const recordings = filter
-    ? allRecordings.filter((r) => (r?.caller || '').toLowerCase().includes(filter))
+    ? allRecordings.filter((r) => (r?.caller || '').toLowerCase().includes(filter)
+        || (r?.contact_name || '').toLowerCase().includes(filter))
     : allRecordings
 
   // Default-select first item when list loads / changes
@@ -436,11 +442,11 @@ export default function Transcripts() {
                       <div className="flex items-center gap-2">
                         <Phone size={13} className="shrink-0 text-dim" />
                         <span className="truncate text-sm font-semibold text-soft">
-                          {r?.caller || r?.call_id || r?.folder || 'Unknown'}
+                          {r?.contact_name || r?.caller || r?.call_id || r?.folder || 'Unknown'}
                         </span>
                       </div>
                       <div className="mt-0.5 pl-5 text-2xs tabular-nums text-dim">
-                        {fmtDate(r?.folder_dt)}
+                        {r?.contact_name && r?.caller ? `${r.caller} · ` : ''}{fmtDate(r?.folder_dt)}
                       </div>
                     </button>
                   )

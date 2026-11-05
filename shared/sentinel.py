@@ -18,7 +18,8 @@ Checks & remedies (cycle = SENTINEL_INTERVAL, default 30 s):
   ledger        no usage_ledger row open > 1 h            -> ALERT (billing!)
   disk          < DISK_ALERT_PCT used                     -> prune docker + old run logs
   memory        > MEM_MIN_MB available                    -> ALERT
-  gcs           storage round-trip (hourly)               -> ALERT (re-auth needed)
+  gcs           a real WRITE to every bucket (hourly)    -> ALERT (billing ≠ auth)
+  recsync       catch-up passes must LAND uploads         -> ALERT
   voice         Sarvam STT/TTS health: live-call timeout/  -> ALERT + optional
                 latency scan every cycle + timed API        escalation call
                 probes (shared/voice_health.py — added       (see that module)
@@ -43,6 +44,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -63,6 +65,14 @@ INBOUND_ALERT_H = float(os.environ.get("SENTINEL_INBOUND_ALERT_H", "26"))
 DISK_ALERT_PCT = int(os.environ.get("SENTINEL_DISK_ALERT_PCT", "90"))
 MEM_MIN_MB = int(os.environ.get("SENTINEL_MEM_MIN_MB", "300"))
 EDGE_URL = os.environ.get("PUBLIC_BASE_URL", "https://agent.lescall.com")
+
+# Buckets the platform WRITES to; the hourly probe writes each one.
+GCS_PROBE_BUCKETS = tuple(b for b in (
+    os.environ.get("GCS_RECORDINGS_BUCKET", "lescall-recordings"),
+    os.environ.get("GCS_LOGS_BUCKET", "lescall-logs")) if b)
+# Consecutive recording-sync passes (15 min apart) that landed nothing while
+# failing something before it is a stall rather than one bad file.
+RECSYNC_STUCK_PASSES = int(os.environ.get("SENTINEL_RECSYNC_STUCK_PASSES", "2"))
 
 RESTART_COOLDOWN_S = 600
 RESTART_CAP_PER_HOUR = 3
@@ -622,28 +632,152 @@ def check_disk_mem(state: State) -> dict:
     return {"disk_pct": pct, "mem_avail_mb": mem_avail_mb}
 
 
+def gcs_failure_kind(exc: BaseException | str) -> str:
+    """Classify a failed GCS write: ``billing`` | ``auth`` | ``other``.
+
+    The 2026-09-16 outage was a billing-account delinquency: every WRITE came
+    back 403 while every READ still worked. The remedy (settle the account in
+    Cloud Console) has nothing in common with the remedy for an auth failure
+    (the attached SA, its scopes, a stray ADC file), so the two get separate
+    alert keys and separate bodies — a "re-auth" alert for a billing hold
+    sends the reader to the wrong console for a day.
+    """
+    text = str(exc).lower()
+    if "billing account" in text:
+        return "billing"
+    if any(w in text for w in ("403", "401", "forbidden", "unauthenticated",
+                               "credential", "refresherror", "permission")):
+        return "auth"
+    return "other"
+
+
+def _gcs_alert(state: State, exc: BaseException, where: str) -> None:
+    if gcs_failure_kind(exc) == "billing":
+        alert(state, "gcs-billing",
+              "GCS WRITES refused: the project's billing account is disabled",
+              f"{exc!r}\n(write probe on {where})\n"
+              "Google is refusing every WRITE to the buckets while READS still "
+              "work: new recordings and exports stay on the VM's disk, log "
+              "shipping has stopped, and nothing is deleted locally until it "
+              "is safely in the bucket — no data is lost yet. The same billing "
+              "account can suspend the VM itself, i.e. the phone lines. This "
+              "is not an auth or code problem and nothing on the VM can fix "
+              "it: Cloud Console → Billing → the account linked to project "
+              "`lescall`, settle it. Stranded recordings then upload by "
+              "themselves on the next recsync pass (`docker logs "
+              "lescall-workers | grep 'sync complete'` shows uploaded>0). "
+              "RUNBOOK §59.")
+        return
+    alert(state, "gcs-auth", "GCS access failing",
+          f"{exc!r}\n(write probe on {where})\n"
+          "Recording/log uploads are paused (local serving "
+          "still works, and nothing is deleted locally until it is "
+          "safely in the bucket). Auth is the VM's attached service "
+          "account via the metadata server — there is no key file and "
+          "no human session to renew, so this should NOT be a "
+          "re-login. Check, in order: (1) is "
+          "GOOGLE_APPLICATION_CREDENTIALS set anywhere (it overrides "
+          "metadata ADC — it must be unset), (2) does the attached SA "
+          "still hold roles/storage.objectAdmin on the bucket, (3) is "
+          "the instance still running with --scopes cloud-platform. "
+          "`deploy/provision_vm_sa.sh` runs this same write check as the "
+          "VM and, with an owner login, repairs the bindings. "
+          "See RUNBOOK 6b and §59.")
+
+
 def check_gcs(state: State) -> bool:
+    """A real WRITE round-trip on every bucket the platform writes to.
+
+    This was a one-object LIST until 2026-09-26. On 2026-09-16 the project's
+    billing account went delinquent and every write 403'd for three days —
+    19 recordings stranded on disk, log shipping stopped — while reads kept
+    working, so the list probe passed every hour and nobody was told. The
+    platform's contract with the buckets is WRITE (recordings, logs, exports);
+    the probe exercises the contract: one tiny object per bucket, written
+    then deleted (objects.create + objects.delete are both in the attached
+    SA's object-level role).
+    """
     try:
         from google.cloud import storage
         client = storage.Client()
-        bucket = client.bucket(os.environ.get("GCS_RECORDINGS_BUCKET",
-                                              "lescall-recordings"))
-        list(client.list_blobs(bucket, max_results=1))
-        return True
     except Exception as exc:
-        alert(state, "gcs-auth", "GCS access failing",
-              f"{exc!r}\nRecording/log uploads are paused (local serving "
-              "still works, and nothing is deleted locally until it is "
-              "safely in the bucket). Auth is the VM's attached service "
-              "account via the metadata server — there is no key file and "
-              "no human session to renew, so this should NOT be a "
-              "re-login. Check, in order: (1) is "
-              "GOOGLE_APPLICATION_CREDENTIALS set anywhere (it overrides "
-              "metadata ADC — it must be unset), (2) does the attached SA "
-              "still hold roles/storage.objectAdmin on the bucket, (3) is "
-              "the instance still running with --scopes cloud-platform. "
-              "See RUNBOOK 6b.")
+        _gcs_alert(state, exc, "client init")
         return False
+    stamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    for name in GCS_PROBE_BUCKETS:
+        blob = client.bucket(name).blob(
+            f"_sentinel/write-probe/{socket.gethostname()}.txt")
+        try:
+            blob.upload_from_string(f"sentinel write probe {stamp}\n",
+                                    content_type="text/plain")
+        except Exception as exc:
+            _gcs_alert(state, exc, f"gs://{name}")
+            return False
+        try:
+            blob.delete()
+        except Exception as exc:
+            # The write landed; a leftover 40-byte object is not an outage.
+            logger.warning("gcs probe: wrote but could not delete gs://%s/%s: %r",
+                           name, blob.name, exc)
+    # Recovery re-arms both keys so the NEXT incident emails at once instead
+    # of waiting out the 6 h repeat window (the voice_health rule).
+    if any(state.d.pop(k, None) is not None
+           for k in ("alert:gcs-billing", "alert:gcs-auth")):
+        state.save()
+    return True
+
+
+_SYNC_LINE = re.compile(r"sync complete: uploaded=(\d+) adopted=\d+ failed=(\d+)")
+
+
+def recsync_stuck(log_text: str,
+                  passes: int = RECSYNC_STUCK_PASSES) -> tuple[int, int] | None:
+    """``(failed, passes)`` when each of the last ``passes`` recording-sync
+    passes landed nothing and failed something; ``None`` otherwise.
+
+    One such pass is a transient (a WAV still being written, one bad file).
+    Two running (30 min) means nothing is landing. A pass that uploaded
+    SOMETHING is progress even with failures — the 2026-09-19 recovery pass
+    read ``uploaded=17 failed=1`` and must not page.
+    """
+    seen = [(int(u), int(f)) for u, f in _SYNC_LINE.findall(log_text)]
+    tail = seen[-passes:]
+    if len(tail) < passes:
+        return None
+    if all(u == 0 and f > 0 for u, f in tail):
+        return tail[-1][1], passes
+    return None
+
+
+def check_recsync(state: State) -> bool:
+    """Recording catch-up must LAND uploads, not merely run.
+
+    The hourly write probe catches a bucket that refuses everything; this
+    catches uploads failing for a reason the probe cannot see (one bad file,
+    a prefix policy, a quota), from the same workers log ``check_workers``
+    already reads. Before 2026-09-26 the only trace of a failing pass was a
+    WARN line inside that log.
+    """
+    code, out = _run(["docker", "logs", "lescall-workers", "--since", "2h"],
+                     timeout=20)
+    if code != 0:
+        return True                # container health is check_workers' job
+    stuck = recsync_stuck(out)
+    if stuck is None:
+        if state.d.pop("alert:recsync-stuck", None) is not None:
+            state.save()
+        return True
+    failed, passes = stuck
+    alert(state, "recsync-stuck",
+          f"{failed} recording(s) cannot be uploaded to GCS",
+          f"The last {passes} recording-sync passes (15 min apart) uploaded "
+          f"nothing and each failed {failed} upload(s). Nothing is deleted "
+          "locally until it is in the bucket, so no data is lost yet. "
+          "`docker logs lescall-workers | grep -E 'GCS upload failed|sync "
+          "complete'` names the call_key and the reason; if the reason "
+          "mentions the billing account, that is the gcs-billing alert "
+          "(RUNBOOK §59), otherwise RUNBOOK 6b.")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -666,6 +800,7 @@ def run_cycle(state: State, cycle: int) -> dict:
         logger.exception("voice health check failed")
     if cycle % 10 == 0:          # every ~5 min
         status["workers_ok"] = check_workers(state)
+        status["recsync_ok"] = check_recsync(state)
         status["inbound"] = check_inbound_flow(state)
         status["ledger_stuck"] = check_ledger(state)
         status["disk_mem"] = check_disk_mem(state)

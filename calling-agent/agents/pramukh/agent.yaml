@@ -7,6 +7,8 @@ identity:
     projects · RERA compliant
   role_description: inbound property sales consultant
   contact: +91 87583 70000
+  pronouns: he
+  role_line: ''
 languages:
   supported:
   - hi
@@ -17,12 +19,18 @@ languages:
     hi:
       model: bulbul:v3
       speaker: shubh
+      pace: 1.0
+      gender: ''
     en:
       model: bulbul:v3
       speaker: shubh
+      pace: 1.0
+      gender: ''
     gu:
       model: bulbul:v3
       speaker: shubh
+      pace: 1.0
+      gender: ''
   register_notes:
     hi: 'Use natural, modern conversational Hindi — exactly how a friendly salesperson
       in Surat or Mumbai speaks. Code-switch to English words that Indians use daily:
@@ -37,6 +45,14 @@ languages:
       ''location'' not formal equivalents. Sound real and warm.'
     en: Use natural, friendly conversational English — warm, real, not corporate.
       Like a knowledgeable friend who happens to work in real estate.
+  stt_forced_language: ''
+  allow_code_mixing: false
+  tts_lang_from_text: true
+  evidence_switch: true
+  auto_switch: true
+  greeting_language: ''
+  bilingual_greeting: false
+  closing_language_policy: ''
 call_flow:
   stages:
   - id: GREETING
@@ -44,6 +60,11 @@ call_flow:
     goal: Caller just responded to your introduction. Warmly acknowledge what they
       said in their language. Ask for their name — ONE question only.
     turns_until_advance: 1
+    role: ''
+    label: ''
+    collect: []
+    advance_when: {}
+    branches: []
   - id: DISCOVERY
     order: 1
     goal: "You are a proactive property sales consultant. Your mission: qualify this\
@@ -60,6 +81,11 @@ call_flow:
       \ right property.\nIf the caller volunteers a field before you ask, capture\
       \ it and move to the next one."
     turns_until_advance: 8
+    role: ''
+    label: ''
+    collect: []
+    advance_when: {}
+    branches: []
   - id: PROJECT_MATCH
     order: 2
     goal: 'You have enough information. Now be the expert.
@@ -75,6 +101,11 @@ call_flow:
 
       ''Photos don''t do it justice — would you like to see it in person?'''
     turns_until_advance: 6
+    role: ''
+    label: ''
+    collect: []
+    advance_when: {}
+    branches: []
   - id: INVITE_VISIT
     order: 3
     goal: 'The caller is interested. Your only goal now: book the site visit.
@@ -87,6 +118,11 @@ call_flow:
 
       Do NOT give more options — scarcity creates urgency.'
     turns_until_advance: 99
+    role: ''
+    label: ''
+    collect: []
+    advance_when: {}
+    branches: []
   - id: CONFIRMATION
     order: 4
     goal: 'Confirm the visit details: day, time, property, and caller''s name.
@@ -95,12 +131,29 @@ call_flow:
 
       Offer to WhatsApp the exact site address and parking instructions.'
     turns_until_advance: 99
+    role: ''
+    label: ''
+    collect: []
+    advance_when: {}
+    branches: []
   - id: CLOSING
     order: 5
     goal: Warm, genuine close using caller's name. Express real excitement about meeting
       them. Keep the door open — any question, just call or WhatsApp.
     turns_until_advance: 99
+    role: ''
+    label: ''
+    collect: []
+    advance_when: {}
+    branches: []
   decline_threshold: 2
+  call_goal: ''
+  completed_when: {}
+  scheduling: {}
+  recommend_before_schedule: auto
+  callback_policy: {}
+  termination: {}
+  connect: {}
 knowledge_base:
   known_projects:
     central park:
@@ -175,6 +228,7 @@ knowledge_base:
 
     MATCH: Budget+Vapi→Sahaj/Aura | Mid+Surat→Aranya II | Premium+Surat→Revanta/Satva
     | Luxury→Vivanta/Agastya | Ready→Satva/Aura/Sahaj'
+  portfolio_section_label: PROJECT PORTFOLIO
   location_aliases:
   - surat
   - vapi
@@ -216,6 +270,7 @@ knowledge_base:
   - abhi nai
   - abhi busy
   - fursat nahi
+  objection_patterns_mode: replace
   time_patterns:
   - morning
   - afternoon
@@ -330,7 +385,12 @@ knowledge_base:
       satwa: satva
       saatva: satva
       agasthya: agastya
-  portfolio_section_label: PROJECT PORTFOLIO
+    use_builtin_tables: true
+  catalog: []
+  match_rules: []
+  pricing_policy: {}
+  fact_policy: {}
+  product_lock: {}
 response_bank:
   opening_greeting: Hello! Namaste — this is Vishal Patel calling from Pramukh Group.
     Hope I haven't caught you at a bad time.
@@ -384,6 +444,7 @@ response_bank:
     hi: जी बिल्कुल, हम हिंदी में बात करते हैं। बताइए, मैं आपकी कैसे मदद कर सकता हूँ?
     en: Sure, let's continue in English. How can I help you?
     gu: જી બિલકુલ, ચાલો ગુજરાતીમાં વાત કરીએ. બોલો, હું તમારી કેવી રીતે મદદ કરી શકું?
+  lang_unsupported_responses: {}
   lang_fallbacks:
     hi: माफ़ कीजिए, क्या आप दोबारा बोल सकते हैं?
     gu: માફ કરશો, શું તમે ફરીથી બોલી શકો?
@@ -392,6 +453,7 @@ response_bank:
     en: Let me get back to you on that.
     hi: मैं इस पर वापस आता हूँ।
     gu: હું આના પર પાછો આવું છું.
+  tool_ack_fallbacks: {}
   response_fallback: Sorry, could you repeat that?
   graceful_close:
     en: Thank you so much for your time! If you ever want to explore options, feel
@@ -437,6 +499,13 @@ response_bank:
         10 बजे, कल दोपहर 2 बजे, या परसों सुबह 11 बजे। कौन सा सही रहेगा?'
       gu: 'શું આપણે site visit schedule કરી શકીએ? અમારી પાસે આ slots છે: કાલે સવારે
         10 વાગે, કાલે બપોરે 2 વાગે, અથવા પરમ દિવસે સવારે 11 વાગે. કયો ચાલશે?'
+  decline_responses: {}
+  slots_prompt: {}
+  objection_playbook: []
+  closing_responses: {}
+  canned_phrases: []
+  ai_disclosure_responses: {}
+  enable_greeting_shortcut: false
 calendar:
   type: mock
   mock_slots:
@@ -454,6 +523,34 @@ calendar:
     en: Tomorrow at 10:00 AM, Tomorrow at 2:00 PM, Day after tomorrow at 11:00 AM
     hi: कल सुबह 10 बजे, कल दोपहर 2 बजे, या परसों सुबह 11 बजे
     gu: કાલે સવારે 10 વાગે, કાલે બપોરે 2 વાગે, અથવા પરમ દિવસે સવારે 11 વાગે
+  day_synonyms: {}
+  timezone: Asia/Kolkata
+  booking_confirmation_line: {}
+llm_config:
+  model: gpt-4o-mini
+  max_tokens: 160
+  timeout_s: 5.0
+  stream_timeout_s: 7.0
+  filler_timeout_s: 1.0
+  intent_classify_timeout_s: 1.0
+  max_response_length: 400
+  filler_min_gap_turns: 0
+  filler_max_per_call: 0
+  filler_ack_extended: false
+  enable_tools: shadow
+  extra_never_rules: []
+  extra_always_rules: []
+personality:
+  pronouns: he
+  energy: medium
+  tone: conversational
+  style: natural
+  lingo: ''
+  custom_instructions: ''
+  traits: []
+  energy_mirroring: true
+  ai_disclosure: deflect
+  verbosity_max_sentences: 3
 slots:
 - name: name
   priority: 10
@@ -463,6 +560,17 @@ slots:
     hi: क्या मैं आपका नाम जान सकता हूँ?
     en: May I know your name?
     gu: શું હું તમારું નામ જાણી શકું?
+  type: ''
+  enum_values: []
+  enum_synonyms: {}
+  extract_patterns: []
+  depends_on: []
+  merge_policy: free
+  confirm_readback: ''
+  max_asks: 0
+  reask_question: {}
+  summary_known: ''
+  summary_unknown: ''
 - name: location
   priority: 20
   required: true
@@ -471,6 +579,17 @@ slots:
     hi: आप किस city में property देख रहे हैं — Surat, Vapi या Silvassa?
     en: Which city are you looking in — Surat, Vapi or Silvassa?
     gu: તમે કયા શહેરમાં property જોઈ રહ્યા છો — Surat, Vapi કે Silvassa?
+  type: ''
+  enum_values: []
+  enum_synonyms: {}
+  extract_patterns: []
+  depends_on: []
+  merge_policy: free
+  confirm_readback: ''
+  max_asks: 0
+  reask_question: {}
+  summary_known: ''
+  summary_unknown: ''
 - name: bhk
   priority: 30
   required: true
@@ -479,6 +598,17 @@ slots:
     hi: आपको कितने BHK चाहिए — 2BHK, 3BHK?
     en: What configuration are you looking for — 2BHK, 3BHK?
     gu: તમને કેટલા BHK જોઈએ — 2BHK, 3BHK?
+  type: ''
+  enum_values: []
+  enum_synonyms: {}
+  extract_patterns: []
+  depends_on: []
+  merge_policy: free
+  confirm_readback: ''
+  max_asks: 0
+  reask_question: {}
+  summary_known: ''
+  summary_unknown: ''
 - name: property_type
   priority: 35
   required: false
@@ -487,6 +617,17 @@ slots:
     hi: Flat चाहिए या villa/plot?
     en: Apartment, villa or plot?
     gu: Flat જોઈએ કે villa/plot?
+  type: ''
+  enum_values: []
+  enum_synonyms: {}
+  extract_patterns: []
+  depends_on: []
+  merge_policy: free
+  confirm_readback: ''
+  max_asks: 0
+  reask_question: {}
+  summary_known: ''
+  summary_unknown: ''
 - name: budget
   priority: 40
   required: true
@@ -495,6 +636,17 @@ slots:
     hi: आपका comfortable budget क्या है?
     en: What budget range are you comfortable with?
     gu: તમારું comfortable budget શું છે?
+  type: ''
+  enum_values: []
+  enum_synonyms: {}
+  extract_patterns: []
+  depends_on: []
+  merge_policy: free
+  confirm_readback: ''
+  max_asks: 0
+  reask_question: {}
+  summary_known: ''
+  summary_unknown: ''
 - name: purpose
   priority: 50
   required: false
@@ -503,6 +655,17 @@ slots:
     hi: खुद रहने के लिए या investment के लिए?
     en: Is this for self-use or investment?
     gu: ખુદ રહેવા માટે કે investment માટે?
+  type: ''
+  enum_values: []
+  enum_synonyms: {}
+  extract_patterns: []
+  depends_on: []
+  merge_policy: free
+  confirm_readback: ''
+  max_asks: 0
+  reask_question: {}
+  summary_known: ''
+  summary_unknown: ''
 - name: timeline
   priority: 60
   required: true
@@ -511,6 +674,17 @@ slots:
     hi: आप कब तक purchase करने का सोच रहे हैं?
     en: When are you planning to purchase?
     gu: તમે ક્યાં સુધીમાં purchase કરવાનું વિચારો છો?
+  type: ''
+  enum_values: []
+  enum_synonyms: {}
+  extract_patterns: []
+  depends_on: []
+  merge_policy: free
+  confirm_readback: ''
+  max_asks: 0
+  reask_question: {}
+  summary_known: ''
+  summary_unknown: ''
 - name: loan_required
   priority: 70
   required: true
@@ -519,16 +693,57 @@ slots:
     hi: क्या आप home loan लेने का सोच रहे हैं?
     en: Will you be taking a home loan?
     gu: શું તમે home loan લેવાનું વિચારો છો?
-llm_config:
-  model: gpt-4o-mini
-  max_tokens: 160
-  timeout_s: 5.0
-  stream_timeout_s: 7.0
-  filler_timeout_s: 1.0
-  intent_classify_timeout_s: 1.0
-  max_response_length: 400
-  extra_never_rules: []
-  extra_always_rules: []
+  type: ''
+  enum_values: []
+  enum_synonyms: {}
+  extract_patterns: []
+  depends_on: []
+  merge_policy: free
+  confirm_readback: ''
+  max_asks: 0
+  reask_question: {}
+  summary_known: ''
+  summary_unknown: ''
+call_direction: inbound
+brand:
+  spoken_company_name: ''
+  positioning_tagline: ''
+  credibility_markers: []
+  trust_proofs: []
+  regions_served: []
+  contact_phone: ''
+  whatsapp_number: ''
+outbound:
+  identity_confirm_line: {}
+  good_time_check_line: {}
+  pitch: {}
+  wrong_person_response: {}
+  busy_response: {}
+  wrong_number_close: {}
+  wrong_number_patterns: []
+  opening_greeting: {}
+  direction_brief: ''
 guardrails:
-  builtin_rules_pack: real_estate
   use_builtin_rules: true
+  builtin_rules_pack: real_estate
+  never_rules: []
+  always_rules: []
+  honesty: {}
+  compliance: {}
+  escalation: {}
+follow_up:
+  whatsapp_promise: {}
+  callback: {}
+  clarify_commitments:
+    enabled: true
+  auto_execute:
+    enabled: true
+post_call:
+  success_definition: {}
+  outcomes: []
+  scoring: {}
+  lead_profile: {}
+memory: {}
+revision: 1
+updated_at: '2026-09-11T07:08:35Z'
+updated_by: platform:runbook-42

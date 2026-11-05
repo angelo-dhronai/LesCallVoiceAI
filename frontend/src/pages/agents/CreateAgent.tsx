@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   buildAgentPayload, createAgent, putRouting,
   extractFromDocument, extractedFieldsToWizardPatch,
+  DOC_ACCEPT, DOC_MAX_MB, DOC_TYPES_HUMAN, docSupported,
   type WizardData, type Routing, type MissingField,
 } from '../../api/agents'
 import { Card, Button, Badge, Spinner, SectionHead, cx } from '../../components/ui'
@@ -161,6 +162,18 @@ export default function CreateAgent() {
   })
 
   const onDocument = async (file: File) => {
+    // The server refuses these too (415 / 413 with the way out); checking
+    // here saves uploading 40 MB to be told it is 20 MB too many.
+    if (!docSupported(file.name)) {
+      toast(`${file.name}: unsupported type — upload ${DOC_TYPES_HUMAN}`, 'error')
+      if (fileRef.current) fileRef.current.value = ''
+      return
+    }
+    if (file.size > DOC_MAX_MB * 1048576) {
+      toast(`${file.name} is ${(file.size / 1048576).toFixed(1)} MB — the limit is ${DOC_MAX_MB} MB`, 'error')
+      if (fileRef.current) fileRef.current.value = ''
+      return
+    }
     setExtracting(true)
     setExtractingName(file.name)
     try {
@@ -353,13 +366,13 @@ export default function CreateAgent() {
           <FileUp size={16} className="text-mint-500" /> Start from a document
         </div>
         <div className="text-xs text-dim">
-          Upload or drop a company profile / brochure (PDF, DOCX or TXT) — every field it contains is
-          extracted and prefilled; anything it lacks, you'll be asked for below.
+          Upload or drop a company profile, brochure or call script ({DOC_TYPES_HUMAN}, up to {DOC_MAX_MB} MB) —
+          every field it contains is extracted and prefilled; anything it lacks, you'll be asked for below.
         </div>
         <input
           ref={fileRef}
           type="file"
-          accept=".pdf,.docx,.txt"
+          accept={DOC_ACCEPT}
           className="hidden"
           onChange={(e) => e.target.files?.[0] && onDocument(e.target.files[0])}
         />

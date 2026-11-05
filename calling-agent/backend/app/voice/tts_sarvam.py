@@ -180,6 +180,65 @@ _CACHE_FIRST_FLUSH_S = float(os.environ.get("TTS_CACHE_FIRST_FLUSH_S", "2.0"))
 _EARLY_FLUSH_TAIL_MS = 40          # window scanned for the pause
 _EARLY_FLUSH_SILENCE_RMS = 300     # ≲1% full-scale ≈ inter-word gap
 
+# ── Did we get back what we asked for? ──────────────────────────────────────
+# Nothing downstream checks the AUDIO against the TEXT, and two failure modes
+# live in that gap:
+#
+#   • Bulbul occasionally appends a hallucinated clause to a short line. Live
+#     2026-09-16, "Am I speaking to Piyush Gupta?" came back as "…Piyush
+#     Gupta OR" and "Am I speaking to Yogesh Kumar?" as "…Yogesh Kumar 40,
+#     the man is Kumar?". Both were then CACHED (below) and replayed to those
+#     contacts on every subsequent call — which is why the owner heard it
+#     "always".
+#   • A stream that ignores speech_sample_rate. `_check_stream_rate` was
+#     written for exactly that, but it can only read a RIFF header and the
+#     stream is headerless linear16 — so it has never fired. 16 kHz PCM
+#     labelled 8 kHz is a 2.0x duration inflation and lands here instead.
+#
+# The invariant both violate is the same: audio duration must be plausible
+# for the text that produced it. `_expected_speech_seconds` is a floor model
+# (per-sentence lead-in/tail + per-character rate, Indic characters counted
+# double because one codepoint carries more speech). Calibrated 2026-09-16
+# over 88 live Bulbul syntheses spanning en/hi/gu, speakers shubh + simran,
+# paces 1.0–1.3 and 5–129 characters: the WORST legitimate ratio measured
+# 0.95. The two confirmed hallucinations measured 1.27 and 1.44.
+#
+# A false positive costs one cache miss (live synthesis — what an uncached
+# line does anyway). A false negative is a corrupted line played to a real
+# contact forever. The threshold sits accordingly.
+_DURATION_SENTENCE_S = 0.55        # lead-in + trailing pad, per sentence
+_DURATION_PER_CHAR_S = 0.052       # steady-state speech rate
+TTS_DURATION_MAX_RATIO = float(
+    os.environ.get("TTS_DURATION_MAX_RATIO", "1.2"))
+
+
+def _expected_speech_seconds(text: str) -> float:
+    """Plausibility model for how long `text` should take to speak."""
+    t = (text or "").strip()
+    if not t:
+        return 0.0
+    sentences = max(1, len([s for s in _SENTENCE_BOUNDARY_RE.split(t)
+                            if s.strip()]))
+    weighted = sum(2 if ord(c) > 0x0900 else 1 for c in t)
+    return _DURATION_SENTENCE_S * sentences + _DURATION_PER_CHAR_S * weighted
+
+
+def _duration_ratio(text: str, pcm_bytes: int, sample_rate: int) -> float:
+    """Actual audio duration ÷ the plausibility model. >1 means too long."""
+    expected = _expected_speech_seconds(text)
+    if expected <= 0.0 or sample_rate <= 0:
+        return 0.0
+    return (pcm_bytes / (2.0 * sample_rate)) / expected
+
+
+def _duration_implausible(text: str, pcm_bytes: int,
+                          sample_rate: int) -> float | None:
+    """The ratio when the audio is too long for the text, else None."""
+    if TTS_DURATION_MAX_RATIO <= 0.0:
+        return None
+    ratio = _duration_ratio(text, pcm_bytes, sample_rate)
+    return ratio if ratio > TTS_DURATION_MAX_RATIO else None
+
 
 def _tail_is_pause(pcm: bytes, sample_rate: int) -> bool:
     """True when the last _EARLY_FLUSH_TAIL_MS of `pcm` is near-silent."""
@@ -283,6 +342,19 @@ class SarvamTTS(StreamingTTS):
         # Set when a mid-stream stall truncated the utterance — such audio
         # must never be cached (it would replay truncated forever).
         self._stream_truncated = False
+        # Audio-duration ÷ plausibility model for the last speak(). >1.0
+        # means Bulbul returned more speech than the text asked for.
+        self._last_speak_duration_ratio = 0.0
+        # ── Was the agent actually AUDIBLE on this call? ─────────────────
+        # A speak() that returns without emitting a single audio chunk is a
+        # mute turn: the caller hears nothing and the transcript still logs
+        # the line as spoken. Counted so call teardown can tell "the callee
+        # said nothing" apart from "we said nothing" — the two are recorded
+        # identically otherwise, and the customer gets blamed for our
+        # outage (RUNBOOK §34).
+        self.spoke_utterances = 0
+        self.mute_utterances = 0
+        self.credit_blocked = False
 
         if not self._api_key:
             logger.warning("[TTS:Sarvam] SARVAM_API_KEY not set — calls will fail")
@@ -360,7 +432,12 @@ class SarvamTTS(StreamingTTS):
         self._last_speak_billed_chars = 0
 
         if not self._api_key:
-            logger.warning("[TTS:Sarvam] No API key — skipping")
+            logger.error("[TTS:Sarvam] No API key — MUTE TURN, the caller "
+                         "hears silence")
+            # No key is silence just as surely as no credits is. Count it, or
+            # teardown reads the resulting dead-air call as the CALLEE saying
+            # nothing (see TelephonySession._agent_was_mute).
+            self.mute_utterances += 1
             self._playing = False
             return
 
@@ -391,6 +468,7 @@ class SarvamTTS(StreamingTTS):
             )
         total_duration = 0.0
         flushed_parts = 0
+        audio_bytes = 0
         speak_t0 = time.monotonic()
 
         # Early-flush state (first part of the utterance only).
@@ -417,6 +495,7 @@ class SarvamTTS(StreamingTTS):
 
                     await self._sink.write_frame(chunk.audio)
                     unflushed_bytes += len(chunk.audio)
+                    audio_bytes += len(chunk.audio)
                     if self._capture_buf is not None:
                         self._capture_buf += chunk.audio
                     chunk_count += 1
@@ -497,6 +576,34 @@ class SarvamTTS(StreamingTTS):
                     "[TTS:Sarvam] Playback complete (%d chunks, %d parts)",
                     chunk_count, flushed_parts or 1,
                 )
+                if chunk_count > 0:
+                    self.spoke_utterances += 1
+                else:
+                    self.mute_utterances += 1
+                    logger.error(
+                        "[TTS:Sarvam] MUTE TURN — utterance produced no audio; "
+                        "the caller heard silence (mute=%d spoke=%d)",
+                        self.mute_utterances, self.spoke_utterances,
+                    )
+            # Did the audio match the text? A hallucinated clause or a stream
+            # at the wrong sample rate both land as "far too long for these
+            # words". Nothing can be un-spoken here — the chunks are already
+            # with the caller — but it is the one place the anomaly is
+            # visible, and speak_cached reads the same verdict to refuse the
+            # cache write that would replay it forever.
+            self._last_speak_duration_ratio = _duration_ratio(
+                text, audio_bytes, self._sample_rate)
+            if not self._cancelled and chunk_count > 0:
+                _bad = _duration_implausible(text, audio_bytes,
+                                             self._sample_rate)
+                if _bad is not None:
+                    logger.warning(
+                        "[TTS:Sarvam] Audio implausible for text — %.2fs for "
+                        "%d chars (%.2fx the expected ceiling). Bulbul may "
+                        "have appended speech the caller heard, or the "
+                        "stream ignored speech_sample_rate=%d. Text: %r",
+                        audio_bytes / (2.0 * self._sample_rate), len(text),
+                        _bad, self._sample_rate, text[:60])
             # _reset() clears _cancelled — preserve completion state for
             # speak_cached's cache-write decision. A truncated stream is
             # never clean: caching it would replay the cut-off audio on
@@ -571,6 +678,23 @@ class SarvamTTS(StreamingTTS):
                     "[TTS:Sarvam] Cache read failed for %r — synthesizing live",
                     text[:40], exc_info=True,
                 )
+            # Sanity ceiling: an entry that is far too long for its text is a
+            # frozen Bulbul hallucination (or a wrong-rate stream). Evict it
+            # and synthesize live — the entry was written before this gate
+            # existed, or by an older build. Without this, the 2026-09-16
+            # "Am I speaking to Piyush Gupta OR" line would replay to that
+            # contact until the LRU happened to drop it.
+            _stale = _duration_implausible(text, len(pcm), self._sample_rate)
+            if pcm and _stale is not None:
+                logger.warning(
+                    "[TTS:Sarvam] Evicting implausible cache entry "
+                    "(%.2fs, %.2fx expected) for %r — synthesizing live",
+                    len(pcm) / (self._sample_rate * 2), _stale, text[:50])
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                pcm = b""
             # Sanity floor: anything under 150ms of audio is a corrupt entry.
             if len(pcm) >= int(self._sample_rate * 2 * 0.15):
                 self._reset()
@@ -627,7 +751,17 @@ class SarvamTTS(StreamingTTS):
         finally:
             buf, self._capture_buf = self._capture_buf, None
             if path is not None and buf and self._last_speak_clean:
-                self._write_cache(path, bytes(buf))
+                # One bad synthesis must not become permanent. speak() already
+                # warned; refusing the write is what keeps the next caller
+                # from hearing it — a cache miss costs one live synthesis,
+                # a cached hallucination costs every future call.
+                _bad = _duration_implausible(text, len(buf), self._sample_rate)
+                if _bad is not None:
+                    logger.warning(
+                        "[TTS:Sarvam] NOT caching implausible utterance "
+                        "(%.2fx expected): %r", _bad, text[:50])
+                else:
+                    self._write_cache(path, bytes(buf))
 
     def _check_stream_rate(self, first_chunk: bytes) -> None:
         """Detect a sample-rate the sink will mislabel.
@@ -705,11 +839,10 @@ class SarvamTTS(StreamingTTS):
                             "[SARVAM:CREDITS] TTS HTTP 402 — %s — rotating key from pool.",
                             body[:200],
                         )
-                        from .key_rotator import rotate as _rotate_key
-                        from .key_rotator import (
-                            mark_exhausted as _mark_exhausted)
-                        _mark_exhausted(self._api_key)
-                        new_key = _rotate_key()
+                        from .key_rotator import retire as _retire_key
+                        # Rotate first, then stop leasing the dead key — the
+                        # same order as STT (see key_rotator.retire).
+                        new_key = _retire_key(self._api_key)
                         if new_key:
                             self._api_key = new_key
                             self._reset_client()  # force fresh TLS with new key
@@ -720,6 +853,7 @@ class SarvamTTS(StreamingTTS):
                         logger.error(
                             "[TTS:Sarvam] No backup key available — cannot speak"
                         )
+                        self.credit_blocked = True
                         return
                     if response.status_code != 200:
                         body = await response.aread()

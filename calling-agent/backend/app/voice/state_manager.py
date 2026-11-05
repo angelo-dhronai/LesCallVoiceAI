@@ -65,6 +65,7 @@ class SlotSpec:
     extract_patterns: list[str] = field(default_factory=list)
     depends_on: list[str] = field(default_factory=list)
     merge_policy: str = "free"                  # free|correction_gated|confirm
+    ask_gated: bool = False                     # RUNBOOK §75 — answer-only writes
     confirm_readback: str = ""                  # ''|verbatim|digit_groups_2
     max_asks: int = 0                           # 0 = unlimited
     reask_question: dict[str, str] = field(default_factory=dict)
@@ -87,11 +88,84 @@ _SLOT_PHONE_RE = re.compile(
 # Generic number for type: number
 _SLOT_NUMBER_RE = re.compile(r'(?<![\d.])(\d+(?:\.\d+)?)(?![\d.])')
 
+# Script-aware word boundaries (RUNBOOK §42 rule: never `\b`, never
+# str.isalnum() as a boundary test around Indic text — a matra, chandrabindu
+# or anusvara is category Mn/Mc, so both treat the middle of "मिली" or the
+# end of "हाँ" as a word edge).
+_WORD_CHAR_RE = re.compile(r"[0-9a-zऀ-ॣ०-ॿ઀-૿]")
+
+
+_AMOUNT_WORD_RE = re.compile(
+    r"lakh|lac\b|lacs|crore|\bcr\b|\bk\b|thousand|hazaar|hazar|"
+    r"लाख|करोड़|करोड|हज़ार|हजार|કરોડ|લાખ|હજાર|"
+    r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty|"
+    r"forty|fifty|sixty|seventy|eighty|ninety|hundred|ek|do|teen|char|"
+    r"paanch|das|bees|tees|chalis|pachas|saath|sattar|assi|nabbe|sau|"
+    r"dedh|dhai|sawa)\b|"
+    r"एक|दो|तीन|चार|पांच|पाँच|छह|सात|आठ|नौ|दस|बीस|तीस|चालीस|पचास|साठ|"
+    r"सत्तर|अस्सी|नब्बे|सौ|डेढ़|ढाई|सवा|साढ़े", re.IGNORECASE)
+
+
+def _looks_like_amount(text: str) -> bool:
+    """Carries a digit, or a money unit / number word — nothing about it
+    says it is a figure otherwise ("No", "नहीं देखना", "flexible")."""
+    t = str(text or "")
+    return any(ch.isdigit() for ch in t) or bool(_AMOUNT_WORD_RE.search(t))
+
+
+def _word_boundary_ok(lower: str, start: int, end: int) -> bool:
+    before_ok = start == 0 or not _WORD_CHAR_RE.match(lower[start - 1])
+    after_ok = end >= len(lower) or not _WORD_CHAR_RE.match(lower[end])
+    return before_ok and after_ok
+
+
+# Boolean answers, with the same script-aware edges. The old `\b` form
+# never matched "हाँ" / "नहीं" at all.
+_NB = r"(?<![0-9a-zऀ-ॣ०-ॿ઀-૿])"
+_NA = r"(?![0-9a-zऀ-ॣ०-ॿ઀-૿])"
+_BOOL_YES_RE = re.compile(
+    _NB + r"(?:yes|yeah|yep|haan|han|ha|ji|bilkul|sure|ok|okay|"
+    r"હા|हां|हाँ|जी|बिल्कुल|हाँजी|हांजी)" + _NA)
+_BOOL_NO_RE = re.compile(
+    _NB + r"(?:no|nahi|nahin|nope|नहीं|नहि|ना|ना|ના|નહીં)" + _NA)
+
+# Everyday words that appear in a closed vocabulary — evaluations,
+# agreements, fillers. Matched anywhere in a call they mean nothing about
+# the slot ("अच्छा, तो…" is "I see", "हाँ ठीक रहेगा" is "fine, go ahead");
+# they are values only as the answer to that slot's own question. A city, a
+# project name or "linkedin" is NOT here — those are taken wherever the
+# caller volunteers them (the Prakhar/Vapi case, RUNBOOK §54).
+_EVERYDAY_ALIASES = frozenset({
+    "ok", "okay", "okey", "fine", "good", "great", "nice", "bad", "poor",
+    "normal", "average", "right", "correct", "sure", "yes", "yeah", "yep",
+    "no", "nope", "so so", "not bad", "very good",
+    "theek", "thik", "theek thaak", "theek hai", "thik hai", "accha",
+    "achha", "acha", "sahi", "badhiya", "bahut accha", "haan", "han", "ha",
+    "ji", "ji haan", "haan ji", "nahi", "nahin", "bilkul", "chalta hai",
+    "ठीक", "ठीक-ठाक", "ठीक ठाक", "ठीक है", "ठीक था", "अच्छा", "अच्छा रहा",
+    "बहुत अच्छा", "सही", "बढ़िया", "मस्त", "हाँ", "हां", "हाँ जी", "जी हाँ",
+    "जी", "नहीं", "बिल्कुल", "चलता है", "सामान्य", "नॉट बैड", "गुड", "ओके",
+    "હા", "ના", "જી", "સારું", "બરાબર", "ઠીક", "ચાલે",
+})
+
+
+def _is_everyday_alias(alias: str) -> bool:
+    return " ".join((alias or "").lower().split()) in _EVERYDAY_ALIASES
+
 # Correction markers for merge_policy: correction_gated — the caller is
 # explicitly revising an earlier value, not just mentioning a new one.
+# Script-aware edges, not `\b`: Python's \w excludes the Devanagari anusvara
+# / matras, so `\bनहीं\b` never matched "नहीं," or "नहीं " — a correction_gated
+# slot could not be corrected in Hindi at all (RUNBOOK §73).
 _CORRECTION_MARKER_RE = re.compile(
-    r"\b(actually|nahi|नहीं|nahin|galat|wrong|change|correct|sorry|"
-    r"i meant|make it|instead|update)\b", re.IGNORECASE)
+    r"(?<![\w\u0900-\u0963\u0966-\u097F\u0A80-\u0AFF])"
+    r"(actually|nahi|नहीं|नही|nahin|galat|गलत|ग़लत|wrong|change|correct|sorry|"
+    r"i meant|make it|instead|update|मतलब|असल\s*में|दरअसल|"
+    # "change" as Hindi callers say it — "बजट चेंज करके 70 लाख" was refused
+    # on the Vedanta test (RUNBOOK §78) because only the Latin spelling and
+    # the bare stem "बदल" (not "बदलकर") were known.
+    r"चेंज|चेन्ज|चैंज|बदलकर|बदलना|बदल)"
+    r"(?![\w\u0900-\u0963\u0966-\u097F\u0A80-\u0AFF])", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Caller identity (2026-08-06)
@@ -292,6 +366,24 @@ def _word_or_digit_to_num(tok: str) -> float | None:
 # The manager
 # ---------------------------------------------------------------------------
 
+def _word_in(needle: str, hay: str) -> bool:
+    """`needle` occurs in `hay` as a whole word — boundaries are "not
+    alphanumeric" rather than \\b so Devanagari / Gujarati text works too."""
+    if not needle or not hay:
+        return False
+    start = 0
+    while True:
+        idx = hay.find(needle, start)
+        if idx < 0:
+            return False
+        before_ok = idx == 0 or not hay[idx - 1].isalnum()
+        after = idx + len(needle)
+        after_ok = after >= len(hay) or not hay[after].isalnum()
+        if before_ok and after_ok:
+            return True
+        start = idx + 1
+
+
 class ConversationStateManager:
     """Per-call structured memory: extract → merge → detect gaps → drive prompts."""
 
@@ -321,6 +413,21 @@ class ConversationStateManager:
         self.asked_count: dict[str, int] = {}    # slot -> times asked
         self._asked_turn: dict[str, int] = {}    # slot -> turn last counted
         self.skipped: set[str] = set()           # max_asks exhausted
+        # A slot whose LAST permitted ask has just been chosen: not askable
+        # again, but the caller has not answered yet — so it stays an
+        # extraction target for the next turn and only becomes `skipped`
+        # once that turn has passed unanswered (RUNBOOK §61, call 971).
+        self._ask_exhausted: dict[str, int] = {}  # slot -> turn of last ask
+        # The slot the engine says its spoken line actually asked about this
+        # turn (set by observe_user's `asked=`), so a yes/no or an everyday
+        # word can be read as the answer to THAT question and nothing else.
+        self._asked_hint: str | None = None
+        self.last_noted_ask: str | None = None
+        # A branch said these do not apply to THIS caller (retire_slots).
+        # Always a subset of `skipped`, so every 'leave missing / counts as
+        # satisfied' path already holds; the subset carries the wording
+        # ('not applicable', never 'not yet discussed') and the write refusal.
+        self.retired: set[str] = set()
         self.readback_done: set[str] = set()     # read-back confirmed slots
         self.extra_flags: dict[str, Any] = {}    # e.g. whatsapp_promised (→ collected_data)
         # Identity slots seeded from a KNOWN contact (see _IDENTITY_SLOT_NAMES).
@@ -378,22 +485,28 @@ class ConversationStateManager:
                 return (m.group(1) if m.groups() else m.group(0)).strip()
         t = spec.type
         if t in ("enum", "location"):
-            # Latest mention wins (mirrors _match_location correction handling)
-            hit, best_idx = None, -1
-            for alias, canon in spec._synonym_lookup.items():
-                start = 0
-                while True:
-                    idx = lower.find(alias, start)
-                    if idx < 0:
-                        break
-                    before_ok = idx == 0 or not lower[idx - 1].isalnum()
-                    after = idx + len(alias)
-                    after_ok = after >= len(lower) or not lower[after].isalnum()
-                    if before_ok and after_ok and idx > best_idx:
-                        best_idx, hit = idx, canon
-                    start = idx + 1
+            # Latest mention wins (mirrors _match_location correction handling),
+            # the LONGEST alias at a position wins over one it contains ("not
+            # bad" is not "bad"), and word boundaries are script-aware —
+            # str.isalnum() is False for every matra and anusvara, so "मिल"
+            # used to match inside "मिली" (RUNBOOK §61).
+            hit, hit_alias = self._latest_alias(spec, lower)
             if hit is None and t == "location":
                 return self._match_location(lower)
+            # An everyday word ("ठीक", "okay", "अच्छा", "सही") is a slot value
+            # ONLY when it answers that slot's own question. Live 2026-09-26
+            # (call 971): "हाँ ठीक रहेगा" — consent to a two-minute chat —
+            # was stored as mahotsav_experience='Okay' on turn 4, the closed
+            # slot then refused the caller's real "it was good" three
+            # minutes later, and the agent read the wrong value back to him
+            # ("अनुभव ठीक-ठाक रहा"). A distinctive alias (a city, a project,
+            # "linkedin") is still taken wherever the caller volunteers it.
+            if (hit is not None and t == "enum"
+                    and _is_everyday_alias(hit_alias)
+                    and not self._is_being_asked(spec.name)):
+                logger.debug("[STATE] %s: everyday word %r ignored — the "
+                             "slot was not asked", spec.name, hit_alias)
+                return None
             return hit
         if t == "money":
             return self._extract_budget(text)
@@ -413,13 +526,23 @@ class ConversationStateManager:
             return None
         if t == "boolean":
             # Only when this slot is the one being asked — a stray "yes"
-            # anywhere else must not fill it.
-            gaps = self.detect_missing_slots()
-            if gaps["missing"] and gaps["missing"][0] == spec.name:
-                if re.search(r"\b(yes|yeah|haan|ha|ji|bilkul|sure|ok|okay|હા|हां|हाँ)\b", lower):
-                    return "Yes"
-                if re.search(r"\b(no|nahi|nope|नहीं|ના|નહીં)\b", lower):
-                    return "No"
+            # anywhere else must not fill it. Script-aware boundaries: `\b`
+            # never matched "हाँ" or "नहीं" (the chandrabindu / anusvara is
+            # not a word character), so Hindi yes/no answers were invisible
+            # here and only the async LLM extractor could store them.
+            if not self._is_being_asked(spec.name):
+                return None
+            # A yes/no slot with an authored vocabulary ("मिल गई" = Yes,
+            # "ढूंढ रहा" = No) reads the answer through it first — the
+            # caller rarely says a bare yes or no.
+            if getattr(spec, "_synonym_lookup", None):
+                canon, _ = self._latest_alias(spec, lower)
+                if canon is not None:
+                    return canon
+            if _BOOL_YES_RE.search(lower):
+                return "Yes"
+            if _BOOL_NO_RE.search(lower):
+                return "No"
             return None
         if t == "email":
             # B1 (2026-07-30): deterministic spoken-form assembly — the ONLY
@@ -428,6 +551,62 @@ class ConversationStateManager:
             return normalize_spoken_email(text)
         # text/date/time: deferred to the LLM gap-filler.
         return None
+
+    @staticmethod
+    def _latest_alias(spec: SlotSpec, lower: str) -> tuple[str | None, str]:
+        """(canonical value, alias) of the LAST vocabulary mention in the
+        utterance, or (None, ""). Latest wins so a correction ("Vapi nahi,
+        Surat") lands on the corrected value; at one position the longest
+        alias wins over any it contains ("not bad" is not "bad"); edges are
+        script-aware (see _word_boundary_ok)."""
+        hits: list[tuple[int, int, str, str]] = []   # (start, end, alias, canon)
+        for alias, canon in (spec._synonym_lookup or {}).items():
+            start = 0
+            while True:
+                idx = lower.find(alias, start)
+                if idx < 0:
+                    break
+                end = idx + len(alias)
+                if _word_boundary_ok(lower, idx, end):
+                    hits.append((idx, end, alias, canon))
+                start = idx + 1
+        hits = [h for h in hits
+                if not any(o is not h and o[0] <= h[0] and h[1] <= o[1]
+                           and (o[1] - o[0]) > (h[1] - h[0]) for o in hits)]
+        if not hits:
+            return None, ""
+        _, _, alias, canon = max(hits, key=lambda h: h[0])
+        return canon, alias
+
+    def _is_being_asked(self, name: str) -> bool:
+        """Is `name` the question the caller is answering right now?
+
+        Three sources, any one suffices: the engine's own reading of what
+        its last spoken line asked (`asked=` on observe_user); the slot the
+        prompt directive chose on the previous turn (`note_asked`, so a
+        stage-scoped ask counts, not only the global-priority head); or the
+        slot at the head of `missing`. An ask noted at turn 0 is a warm-up
+        prompt build, not a question anyone heard — it never counts."""
+        if self._asked_hint == name:
+            return True
+        t = self._asked_turn.get(name)
+        if t is not None and t >= 1 and t == self.turn_index - 1:
+            return True
+        gaps = self.detect_missing_slots()
+        return bool(gaps["missing"]) and gaps["missing"][0] == name
+
+    def _just_asked(self, name: str) -> bool:
+        """Stricter than `_is_being_asked` (RUNBOOK §75): the agent's LAST
+        line asked `name` — the utterance hint, or the directive noted on
+        the previous turn — never the head-of-missing fallback. The next
+        question is not the current one: with the fallback, "हमें 3 BHK
+        चाहिए, location बताओ" filled the size AND, in the same breath,
+        decision_factor=Location, because the size's arrival made the
+        factor the new head of the list."""
+        if self._asked_hint == name:
+            return True
+        t = self._asked_turn.get(name)
+        return t is not None and t >= 1 and t == self.turn_index - 1
 
     def extract_entities(self, text: str) -> dict[str, Any]:
         """Extract every recognizable slot value from one utterance."""
@@ -541,6 +720,7 @@ class ConversationStateManager:
     @staticmethod
     def _extract_budget(text: str) -> str | None:
         result: str | None = None
+        parts: list[tuple[float, str]] = []    # single amounts, in order
         for m in _BUDGET_RE.finditer(text):
             raw_num, unit = m.group(1), m.group(2).lower()
             unit_label = "Crore" if unit.startswith(("cr", "कर")) or unit == "करोड़" else "Lakhs"
@@ -548,12 +728,21 @@ class ConversationStateManager:
             if re.search(r"[-–]", num_part):
                 lo, hi = re.split(r"\s*[-–]\s*", num_part)[:2]
                 result = f"{lo.strip()}-{hi.strip()} {unit_label}"
+                parts = []
             else:
                 n = _word_or_digit_to_num(num_part)
                 if n is None:
                     continue
                 n_str = str(int(n)) if float(n).is_integer() else str(n)
                 result = f"{n_str} {unit_label}"
+                parts.append((float(n), unit_label))
+        # "एक करोड़ बीस लाख" / "1 crore 20 lakh" is ONE amount — 1.2 crore, not
+        # the 20 lakh of the last match alone. Call 1074 (2026-10-12) stored
+        # "20 Lakhs" for a ₹1.2 Cr caller and the budget-fit check then told
+        # her, after the visit was fixed, that the home did not fit.
+        if len(parts) >= 2 and parts[-2][1] == "Crore" and parts[-1][1] == "Lakhs":
+            total = parts[-2][0] * 100 + parts[-1][0]
+            result = f"{total / 100.0:g} Crore"
         return result
 
     @staticmethod
@@ -591,6 +780,18 @@ class ConversationStateManager:
                 continue
             if key not in self.state:
                 continue  # unknown slot for this agent — ignore
+            if key in self.retired:
+                # A branch retired this slot for THIS caller — a candidate
+                # with no job has no company, role, joining date or offer
+                # letter. Live 2026-09-24 (call 934): the caller said on
+                # turn 1 he was unemployed, and the office's record still
+                # got company_name='होना है private limited',
+                # designation='डेटा साइंस', joining_status='अभी बाकी है'.
+                self.update_audit_log(
+                    key, self.state.get(key), self.state.get(key), source,
+                    f"REJECTED {source} write {new!r}: slot retired (not "
+                    f"applicable to this caller)")
+                continue
             if key in self._pending_fields:
                 # Field is awaiting the caller's explicit confirmation (e.g.
                 # name). No extractor — regex OR async LLM — may write it;
@@ -631,12 +832,74 @@ class ConversationStateManager:
                     "[IDENTITY] kept %r, rejected %s guess %r from %r",
                     old, source, new, (utterance or "")[:60])
                 continue
+            if slot_type == "money" and source != "system":
+                # A budget is an AMOUNT. The LLM gap-filler stored
+                # budget_range='No' from "मैंने बोला कि मुझे नहीं देखना" (a
+                # refusal to visit, call 1059) and the value then fed the
+                # budget-fit check as if the caller had named a figure. Both
+                # the value and the caller's words must carry a number or a
+                # money unit.
+                if not _looks_like_amount(str(new)) or (
+                        utterance and not _looks_like_amount(utterance)):
+                    self.update_audit_log(
+                        key, old, old, source,
+                        f"REJECTED {source} write {new!r}: not an amount "
+                        f"(or not in what the caller said): "
+                        f"{(utterance or '')[:80]}")
+                    logger.info("[STATE] %s: rejected %s value %r — no "
+                                "amount in %r", key, source, new,
+                                (utterance or "")[:60])
+                    continue
             if slot_type in ("email", "phone") and source in ("llm", "answer"):
                 self.update_audit_log(
                     key, old, old, source,
                     f"REJECTED {source} write {new!r} (contact slots are "
                     f"deterministic-only)")
                 continue
+            # An ask-gated slot (RUNBOOK §75) is written only as the answer
+            # to its own question, or on an explicit correction. Its
+            # vocabulary is everyday domain words a caller also says in
+            # QUESTIONS about the project: call 1052 flipped decision_factor
+            # six times ("लोकेशन बता सकते हो" → Location, "एमेनिटीज़ के बारे
+            # में बता सकते हो" → Amenities, "कंस्ट्रक्शन में है अभी?" →
+            # Construction quality) and the LLM gap-filler wrote it from
+            # "निवेश के लिए" two turns before it was asked.
+            if (spec is not None and getattr(spec, "ask_gated", False)
+                    and source not in ("system", "answer")
+                    and not self._just_asked(key)
+                    and not _CORRECTION_MARKER_RE.search(utterance or "")):
+                self.update_audit_log(
+                    key, old, old, source,
+                    f"REJECTED {source} write {new!r}: ask-gated slot, not "
+                    f"the answer to its question: {(utterance or '')[:80]}")
+                logger.info("[STATE] %s: rejected %s value %r — ask-gated "
+                            "slot was not being asked", key, source, new)
+                continue
+            # A slot with an authored vocabulary (enum_values / enum_synonyms)
+            # is CLOSED for every writer — regex, LLM extractor, tool: the
+            # canonical value is stored, or nothing is. Live 2026-09-24
+            # (call 904, Prakhar): the tool wrote preferred_location='Chala'
+            # — a locality of Vapi, so the `location: Vapi` match rule never
+            # fired and the budget rule pushed a Surat project at a Vapi
+            # caller — plus configuration_required='KBS' and
+            # finalized_property='Bhagwati', STT noise the agent then treated
+            # as facts it "remembered". Type decides whether the
+            # deterministic extractor runs; the vocabulary decides what may
+            # be stored. A slot with no vocabulary is untouched.
+            if spec is not None and getattr(spec, "_synonym_lookup", None):
+                canon = self._canonical_enum(spec, str(new))
+                if canon is None:
+                    self.update_audit_log(
+                        key, old, old, source,
+                        f"REJECTED {source} write {new!r}: not in the "
+                        f"slot's vocabulary")
+                    logger.info("[STATE] %s: rejected %s value %r — not one "
+                                "of the slot's %d known values",
+                                key, source, new, len(spec._synonym_lookup))
+                    continue
+                if canon == old:
+                    continue
+                new = canon
             if slot_type == "email":
                 from .contact_capture import validate_email
                 if not validate_email(str(new)):
@@ -645,10 +908,18 @@ class ConversationStateManager:
                         f"REJECTED invalid email {new!r}")
                     continue
                 new = str(new).strip().lower()
-            elif slot_type in ("date", "time") and source in ("llm", "answer"):
+            elif slot_type in ("date", "time") and source in ("llm", "answer",
+                                                              "tool"):
                 # A gap-filled date/time must at least parse-ish: carry a
                 # digit or a recognizable day/time word ('after office' was
                 # stored as preferred_time from a discovery answer).
+                # "tool" joined this list 2026-09-18: with LLM_TOOLS_MODE=on
+                # the main model's record_customer_details is the writer that
+                # actually runs in production, and it stored the caller's
+                # "Sure, we can do a call" as consultation_time — fill-only
+                # then refused the real "Monday 11 am" one turn later. Native
+                # script words too: a Hindi caller's "परसों शाम" carries no
+                # Latin token and no digit.
                 _sv = str(new).lower()
                 if not (any(ch.isdigit() for ch in _sv)
                         or re.search(
@@ -656,6 +927,12 @@ class ConversationStateManager:
                             r"tomorrow|tonight|monday|tuesday|wednesday|"
                             r"thursday|friday|saturday|sunday|subah|dopahar|"
                             r"shaam|raat|aaj|kal|parso|savare|bapore|saanje)\b",
+                            _sv)
+                        or re.search(
+                            r"आज|कल|परसों|परसो|सुबह|दोपहर|शाम|रात|बजे|सोमवार|"
+                            r"मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार|इतवार|"
+                            r"આજે|કાલે|પરમ|સવારે|બપોરે|સાંજે|રાત્રે|વાગ્યે|સોમવાર|"
+                            r"મંગળવાર|બુધવાર|ગુરુવાર|શુક્રવાર|શનિવાર|રવિવાર",
                             _sv)):
                     self.update_audit_log(
                         key, old, old, source,
@@ -702,10 +979,19 @@ class ConversationStateManager:
         # not yet met is BLOCKED — never asked early, still filled
         # opportunistically when volunteered (extraction is ungated).
         # v2 ask fatigue: a slot in `skipped` (max_asks hit) leaves `missing`.
+        # So does one whose last permitted ask was just spoken (`awaiting`):
+        # never asked again, but still listened for — the extractor reads
+        # `missing + awaiting` (RUNBOOK §61).
+        awaiting = sorted(
+            (n for n, t in self._ask_exhausted.items()
+             if n in self.slots and self.state.get(n) is None
+             and n not in self.skipped),
+            key=lambda n: self.slots[n].priority)
         unfilled = [n for n, s in self.slots.items()
                     if s.required and self.state.get(n) is None
                     and n not in self._pending_fields
-                    and n not in self.skipped]
+                    and n not in self.skipped
+                    and n not in self._ask_exhausted]
         blocked = sorted((n for n in unfilled if not self._deps_met(n)),
                          key=lambda n: self.slots[n].priority)
         missing = sorted((n for n in unfilled if self._deps_met(n)),
@@ -718,7 +1004,8 @@ class ConversationStateManager:
             key=lambda n: self.slots[n].priority,
         )
         return {"filled": filled, "missing": missing, "pending": pending,
-                "blocked": blocked, "skipped": sorted(self.skipped)}
+                "blocked": blocked, "skipped": sorted(self.skipped),
+                "awaiting": awaiting}
 
     def collect_satisfied(self, names: list[str]) -> bool:
         """Stage-advancement check: every named slot is filled (pending
@@ -748,7 +1035,8 @@ class ConversationStateManager:
                 return False
             if n in self._pending_fields:
                 return False
-            if self.state.get(n) is None and n not in self.skipped:
+            if (self.state.get(n) is None and n not in self.skipped
+                    and n not in self._ask_exhausted):
                 return False
         return True
 
@@ -760,6 +1048,44 @@ class ConversationStateManager:
             spec.required = True
             self.skipped.discard(name)
 
+    def retire_slots(self, names: list[str], reason: str = "") -> list[str]:
+        """Branch action hook (`retire_slots:a,b,c`): these slots do not
+        apply to THIS caller. They leave `missing` (so the state block stops
+        calling them a LATER part of the call), count as satisfied for the
+        stage gate, read 'not applicable' in the summary and the record,
+        and refuse every later write (merge_state). Idempotent; unknown
+        names are ignored with a warning.
+
+        Why a branch action and not `depends_on`: depends_on gates a slot
+        on another slot being FILLED, not on its VALUE, so a survey whose
+        two halves ('got a job' / 'still looking') never share a question
+        could not be expressed — call 934 (2026-09-24, RUNBOOK §56) asked
+        an unemployed caller which company he had joined, his designation,
+        his joining date and whether the offer letter had come."""
+        done: list[str] = []
+        for raw in names or []:
+            n = str(raw or "").strip()
+            if not n:
+                continue
+            if n not in self.slots:
+                logger.warning("[STATE] retire_slots names '%s', not a defined "
+                               "slot — ignored", n)
+                continue
+            if n in self.retired:
+                continue
+            self.retired.add(n)
+            self.skipped.add(n)
+            self._pending_fields.discard(n)
+            self._ask_exhausted.pop(n, None)
+            self.update_audit_log(
+                n, self.state.get(n), self.state.get(n), "branch",
+                f"RETIRED — {reason or 'not applicable to this caller'}")
+            done.append(n)
+        if done:
+            logger.info("[STATE] retired %s (%s)", done,
+                        reason or "not applicable to this caller")
+        return done
+
     def next_missing_slot(self) -> SlotSpec | None:
         missing = self.detect_missing_slots()["missing"]
         return self.slots[missing[0]] if missing else None
@@ -767,8 +1093,16 @@ class ConversationStateManager:
     # ------------------------------------------------------------------
     # 4. dynamic question generation
     # ------------------------------------------------------------------
-    def generate_next_question(self, language: str | None = None) -> str | None:
-        slot = self.next_missing_slot()
+    def generate_next_question(self, language: str | None = None,
+                               only: str | None = None) -> str | None:
+        """Phrasing for the next slot question.
+
+        `only` names the slot to phrase — passed when the CURRENT stage's
+        collect list, not global priority, decided which one to ask. Without
+        it the suggested phrasing could belong to a different slot than the
+        directive above it named.
+        """
+        slot = self.slots.get(only) if only else self.next_missing_slot()
         if slot is None:
             return None
         lang = language or self.language
@@ -781,6 +1115,22 @@ class ConversationStateManager:
                 return q
         q = slot.question.get(lang) or slot.question.get("en") or ""
         return q or f"Ask the caller about their {slot.display().lower()}."
+
+    @staticmethod
+    def _stage_missing(missing: "list[str]",
+                       stage_slots: "list[str] | None") -> "list[str]":
+        """`missing`, narrowed to this stage's collect list.
+
+        Returns the full list when the stage declares no slots (legacy flows
+        keep global priority order, byte-for-byte), and [] when the stage
+        declares slots and every one of them is already answered — the caller
+        then falls through to the softer "weave one in" directive instead of
+        being marched into the next stage's questions early.
+        """
+        if not stage_slots:
+            return list(missing)
+        wanted = {str(s) for s in stage_slots}
+        return [m for m in missing if m in wanted]
 
     def note_asked(self, name: str) -> None:
         """Ask-fatigue bookkeeping (v2): called at question-selection time.
@@ -796,24 +1146,100 @@ class ConversationStateManager:
         if self._asked_turn.get(name) == self.turn_index:
             return
         self._asked_turn[name] = self.turn_index
+        self.last_noted_ask = name
         self.asked_count[name] = self.asked_count.get(name, 0) + 1
         max_asks = getattr(spec, "max_asks", 0) or 0
         if max_asks > 0 and self.asked_count[name] >= max_asks and \
                 self.state.get(name) is None:
-            self.skipped.add(name)
-            logger.info("[STATE] slot %s hit max_asks=%d — skipped", name, max_asks)
+            # Not `skipped` yet: the question is being asked THIS turn and
+            # the caller has not had a chance to answer. Live 2026-09-26
+            # (call 971): every max_asks=1 slot moved to `skipped` here, the
+            # background extractor reads only `missing`, so the caller's
+            # "नहीं, अभी तक नहीं आई" (company_contacted) and "रोजगार की मदद
+            # चाहूंगा" (future_assistance) were heard, answered and never
+            # stored. It settles on the caller's NEXT turn (observe_user).
+            self._ask_exhausted[name] = self.turn_index
+            logger.info("[STATE] slot %s at max_asks=%d — last ask; skipped "
+                        "if unanswered", name, max_asks)
+
+    def unnote_asked(self, name: str) -> None:
+        """Undo this turn's `note_asked` — the agent's spoken line asked a
+        DIFFERENT question than the directive suggested, so the budget for
+        this one was never spent. Call 971: the directive said issues_faced,
+        the model asked about the Mahotsav experience instead (the stage
+        goal's first beat), and issues_faced was retired unvoiced."""
+        if self._asked_turn.get(name) != self.turn_index:
+            return
+        self._asked_turn.pop(name, None)
+        self.asked_count[name] = max(0, self.asked_count.get(name, 0) - 1)
+        self._ask_exhausted.pop(name, None)
+        if self.last_noted_ask == name:
+            self.last_noted_ask = None
+        logger.info("[STATE] slot %s not actually asked this turn — ask "
+                    "budget restored (count=%d)", name, self.asked_count[name])
+
+    # How many times one slot may have its last ask given back because the
+    # caller replied with a question / confusion / hello instead of an answer.
+    NON_ANSWER_GRACE = 2
+
+    def _keep_ask_budget(self) -> None:
+        """The caller's reply to our last question was not an answer (they
+        asked something back, were confused, or checked the line). The ask
+        just spent did not get a chance — give it back, so the slot is asked
+        again after the agent clears up the confusion instead of being
+        skipped (RUNBOOK §69, call 1032: three questions skipped this way)."""
+        grace = self.__dict__.setdefault("_non_answer_grace", {})
+        for name, asked_at in list(self._ask_exhausted.items()):
+            if self.state.get(name) is not None or asked_at < self.turn_index - 1:
+                continue
+            if grace.get(name, 0) >= self.NON_ANSWER_GRACE:
+                continue
+            grace[name] = grace.get(name, 0) + 1
+            self._ask_exhausted.pop(name, None)
+            self.asked_count[name] = max(0, self.asked_count.get(name, 0) - 1)
+            logger.info("[STATE] slot %s: the caller did not answer (question/"
+                        "confusion) — ask budget kept (grace %d/%d)",
+                        name, grace[name], self.NON_ANSWER_GRACE)
+
+    def _settle_asks(self) -> None:
+        """Promote exhausted-and-still-unanswered slots to `skipped` once
+        the caller has had a full turn (and the async extractor a chance)
+        to answer; drop the bookkeeping for ones that got filled."""
+        for name, asked_at in list(self._ask_exhausted.items()):
+            if self.state.get(name) is not None:
+                self._ask_exhausted.pop(name, None)
+                continue
+            if asked_at < self.turn_index - 1:
+                self._ask_exhausted.pop(name, None)
+                self.skipped.add(name)
+                logger.info("[STATE] slot %s asked its %d permitted time(s) "
+                            "and went unanswered — skipped",
+                            name, self.asked_count.get(name, 0))
 
     # ------------------------------------------------------------------
     # 5. prompt context — THE single authoritative state block
     # ------------------------------------------------------------------
     def build_prompt_context(self, language: str | None = None,
-                             stage_discovery: bool = True) -> str:
+                             stage_discovery: bool = True,
+                             stage_slots: "list[str] | None" = None,
+                             stage_asks: bool = True) -> str:
         """The single authoritative state block for the system prompt.
 
         Ground truth for FACTS always; the next-ACTION directive is
         stage-aware — during discovery it demands the one next question,
         after discovery it defers to the stage goal so booking/closing flows
         are never deadlocked by an unfilled optional-ish slot.
+
+        `stage_slots` is the CURRENT stage's `collect` list. When the author
+        declared one, the next question is chosen from it rather than from
+        global slot priority. Without that scoping the agent runs ahead of
+        its own flow: it asks a LATER stage's question because that slot
+        happens to be the next one missing, the caller answers, and then that
+        stage arrives and its script asks the same question again. Measured
+        live 2026-09-15 (call 851) — "Could you let us know how fast you
+        could join us?" / "immediately" / "Okay, so just to confirm, could
+        you let me know of the roles that you are interested in, and also how
+        fast you could join us?" nine seconds later.
         """
         gaps = self.detect_missing_slots()
         lines = ["━━ CONVERSATION STATE (ground truth for FACTS — never re-ask ✓ fields) ━━"]
@@ -837,6 +1263,11 @@ class ConversationStateManager:
                 lines.append(f"  ? {spec.display()}: awaiting caller confirmation")
             elif val is not None:
                 lines.append(f"  ✓ {spec.display()}: {val}")
+            elif name in self.retired:
+                # Retired by a branch: not a fact to learn, not a gap. Listing
+                # it as Unknown is what told the model a jobless caller's
+                # "company" was still an open question (call 934).
+                continue
             elif spec.required:
                 lines.append(f"  ✗ {spec.display()}: Unknown")
         if gaps["missing"]:
@@ -886,13 +1317,37 @@ class ConversationStateManager:
                                  f"(\"{spoken}\") — ask if it's correct, nothing else first.")
             lines.append(f"  • Awaiting confirmation of: {pretty_p}. Confirm that FIRST — "
                          "do not ask any other question this turn.")
-        elif gaps["missing"] and stage_discovery:
-            nq = self.generate_next_question(language)
-            first_name = gaps["missing"][0]
+        elif not stage_asks:
+            # This step of the call is not for questions — a greeting, an
+            # identity confirmation, an availability check, a close. Without
+            # this branch the directive below hands it the next missing slot
+            # and the model asks THAT instead of doing the step: measured
+            # live 2026-09-16, the agent answered "am I speaking to Piyush?"
+            # and went straight to "what are your core technical skills?",
+            # never introducing itself and never asking for the caller's
+            # introduction, because CONVERSATION STATE outranks a stage goal.
+            lines.append(
+                "  • This step is NOT for collecting information. Do NOT ask "
+                "about any of the fields above here — the later steps that "
+                "own them ask them themselves. Do only what the CURRENT GOAL "
+                "says.")
+        elif gaps["missing"] and stage_discovery and self._stage_missing(
+                gaps["missing"], stage_slots):
+            _scoped = self._stage_missing(gaps["missing"], stage_slots)
+            first_name = _scoped[0]
+            nq = self.generate_next_question(language, only=first_name)
             first = self.slots[first_name].display()
             self.note_asked(first_name)
             lines.append(f"  • Ask ONLY ONE question next, about: {first}."
                          + (f" Suggested phrasing: {nq}" if nq else ""))
+            _later = [m for m in gaps["missing"] if m not in _scoped]
+            if _later:
+                lines.append(
+                    "  • Questions belonging to a LATER part of the call: "
+                    + ", ".join(self.slots[m].display() for m in _later)
+                    + ". Do NOT ask them yet — that part of the flow asks "
+                      "them itself, and asking early means the caller is "
+                      "asked twice.")
         elif gaps["missing"]:
             pretty = ", ".join(self.slots[m].display() for m in gaps["missing"])
             lines.append(f"  • Still unknown: {pretty}. Weave in AT MOST one of these "
@@ -922,11 +1377,82 @@ class ConversationStateManager:
     # ------------------------------------------------------------------
     # Convenience / lifecycle
     # ------------------------------------------------------------------
-    def observe_user(self, text: str) -> list[AuditEntry]:
-        """The per-turn hot-path entry point: extract + merge in one call."""
+    def observe_user(self, text: str,
+                     asked: str | None = None,
+                     non_answer: bool = False) -> list[AuditEntry]:
+        """The per-turn hot-path entry point: extract + merge in one call.
+
+        `asked` is the slot the engine believes its last spoken line asked
+        about (from the utterance itself, not the directive) — a yes/no or
+        an everyday word in this turn is read as the answer to THAT."""
         self.turn_index += 1
+        self._asked_hint = asked if asked in self.slots else None
+        if non_answer:
+            self._keep_ask_budget()
+        self._settle_asks()
         extracted = self.extract_entities(text)
         return self.merge_state(extracted, source="regex", utterance=text)
+
+    def options_asked(self, agent_text: str) -> str | None:
+        """The enum slot whose OPTIONS the agent's question lists — "3 BHK या
+        4 BHK?", "लोकेशन, साइज़, amenities या construction quality?". A line
+        that offers two or more of a slot's own values as the choice asked
+        THAT slot, however the model worded the rest (calls 1080/1081: the
+        reworded factor question was not recognised and the answer was
+        refused as "not asked"). Only the question sentence is read; filled
+        slots are skipped; the slot with the most options listed wins."""
+        txt = (agent_text or "").strip()
+        if not txt:
+            return None
+        parts = re.split(r"(?<=[?।.!])\s+", txt)
+        qs = [p for p in parts if "?" in p] or ([parts[-1]] if parts else [])
+        q = (qs[-1] if qs else "").lower()
+        if not q:
+            return None
+        best, best_n = None, 1
+        for name, spec in self.slots.items():
+            if self.state.get(name) is not None or name in self.retired:
+                continue
+            lookup = getattr(spec, "_synonym_lookup", None) or {}
+            if len(set(lookup.values())) < 2:
+                continue
+            hit: set[str] = set()
+            for alias, canon in lookup.items():
+                if len(alias) < 3:
+                    continue
+                i = q.find(alias)
+                while i >= 0:
+                    if _word_boundary_ok(q, i, i + len(alias)):
+                        hit.add(canon)
+                        break
+                    i = q.find(alias, i + 1)
+            if len(hit) > best_n:
+                best, best_n = name, len(hit)
+        return best
+
+    def _canonical_enum(self, spec: SlotSpec, raw: str) -> str | None:
+        """The canonical vocabulary value a written string means, or None.
+
+        Exact alias first; else the LONGEST alias that occurs in the value as
+        a whole word ("Aranya II" beats "Aranya"; "chala, vapi" → Vapi); a
+        location-typed slot finally consults the knowledge base's own
+        location aliases. Whole-word so "Pal" never matches inside "Palanpur"
+        and "office" never inside "officer"."""
+        norm = " ".join(str(raw or "").lower().split()).strip(" .,!?;:")
+        if not norm:
+            return None
+        lookup = spec._synonym_lookup or {}
+        if norm in lookup:
+            return lookup[norm]
+        best, best_len = None, 0
+        for alias, canon in lookup.items():
+            if len(alias) > best_len and _word_in(alias, norm):
+                best, best_len = canon, len(alias)
+        if best is not None:
+            return best
+        if getattr(spec, "type", "") == "location":
+            return self._match_location(norm)
+        return None
 
     def set_externally(self, field_name: str, value: Any, source: str = "system") -> None:
         """Write-through for values captured by other subsystems (name flow,
@@ -1028,6 +1554,8 @@ class ConversationStateManager:
             if val is not None:
                 known.append(spec.summary_known.format(value=val) if spec.summary_known
                              else f"{spec.display()}: {val}.")
+            elif name in self.retired:
+                known.append(f"{spec.display()}: not applicable.")
             elif spec.required:
                 parts_unknown = spec.summary_unknown or f"{spec.display()} not yet discussed."
                 known.append(parts_unknown)
@@ -1043,9 +1571,12 @@ class ConversationStateManager:
             "summary": self.running_summary(),
             "audit_log": [a.to_dict() for a in self.audit_log],
             "turns_observed": self.turn_index,
-            # v2 — additive keys only (snapshot consumers rely on the rest):
-            "skipped": gaps["skipped"],
+            # v2 — additive keys only (snapshot consumers rely on the rest).
+            # A slot still awaiting its answer when the call ends was asked
+            # and unanswered — the record says `skipped`, as before.
+            "skipped": sorted(set(gaps["skipped"]) | set(gaps["awaiting"])),
             "blocked": gaps["blocked"],
+            "retired": sorted(self.retired),
         }
         if self.extra_flags:
             out["flags"] = dict(self.extra_flags)
@@ -1153,6 +1684,7 @@ def build_state_manager(agent_def, language: str = "hi") -> ConversationStateMan
             extract_patterns=list(getattr(s, "extract_patterns", None) or []),
             depends_on=list(getattr(s, "depends_on", None) or []),
             merge_policy=_policy,
+            ask_gated=bool(getattr(s, "ask_gated", False)),
             confirm_readback=_readback,
             max_asks=_max_asks,
             reask_question=dict(getattr(s, "reask_question", None) or {}),

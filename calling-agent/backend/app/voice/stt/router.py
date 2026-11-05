@@ -101,6 +101,43 @@ _DEVANAGARI_HALLUCINATIONS = [
 ]
 
 _REPETITION_THRESHOLD = 0.6
+# Words a real caller repeats for emphasis — "हाँ हाँ हाँ बिल्कुल", "ji ji
+# okay". Repetition of one of these beside at least one other word is
+# collapsed, not rejected (see validate_transcript_ex).
+_REPEAT_OK_WORDS = frozenset({
+    "haan", "haa", "han", "ha", "ji", "yes", "yeah", "ok", "okay", "no",
+    "nahi", "nahin", "bilkul", "theek", "thik", "accha", "achha", "sahi",
+    "right", "correct", "hmm",
+    "हाँ", "हां", "जी", "नहीं", "ना", "बिल्कुल", "ठीक", "हा", "अच्छा", "सही",
+    "હા", "ના", "જી", "બરાબર", "સારું",
+})
+
+# Rejection reasons that mean "real speech, wrong language label" — worth
+# ONE forced-language Sarvam retry when the conversation language is known.
+# `marathi_*` joined `unsupported_script` on 2026-09-26 (call 971): the
+# caller's Hindi "हाँ, कौन बोल रहा है?" came back as Marathi at p=0.52 and
+# was dropped as noise; the same forced-hi retry that rescues Gurmukhi
+# misfires rescues this.
+_SCRIPT_RETRY_REASONS = frozenset({
+    "unsupported_script", "marathi_copula", "marathi_transcript"})
+
+# Whisper is the paid fallback. When its account is out of credit every
+# call to it is a guaranteed 429 — and one segment used to pay for TWO of
+# them (attempt + retry, ~4 s) before being dropped, while the transcripts
+# queued behind it waited (call 971: a 3.6 s Hindi answer arrived 5.4 s late
+# for this reason). One quota error opens a cooldown during which the
+# fallback is not attempted at all.
+FALLBACK_QUOTA_COOLDOWN_S = float(
+    os.environ.get("STT_FALLBACK_QUOTA_COOLDOWN_S", "900"))
+_QUOTA_MARKERS = ("insufficient_quota", "credit_balance_exhausted",
+                  "no credits remaining", "exceeded your current quota",
+                  "billing")
+
+
+def _is_quota_error(exc: BaseException) -> bool:
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    return ("429" in msg or "ratelimit" in msg or "rate_limit" in msg) and \
+        any(m in msg for m in _QUOTA_MARKERS)
 
 _REPEATED_CHAR_RE = re.compile(r"^(.{1,3}[- ]?)\1{2,}[-]?$")
 
@@ -326,12 +363,32 @@ def validate_transcript_ex(text: str) -> tuple[str, str | None]:
     if len(words) >= 3:
         digit_count = sum(ch.isdigit() for ch in cleaned)
         counts = Counter(words)
-        most_common_count = counts.most_common(1)[0][1]
+        most_common_word, most_common_count = counts.most_common(1)[0]
         if most_common_count / len(words) > _REPETITION_THRESHOLD:
             if digit_count >= 5:
                 logger.info(
                     "[STT-FILTER] repetition waived (digits=%d) text=%r",
                     digit_count, text)
+            elif (most_common_word in _REPEAT_OK_WORDS
+                  and any(w != most_common_word and not w.isdigit()
+                          for w in words)):
+                # An emphatic yes is not a hallucination. Live 2026-09-26
+                # (call 971): "हाँ हाँ हाँ बिल्कुल।" — the caller agreeing to a
+                # follow-up — scored 0.75 and was thrown out, the next
+                # 300 ms blip made it two empties in a row, and the agent
+                # said "माफ़ कीजिए, आपकी आवाज़ स्पष्ट नहीं आई" to a man who
+                # had just said yes four times. Collapse the repeats and
+                # keep the words that carry the answer. A repeated word with
+                # nothing else beside it ("na na na na") is still noise.
+                collapsed: list[str] = []
+                for w in words:
+                    if not (collapsed and w == collapsed[-1] == most_common_word):
+                        collapsed.append(w)
+                text = " ".join(collapsed)
+                cleaned = text.lower().strip()
+                words = collapsed
+                logger.info("[STT-FILTER] repetition collapsed (affirmation) "
+                            "-> %r", text)
             else:
                 logger.info("[STT-FILTER] reason=repetition text=%r ratio=%.2f",
                             text, most_common_count / len(words))
@@ -416,6 +473,9 @@ class STTRouter:
         # Rate-limit state (Sarvam HTTP 429 tracking)
         self._sarvam_rl_until: float = 0.0   # monotonic time when backoff expires
         self._sarvam_rl_count: int = 0        # consecutive rate-limit strikes
+        # Fallback (Whisper) quota breaker — see FALLBACK_QUOTA_COOLDOWN_S.
+        self._fallback_disabled_until: float = 0.0
+        self._fallback_skips_logged: int = 0
 
         # F16 script-misdetection counters — read by the bridge/pipeline for
         # observability. reject: primary transcript was non-empty but rejected
@@ -428,6 +488,11 @@ class STTRouter:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def fallback_available(self) -> bool:
+        """False while the fallback provider is cooling down after a quota
+        error (no credit) — nothing is sent to it, no hedge is started."""
+        return time.monotonic() >= self._fallback_disabled_until
 
     async def transcribe(
         self,
@@ -496,7 +561,7 @@ class STTRouter:
         hedge_result: tuple[str, float | None] | None = None
 
         try:
-            if self._hedge_delay > 0:
+            if self._hedge_delay > 0 and self.fallback_available():
                 done, _ = await asyncio.wait(
                     {primary_task}, timeout=self._hedge_delay)
                 if not done:
@@ -552,7 +617,7 @@ class STTRouter:
                 # (e.g. genuine Hindi transcribed as Gurmukhi/pa-IN). The audio
                 # demonstrably contained speech — retry once with the language
                 # forced, then fall back to Whisper if that also fails.
-                if reject is not None and reject.reason == SCRIPT_REJECT_REASON:
+                if reject is not None and reject.reason in _SCRIPT_RETRY_REASONS:
                     if hedge_task is not None:
                         # A hedge is already in flight (the primary stalled
                         # before answering): its transcript — Whisper WITH the
@@ -883,6 +948,15 @@ class STTRouter:
         """
         had_error = False
 
+        if provider is self._fallback and not self.fallback_available():
+            if self._fallback_skips_logged < 3:
+                self._fallback_skips_logged += 1
+                logger.warning(
+                    "[STT] %s skipped — fallback provider out of quota, "
+                    "cooling down another %.0fs", label,
+                    self._fallback_disabled_until - time.monotonic())
+            return "", True, None, None, None
+
         for attempt in range(1, self._max_retries + 2):
             try:
                 t0 = time.monotonic()
@@ -973,6 +1047,17 @@ class STTRouter:
                     label, attempt, self._max_retries + 1, exc,
                 )
                 had_error = True
+                if provider is self._fallback and _is_quota_error(exc):
+                    # The account is out of credit: retrying is a guaranteed
+                    # second 429 and so is every segment for the next while.
+                    self._fallback_disabled_until = (
+                        time.monotonic() + FALLBACK_QUOTA_COOLDOWN_S)
+                    self._fallback_skips_logged = 0
+                    logger.error(
+                        "[STT] fallback provider reports NO QUOTA — disabling "
+                        "the fallback for %.0fs (top up the account)",
+                        FALLBACK_QUOTA_COOLDOWN_S)
+                    break
 
             if attempt <= self._max_retries:
                 logger.info(

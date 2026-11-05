@@ -390,14 +390,29 @@ def resolve_agent_slug(did: str = "", campaign_id: int | None = None,
     return slug
 
 
-def _dial_matches_phone(caller_number: str, dial: dict | None) -> bool:
-    """True only when the dial record's phone exactly suffix-matches the
-    caller — the bar for letting a dial record steer agent selection."""
+def _sig10(number: str) -> str:
+    """Last ten digits — the comparable core of an Indian number however it was
+    written (+91…, 91…, a trunk prefix like 9122… in front of the dial string)."""
+    return "".join(c for c in (number or "") if c.isdigit())[-10:]
+
+
+def _dial_matches_phone(caller_number: str, dial: dict | None,
+                        dialed_number: str = "") -> bool:
+    """True only when the dial record's phone suffix-matches THIS call's other
+    party — the bar for letting a dial record speak for who we are talking to.
+
+    Both numbers are offered because which one is the customer depends on the
+    leg: inbound it is the caller id, outbound it is the number FreeSWITCH
+    dialled (`Caller-Destination-Number`, carried here as `did`). Checking the
+    caller id alone can never match on an outbound call, because on that leg
+    the caller id is OUR origination number.
+    """
     if not dial:
         return False
-    a = "".join(c for c in (caller_number or "") if c.isdigit())[-10:]
-    b = "".join(c for c in dial.get("phone", "") if c.isdigit())[-10:]
-    return bool(a) and a == b
+    b = _sig10(dial.get("phone", ""))
+    if not b:
+        return False
+    return b in {x for x in (_sig10(caller_number), _sig10(dialed_number)) if x}
 
 
 def _lookup_agent_owner(slug: str) -> str:
@@ -423,12 +438,21 @@ CALL_LINK_FILE = Path(os.path.abspath("dashboard")) / "call_link.json"
 OUTBOUND_DIAL_MATCH_WINDOW_S = 120.0
 
 
-def _lookup_recent_outbound_dial(caller_number: str = "") -> dict | None:
+def _lookup_recent_outbound_dial(caller_number: str = "",
+                                 dialed_number: str = "") -> dict | None:
     """Most recent dial logged within the match window; prefers a phone match.
 
     Best-effort timestamp heuristic (same contract as the dashboard's own
     _classify_direction) — returns None on any doubt so inbound calls are
     never mislabeled outbound.
+
+    The returned record carries `_exact`: True when its phone actually matches
+    this call's other party, False when it is merely the newest dial in the
+    window. That distinction is the whole point. A time-only match is a fair
+    hint that SOME dial is happening, and it is worthless as a statement about
+    WHO is on this call — during a campaign burst the newest dial is almost
+    always a different person. Callers must consult `_exact` before using
+    anything identifying from it (see _resolve_call_routing).
     """
     try:
         import datetime
@@ -443,7 +467,7 @@ def _lookup_recent_outbound_dial(caller_number: str = "") -> dict | None:
                 entries = [dict(r) for r in db.execute(
                     "SELECT owner, phone, contact_id, name, agent_slug,"
                     " dialed_at, context_note, followup_id, placed_by,"
-                    " callback_meta"
+                    " callback_meta, gender"
                     " FROM call_links WHERE dialed_at >= ?"
                     " ORDER BY dialed_at DESC LIMIT 50",
                     (window_start,)).fetchall()]
@@ -453,7 +477,13 @@ def _lookup_recent_outbound_dial(caller_number: str = "") -> dict | None:
         if not entries and CALL_LINK_FILE.exists():
             entries = (json.loads(CALL_LINK_FILE.read_text(encoding="utf-8"))
                        or [])[-50:]
-        digits = "".join(c for c in (caller_number or "") if c.isdigit())[-10:]
+        # Whichever of the two numbers is the customer on this leg — inbound
+        # the caller id, outbound the dialled number. Before 2026-08-29 only
+        # the caller id was consulted, so on every outbound leg the comparison
+        # was against OUR origination number and could not match: the exact
+        # branch never fired and every outbound call fell through to the
+        # newest-dial fallback below.
+        wanted = {d for d in (_sig10(caller_number), _sig10(dialed_number)) if d}
         best, best_age = None, None
         for entry in entries:
             try:
@@ -466,12 +496,14 @@ def _lookup_recent_outbound_dial(caller_number: str = "") -> dict | None:
             age = (now - dial_dt).total_seconds()
             if not (0 <= age <= OUTBOUND_DIAL_MATCH_WINDOW_S):
                 continue
-            entry_digits = "".join(c for c in entry.get("phone", "") if c.isdigit())[-10:]
-            if digits and entry_digits and digits == entry_digits:
-                return entry  # exact phone match wins immediately
+            entry_digits = _sig10(entry.get("phone", ""))
+            if entry_digits and entry_digits in wanted:
+                return {**entry, "_exact": True}   # this really is that dial
             if best_age is None or age < best_age:
                 best, best_age = entry, age
-        return best
+        # Time-only match: a hint that a dial burst is in progress, NOT a claim
+        # about who is on this call. Flagged so no caller can mistake it.
+        return {**best, "_exact": False} if best else None
     except Exception as exc:
         logger.warning("[BRIDGE] outbound dial lookup failed: %r", exc)
         return None
@@ -501,7 +533,8 @@ def _fetch_customer_context(owner: str, phone: str) -> dict | None:
         ctx: dict | None = None
         with get_db() as db:
             contact = db.execute(
-                "SELECT id, name FROM contacts WHERE owner=? AND sig_digits=?",
+                "SELECT id, name, gender FROM contacts "
+                "WHERE owner=? AND sig_digits=?",
                 (owner, sig)).fetchone()
             if contact:
                 row = db.execute(
@@ -522,6 +555,10 @@ def _fetch_customer_context(owner: str, phone: str) -> dict | None:
                     ctx = {
                         "contact_id": contact["id"],
                         "name": (contact["name"] or "").strip(),
+                        # Optional; drives the {honorific} placeholder on an
+                        # INBOUND call, where there is no dial record to carry
+                        # it. "" for the vast majority of contacts.
+                        "gender": (contact["gender"] or "").strip().lower(),
                         "calls_count": row["calls_count"],
                         "last_call_at": row["last_call_at"],
                         "last_outcome": row["last_outcome"],
@@ -541,9 +578,40 @@ def _fetch_customer_context(owner: str, phone: str) -> dict | None:
         return None
 
 
+def _customer_number(direction: str, caller_number: str, did: str,
+                     identity_dial: dict | None) -> str:
+    """The OTHER party's number — the one fact every per-customer lookup keys on.
+
+    Inbound that is the caller id. Outbound it is the number FreeSWITCH dialled
+    (`Caller-Destination-Number`), NOT the channel's caller id, which on that
+    leg is our own origination number.
+
+    A VERIFIED dial record wins over the raw dial string because the dial
+    string can carry a trunk prefix (we have seen "9122" + the number), and the
+    record holds the normalized form the contacts table is keyed on. An
+    unverified record is not consulted at all — it describes a different call.
+    """
+    if direction != "outbound":
+        return (caller_number or "").strip()
+    if identity_dial and identity_dial.get("phone"):
+        return str(identity_dial["phone"]).strip()
+    dialed = (did or "").strip()
+    if dialed:
+        try:
+            from shared.phone import significant_digits
+            sig = significant_digits(dialed)
+            if sig:
+                return sig
+        except Exception:
+            pass
+        return dialed
+    return (caller_number or "").strip()
+
+
 def _resolve_call_routing(conn_id: str, caller_number: str = "", did: str = "",
                           campaign_id: int | None = None,
-                          agent_slug: str = "") -> dict:
+                          agent_slug: str = "",
+                          dialed_number: str = "") -> dict:
     """All blocking routing work for call setup, bundled in one place.
 
     Runs the serial DB round-trips (recent-dial lookup → agent-slug
@@ -554,7 +622,13 @@ def _resolve_call_routing(conn_id: str, caller_number: str = "", did: str = "",
     """
     dial = None
     try:
-        dial = _lookup_recent_outbound_dial(caller_number)
+        # `dialed_number` is the lescall_dest channel variable — the number
+        # this leg actually dialled, set at originate time and belonging to
+        # this channel alone. `did` (Caller-Destination-Number) is the
+        # fallback: it is the customer's number on a leg that arrived through
+        # a DID, but on an ORIGINATED leg FreeSWITCH fills it with the
+        # dialplan extension, which is why it could never be matched against.
+        dial = _lookup_recent_outbound_dial(caller_number, dialed_number or did)
     except Exception as exc:
         logger.warning("[%s] outbound dial lookup failed: %r", conn_id, exc)
 
@@ -565,10 +639,28 @@ def _resolve_call_routing(conn_id: str, caller_number: str = "", did: str = "",
     #   dial burst could inherit the dial's agent.
     # - On a confident outbound leg, Caller-Destination-Number is the
     #   CUSTOMER's number, not one of our DIDs — never DID-route on it.
-    dial_phone_match = _dial_matches_phone(caller_number, dial)
+    dial_phone_match = _dial_matches_phone(caller_number, dial,
+                                          dialed_number or did)
     confident_outbound = campaign_id is not None or dial_phone_match
     routing_did = "" if confident_outbound else did
     routing_dial_meta = dial if dial_phone_match else None
+
+    # IDENTITY vs DIRECTION — the distinction this whole function turns on.
+    #
+    # A time-only dial match may say "a dial burst is happening", and that is
+    # enough to LABEL the leg outbound. It may never say WHO is on the call.
+    # Until 2026-08-29 the unverified record was handed straight to
+    # set_call_context(), so during a campaign the agent opened with whichever
+    # contact had been dialled most recently: 44 calls across two tenants
+    # greeted a real person by a stranger's name (RUNBOOK §33). The guard
+    # already existed for agent selection two lines up — identity simply never
+    # got it.
+    identity_dial = dial if dial_phone_match else None
+    if dial is not None and identity_dial is None:
+        logger.info("[%s] dial record within the window is NOT this call "
+                    "(dialed=%s record=%s) — no contact identity applied",
+                    conn_id, _sig10(dialed_number or did) or "-",
+                    _sig10(dial.get("phone", "")) or "-")
 
     # Direction is decided BEFORE the agent stack is built: it selects which
     # of the number's two agent bindings (inbound vs outbound) applies.
@@ -587,12 +679,17 @@ def _resolve_call_routing(conn_id: str, caller_number: str = "", did: str = "",
     # inbound and the dialed number outbound.
     customer = None
     if INTEL_PRECALL_CONTEXT:
-        customer_phone = ((dial or {}).get("phone") if direction == "outbound"
-                          else caller_number) or caller_number
-        customer = _fetch_customer_context(owner, customer_phone)
+        # Returning-caller memory is IDENTITY too: loading it off an unverified
+        # dial record hands one customer's history to another.
+        customer_phone = (_customer_number(direction, caller_number,
+                                           dialed_number or did, identity_dial))
+        customer = _fetch_customer_context(owner, customer_phone) if customer_phone else None
 
     return {
+        # `dial` is the direction hint and may be someone else's dial.
+        # `identity_dial` is the only one allowed to name the person.
         "dial": dial,
+        "identity_dial": identity_dial,
         "direction": direction,
         "slug": slug,
         "owner": owner,
@@ -737,16 +834,23 @@ def _build_agent_stack(conn_id: str, did: str = "", campaign_id: int | None = No
         # lands on the same credit-log row as its speech spend.
         call_id_provider=call_id_provider,
     )
+    # Namespaces this agent's LLM context cache (RUNBOOK §62): one provider
+    # cache per agent slug, never shared across agents.
+    conversation.agent_slug = slug or ""
     return slug, conversation, stt, tts, agent_health
 
 class TelephonySession:
     """Manages one AI pipeline per phone call."""
     def __init__(self, conn_id: str, sample_rate: int, caller_number: str = "",
                  skip_greeting: bool = False, did: str = "", campaign_id: int | None = None,
-                 agent_slug: str = "", routing: dict | None = None):
+                 agent_slug: str = "", routing: dict | None = None,
+                 dialed_number: str = ""):
         self.conn_id = conn_id
         self.sample_rate = sample_rate
         self.caller_number = caller_number
+        # The number an OUTBOUND leg actually dialled (lescall_dest channel
+        # variable). Empty on inbound and on legacy dial paths.
+        self.dialed_number = dialed_number
         self.did = did
         self.campaign_id = campaign_id
         self.call_key = None  # recording folder basename; set in start()
@@ -767,10 +871,22 @@ class TelephonySession:
         if routing is None:
             routing = _resolve_call_routing(
                 conn_id, caller_number=caller_number, did=did,
-                campaign_id=campaign_id, agent_slug=agent_slug)
-        dial = routing.get("dial")
-        self._dial = dial
+                campaign_id=campaign_id, agent_slug=agent_slug,
+                dialed_number=dialed_number)
+        # `_dial` is the record allowed to SPEAK FOR the person on this call,
+        # so it is the phone-verified one only. `_dial_hint` keeps the loose
+        # match for the things that legitimately only need "a dial happened"
+        # (direction labelling). Conflating the two greeted 44 real people by
+        # a stranger's name — RUNBOOK §33.
+        self._dial = routing.get("identity_dial")
+        self._dial_hint = routing.get("dial")
+        # Local alias used further down for the call-context handoff. It is
+        # the VERIFIED record on purpose: an unverified one must never reach
+        # set_call_context(), which is what puts a name in the agent's mouth.
+        dial = self._dial
         self.direction = routing.get("direction", "inbound")
+        self.customer_number = _customer_number(
+            self.direction, caller_number, dialed_number or did, self._dial)
 
         # Build the resolved agent's STT/TTS the same way run.py does.
         self.agent_slug, conversation, stt, tts, self.agent_health = _build_agent_stack(
@@ -805,9 +921,16 @@ class TelephonySession:
                     contact_name=dial.get("name", ""),
                     contact_phone=dial.get("phone", ""),
                     conn_id=conn_id,
+                    # Optional and usually absent: only a contact list that
+                    # carried a gender column has one. It rides the SAME
+                    # verified dial record as the name, so it can never be
+                    # borrowed from a different person's dial (RUNBOOK §33).
+                    contact_gender=dial.get("gender") or "",
                 )
-                logger.info("[%s] Outbound call context: contact=%r phone=%s",
-                            conn_id, dial.get("name"), dial.get("phone"))
+                logger.info("[%s] Outbound call context: contact=%r phone=%s "
+                            "gender=%s",
+                            conn_id, dial.get("name"), dial.get("phone"),
+                            dial.get("gender") or "-")
                 # Callback context (call_links.context_note): why this call
                 # is being made — WHY-YOU-ARE-CALLING-BACK prompt block.
                 # callback_meta (scheduled follow-ups only) additionally makes
@@ -879,7 +1002,8 @@ class TelephonySession:
     async def create(cls, conn_id: str, sample_rate: int, caller_number: str = "",
                      skip_greeting: bool = False, did: str = "",
                      campaign_id: int | None = None,
-                     agent_slug: str = "") -> "TelephonySession":
+                     agent_slug: str = "",
+                     dialed_number: str = "") -> "TelephonySession":
         """Async factory: resolve routing in a worker thread, then construct.
 
         Keeps the serial DB round-trips (dial lookup → slug resolution →
@@ -888,11 +1012,11 @@ class TelephonySession:
         """
         routing = await asyncio.to_thread(
             _resolve_call_routing, conn_id, caller_number, did,
-            campaign_id, agent_slug)
+            campaign_id, agent_slug, dialed_number)
         session = cls(conn_id, sample_rate, caller_number=caller_number,
                       skip_greeting=skip_greeting, did=did,
                       campaign_id=campaign_id, agent_slug=agent_slug,
-                      routing=routing)
+                      routing=routing, dialed_number=dialed_number)
         # E6 — billing admission, off the event loop, BEFORE the greeting gate
         # opens. A refused call is answered politely and hung up rather than
         # dropped silently: a caller who hears nothing redials, which costs us
@@ -1194,10 +1318,7 @@ class TelephonySession:
 
     def _metering_open(self):
         from shared.usage_metering import open_call
-        phone = self.caller_number
-        dial = getattr(self, "_dial", None)
-        if self.direction == "outbound" and dial and dial.get("phone"):
-            phone = dial["phone"]
+        phone = getattr(self, "customer_number", "") or self.caller_number
         owner = self._metering_owner()
         decision = getattr(self, "_billing_decision", None)
         # An unattributed call is metered but NOT billable: it must leave a
@@ -1298,6 +1419,24 @@ class TelephonySession:
             logger.warning("[%s] collected-data snapshot failed: %r", self.conn_id, exc)
         return transcript, summary, collected, recording_path
 
+    def _agent_was_mute(self) -> bool:
+        """True when this call's TTS produced no audible turn at all.
+
+        Deliberately conservative: a single audible utterance is enough to
+        say the line was working, so a mid-call TTS hiccup never re-labels a
+        genuinely silent callee. Never raises — teardown path.
+        """
+        try:
+            tts = getattr(self.pipeline, "tts", None)
+            if tts is None:
+                return False
+            spoke = int(getattr(tts, "spoke_utterances", 0) or 0)
+            mute = int(getattr(tts, "mute_utterances", 0) or 0)
+            blocked = bool(getattr(tts, "credit_blocked", False))
+            return spoke == 0 and (mute > 0 or blocked)
+        except Exception:
+            return False
+
     def _compute_answer_state(self, duration_s: float):
         """Did a real conversation happen on this connected call?
 
@@ -1312,6 +1451,21 @@ class TelephonySession:
         Never raises — it runs inside call teardown.
         """
         try:
+            # (0) The engine KNOWS a machine had the line (RUNBOOK §63): a
+            # mailbox or network announcement it closed on, or a screener /
+            # hold that no person ever came through.
+            conv = getattr(self.pipeline, "conversation", None)
+            if conv is not None and not getattr(conv, "_human_spoke", True):
+                flags = getattr(getattr(conv, "state_mgr", None),
+                                "extra_flags", {}) or {}
+                _kind = flags.get("machine_answered") or getattr(
+                    conv, "_machine_wait_kind", None)
+                if _kind:
+                    return "empty", {"voicemail": "voicemail_detected",
+                                     "unreachable": "unreachable_announcement",
+                                     "screener": "screened_no_pickup",
+                                     "hold": "hold_no_pickup"}.get(
+                                         str(_kind), f"machine_{_kind}")
             turns = list(getattr(self, "transcript_tail", None) or [])
             caller_raw = [str(t.get("text") or "").strip() for t in turns
                           if str(t.get("speaker") or "").strip().lower().startswith("caller")]
@@ -1319,6 +1473,16 @@ class TelephonySession:
 
             # (1) The callee never produced a single transcript.
             if not caller_raw:
+                # ...but first: were WE audible? A call where TTS never
+                # emitted a single audio chunk is dead air from the
+                # customer's side — they were never spoken to, so of course
+                # they never answered. Recording that as "no_caller_speech"
+                # blames them for our outage and, worse, marks the phone-book
+                # row 'empty_call' so the number reads as unreachable. On
+                # 2026-09-08 two calls were logged exactly that way while
+                # every Sarvam key sat wrongly marked dead (RUNBOOK §34).
+                if self._agent_was_mute():
+                    return "empty", "agent_tts_unavailable"
                 return "empty", "no_caller_speech"
 
             # (2) Everything they produced was noise/filler. The STT router
@@ -1448,18 +1612,24 @@ class TelephonySession:
 
         lang = ""
         try:
-            lang = getattr(self.pipeline.conversation.state, "language", "") or ""
+            conv = self.pipeline.conversation
+            # The language the CALL was in, not the last turn's flip — see
+            # ConversationRouter.dominant_language (RUNBOOK §56).
+            _dom = getattr(conv, "dominant_language", None)
+            lang = (_dom() if callable(_dom) else "") or \
+                getattr(conv.state, "language", "") or ""
         except Exception:
             pass
         started = self.stats.get("start_time") or time.time()
         ended = time.time()
 
-        # On outbound legs the channel's caller id is OUR origination number;
-        # the customer's number lives in the dial record.
-        phone = self.caller_number
+        # On outbound legs the channel's caller id is OUR origination number.
+        # The customer is the number FreeSWITCH dialled, preferring a VERIFIED
+        # dial record's normalized form — never an unverified one, which is
+        # how calls.phone and calls.contact_id used to be stamped with the
+        # wrong person entirely (RUNBOOK §33).
+        phone = getattr(self, "customer_number", "") or self.caller_number
         dial = getattr(self, "_dial", None)
-        if self.direction == "outbound" and dial and dial.get("phone"):
-            phone = dial["phone"]
 
         # Billing transparency (0009): who initiated the call. Inbound = the
         # customer dialled us; outbound = whatever the dial record declared
@@ -1576,7 +1746,9 @@ class TelephonySession:
             # status filter can find these contacts. Only overwrites the
             # dial-time result ('answered' / never called) — a status the user
             # or a later real conversation set is left alone.
-            if answer_state == "empty" and contact_id:
+            if (answer_state == "empty"
+                    and answer_reason != "agent_tts_unavailable"
+                    and contact_id):
                 try:
                     db.execute(
                         "UPDATE contacts SET call_status='empty_call' "
@@ -1670,6 +1842,41 @@ class TelephonySession:
                 elif etype == "agent":
                     audit_manager.add_event(self.conn_id, "Agent", event.get("text", ""))
                     self.transcript_tail.append({"speaker": "Agent", "text": event.get("text", "")})
+                elif etype == "agent_retract":
+                    # The pipeline cut this reply before a frame of it reached
+                    # the wire (continuation merge). It is not part of the
+                    # call, and leaving it on the transcript is what makes a
+                    # clean call read back as the agent repeating itself.
+                    _text = event.get("text", "")
+                    audit_manager.drop_last_event(self.conn_id, "Agent", _text)
+                    if (self.transcript_tail
+                            and self.transcript_tail[-1].get("speaker") == "Agent"
+                            and self.transcript_tail[-1].get("text") == _text):
+                        self.transcript_tail.pop()
+                elif etype == "user_retranscribed":
+                    # The pieces of a split turn were written as heard; the
+                    # engine acts on the joined re-transcription (RUNBOOK
+                    # §78) — the transcript must say what the agent heard.
+                    _pieces = [p for p in (event.get("pieces") or []) if p]
+                    _text = event.get("text", "")
+                    span = None
+                    sst = event.get("speech_start_mono") or 0.0
+                    sen = event.get("speech_end_mono") or 0.0
+                    fa = self.stats.get("first_audio_t")
+                    if sst > 0.0 and sen > sst and fa:
+                        _nm, _nw = time.monotonic(), time.time()
+                        span = (max(0.0, _nw - (_nm - sst) - fa),
+                                max(0.0, _nw - (_nm - sen) - fa))
+                    if _pieces and _text and audit_manager.replace_last_events(
+                            self.conn_id, "Caller", _pieces, _text, span=span):
+                        k = len(_pieces)
+                        tail = list(self.transcript_tail)[-k:]
+                        if (len(tail) == k and all(
+                                e.get("speaker") == "Caller" and e.get("text") == p
+                                for e, p in zip(tail, _pieces))):
+                            for _ in range(k):
+                                self.transcript_tail.pop()
+                        self.transcript_tail.append({"speaker": "Caller", "text": _text})
         except asyncio.CancelledError:
             pass
         finally:
@@ -1829,6 +2036,18 @@ class TelephonySession:
             self._hangup_armed_ts = None  # engine cancelled (caller spoke again)
             return
         now = time.monotonic()
+        if getattr(conv, "hangup_immediate", False):
+            # RUNBOOK §83: a machine has the line (mailbox, network
+            # announcement, a hold nobody came back from). Nothing queued or
+            # playing is for anyone — break the audio at FreeSWITCH and end
+            # the channel now, without the drain or the quiet check.
+            self._hangup_sent = True
+            logger.info("[%s] [HANGUP_REQUEST] machine on the line (%s) — "
+                        "ending call immediately", self.conn_id,
+                        getattr(conv, "call_outcome", "") or "machine")
+            await self._send_break_request()
+            await self._send_hangup_request()
+            return
         if self._hangup_armed_ts is None:
             self._hangup_armed_ts = now
             logger.info("[%s] [HANGUP_ARMED] farewell delivered — waiting for "
@@ -1967,6 +2186,7 @@ class SessionManager:
         self.sessions: Dict[str, TelephonySession] = {}
 
     async def get_or_create(self, conn_id: str, sample_rate: int, caller_number: str = "",
+                            dialed_number: str = "",
                             did: str = "", campaign_id: int | None = None,
                             agent_slug: str = "") -> TelephonySession:
         if conn_id not in self.sessions:
@@ -1987,6 +2207,7 @@ class SessionManager:
 
             session = await TelephonySession.create(
                 conn_id, sample_rate, caller_number=caller_number,
+                dialed_number=dialed_number,
                 skip_greeting=skip_greeting, did=did,
                 campaign_id=campaign_id, agent_slug=agent_slug)
             self.sessions[conn_id] = session

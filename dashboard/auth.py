@@ -325,17 +325,44 @@ def _upsert_user(email: str, name: str, google_sub: str, picture: str) -> None:
 router = APIRouter()
 
 
+def _saved_profile(email: str) -> dict:
+    """The user's own Settings row ({} when absent or unreadable).
+
+    The session cookie carries the name Google knew at login and is only
+    rewritten by a fresh sign-in — so it must never be the last word on who
+    the user is. Whatever they typed in Settings wins everywhere the identity
+    is rendered; a failed read degrades to the Google name rather than to a
+    blank account chip.
+    """
+    if not email:
+        return {}
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            row = db.execute("SELECT name, picture FROM users WHERE email=?",
+                             (email,)).fetchone()
+        return dict(row) if row else {}
+    except Exception as exc:
+        logger.warning("profile lookup failed for %s: %r", email, exc)
+        return {}
+
+
 @router.get("/api/auth/me")
 def me(request: Request):
     if not oauth_enabled():
+        saved = _saved_profile(DEFAULT_OWNER)
         return {"mode": "single-tenant", "email": DEFAULT_OWNER,
-                "login_required": False}
+                "login_required": False,
+                "name": (saved.get("name") or ""),
+                "picture": (saved.get("picture") or "")}
     session = read_session_cookie(request.cookies.get(SESSION_COOKIE))
     if not session:
         return JSONResponse({"mode": "multi-tenant", "login_required": True}, status_code=401)
+    saved = _saved_profile(session["email"])
     return {"mode": "multi-tenant", "login_required": False,
-            "email": session["email"], "name": session.get("name", ""),
-            "picture": session.get("picture", "")}
+            "email": session["email"],
+            "name": (saved.get("name") or "").strip() or session.get("name", ""),
+            "picture": session.get("picture", "") or (saved.get("picture") or "")}
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +545,18 @@ def login_page(request: Request, next: str = ""):
     page = Path(__file__).parent / "static" / "login.html"
     resp = (FileResponse(str(page), media_type="text/html") if page.exists()
             else RedirectResponse("/auth/login"))  # page missing — go to Google
+    # The response carried no Cache-Control, so browsers applied HEURISTIC
+    # freshness off last-modified and kept serving a stored copy without
+    # asking — a redesigned or fixed login page reached returning visitors
+    # only once their cache aged out. "no-cache" is revalidate-before-use,
+    # not don't-store.
+    #
+    # Starlette's FileResponse sends an ETag but does NOT honour
+    # If-None-Match, so each revalidation is a full 200, not a 304. That is
+    # the right trade here and nowhere else: this page is ~15 KB, unauthed,
+    # and served once per sign-in. Do not copy this header onto the SPA's
+    # hashed assets, which are immutable and must stay cacheable.
+    resp.headers["Cache-Control"] = "no-cache"
     _set_return_cookie(resp, destination)
     return resp
 
@@ -528,10 +567,29 @@ def login_page(request: Request, next: str = ""):
 
 # Reachable without a session: the login surface itself + static assets
 # (login.html needs its fonts/styles) + the session probe.
-# /api/recordings/dl/ is the public tokenized recording download: the 256-bit
-# random token in the path is the credential, so no session is required.
+# /api/recordings/dl/ and /api/exports/dl/ are the public tokenized downloads
+# (a call recording, a generated .xlsx export): the 256-bit random token in the
+# path is the credential, so no session is required. Both live under a /dl/
+# path segment rather than at the resource root, so opening them by prefix
+# cannot widen to the owner-scoped routes beside them.
+# /v1/ is the PUBLIC INTEGRATION API. It is exempt from the session wall
+# because it carries its own credential — an API key — and enforces its own
+# tenancy, IP allowlist and rate limit in shared/public_api/keys.py. It lives
+# OUTSIDE /api/ precisely so it cannot inherit, or accidentally widen, the
+# tenancy allowlist below: a bypass granted there would apply by prefix to
+# every future sibling route.
+# /r/ is a tracked link inside a WhatsApp message a CUSTOMER taps: it has to
+# work with no session at all. The token names one URL and nothing else, and
+# the handler validates its shape before touching the database.
 _OPEN_PREFIXES = ("/auth/", "/login", "/static/", "/api/auth/me", "/favicon",
-                  "/api/recordings/dl/")
+                  "/api/recordings/dl/", "/api/exports/dl/", "/v1/", "/r/",
+                  # Interakt's WhatsApp webhook is per tenant — the account is
+                  # named by the token in the path, so it cannot be an exact
+                  # path. It authenticates itself with an HMAC over the raw
+                  # body keyed by that tenant's secret (whatsapp_api.py), and
+                  # the prefix ends in a slash + token, so no sibling route can
+                  # ever start with it (RUNBOOK §80).
+                  "/api/whatsapp/webhook/interakt/")
 
 # Paths open to unauthenticated callers by EXACT match only. Prefix matching is
 # wrong for these: a prefix short-circuits both the session requirement and the
@@ -540,7 +598,13 @@ _OPEN_PREFIXES = ("/auth/", "/login", "/static/", "/api/auth/me", "/favicon",
 # with those characters (…/razorpay-test, …/razorpay2). The webhook
 # authenticates itself with an HMAC over the raw body — that signature IS its
 # credential — so exactly one path, compared with ==, is what it needs.
-_OPEN_EXACT = ("/api/billing/webhook/razorpay",)
+# "/v1" is the API's service descriptor. It is EXACT here rather than a prefix
+# so that only the documented "/v1/..." namespace (above) and this one path are
+# opened — "/v1" as a prefix would also un-gate any future "/v1beta"-shaped
+# route by accident.
+# The Meta WhatsApp webhook is the same shape as Razorpay's: its credential is
+# the X-Hub-Signature-256 HMAC over the raw body, so exactly one path opens.
+_OPEN_EXACT = ("/api/billing/webhook/razorpay", "/v1", "/api/whatsapp/webhook")
 
 # API prefixes tenants may use — every handler under these performs its own
 # per-owner scoping. EVERYTHING ELSE under /api/ is DENIED for every session
@@ -594,6 +658,19 @@ _TENANT_API_PREFIXES = (
     # speaker), no tenant data. Session still required. Absent from this list
     # 07-24→08-01, which made every "tap to hear" chip in the copilot 403.
     "/api/voices",
+    # Live voice preview (a fixed sample line at a chosen speed) for the
+    # Builder's Preview button and the Copilot voice picker — platform
+    # synthesis, no tenant data; session still required. Unlisted, every
+    # tenant's preview 403'd (RUNBOOK §67).
+    "/api/tts/preview",
+    # Settings → API access: the tenant mints and revokes their OWN integration
+    # keys here, with a session. Owner-scoped in api_keys_api. The keys it
+    # mints are spent against /v1, which is not under /api/ at all.
+    "/api/apikeys",
+    # Integrations → WhatsApp (dashboard/whatsapp_api.py): every route takes
+    # Depends(current_owner). The Meta webhook is NOT under this prefix — it
+    # is opened by exact match above and authenticates by signature.
+    "/api/integrations",
 )
 
 

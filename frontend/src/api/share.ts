@@ -6,6 +6,11 @@
  * edits ever reach the other. Nothing here creates a live relationship, which
  * is why there is no "shared with me" list to keep in sync — once imported, it
  * is just one of your agents.
+ *
+ * The same link can be opened again, because that is how it is really used:
+ * someone builds an agent for you, improves it, and re-sends it. The second
+ * open is a choice — REPLACE a copy you hold, or take a NEW one. Replace is
+ * still a one-off copy, not a subscription.
  */
 import { api } from './client'
 import { post, del } from './mutate'
@@ -38,22 +43,50 @@ export type SharePreview = {
   }
   shared_by: { email: string; name: string }
   expires_at: string | null
+  /** When the sharer last changed the agent. */
+  source_updated_at: string | null
+  /** May this account take a NEW copy? Holding a copy already does not make
+      this false — being at the plan cap or over the daily ceiling does. */
   can_import: boolean
-  /** Human sentence explaining a refusal the user can act on. */
+  /** Human sentence explaining why a NEW copy is unavailable. */
   reason: string
-  /** 'cap_agents' | 'already_imported' | 'rate_limited' | '' */
+  /** 'cap_agents' | 'rate_limited' | '' */
   code: string
   billing: { agents_used?: number; agents_limit?: number | null; enforcement?: boolean }
-  already_imported: { slugs: string[]; at: string } | null
+  /** Live agents in MY account that came from this link. Non-empty means the
+      dialog offers Replace — which needs no plan slot, so it stays available
+      to an account at its cap. */
+  copies: ShareCopy[]
+}
+
+/** One earlier import of a link that is still live in my account. */
+export type ShareCopy = {
+  family: string
+  /** Its live slugs only — a direction I archived is not listed. */
+  slugs: string[]
+  primary: string
+  imported_at: string
+  /** Last time it was replaced from the link; null = never. */
+  replaced_at: string | null
 }
 
 export type ImportResult = {
-  status: string
+  status: 'imported' | 'replaced'
   family: string
   slugs: string[]
   /** The slug to open in the editor. */
   primary: string
+  /** replace only ↓ */
+  replaced?: string[]
+  /** Directions created from the shared version because my copy lacked them. */
+  added?: string[]
+  skipped?: string[]
+  documents?: { updated: number; removed: number; kept: number; failed?: boolean }
 }
+
+export type ImportOptions =
+  | { mode: 'new' }
+  | { mode: 'replace'; target: string }
 
 /* ── sharer ── */
 export const getShareLink = (slug: string) =>
@@ -70,5 +103,7 @@ export const revokeShareLink = (token: string) =>
 export const previewShare = (token: string) =>
   api<SharePreview>(`/share/${encodeURIComponent(token)}`)
 
-export const importShare = (token: string) =>
-  post<ImportResult>(`/share/${encodeURIComponent(token)}/import`)
+/** No options = the first import. Once a copy exists the server refuses a
+    bare call (409) rather than guess between the two. */
+export const importShare = (token: string, opts?: ImportOptions) =>
+  post<ImportResult>(`/share/${encodeURIComponent(token)}/import`, opts)

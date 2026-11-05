@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 # stopped counting toward filler_max_per_call.
 _ROUTER_SCALARS = (
     "last_agent_response",
+    "_good_time_spoken",
     "last_agent_language",
     "_name_pending",
     "_name_confirmed",
@@ -51,6 +52,11 @@ _ROUTER_SCALARS = (
     "_last_nudge_stage",
     "_llm_failure_streak",
     "llm_fallback_turns",
+    # RUNBOOK §73: identity re-confirmation + declined-visit memory.
+    "_wrong_number_pending",
+    "_identity_other",
+    "_visit_declined_turn",
+    "_visit_answer_first_turn",
 )
 
 # Router attributes holding flat containers (shallow copy suffices).

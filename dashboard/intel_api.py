@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
@@ -38,6 +39,7 @@ except Exception:  # pragma: no cover - key absence just degrades search
     pass
 
 from auth import current_owner  # noqa: E402
+from contact_names import label_rows as _label_contacts  # noqa: E402
 from shared.db.database import get_db  # noqa: E402
 from shared.intelligence import queue as intel_queue  # noqa: E402
 from shared.intelligence import search as intel_search  # noqa: E402
@@ -139,6 +141,17 @@ _SORTABLE = {"date": "c.started_at", "lead": "ci.lead_score",
              "duration": "c.duration_s"}
 
 
+def _agent_list(agent: str) -> list[str]:
+    """`?agent=` accepts ONE slug or a comma-separated set.
+
+    The Intelligence filter can now scope to several agents at once, and a CSV
+    keeps that on the existing parameter: a single slug is a one-item list, so
+    every saved link, bookmark and API caller written against the old
+    single-agent form keeps working unchanged.
+    """
+    return [a.strip() for a in (agent or "").split(",") if a.strip()]
+
+
 def _like_escape(term: str) -> str:
     """Neutralize LIKE wildcards so a literal % or _ typed by the user matches
     itself. Pairs with the ESCAPE '\\' clause on every predicate below."""
@@ -189,13 +202,17 @@ def _search_clause(term: str) -> tuple[str, list[Any]]:
     return "(" + " OR ".join(parts) + ")", params
 
 
-@router.get("/calls")
-def intel_calls(owner: str = Depends(current_owner),
-                page: int = Query(1, ge=1), limit: int = Query(_PAGE_LIMIT, le=200),
-                search: str = "", sentiment: str = "", decision: str = "",
-                agent: str = "", days: int = Query(0, ge=0),
-                min_lead: int = Query(0, ge=0, le=100),
-                sort: str = "date", order: str = "desc"):
+def _call_filters(owner: str, *, search: str = "", sentiment: str = "",
+                  decision: str = "", agent: str = "", days: int = 0,
+                  min_lead: int = 0, call_direction: str = "",
+                  analyzed_only: bool = False) -> tuple[list[str], list[Any]]:
+    """The shared WHERE for "which calls?" → (clauses, params).
+
+    One definition, used by the Intelligence list AND by filter-built reports,
+    so a report generated from a filter covers exactly the calls that filter
+    showed. Assumes the caller's FROM already joins call_intelligence ci and
+    the latest followup as f (both LEFT, so an unanalyzed call still lists).
+    """
     where = ["c.owner = ?"]
     params: list[Any] = [owner]
     if search.strip():
@@ -205,9 +222,15 @@ def intel_calls(owner: str = Depends(current_owner),
     if sentiment:
         where.append("ci.sentiment = ?")
         params.append(sentiment)
-    if agent:
-        where.append("c.agent_slug = ?")
-        params.append(agent)
+    agents = _agent_list(agent)
+    if agents:
+        # ANY() rather than "=" so one slug and twelve take the same path; a
+        # single-agent filter is just a one-element set.
+        where.append("c.agent_slug = ANY(?)")
+        params.append(agents)
+    if call_direction:
+        where.append("c.direction = ?")
+        params.append(call_direction)
     if days:
         # calls.started_at is a legacy naive TIMESTAMP (stored as UTC) — the
         # cast is required; comparing against ::text raises UndefinedFunction
@@ -220,6 +243,23 @@ def intel_calls(owner: str = Depends(current_owner),
     if decision:
         where.append("f.decision = ?")
         params.append(decision)
+    if analyzed_only:
+        # A report synthesizes STORED intelligence, so a call with none in it
+        # contributes nothing but does consume one of the 1000 slots.
+        where.append("ci.call_id IS NOT NULL")
+    return where, params
+
+
+@router.get("/calls")
+def intel_calls(owner: str = Depends(current_owner),
+                page: int = Query(1, ge=1), limit: int = Query(_PAGE_LIMIT, le=200),
+                search: str = "", sentiment: str = "", decision: str = "",
+                agent: str = "", days: int = Query(0, ge=0),
+                min_lead: int = Query(0, ge=0, le=100),
+                sort: str = "date", order: str = "desc"):
+    where, params = _call_filters(
+        owner, search=search, sentiment=sentiment, decision=decision,
+        agent=agent, days=days, min_lead=min_lead)
 
     sort_col = _SORTABLE.get(sort, "c.started_at")
     direction = "ASC" if order == "asc" else "DESC"
@@ -265,6 +305,10 @@ def intel_calls(owner: str = Depends(current_owner),
         ).fetchone()["n"]
     for r in rows:
         r["tags"] = _j(r.get("tags"))
+    # The contact_id join only fires for calls that were already bound to a
+    # contact when they happened; the phone book fills in the rest, so saving
+    # a number today renames every past call from it too.
+    _label_contacts(owner, rows)
     return {"items": rows, "total": total, "page": page, "limit": limit}
 
 
@@ -272,7 +316,8 @@ def intel_calls(owner: str = Depends(current_owner),
 # Hybrid semantic search (Call History fuzzy filter)
 # ---------------------------------------------------------------------------
 
-def _identifier_arm(owner: str, term: str, limit: int) -> list[int]:
+def _identifier_arm(owner: str, term: str, limit: int,
+                    agents: list[str] | None = None) -> list[int]:
     """Exact-ish lookup that the embedding arms structurally cannot do.
 
     call_embeddings holds transcript chunks — a call ID, a phone number or a
@@ -281,45 +326,181 @@ def _identifier_arm(owner: str, term: str, limit: int) -> list[int]:
     ahead of the fused semantic results.
     """
     clause, params = _search_clause(term)
+    agent_sql, agent_params = "", []
+    if agents:
+        agent_sql, agent_params = " AND c.agent_slug = ANY(?)", [list(agents)]
     with get_db() as db:
         rows = db.execute(
             f"""SELECT c.id FROM calls c
                   LEFT JOIN call_intelligence ci ON ci.call_id = c.id
                   LEFT JOIN contacts ct ON ct.id = c.contact_id
-                 WHERE c.owner = ? AND {clause}
+                 WHERE c.owner = ? AND {clause}{agent_sql}
                  ORDER BY c.started_at DESC NULLS LAST LIMIT ?""",
-            (owner, *params, limit),
+            (owner, *params, *agent_params, limit),
         ).fetchall()
     return [r["id"] for r in rows]
 
 
+# Everything this platform calls an identifier carries DIGITS: a phone number,
+# a call_key ("<digits>_<YYYYMMDD>_<HHMMSS>"), a conn_id (a UUID). That is the
+# whole test, and it has to be, because the first cut — "no spaces and 8+
+# characters" — matched "relocation", "complaints", "interested" and
+# "possession", so every one-word English query silently SKIPPED the AI judge
+# and fell back to the loose similarity matching this feature exists to
+# replace. It also failed the opposite way: "+91 98765 43210" has spaces, so a
+# pasted phone number was sent to the judge and spent 100 model calls
+# confirming a primary key.
+_PHONE_PUNCT = re.compile(r"^[0-9 +().\-]+$")
+_IDLIKE_RE = re.compile(r"^(?=.*\d)[A-Za-z0-9_.\-]{8,}$")
+
+
+def _looks_like_identifier(term: str) -> bool:
+    """A pasted phone number / call key / conn id is an unambiguous lookup, not
+    a description of a conversation. Those bypass the AI judge: there is no
+    membership question to decide, and paying a model to re-confirm a primary
+    key would be slow AND less correct than the index that found it."""
+    t = (term or "").strip()
+    if not t:
+        return False
+    # A phone number may be typed with spaces, +91 and dashes.
+    if _PHONE_PUNCT.match(t) and sum(c.isdigit() for c in t) >= 6:
+        return True
+    # A call_key or conn_id: one token, and it contains a digit.
+    return " " not in t and bool(_IDLIKE_RE.match(t))
+
+
 @router.get("/search")
 async def intel_search_calls(request: Request, q: str = "",
-                             limit: int = Query(25, le=100),
+                             limit: int = Query(25, le=500),
+                             agent: str = "",
+                             verify: int = 1,
                              owner: str = Depends(current_owner)):
+    """Natural-language call filter: retrieve, then DECIDE.
+
+    Retrieval alone answers "which calls are about this?", which is not what a
+    filter is asked. "whoever relocated to Vapi" and "whoever agreed to
+    relocate to Delhi" embed almost identically, so the Delhi query used to
+    return the Vapi calls — plausible rows instead of the correct empty answer.
+
+    So the hybrid arms now generate CANDIDATES (up to FILTER_MAX_CANDIDATES,
+    widened with the planner's paraphrases so a code-mixed transcript is not
+    missed), and a small model decides membership per call against an explicit
+    requirement checklist, defended by a verbatim quote that must actually
+    occur in that call's transcript (shared/intelligence/verify.py).
+
+    `verify=0` returns the raw retrieval ranking — kept for debugging and for
+    the export path's "show me what was considered", never as a silent
+    fallback: when the judge cannot run, the response says verified=false and
+    the UI labels the rows unverified rather than passing them off as filtered.
+    """
     import asyncio
+
+    from shared.intelligence import config as intel_config, verify as intel_verify
 
     q = (q or "").strip()
     if not q:
         return {"items": [], "degraded": False, "query": q}
 
-    result = await intel_search.search_calls(owner, q, limit=limit)
-    exact = await asyncio.to_thread(_identifier_arm, owner, q, limit)
+    # A constraint typed INSIDE the sentence ("...using agent shubhangi") is
+    # lifted out and applied as a real filter; only the remaining phrase is
+    # embedded. The dropdown wins when both name an agent — it is the explicit
+    # control, and silently overriding it would make the UI lie.
+    intent = await asyncio.to_thread(intel_search.parse_query_intent, owner, q)
+    picked = _agent_list(agent)
+    agents = picked or intent["agents"]
+    sem_q = intent["query"] if not picked else q
+    applied = {"agent": ", ".join(picked) or intent["agent_label"], "query": sem_q}
 
-    # Identifier hits first (a pasted call ID / phone / name is an unambiguous
-    # intent), then semantic hits not already covered.
-    seen = set(exact)
-    ordered: list[tuple[int, dict | None]] = [(cid, None) for cid in exact]
-    for res in result["results"]:
-        if res["call_id"] in seen:
-            continue
-        seen.add(res["call_id"])
-        ordered.append((res["call_id"], res))
+    identifier = _looks_like_identifier(sem_q)
+    want_verify = (bool(verify) and not identifier
+                   and intel_config.FILTER_VERIFY_ENABLED
+                   and bool(intel_config.FILTER_LLM_API_KEY))
+
+    client = None
+    criterion: dict | None = None
+    try:
+        if want_verify:
+            # One client for the planner and every judgement in this request.
+            client = intel_verify._client()
+            criterion = await intel_verify.plan_query(sem_q, client, owner)
+
+        pool = intel_config.FILTER_MAX_CANDIDATES if want_verify else limit
+        result = await intel_search.search_calls(
+            owner, sem_q, limit=pool, agents=agents,
+            probes=(criterion or {}).get("paraphrases"),
+            keywords=(criterion or {}).get("keywords"))
+        exact = await asyncio.to_thread(_identifier_arm, owner, sem_q, pool, agents)
+
+        # Identifier hits first (a pasted call ID / phone / name is an
+        # unambiguous intent), then semantic hits not already covered.
+        seen = set(exact)
+        ordered: list[tuple[int, dict | None]] = [(cid, None) for cid in exact]
+        for res in result["results"]:
+            if res["call_id"] in seen:
+                continue
+            seen.add(res["call_id"])
+            ordered.append((res["call_id"], res))
+
+        verdicts: dict[int, dict] = {}
+        vinfo: dict[str, Any] = {}
+        if want_verify and ordered:
+            vinfo = await intel_verify.verify_calls(
+                owner, sem_q, [cid for cid, _ in ordered],
+                criterion=criterion, client=client)
+            verdicts = vinfo.get("verdicts") or {}
+    finally:
+        if client is not None:
+            await client.close()
+
+    candidates = len(ordered)
+    # No candidates at all is a checked, honest zero — not a broken verifier.
+    # Reporting verified=False here made the UI warn "these are similarity
+    # matches" about an empty list it had never claimed anything about.
+    verified = (bool(vinfo.get("verified")) or not ordered) if want_verify else False
+    if verified:
+        # Judged membership REPLACES similarity ranking: the strongest evidence
+        # first, retrieval order only breaking ties. A call that failed the
+        # checklist is not a weaker match, it is not a match.
+        rank = {cid: i for i, (cid, _) in enumerate(ordered)}
+        ordered = [(cid, res) for cid, res in ordered
+                   if verdicts.get(cid, {}).get("match")]
+        ordered.sort(key=lambda cr: (-(verdicts[cr[0]].get("confidence") or 0.0),
+                                     rank[cr[0]]))
     ordered = ordered[:limit]
+
+    meta = {
+        "degraded": result["degraded"], "query": q, "applied": applied,
+        "verified": verified,
+        "verification": {
+            "enabled": want_verify,
+            "model": intel_config.FILTER_LLM_MODEL if want_verify else None,
+            "candidates": candidates,
+            "examined": vinfo.get("examined", 0),
+            "cached": vinfo.get("cached", 0),
+            "matched": sum(1 for v in verdicts.values() if v.get("match")),
+            "returned": len(ordered),
+            # Retrieval filled its own candidate pool, so there may be further
+            # matches it never offered the judge. "70 matched" reads as a
+            # complete count and on 2026-08-29 it was not one: the true answer
+            # to "people willing to relocate to vapi" was 98 and the arms
+            # surfaced 103 candidates of which 69 matched. The pool is much
+            # wider now, but a ceiling that can be hit silently is the bug —
+            # say so when it is hit.
+            "pool_full": candidates >= intel_config.FILTER_MAX_CANDIDATES,
+            "truncated": bool(vinfo.get("truncated")),
+            "identifier_lookup": identifier,
+            "criterion": {
+                "restated": (criterion or {}).get("restated"),
+                "requirements": [r["text"] for r in (criterion or {}).get("requirements") or []],
+                "excludes": (criterion or {}).get("excludes") or [],
+                "planned": bool((criterion or {}).get("planned")),
+            } if criterion else None,
+        },
+    }
 
     ids = [cid for cid, _ in ordered]
     if not ids:
-        return {"items": [], "degraded": result["degraded"], "query": q}
+        return {"items": [], **meta}
 
     def _hydrate():
         # Column list mirrors intel_calls (including the follow-up LATERAL):
@@ -364,13 +545,82 @@ async def intel_search_calls(request: Request, q: str = "",
                           else (row.get("summary") or "")[:400])
         row["score"] = round(res["rrf"], 5) if res else None
         row["match"] = "semantic" if res else "exact"
+        v = verdicts.get(cid)
+        if v:
+            # The words that put this row in the result. Shown in the UI and
+            # carried into the Excel export, so a filtered list can be audited
+            # afterwards instead of being trusted.
+            row["match"] = "verified"
+            row["match_confidence"] = round(v.get("confidence") or 0.0, 3)
+            row["match_evidence"] = v.get("evidence") or ""
+            row["match_reason"] = v.get("reason") or ""
+            if v.get("evidence"):
+                row["snippet"] = v["evidence"][:400]
         items.append(row)
-    return {"items": items, "degraded": result["degraded"], "query": q}
+    _label_contacts(owner, items)
+    return {"items": items, **meta}
 
 
 # ---------------------------------------------------------------------------
 # Conversation-intelligence workspace (single call)
 # ---------------------------------------------------------------------------
+
+
+@router.get("/calls/ids")
+def intel_call_ids(owner: str = Depends(current_owner),
+                   search: str = "", sentiment: str = "", decision: str = "",
+                   agent: str = "",
+                   days: Annotated[int, Query(ge=0)] = 0,
+                   min_lead: Annotated[int, Query(ge=0, le=100)] = 0,
+                   sort: str = "date", order: str = "desc"):
+    """Every call id the current list filter matches — the whole set, not a page.
+
+    The Intelligence list is server-paged at 50, and Export/Report can only
+    send TICKED ids, so "select all" could never mean more than one screen:
+    a 246-call filter exported as 50 unless the user paged through and ticked
+    each page in turn. Returning ids only (not the ~30-column row the list
+    renders) is what makes the whole set cheap enough to hand over at once.
+
+    Declared BEFORE /calls/{call_key} — FastAPI matches in declaration order
+    and the path-param route would otherwise swallow "ids" as a call key.
+
+    Capped at _EXPORT_MAX_CALLS, the larger of the two consumer ceilings;
+    `capped` tells the caller the selection is a floor, not the total, so the
+    UI can say so rather than silently shortening a workbook.
+
+    `days`/`min_lead` are Annotated rather than `= Query(0, ...)` so the
+    default is a real int. The tests call endpoint functions directly (the
+    current_owner dependency is FastAPI-resolved only over HTTP), and an
+    unresolved `Query` object is TRUTHY — with the bare form the day-window
+    predicate switched itself on and the object reached psycopg as a bind
+    parameter. Same validation over HTTP, callable in a test.
+    """
+    where, params = _call_filters(
+        owner, search=search, sentiment=sentiment, decision=decision,
+        agent=agent, days=days, min_lead=min_lead)
+    sort_col = _SORTABLE.get(sort, "c.started_at")
+    direction = "ASC" if order == "asc" else "DESC"
+    with get_db() as db:
+        rows = db.execute(
+            f"""SELECT c.id AS call_id
+                  FROM calls c
+                  LEFT JOIN call_intelligence ci ON ci.call_id = c.id
+                  LEFT JOIN LATERAL (
+                        SELECT * FROM followups f2
+                         WHERE f2.call_id = c.id AND f2.deleted_at IS NULL
+                         ORDER BY f2.id DESC LIMIT 1
+                  ) f ON true
+                  LEFT JOIN contacts ct ON ct.id = c.contact_id
+                 WHERE {' AND '.join(where)}
+                 ORDER BY {sort_col} {direction} NULLS LAST
+                 LIMIT ?""",
+            (*params, _EXPORT_MAX_CALLS + 1)).fetchall()
+    ids = [int(r["call_id"]) for r in rows]
+    capped = len(ids) > _EXPORT_MAX_CALLS
+    return {"ok": True, "call_ids": ids[:_EXPORT_MAX_CALLS],
+            "count": min(len(ids), _EXPORT_MAX_CALLS), "capped": capped,
+            "max": _EXPORT_MAX_CALLS}
+
 
 def _call_by_key(db, owner: str, call_key: str) -> dict[str, Any]:
     row = db.execute(
@@ -432,11 +682,22 @@ def intel_call_detail(call_key: str, owner: str = Depends(current_owner)):
                       "last_call_at": mrow["last_call_at"],
                       **_j(mrow["memory"], "{}")}
 
+    # Who this call was with, by name — the workspace headlines the person and
+    # keeps the number underneath, same as every list that links here.
+    call_out = {k: call.get(k) for k in
+                ("id", "call_key", "conn_id", "phone", "direction", "agent_slug",
+                 "language", "started_at", "ended_at", "duration_s", "outcome",
+                 "outcome_kind", "contact_id", "recording_url")}
+    call_out["contact_name"] = ""
+    if call.get("contact_id"):
+        with get_db() as db:
+            crow = db.execute("SELECT name FROM contacts WHERE id=?",
+                              (call["contact_id"],)).fetchone()
+        call_out["contact_name"] = (crow["name"] if crow else "") or ""
+    _label_contacts(owner, [call_out])
+
     return {
-        "call": {k: call.get(k) for k in
-                 ("id", "call_key", "conn_id", "phone", "direction", "agent_slug",
-                  "language", "started_at", "ended_at", "duration_s", "outcome",
-                  "outcome_kind", "contact_id", "recording_url")},
+        "call": call_out,
         "audio_url": f"/api/calls/recordings/{call.get('call_key')}/audio"
                      if call.get("call_key") else None,
         "intelligence": intelligence,
@@ -568,6 +829,7 @@ def followups_list(owner: str = Depends(current_owner), bucket: str = "",
     for r in rows:
         r["notes"] = _j(r.get("notes"))
         r["audit"] = _j(r.get("audit"))
+    _label_contacts(owner, rows, phone_key="dial_phone")
     return {"items": rows, "total": total, "counts": counts,
             "page": page, "limit": limit}
 
@@ -830,6 +1092,7 @@ def followup_review_queue(owner: str = Depends(current_owner),
         r["evidence"] = evidence.get(int(r["id"]),
                                      {"strength": "inferred", "commitments": [],
                                       "transcript_tail": []})
+    _label_contacts(owner, rows, phone_key="dial_phone")
     # `total` counts only what still needs a decision, so the header badge
     # means the same thing whether or not declined rows are being shown.
     return {"items": rows,
@@ -1009,9 +1272,79 @@ def reports_list(owner: str = Depends(current_owner),
     return {"items": rows, "total": total, "page": page, "limit": limit}
 
 
+_REPORT_MAX_CALLS = 1000
+
+
+def _calls_matching_filters(owner: str, filters: dict,
+                            analyzed_only: bool = True) -> list[int]:
+    """Call ids for a filter-built report, newest first.
+
+    Reports could only ever be built by hand-ticking rows on the Intelligence
+    page, which does not scale past one screen and makes the obvious ask —
+    "report on last month's outbound calls" — a manual selection exercise. The
+    filter vocabulary here is deliberately the SAME one the Intelligence list
+    uses, via _call_filters, so "what the filter showed" and "what the report
+    covers" cannot drift apart.
+    """
+    try:
+        days = max(0, min(int(filters.get("days") or 0), 3650))
+        min_lead = max(0, min(int(filters.get("min_lead") or 0), 100))
+        cap = int(filters.get("limit") or 200)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="filters must be numeric where numeric")
+    cap = max(1, min(cap, _REPORT_MAX_CALLS))
+    where, params = _call_filters(
+        owner,
+        search=str(filters.get("search") or ""),
+        sentiment=str(filters.get("sentiment") or ""),
+        decision=str(filters.get("decision") or ""),
+        agent=str(filters.get("agent") or ""),
+        call_direction=str(filters.get("direction") or ""),
+        days=days, min_lead=min_lead, analyzed_only=analyzed_only)
+    with get_db() as db:
+        rows = db.execute(
+            f"""SELECT c.id FROM calls c
+                  LEFT JOIN call_intelligence ci ON ci.call_id = c.id
+                  LEFT JOIN LATERAL (
+                        SELECT * FROM followups f2
+                         WHERE f2.call_id = c.id AND f2.deleted_at IS NULL
+                         ORDER BY f2.id DESC LIMIT 1
+                  ) f ON true
+                  LEFT JOIN contacts ct ON ct.id = c.contact_id
+                 WHERE {' AND '.join(where)}
+                 ORDER BY c.started_at DESC NULLS LAST
+                 LIMIT ?""",
+            (*params, cap)).fetchall()
+    return [int(r["id"]) for r in rows]
+
+
+@router.post("/reports/preview")
+def report_preview(body: dict, owner: str = Depends(current_owner)):
+    """How many analyzed calls a filter would put in a report.
+
+    The builder shows this before you commit: generating a report is a
+    background LLM job, so "0 calls match" has to be visible at the point of
+    choosing, not discovered as a failed report ten minutes later.
+    """
+    ids = _calls_matching_filters(owner, body.get("filters") or {})
+    return {"ok": True, "call_count": len(ids),
+            "capped": len(ids) >= max(1, min(
+                int((body.get("filters") or {}).get("limit") or 200),
+                _REPORT_MAX_CALLS))}
+
+
 @router.post("/reports")
 def report_create(body: dict, owner: str = Depends(current_owner)):
     raw = body.get("call_ids") or []
+    # No explicit selection → build the set from the filter instead. Both
+    # paths converge on the same ownership check below.
+    if not raw and isinstance(body.get("filters"), dict) and body["filters"]:
+        raw = _calls_matching_filters(owner, body["filters"])
+        if not raw:
+            raise HTTPException(
+                status_code=422,
+                detail="No analyzed calls match that filter — widen the date "
+                       "range or clear a filter.")
     if not isinstance(raw, list) or not raw:
         raise HTTPException(status_code=422, detail="call_ids required")
     try:
@@ -1120,6 +1453,34 @@ def report_export_xlsx(rid: int, owner: str = Depends(current_owner)):
         headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
+@router.get("/reports/{rid}/export.{fmt}", include_in_schema=False)
+def report_export_text(rid: int, fmt: str, owner: str = Depends(current_owner)):
+    """The report as markdown or plain text.
+
+    The synthesized document IS markdown, so .md is the source with a
+    provenance header — nothing is re-rendered and nothing can drift from what
+    the reader saw on screen. .txt is the same content with the markup taken
+    off, for mail clients and CRM note fields.
+    """
+    from fastapi.responses import Response
+    from shared.intelligence import report_export as rx
+
+    builders = {"md": (rx.build_md, "text/markdown"),
+                "txt": (rx.build_txt, "text/plain")}
+    if fmt not in builders:
+        raise HTTPException(status_code=404, detail=f"unknown export format {fmt!r}")
+    build, media = builders[fmt]
+    rep, rows = _report_export_payload(rid, owner)
+    if not (rep.get("document") or "").strip():
+        raise HTTPException(
+            status_code=409,
+            detail="This report has no document yet — it is still generating.")
+    blob = build(rep, rows, owner)
+    name = rx.safe_filename(rep.get("title"), fmt)
+    return Response(content=blob, media_type=f"{media}; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
 @router.delete("/reports/{rid}")
 def report_delete(rid: int, owner: str = Depends(current_owner)):
     with get_db() as db:
@@ -1130,6 +1491,276 @@ def report_delete(rid: int, owner: str = Depends(current_owner)):
     if not getattr(cur, "rowcount", 0):
         raise HTTPException(status_code=404, detail="report not found")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Excel exports of a call selection → Google Cloud Storage
+#
+# "Generate report" synthesises prose. This is the other half of what a
+# selection is for: the rows themselves, as a workbook someone can pivot,
+# hand to a dialling team, or load into a CRM — and living in the customer's
+# cloud bucket rather than a browser download folder, so it survives the
+# laptop it was made on and can be shared by link.
+# ---------------------------------------------------------------------------
+
+# Ceiling on one workbook. At the live corpus average (1.7 kB of transcript per
+# call) 2000 calls is a ~10 MB file that Excel still opens comfortably; past
+# that the Transcripts sheet is what breaks first.
+_EXPORT_MAX_CALLS = 2000
+
+
+def _utcnow():
+    import datetime as _dt
+
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
+def _safe_criterion(raw: Any) -> dict:
+    """The filter criterion is echoed onto the workbook's Summary sheet, and it
+    arrives from the browser — so it is bounded here rather than trusted. The
+    client sends it (instead of the server re-deriving it) so the sheet records
+    the checklist the user actually SAW, not one a re-plan might reword."""
+    if not isinstance(raw, dict):
+        return {}
+    reqs = [str(r)[:300] for r in (raw.get("requirements") or [])[:8]
+            if isinstance(r, (str, int, float))]
+    return {"restated": str(raw.get("restated") or "")[:400],
+            "requirements": reqs}
+
+
+def _revoked_token(eid: int) -> str:
+    """Deleting an export must invalidate its link, but download_token is
+    UNIQUE — so the row keeps a value that cannot collide and cannot be
+    guessed back into a working link."""
+    import secrets as _s
+
+    return f"revoked-{eid}-{_s.token_urlsafe(8)}"
+
+
+def _export_row(row: dict) -> dict:
+    """One export as the UI sees it. `url` is the tokenized link (the bucket is
+    private; the token is the credential — see shared/export_store.py)."""
+    from shared import export_store
+
+    obj = row.get("gcs_object")
+    return {
+        "id": row["id"], "title": row.get("title") or "",
+        "query": row.get("query") or "",
+        "call_count": row.get("call_count") or 0,
+        "contact_count": row.get("contact_count") or 0,
+        "filename": row.get("filename"),
+        "size_bytes": row.get("size_bytes"),
+        "storage": row.get("storage"),
+        "gcs_uri": (f"gs://{row['gcs_bucket']}/{obj}"
+                    if obj and row.get("gcs_bucket") else None),
+        "gcs_object": obj,
+        "gcs_console_url": export_store.console_url(obj) if obj else None,
+        "uploaded_at": row.get("gcs_uploaded_at"),
+        "upload_error": row.get("upload_error"),
+        "url": export_store.public_download_url(row["download_token"]),
+        "created_at": row.get("created_at"),
+        "created_by": row.get("created_by"),
+    }
+
+
+@router.post("/exports")
+async def export_create(body: dict, owner: str = Depends(current_owner)):
+    """Build the workbook for a selection and put it in the bucket.
+
+    Selection is either `call_ids` (the ticked rows) or `filters` (the same
+    vocabulary the Intelligence list uses). `query` is the filter phrase that
+    produced the selection: it is stored for provenance AND used to pull the
+    AI filter's recorded evidence, so the workbook can show the line from each
+    call that made it qualify.
+
+    Synchronous on purpose — the workbook is built from rows already in the
+    database, so it is ready in about a second and a background job would only
+    add a place for it to get lost.
+    """
+    import asyncio
+
+    from shared import export_store
+    from shared.db.database import get_db as _get_db
+    from shared.intelligence import config as intel_config
+    from shared.intelligence import selection_export, verify as intel_verify
+
+    raw = body.get("call_ids") or []
+    if not raw and isinstance(body.get("filters"), dict) and body["filters"]:
+        # An export is a data dump, not a synthesis: a call with no analysis
+        # still has a number, a duration and a transcript worth exporting, so
+        # this path does NOT restrict to analysed calls the way reports do.
+        raw = _calls_matching_filters(owner, {**body["filters"],
+                                             "limit": _EXPORT_MAX_CALLS},
+                                      analyzed_only=False)
+    try:
+        ids = [int(x) for x in raw][:_EXPORT_MAX_CALLS]
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="call_ids must be integers")
+    if not ids:
+        raise HTTPException(status_code=422,
+                            detail="select at least one call to export")
+
+    title = (str(body.get("title") or "").strip()
+             or f"Calls — {(str(body.get('query') or '').strip() or 'selection')}")[:200]
+    query = str(body.get("query") or "").strip()[:2000]
+    token = export_store.new_token()
+
+    with get_db() as db:
+        row = db.execute(
+            """INSERT INTO call_exports
+                   (owner, title, query, call_ids, filename, download_token,
+                    created_by, storage)
+               VALUES (?,?,?,?,?,?,?,'pending') RETURNING id""",
+            (owner, title, query, json.dumps(ids), "pending.xlsx", token, owner),
+        ).fetchone()
+    export_id = row["id"]
+    filename = export_store.filename_for(title, export_id)
+
+    def _build():
+        with _get_db() as db2:
+            # Verdicts are stored under the phrase the JUDGE was given, which is
+            # the query with any "...using agent shubhangi" constraint lifted
+            # out (see intel_search_calls). The client sends the phrase the user
+            # TYPED, so whenever an agent was named inside the sentence — a
+            # documented way to use this box — the lookup missed every row and
+            # the workbook shipped with an empty Evidence sheet and
+            # `verified: false`, silently downgrading a filtered export to an
+            # unverified one. Fixed here rather than in the caller so it holds
+            # for every client, not just the dashboard.
+            evidence = {}
+            if query:
+                evidence = intel_verify.load_evidence(owner, query, ids)
+                if not evidence:
+                    lifted = intel_search.parse_query_intent(owner, query)["query"]
+                    if lifted and lifted != query:
+                        evidence = intel_verify.load_evidence(owner, lifted, ids)
+            return selection_export.build_for_selection(
+                db2, owner, ids,
+                {"title": title, "query": query, "created_by": owner,
+                 "verified": bool(evidence),
+                 "verify_model": intel_config.FILTER_LLM_MODEL,
+                 "criterion": _safe_criterion(body.get("criterion"))},
+                evidence=evidence)
+
+    try:
+        blob, stats = await asyncio.to_thread(_build)
+    except Exception as exc:
+        logger.exception("export %s failed to build", export_id)
+        with get_db() as db:
+            db.execute("UPDATE call_exports SET deleted_at=now(), "
+                       "upload_error=? WHERE id=? AND owner=?",
+                       (f"build failed: {exc}"[:500], export_id, owner))
+        raise HTTPException(status_code=500, detail=f"export failed: {exc}")
+
+    if not stats["call_count"]:
+        with get_db() as db:
+            db.execute("UPDATE call_exports SET deleted_at=now() WHERE id=? AND owner=?",
+                       (export_id, owner))
+        raise HTTPException(status_code=404,
+                            detail="none of those calls belong to this account")
+
+    # Local copy first: it is the serving fallback while GCS is unreachable,
+    # and the retry source afterwards. Only then the upload.
+    local = await asyncio.to_thread(export_store.write_local, filename, blob)
+    storage, obj, bucket, err = "local", None, None, None
+    if export_store.gcs_enabled():
+        obj = export_store.object_name(owner, export_id, filename)
+        try:
+            await asyncio.to_thread(export_store.upload_bytes, obj, blob)
+            storage, bucket = "gcs", export_store.bucket_name()
+        except Exception as exc:
+            logger.error("export %s upload to GCS failed: %r", export_id, exc)
+            obj, err = None, f"{type(exc).__name__}: {exc}"[:500]
+    else:
+        err = "GCS_EXPORTS_BUCKET/GCS_RECORDINGS_BUCKET is not configured"
+
+    with get_db() as db:
+        db.execute(
+            """UPDATE call_exports
+                  SET filename=?, size_bytes=?, sha256=?, call_ids=?,
+                      call_count=?, contact_count=?, storage=?, gcs_bucket=?,
+                      gcs_object=?, gcs_uploaded_at=?, local_path=?,
+                      upload_error=?
+                WHERE id=? AND owner=?""",
+            (filename, len(blob), export_store.sha256(blob),
+             json.dumps(stats["call_ids"]), stats["call_count"],
+             stats["contact_count"], storage, bucket, obj,
+             (_utcnow() if storage == "gcs" else None),
+             str(local), err, export_id, owner),
+        )
+        out = dict(db.execute("SELECT * FROM call_exports WHERE id=? AND owner=?",
+                              (export_id, owner)).fetchone())
+    payload = _export_row(out)
+    payload["number_count"] = stats["number_count"]
+    payload["ok"] = True
+    return payload
+
+
+@router.get("/exports")
+def exports_list(owner: str = Depends(current_owner),
+                 limit: int = Query(25, le=100)):
+    with get_db() as db:
+        rows = [dict(r) for r in db.execute(
+            """SELECT * FROM call_exports
+                WHERE owner=? AND deleted_at IS NULL
+                ORDER BY id DESC LIMIT ?""", (owner, limit)).fetchall()]
+    return {"items": [_export_row(r) for r in rows]}
+
+
+@router.get("/exports/{eid}/download")
+def export_download(eid: int, owner: str = Depends(current_owner)):
+    """Session-authenticated download. Same bytes the tokenized link serves."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM call_exports WHERE id=? AND owner=? AND deleted_at IS NULL",
+            (eid, owner)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="export not found")
+    return stream_export(dict(row))
+
+
+@router.delete("/exports/{eid}")
+def export_delete(eid: int, owner: str = Depends(current_owner)):
+    """Revokes the link and hides the row. The GCS object is deliberately left
+    in place: the bucket is the customer's record of what was exported, and a
+    dashboard click should not silently delete from their cloud storage."""
+    with get_db() as db:
+        cur = db.execute(
+            "UPDATE call_exports SET deleted_at=now(), download_token=? "
+            "WHERE id=? AND owner=? AND deleted_at IS NULL",
+            (_revoked_token(eid), eid, owner))
+    if not getattr(cur, "rowcount", 0):
+        raise HTTPException(status_code=404, detail="export not found")
+    return {"ok": True}
+
+
+def stream_export(row: dict):
+    """Local staging copy first, GCS second — the same order recordings use,
+    because the local file is the one that certainly exists right after the
+    export was built."""
+    from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+
+    from shared import export_store
+
+    name = row.get("filename") or "calls.xlsx"
+    headers = {"Content-Disposition": f'attachment; filename="{name}"'}
+    path = row.get("local_path")
+    if path and Path(path).exists():
+        return FileResponse(path, media_type=export_store.XLSX_MIME,
+                            headers=headers)
+    obj = row.get("gcs_object")
+    if obj:
+        try:
+            # The bucket recorded on the ROW, not the one configured now —
+            # see export_store.open_stream.
+            stream = export_store.open_stream(obj, row.get("gcs_bucket"))
+        except Exception as exc:
+            logger.error("export %s unreadable from GCS: %r", row.get("id"), exc)
+            return JSONResponse({"error": "export file is unavailable"},
+                                status_code=404)
+        return StreamingResponse(stream, media_type=export_store.XLSX_MIME,
+                                 headers=headers)
+    return JSONResponse({"error": "export file is unavailable"}, status_code=404)
 
 
 # ---------------------------------------------------------------------------
@@ -1692,7 +2323,14 @@ _LEAD_BANDS = [("hot", 70, 101), ("warm", 40, 70), ("cold", 0, 40)]
 
 
 @router.get("/analytics")
-def intel_analytics(owner: str = Depends(current_owner), days: int = Query(30, ge=1)):
+def intel_analytics(owner: str = Depends(current_owner), days: int = Query(30, ge=1),
+                    agent: str = ""):
+    # Every panel below the filter row is scoped by the SAME clause, so the KPI
+    # cards, the topic/objection lists and the trend line can never describe a
+    # different population than the table underneath them.
+    _agents = _agent_list(agent)
+    agent_sql = " AND c.agent_slug = ANY(?)" if _agents else ""
+    ap: list = [_agents] if _agents else []
     with get_db() as db:
         head = db.execute(
             f"""SELECT count(*) AS analyzed,
@@ -1705,15 +2343,19 @@ def intel_analytics(owner: str = Depends(current_owner), days: int = Query(30, g
                       count(*) FILTER (WHERE ci.lead_score >= 70) AS hot_leads
                  FROM call_intelligence ci
                  JOIN calls c ON c.id = ci.call_id
-                WHERE ci.owner=? AND {_WINDOW}""",
-            (owner, days),
+                WHERE ci.owner=? AND {_WINDOW}{agent_sql}""",
+            (owner, days, *ap),
         ).fetchone()
+        # followups carries no agent column; join through the call it came
+        # from so this row reads the same population as everything else.
         followups = {r["decision"]: r["n"] for r in db.execute(
-            """SELECT decision, count(*) AS n FROM followups
-                WHERE owner=? AND deleted_at IS NULL
-                  AND created_at > now() - make_interval(days => ?)
-                GROUP BY decision""",
-            (owner, days),
+            f"""SELECT fu.decision, count(*) AS n FROM followups fu
+                  LEFT JOIN calls c ON c.id = fu.call_id
+                 WHERE fu.owner=? AND fu.deleted_at IS NULL
+                   AND fu.created_at > now() - make_interval(days => ?)
+                   {agent_sql}
+                 GROUP BY fu.decision""",
+            (owner, days, *ap),
         ).fetchall()}
 
         def top_list(field: str, cap: int = 15):
@@ -1723,8 +2365,9 @@ def intel_analytics(owner: str = Depends(current_owner), days: int = Query(30, g
                       JOIN calls c ON c.id = ci.call_id,
                            jsonb_array_elements_text(ci.{field}::jsonb) AS item
                      WHERE ci.owner=? AND ci.{field} IS NOT NULL AND {_WINDOW}
+                           {agent_sql}
                      GROUP BY item ORDER BY n DESC LIMIT ?""",
-                (owner, days, cap),
+                (owner, days, *ap, cap),
             ).fetchall()]
 
         topics = top_list("topics")
@@ -1736,13 +2379,23 @@ def intel_analytics(owner: str = Depends(current_owner), days: int = Query(30, g
                       count(*) FILTER (WHERE ci.sentiment='negative') AS negative
                  FROM call_intelligence ci
                  JOIN calls c ON c.id = ci.call_id
-                WHERE ci.owner=? AND {_WINDOW}
+                WHERE ci.owner=? AND {_WINDOW}{agent_sql}
                 GROUP BY 1 ORDER BY 1""",
+            (owner, days, *ap),
+        ).fetchall()]
+        # Options come from the WINDOW, never the agent filter itself — a
+        # dropdown that removes its own other choices cannot be changed back.
+        agent_options = [r["agent_slug"] for r in db.execute(
+            f"""SELECT DISTINCT c.agent_slug FROM calls c
+                 WHERE c.owner=? AND {_WINDOW}
+                   AND c.agent_slug IS NOT NULL AND c.agent_slug <> ''
+                 ORDER BY 1""",
             (owner, days),
         ).fetchall()]
     return {"summary": dict(head), "followup_decisions": followups,
             "topics": topics, "objections": objections, "products": products,
-            "trends": trends, "days": days}
+            "trends": trends, "days": days, "agent": agent,
+            "agent_options": agent_options}
 
 
 # ---------------------------------------------------------------------------
@@ -1765,12 +2418,43 @@ def _pct(part: float | None, whole: float | None) -> float | None:
             dependencies=[Depends(require_feature("conversation_analytics"))])
 def conversation_analytics(owner: str = Depends(current_owner),
                            days: int = Query(30, ge=1, le=365),
-                           agent: str = ""):
-    scope = [f"ci.owner = ?"]
+                           agent: str = "",
+                           direction: str = "",
+                           language: str = "",
+                           sentiment: str = "",
+                           lead_band: str = ""):
+    """Every panel on /conv-analytics, over one scoped set of calls.
+
+    `agent` was the only way to narrow the call set, which made the page an
+    all-or-nothing view: there was no way to ask "how do outbound Gujarati
+    calls compare" without leaving for Intelligence and hand-picking rows.
+    Direction / language / sentiment / lead band are deliberately COARSE — they
+    name a cohort, not individual calls — and every one of them folds into the
+    single `scoped` predicate below, so the KPI deltas, the funnel, the
+    heatmap and the leaderboard all describe exactly the same population.
+    """
+    scope = ["ci.owner = ?"]
     base: list[Any] = [owner]
     if agent:
         scope.append("c.agent_slug = ?")
         base.append(agent)
+    if direction:
+        scope.append("COALESCE(c.direction,'unknown') = ?")
+        base.append(direction)
+    if language:
+        scope.append("COALESCE(NULLIF(c.language,''),'unknown') = ?")
+        base.append(language)
+    if sentiment in ("positive", "neutral", "negative"):
+        scope.append("ci.sentiment = ?")
+        base.append(sentiment)
+    band = next((b for b in _LEAD_BANDS if b[0] == lead_band), None)
+    if band:
+        # Same band edges the KPI row and the distribution chart use, so a
+        # call can never be counted hot by the filter and warm by the chart.
+        scope.append("(ci.lead_score >= ? AND ci.lead_score < ?)")
+        base += [band[1], band[2]]
+    elif lead_band == "unscored":
+        scope.append("ci.lead_score IS NULL")
     scoped = " AND ".join(scope)
 
     # `offset_days` shifts the window back one full period so the same query
@@ -1947,6 +2631,9 @@ def conversation_analytics(owner: str = Depends(current_owner),
             (*base, days),
         ).fetchall()]
 
+        # Joined through call_intelligence and scoped like every other panel:
+        # a footer counting follow-ups from calls the rest of the page has
+        # filtered out is a number that contradicts the page it sits on.
         followups = dict(db.execute(
             f"""SELECT count(*) AS total,
                        count(*) FILTER (WHERE f.decision='yes')    AS yes,
@@ -1955,18 +2642,35 @@ def conversation_analytics(owner: str = Depends(current_owner),
                        count(*) FILTER (WHERE f.status='missed')    AS missed
                   FROM followups f
                   JOIN calls c ON c.id = f.call_id
-                 WHERE f.owner=? AND f.deleted_at IS NULL AND {_WINDOW}
-                   {'AND c.agent_slug = ?' if agent else ''}""",
-            (owner, days, *( [agent] if agent else [] )),
+                  JOIN call_intelligence ci ON ci.call_id = c.id
+                 WHERE f.deleted_at IS NULL AND {scoped} AND {_WINDOW}""",
+            (*base, days),
         ).fetchone())
 
         lists = {name: top_list(db, name) for name in
                  ("topics", "objections", "product_interest", "pain_points",
                   "buying_signals", "competitor_mentions")}
 
+        # Picker options are deliberately NOT scoped by the active filters —
+        # narrowing them to the current selection is how a filter row becomes a
+        # dead end you can only escape with Reset.
         agent_options = [r["agent_slug"] for r in db.execute(
             """SELECT DISTINCT agent_slug FROM calls
                 WHERE owner=? AND agent_slug IS NOT NULL ORDER BY 1""",
+            (owner,),
+        ).fetchall()]
+        language_options = [r["language"] for r in db.execute(
+            """SELECT DISTINCT COALESCE(NULLIF(c.language,''),'unknown') AS language
+                 FROM calls c
+                 JOIN call_intelligence ci ON ci.call_id = c.id
+                WHERE ci.owner=? ORDER BY 1""",
+            (owner,),
+        ).fetchall()]
+        direction_options = [r["direction"] for r in db.execute(
+            """SELECT DISTINCT COALESCE(c.direction,'unknown') AS direction
+                 FROM calls c
+                 JOIN call_intelligence ci ON ci.call_id = c.id
+                WHERE ci.owner=? ORDER BY 1""",
             (owner,),
         ).fetchall()]
 
@@ -1980,8 +2684,13 @@ def conversation_analytics(owner: str = Depends(current_owner),
     previous["positive_rate"] = _pct(previous.get("positive"), prev_analyzed)
 
     return {"days": days, "agent": agent or None,
+            "filters": {"agent": agent or "", "direction": direction or "",
+                        "language": language or "", "sentiment": sentiment or "",
+                        "lead_band": lead_band or ""},
             "current": current, "previous": previous,
             "series": series, "lead_bands": bands, "agents": agents,
             "heatmap": heat, "mix": mix, "followups": followups,
             "funnel": funnel, "commitments": commitments,
-            "agent_options": agent_options, **lists}
+            "agent_options": agent_options,
+            "language_options": language_options,
+            "direction_options": direction_options, **lists}

@@ -148,6 +148,7 @@ def page(title: str, body: str, flash: tuple[str, str] | None = None) -> str:
     <a href="/admin/invoices">Outstanding</a>
     <a href="/admin/payments">Payments</a>
     <a href="/admin/health">Health</a>
+    <a href="/admin/integration">Integration API</a>
     <a href="/admin/keys">Keys</a>
     <a href="/admin/audit">Audit</a>
     <a href="/admin/logout">Sign out</a>

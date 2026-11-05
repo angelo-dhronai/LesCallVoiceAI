@@ -3,22 +3,25 @@ import { Link } from 'react-router-dom'
 import { useGet, useRefresh } from '../api/hooks/useApi'
 import {
   copilotChat, copilotSession, copilotSessions, copilotDeleteSession,
-  copilotUpload, applyPendingChange, discardPendingChange,
+  copilotUpload, applyPendingChange, discardPendingChange, copilotQuickControls,
   type CopilotAction, type TranscriptMsg, type SessionSummary,
-  type InterviewProgress, type PendingChange, type VoiceSample,
+  type InterviewProgress, type PendingChange, type VoiceSample, type QuickControls,
 } from '../api/copilot'
+import { DOC_ACCEPT, DOC_MAX_MB, DOC_TYPES_HUMAN, docSupported } from '../api/agents'
 import { cx, Badge, Button, EmptyState, IconButton, Spinner } from '../components/ui'
 import { TextShimmer } from '../components/motion'
 import { Markdown } from '../components/markdown'
 import { useVoicePrompt } from '../lib/voicePrompt'
+import { parseTs } from '../lib/format'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { TryAgentDialog } from '../components/TryAgent'
 import { ActivateAgentModal, type ActivateTarget } from '../components/ActivateAgent'
+import { VoiceSpeedControls } from '../components/VoiceSpeedControls'
 import {
   Sparkles, SendHorizontal, RotateCcw, Check, X, ArrowDown, Info,
   Plus, Pencil, Radio, Bot, Trash2, MessagesSquare, SquarePen, Lightbulb,
   Paperclip, FileText, ClipboardList, Eye, EyeOff, PlayCircle, Volume2,
-  Mic, Square, Languages,
+  Mic, Square, Languages, SlidersHorizontal,
 } from 'lucide-react'
 
 /* ─────────────────────────── session id ─────────────────────────── */
@@ -61,16 +64,15 @@ function syncSessionUrl(sid: string) {
 }
 
 function relTime(iso?: string | null): string {
-  if (!iso) return ''
-  const t = new Date(iso).getTime()
-  if (Number.isNaN(t)) return ''
-  const mins = Math.max(0, Math.round((Date.now() - t) / 60000))
+  const at = parseTs(iso)
+  if (!at) return ''
+  const mins = Math.max(0, Math.round((Date.now() - at.getTime()) / 60000))
   if (mins < 1) return 'now'
   if (mins < 60) return `${mins}m`
   const hours = Math.round(mins / 60)
   if (hours < 24) return `${hours}h`
   const days = Math.round(hours / 24)
-  return days < 7 ? `${days}d` : new Date(iso).toLocaleDateString()
+  return days < 7 ? `${days}d` : at.toLocaleDateString('en-IN')
 }
 
 /* Local message shape: TranscriptMsg plus a frontend-only error flag so
@@ -561,9 +563,14 @@ const SUGGESTIONS = [
   },
 ]
 
-/* Placeholder tip — the two live templates the call engine substitutes in the
-   opening greeting. Shown in the empty state and (dismissibly) above the
-   composer so agent builders discover them mid-conversation too. */
+/* Placeholder tip — the four live templates the call engine substitutes into
+   authored spoken lines. Shown in the empty state and (dismissibly) above the
+   composer so agent builders discover them mid-conversation too.
+
+   Deliberately short: this is a discovery hint, not documentation. It names
+   what exists, shows one line using all four, and gives the single caveat that
+   would otherwise surprise someone — the gendered two need a Gender column and
+   most contact lists have none. The long form lives in /developers. */
 const TIP_KEY = 'copilot_placeholder_tip_dismissed'
 
 function PlaceholderTip({ onDismiss }: { onDismiss?: () => void }) {
@@ -571,12 +578,17 @@ function PlaceholderTip({ onDismiss }: { onDismiss?: () => void }) {
     <div className="flex items-start gap-2.5 rounded-xl bg-amber-400/10 px-3 py-2.5 text-left ring-1 ring-amber-400/25">
       <Lightbulb size={15} className="mt-0.5 shrink-0 text-amber-500" />
       <div className="min-w-0 flex-1 text-xs leading-relaxed text-soft">
-        <span className="font-semibold text-[var(--text)]">Tip — smart greeting placeholders:</span>{' '}
-        use <code className="rounded bg-[var(--bg-2)] px-1 py-0.5 font-mono text-2xs">{'{contact_name}'}</code>{' '}
-        in your opening line and the agent says the dialed contact's name from your contact list, and{' '}
-        <code className="rounded bg-[var(--bg-2)] px-1 py-0.5 font-mono text-2xs">{'{current_time}'}</code>{' '}
-        becomes morning, afternoon or evening at call time — e.g.{' '}
-        <span className="italic">"Good {'{current_time}'}, am I speaking with {'{contact_name}'}?"</span>
+        <span className="font-semibold text-[var(--text)]">Tip — greeting placeholders:</span>{' '}
+        <code className="rounded bg-[var(--bg-2)] px-1 py-0.5 font-mono text-2xs">{'{contact_name}'}</code> is the dialed contact's name,{' '}
+        <code className="rounded bg-[var(--bg-2)] px-1 py-0.5 font-mono text-2xs">{'{current_time}'}</code> becomes morning, afternoon or evening,{' '}
+        <code className="rounded bg-[var(--bg-2)] px-1 py-0.5 font-mono text-2xs">{'{honorific}'}</code> becomes Sir or Ma'am, and{' '}
+        <code className="rounded bg-[var(--bg-2)] px-1 py-0.5 font-mono text-2xs">{'{title}'}</code> becomes Mr. or Mrs. — e.g.{' '}
+        <span className="italic">"Good {'{current_time}'} {'{honorific}'}, am I speaking with {'{title}'} {'{contact_name}'}?"</span>{' '}
+        <span className="text-dim">
+          The last two need a <span className="font-mono text-2xs">Gender</span> column in your
+          contact sheet — a contact without one is addressed by name only, never guessed. The
+          agent's own he/she follows the voice you pick.
+        </span>
       </div>
       {onDismiss && (
         <button
@@ -642,6 +654,9 @@ export default function CopilotChat() {
   const [interview, setInterview] = useState<InterviewProgress | null>(null)
   const [pendingChanges, setPendingChanges] = useState<PendingChange[]>([])
   const [showPreview, setShowPreview] = useState(true)
+  // Quick controls (voice + speed by click) for whatever this chat edits.
+  const [quick, setQuick] = useState<QuickControls | null>(null)
+  const [quickOpen, setQuickOpen] = useState(false)
   const [attachments, setAttachments] = useState<{ doc_id: string; name: string }[]>([])
   const [uploading, setUploading] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -697,12 +712,24 @@ export default function CopilotChat() {
   // server actually has history — switching to a brand-new/empty session must
   // not wipe messages we just appended locally (see the fresh-session retry
   // in send()). Explicit "New chat" clears via newChat().
+  const loadQuick = useCallback(() => {
+    copilotQuickControls(sid)
+      .then(setQuick)
+      .catch(() => setQuick(null))
+  }, [sid])
+
   useEffect(() => {
     let cancelled = false
     syncSessionUrl(sid)
+    loadQuick()
     copilotSession(sid)
       .then((res) => {
-        if (!cancelled && (res.transcript?.length ?? 0) > 0) setMessages(res.transcript)
+        if (!cancelled && (res.transcript?.length ?? 0) > 0) {
+          setMessages(res.transcript)
+          // The rail, preview and diff cards survive a reload too.
+          setInterview(res.interview ?? null)
+          setPendingChanges(res.pending_changes ?? [])
+        }
       })
       .catch(() => { /* fresh session, backend restart, or not ours — leave as-is */ })
       .finally(() => { if (!cancelled) setLoadingTranscript(false) })
@@ -781,6 +808,7 @@ export default function CopilotChat() {
       setPendingChanges(res.pending_changes ?? [])
       if (res.agents_changed) refresh(['agents'])
       loadHistory() // title/agent may have changed — keep the sidebar in sync
+      loadQuick()   // the chat may have created the agent or changed its voice
     } catch (e: any) {
       setMessages((m) => [
         ...m,
@@ -811,12 +839,25 @@ export default function CopilotChat() {
     setInput('')
     setInterview(null)
     setPendingChanges([])
+    setQuick(null)
     setAttachments([])
     setLoadingTranscript(false)
     inputRef.current?.focus()
   }
 
   const attachFile = async (file: File) => {
+    // Same gate as the Builder: the server would refuse these anyway, but
+    // with the sentence in the chat instead of after a full upload.
+    const refusal = !docSupported(file.name)
+      ? `Couldn't attach "${file.name}" — upload ${DOC_TYPES_HUMAN}.`
+      : file.size > DOC_MAX_MB * 1048576
+        ? `Couldn't attach "${file.name}" — it is ${(file.size / 1048576).toFixed(1)} MB and the limit is ${DOC_MAX_MB} MB.`
+        : ''
+    if (refusal) {
+      setMessages((m) => [...m, { role: 'assistant', isError: true, actions: [], content: refusal }])
+      if (fileRef.current) fileRef.current.value = ''
+      return
+    }
     setUploading(true)
     try {
       const res = await copilotUpload(sid, file)
@@ -932,6 +973,28 @@ export default function CopilotChat() {
         </SheetContent>
       </Sheet>
 
+      <Sheet open={quickOpen} onOpenChange={setQuickOpen}>
+        <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-md">
+          <SheetHeader>
+            <SheetTitle>Voice &amp; speed</SheetTitle>
+          </SheetHeader>
+          {quick && quick.target.kind !== 'none' && 'languages' in quick.state && (
+            <div className="mt-4">
+              <VoiceSpeedControls
+                sid={sid}
+                data={quick}
+                onApplied={(res) => {
+                  setQuick((q) => (q ? { ...q, target: res.target, state: res.state } : q))
+                  if (res.interview) setInterview(res.interview)
+                  if (res.pending_changes) setPendingChanges(res.pending_changes)
+                  refresh(['agents'])
+                }}
+              />
+            </div>
+          )}
+        </SheetContent>
+      </Sheet>
+
       <div className="flex min-w-0 flex-1 flex-col">
       {/* header row */}
       <div className="mb-2 flex items-center justify-between gap-2">
@@ -945,6 +1008,20 @@ export default function CopilotChat() {
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {quick && quick.target.kind !== 'none' && (
+            <Button
+              variant="soft"
+              size="sm"
+              onClick={() => setQuickOpen(true)}
+              title="Pick the agent's voice and speaking speed"
+            >
+              <SlidersHorizontal size={13} />
+              <span className="hidden sm:inline">Voice &amp; speed</span>
+              {'speaker' in quick.state && quick.state.speaker && (
+                <span className="capitalize opacity-70">· {quick.state.speaker}</span>
+              )}
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="sm"
@@ -1039,7 +1116,7 @@ export default function CopilotChat() {
             ref={fileRef}
             type="file"
             className="hidden"
-            accept=".pdf,.txt,.md,.csv,.docx,.doc"
+            accept={DOC_ACCEPT}
             onChange={(e) => {
               const f = e.target.files?.[0]
               if (f) void attachFile(f)

@@ -45,6 +45,17 @@ _RMS_FLOOR = float(os.environ.get("AEC_RMS_FLOOR", "60"))
 _HYSTERESIS_HOPS = 3
 _TRANSIENT = {"DTMF", "BEEP"}
 
+# A CONFIRMED mailbox beep (RUNBOOK §83): BEEP_MIN_HOPS..BEEP_MAX_HOPS
+# consecutive 100 ms hops whose peak frequency stays within
+# BEEP_MAX_SPREAD_HZ, after which the tone STOPS. Carrier and handset record
+# cues measure 0.3-1.0 s at one frequency; a whistle glides, hold music
+# moves, and a dial tone never ends (it overruns the 1.2 s ceiling and is
+# discarded). The raw per-hop BEEP label above stays as it was — it is a
+# shadow signal; only a confirmed beep is reported through on_beep.
+BEEP_MIN_HOPS = int(os.environ.get("AEC_BEEP_MIN_HOPS", "3"))
+BEEP_MAX_HOPS = int(os.environ.get("AEC_BEEP_MAX_HOPS", "12"))
+BEEP_MAX_SPREAD_HZ = float(os.environ.get("AEC_BEEP_MAX_SPREAD_HZ", "40"))
+
 
 def _goertzel(x: np.ndarray, sr: int, freq: float) -> float:
     """Single-bin power. Cheap enough to run a ~13-freq bank per hop."""
@@ -60,9 +71,15 @@ def _goertzel(x: np.ndarray, sr: int, freq: float) -> float:
 
 
 class AudioEventClassifier:
-    def __init__(self, sample_rate: int = 16000, on_label=None) -> None:
+    def __init__(self, sample_rate: int = 16000, on_label=None,
+                 on_beep=None) -> None:
         self.sr = sample_rate
         self._on_label = on_label          # callback(label, prev, at_ms)
+        self._on_beep = on_beep            # callback(duration_ms, freq_hz, at_ms)
+        self._beep_run: list[float] = []   # peak Hz of consecutive BEEP hops
+        self._beep_overrun = False         # the tone outlived the beep ceiling
+        self._last_peak_hz = 0.0
+        self.beeps: list[tuple[float, float, float]] = []  # (at_ms, dur_ms, hz)
         self._rms_hist: list[float] = []   # last 2s of hop RMS
         self._tone_state = {"on_ms": 0.0, "off_ms": 0.0, "cycles": []}
         self._candidate = "SILENCE"
@@ -84,6 +101,7 @@ class AudioEventClassifier:
         self._speech_run_ms = self._speech_run_ms + 100.0 if fsmn_speech else 0.0
 
         label = self._classify(x, sr4, hop, rms, fsmn_speech)
+        self._track_beep(label, at_ms)
         self._apply_hysteresis(label, at_ms)
         return self.current_label
 
@@ -128,9 +146,11 @@ class AudioEventClassifier:
                 return "FAX"
             if 650.0 <= peak_hz <= 1400.0:
                 self._track_tone(True)
+                self._last_peak_hz = peak_hz
                 # short isolated burst = beep; sustained = treat as tone/noise
                 if self._tone_state["on_ms"] <= 1200.0:
                     return "BEEP"
+                self._beep_overrun = True
                 return "NOISE"
         self._track_tone(False)
 
@@ -144,6 +164,35 @@ class AudioEventClassifier:
                 min(self._rms_hist[-15:]) > _RMS_FLOOR:
             return "MUSIC"
         return "NOISE"
+
+    # ------------------------------------------------------------------
+    def _track_beep(self, label: str, at_ms: float) -> None:
+        """Confirm a mailbox beep from the run of raw BEEP hops: a run ends
+        when the label changes; it counts only if it is beep-length, held one
+        frequency, and ended because the tone stopped (not because it ran
+        past the 1.2 s ceiling)."""
+        if label == "BEEP":
+            self._beep_run.append(self._last_peak_hz)
+            return
+        if not self._beep_run:
+            self._beep_overrun = False
+            return
+        run, self._beep_run = self._beep_run, []
+        overrun, self._beep_overrun = self._beep_overrun, False
+        n = len(run)
+        if overrun or n < BEEP_MIN_HOPS or n > BEEP_MAX_HOPS:
+            return
+        if max(run) - min(run) > BEEP_MAX_SPREAD_HZ:
+            return
+        dur_ms = n * 100.0
+        hz = sum(run) / n
+        self.beeps.append((at_ms, dur_ms, hz))
+        logger.info("[AUDIO-EVENT] beep confirmed %.0fms @%.0fHz", dur_ms, hz)
+        if self._on_beep is not None:
+            try:
+                self._on_beep(dur_ms, hz, at_ms)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     def _syllabic_modulation(self) -> float:

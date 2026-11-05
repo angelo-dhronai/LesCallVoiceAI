@@ -61,7 +61,8 @@ from backend.app.agent_definition.schema import (                   # noqa: E402
 )
 from backend.app.agent_definition.registry import agent_registry    # noqa: E402
 from backend.app.agent_definition.voice_catalog import (            # noqa: E402
-    recommended_speaker,
+    DEFAULT_TTS_MODEL, RECOMMENDED_SPEAKERS, SPEAKER_CATALOG,
+    recommended_speaker, speaker_gender,
 )
 from backend.app.agent_definition.boot_check import engine_boot_check  # noqa: E402
 from backend.app.agent_definition import spoken_surfaces as _surfaces  # noqa: E402
@@ -105,27 +106,88 @@ _MINE_DUMP_MIN_CHARS = 1500  # a paste this big during a build is mined server-s
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,80}$")
 
 
-def _billing_llm_gate(request, surface: str) -> None:
+def _gate_owner(request):
+    owner = getattr(request.state, "owner", None)
+    if owner:
+        return owner
+    try:
+        import auth
+        return auth.current_owner(request)
+    except Exception:
+        return None
+
+
+def _billing_llm_gate(request, surface: str, request_tokens: int = 0) -> None:
     """E9/E10: charge one LLM turn against the tenant's daily budget.
 
     Raises BillingRefusal (402) when the budget is spent. The refusal is an
     HTTPException subclass on purpose — the copilot's outer handler turns bare
     exceptions into a chat reply string, which would have shown the user a
     stack-trace-ish message instead of an upgrade prompt.
+
+    `request_tokens` is the size of what the user just sent, so the per-message
+    ceiling can refuse an enormous paste BEFORE it is forwarded to the model.
+    Checking it afterwards would be theatre: the shared model quota is already
+    spent by then, and that quota is the same one live phone calls draw on.
     """
     try:
-        from shared.billing.entitlements import check_copilot_turn, record_copilot_turn
+        from shared.billing.entitlements import (
+            check_copilot_budget, record_copilot_turn)
     except Exception:
         return
-    owner = getattr(request.state, "owner", None)
+    owner = _gate_owner(request)
     if not owner:
-        try:
-            import auth
-            owner = auth.current_owner(request)
-        except Exception:
-            return
-    check_copilot_turn(owner).raise_for_http()
+        return
+    check_copilot_budget(owner, request_tokens).raise_for_http()
     record_copilot_turn(owner, surface)
+
+
+def _remaining_tokens(owner) -> int | None:
+    """Today's unspent token budget, or None when nothing caps this tenant.
+
+    Read once per turn. Returns None on any failure — a budget that cannot be
+    read must not become a wall in the middle of someone's work.
+    """
+    if not owner:
+        return None
+    try:
+        from shared.billing.entitlements import (
+            copilot_tokens_used, effective_limits)
+        cap = effective_limits(owner)["copilot_tokens_per_day"]
+        if cap is None:
+            return None
+        return max(0, int(cap) - copilot_tokens_used(owner))
+    except Exception as exc:
+        logger.debug("[copilot] token budget lookup failed for %s: %r", owner, exc)
+        return None
+
+
+def _charge_tokens(owner, usage) -> int:
+    """Bill one LLM response's usage to today's token budget; return the total.
+
+    Called for EVERY provider round, not once per user turn — a single turn is
+    a tool loop of up to _MAX_TOOL_ROUNDS requests, and charging only the last
+    one would under-count the expensive turns by the exact factor that makes
+    them worth capping.
+
+    `usage` is whatever the OpenAI-compatible endpoint returned. It is read
+    defensively: Groq, Gemini's compat layer and the OpenAI fallback all shape
+    it slightly differently, and a missing field must cost a count, never a
+    reply.
+    """
+    if not owner or usage is None:
+        return 0
+    try:
+        from shared.billing.entitlements import record_copilot_tokens
+        prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion = int(getattr(usage, "completion_tokens", 0) or 0)
+        total = int(getattr(usage, "total_tokens", 0) or 0)
+        record_copilot_tokens(owner, prompt_tokens=prompt,
+                              completion_tokens=completion, total_tokens=total)
+        return max(total, prompt + completion)
+    except Exception as exc:
+        logger.debug("[copilot] token charge failed for %s: %r", owner, exc)
+        return 0
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{1,60}$")
 # The only languages the voice engine can actually speak.
 _PLATFORM_LANGUAGES = frozenset({"hi", "en", "gu"})
@@ -364,8 +426,13 @@ def _default_definition(name: str, provided: dict) -> dict:
     # ONE speaker across all languages (mid-call speaker switches change the
     # person), picked for the DEFAULT language per Sarvam's CER tables —
     # the old hardcoded simran spoke English below its recommended tier.
-    _speaker = recommended_speaker(default_lang, "female")
+    # The voice's gender defaults to the first person the owner WROTE ("करण
+    # बोल रहा हूँ" → male); female only when the script commits to neither.
+    # Any voice the user actually chose is merged on top of this default.
+    _gender = _authored_self_gender(_spoken_texts_of(provided)) or "female"
+    _speaker = recommended_speaker(default_lang, _gender)
     tts_voices = {l: {"model": "bulbul:v3", "speaker": _speaker, "pace": 1.15} for l in supported}
+    _pron = "he" if _gender == "male" else "she"
     register_notes = {l: s(l, "register_note") for l in supported}
 
     # Outbound agents lead the call and need a pitch-shaped flow, not the
@@ -384,10 +451,10 @@ def _default_definition(name: str, provided: dict) -> dict:
             "company_tagline": pretty,
             "role_description": "inbound customer assistant",
             "contact": "",
-            "pronouns": "she",
+            "pronouns": _pron,
         },
         "personality": {
-            "pronouns": "she",
+            "pronouns": _pron,
             "energy": "medium",
             "tone": "conversational",
             "style": "natural",
@@ -553,6 +620,79 @@ _RB_LANG_LIST_FIELDS = ("filler_responses", "objection_responses", "decline_resp
 def _fields_of(cls: type) -> set[str]:
     import dataclasses as _dc
     return {f.name for f in _dc.fields(cls)}
+
+
+def _dict_typed_fields(cls: type) -> dict[str, bool]:
+    """{field: is_plain_dict} for every dict-typed field of a section
+    dataclass. A plain `dict` field is STRUCTURAL settings (scheduling,
+    honesty, callback…); a `dict[str, …]` one is a per-language spoken
+    surface, which _lang_dict later accepts as a bare string too."""
+    import dataclasses as _dc
+    out: dict[str, bool] = {}
+    for f in _dc.fields(cls):
+        t = f.type if isinstance(f.type, str) else getattr(f.type, "__name__", str(f.type))
+        t = str(t).strip()
+        if t == "dict" or t.startswith("dict[") or t.startswith("Dict["):
+            out[f.name] = t == "dict"
+    return out
+
+
+# What a bare word in call_flow.scheduling means. Gemini has sent both the
+# JSON text of the object and a style/flag word where the object belongs.
+_SCHEDULING_WORDS: dict[str, dict] = {
+    "flexible": {"style": "flexible"}, "exact_n": {"style": "exact_n"},
+    "false": {"enabled": False}, "off": {"enabled": False},
+    "none": {"enabled": False}, "no": {"enabled": False},
+    "disabled": {"enabled": False},
+    "true": {"enabled": True}, "on": {"enabled": True},
+    "yes": {"enabled": True}, "enabled": {"enabled": True},
+}
+
+
+def _decode_stringified_objects(d: dict, notes: list[str]) -> None:
+    """Nested objects that arrived as JSON TEXT (RUNBOOK §60).
+
+    `call_flow.scheduling: '{ "enabled": false }'` passed every guard: the
+    top-level sections are shape-checked, from_dict reads {} for a non-dict
+    nested field, and the quality lints then called .get() on the string —
+    AFTER the write. create_agent wrote both twins and reported "DID NOT
+    HAPPEN"; update_draft recorded the draft and said the same, eight turns
+    in a row, and the poisoned draft failed every later turn too. Decode
+    what parses to an object; map the scheduling words; drop any other
+    non-dict from a STRUCTURAL field with a note. Per-language spoken
+    fields are left for _lang_dict, which accepts a bare string on purpose."""
+    for section, cls in _SECTION_DATACLASSES.items():
+        val = d.get(section)
+        if not isinstance(val, dict):
+            continue
+        for fname, plain in _dict_typed_fields(cls).items():
+            if fname not in val:
+                continue
+            v = val[fname]
+            if isinstance(v, dict):
+                continue
+            if isinstance(v, str):
+                text = v.strip()
+                if text.startswith("{"):
+                    try:
+                        parsed = json.loads(text)
+                    except ValueError:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        val[fname] = parsed
+                        notes.append(f"{section}.{fname} arrived as JSON text — decoded")
+                        continue
+                if section == "call_flow" and fname == "scheduling":
+                    mapped = _SCHEDULING_WORDS.get(text.lower())
+                    if mapped is not None:
+                        val[fname] = dict(mapped)
+                        notes.append(f"call_flow.scheduling {v!r} read as {mapped}")
+                        continue
+            if plain:
+                val.pop(fname)
+                notes.append(
+                    f"'{section}.{fname}' had an unusable shape (expected settings, "
+                    "not text or a list) — ignored.")
 
 
 def _default_lang_of(d: dict) -> str:
@@ -742,10 +882,15 @@ def _closest_paths(key: str, n: int = 2) -> list[str]:
     return hits[:n]
 
 
-# The TWO template placeholders the runtime understands, both only in the
-# opening greeting (conversation.py generate_opening):
-#   {contact_name} — the outbound contact's name, falling back to "sir/ma'am"
+# The FOUR template placeholders the runtime understands, in ANY authored
+# spoken line (conversation.py _substitute_tokens, called from _lang_response):
+#   {contact_name} — the outbound contact's name; with none on file an
+#                    identity-question clause is dropped (RUNBOOK §42)
 #   {current_time} — morning/afternoon/evening in IST at call time
+#   {honorific}    — "Sir"/"Ma'am" from contacts.gender, standing alone
+#   {title}        — "Mr."/"Mrs." from contacts.gender, before the name
+# The last two resolve to NOTHING when that contact has no gender (the token
+# and the seam it leaves are removed).
 # LLMs constantly invent other syntaxes — ${contact_name}, {{contact_name}},
 # [contact name], {time_of_day} — which would be SPOKEN LITERALLY on a real
 # call. Canonicalize them all.
@@ -766,13 +911,61 @@ _TIME_PLACEHOLDER_RE = re.compile(
 )
 
 
+# Mirrors conversation.ConversationRouter._HONORIFIC_PH_RE — the two must agree
+# about what the engine will substitute, or the copilot writes a token that the
+# runtime strips (silently losing the author's intent) or lints a token that
+# actually works.
+_HONORIFIC_PLACEHOLDER_RE = re.compile(
+    r"(?:\$\{|\{\{|\{|\[|<)\s*"
+    r"(?:honorific|sir[ _\-/]?(?:or[ _\-/]?)?ma['\u2019 ]?am|"
+    r"gender[ _\-]?(?:honorific|salutation)|salutation)"
+    r"\s*(?:\}\}|\}|\]|>)"
+    r"|\$honorific\b",
+    re.IGNORECASE,
+)
+
+# Mirrors ConversationRouter._TITLE_PH_RE — the name-prefix half of gendered
+# address ("Mr. Rajesh"), distinct from the standalone {honorific} ("Yes Sir").
+_TITLE_PLACEHOLDER_RE = re.compile(
+    r"(?:\$\{|\{\{|\{|\[|<)\s*"
+    r"(?:title|mr\.?[ _\-/]*(?:or[ _\-/]+)?mr?s\.?|"
+    r"name[ _\-]?(?:title|prefix)|gender[ _\-]?title|prefix)"
+    r"\s*(?:\}\}|\}|\]|>)"
+    r"|\$title\b",
+    re.IGNORECASE,
+)
+
+
 def _canonicalize_placeholders(text: str) -> str:
     text = _PLACEHOLDER_RE.sub("{contact_name}", text)
-    return _TIME_PLACEHOLDER_RE.sub("{current_time}", text)
+    text = _TIME_PLACEHOLDER_RE.sub("{current_time}", text)
+    text = _HONORIFIC_PLACEHOLDER_RE.sub("{honorific}", text)
+    return _TITLE_PLACEHOLDER_RE.sub("{title}", text)
 
 
 def _any_placeholder(text: str) -> bool:
-    return bool(_PLACEHOLDER_RE.search(text) or _TIME_PLACEHOLDER_RE.search(text))
+    return bool(_PLACEHOLDER_RE.search(text) or _TIME_PLACEHOLDER_RE.search(text)
+                or _HONORIFIC_PLACEHOLDER_RE.search(text)
+                or _TITLE_PLACEHOLDER_RE.search(text))
+
+
+# The exact spellings conversation._substitute_tokens resolves in every
+# authored line, plus {trust_proofs}, which _match_objection_playbook fills.
+_RESOLVED_TOKENS = ("{contact_name}", "{current_time}", "{honorific}",
+                    "{title}", "{trust_proofs}")
+# Exact form only: "${contact_name}" and "{{contact_name}}" contain the
+# canonical spelling but are NOT it, and the engine resolves neither.
+_RESOLVED_TOKEN_RE = re.compile(
+    r"(?<![${])(?:" + "|".join(re.escape(t) for t in _RESOLVED_TOKENS) + r")(?!\})")
+_BRACE_TOKEN_RE = re.compile(r"\$?\{\{?\s*[A-Za-z_][A-Za-z0-9_ \-]*\s*\}?\}")
+
+
+def _unresolvable_placeholder(text: str) -> bool:
+    """A placeholder the engine will NOT resolve — a non-canonical spelling
+    of a known one (${contact_name}, [name]) or a token it has never heard of
+    ({company}). The canonical four are fine anywhere a line is spoken."""
+    rest = _RESOLVED_TOKEN_RE.sub("", str(text or ""))
+    return bool(_any_placeholder(rest) or _BRACE_TOKEN_RE.search(rest))
 
 
 # ── what the user dictated, and which beat they meant ───────────────────────
@@ -917,6 +1110,9 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
 
     # ── F1: known-wrong key names → canonical paths (before anything drops) ─
     _alias_rewrite(d, notes)
+
+    # ── F14: nested objects sent as JSON text / a bare word (RUNBOOK §60) ───
+    _decode_stringified_objects(d, notes)
 
     # ── sections in impossible container shapes ─────────────────────────────
     for section in ("identity", "personality"):
@@ -1337,6 +1533,8 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
                 s["type"] = ""
             elif isinstance(s.get("type"), str):
                 s["type"] = s["type"].strip().lower()
+            if "ask_gated" in s:
+                s["ask_gated"] = bool(s["ask_gated"])
             if "merge_policy" in s and str(s.get("merge_policy")).strip().lower() not in (
                     "free", "correction_gated", "confirm"):
                 notes.append(f"slot '{s['name']}' merge_policy {s['merge_policy']!r} invalid — reset to 'free'")
@@ -1449,7 +1647,7 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
     if isinstance(ob, dict):
         for k in ("identity_confirm_line", "good_time_check_line", "pitch",
                   "wrong_person_response", "busy_response", "wrong_number_close",
-                  "opening_greeting"):
+                  "wrong_number_reconfirm_line", "opening_greeting"):
             if k in ob:
                 fixed = _lang_dict(ob[k])
                 if fixed is None:
@@ -1628,6 +1826,15 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
             for bk in ("llm_end_call", "confirm_before_end"):
                 if bk in term:
                     term[bk] = bool(term[bk])
+            if "pre_close_question" in term:
+                # RUNBOOK §75: {lang: str}, like the outbound lines.
+                fixed = _lang_dict(term["pre_close_question"])
+                if fixed is None:
+                    term.pop("pre_close_question")
+                    notes.append("call_flow.termination.pre_close_question "
+                                 "had an unusable shape — ignored")
+                else:
+                    term["pre_close_question"] = fixed
             if "max_call_minutes" in term:
                 try:
                     term["max_call_minutes"] = max(
@@ -1663,6 +1870,32 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
                     conn.pop("intro_line", None)
                     notes.append("call_flow.connect.intro_line had an "
                                  "unusable shape — ignored")
+    # RUNBOOK §78: per-agent turn-taking — numbers and booleans only.
+    if isinstance(cf2, dict) and "turn_taking" in cf2:
+        tt = cf2.get("turn_taking")
+        if not isinstance(tt, dict):
+            cf2.pop("turn_taking", None)
+            notes.append("call_flow.turn_taking had an unusable shape — ignored")
+        else:
+            for nk in ("pause_hold_ms", "sustained_barge_ms"):
+                if nk in tt:
+                    try:
+                        tt[nk] = max(0.0, float(tt[nk]))
+                    except (TypeError, ValueError):
+                        tt.pop(nk)
+                        notes.append(f"call_flow.turn_taking.{nk} was not a "
+                                     "number — ignored")
+            if "max_merged_fragments" in tt:
+                try:
+                    tt["max_merged_fragments"] = max(
+                        1, int(tt["max_merged_fragments"]))
+                except (TypeError, ValueError):
+                    tt.pop("max_merged_fragments")
+                    notes.append("call_flow.turn_taking.max_merged_fragments "
+                                 "was not a number — ignored")
+            for bk in ("backchannel_guard", "tail_barge_in"):
+                if bk in tt:
+                    tt[bk] = bool(tt[bk])
 
     # ── knowledge_base v2 fields ─────────────────────────────────────────────
     kb2 = d.get("knowledge_base")
@@ -1774,6 +2007,10 @@ def _normalize_definition(d: dict, notes: list[str] | None = None) -> dict:
         hint = f" Did you mean: {', '.join(close)}?" if close else ""
         notes.append(f"top-level '{k}' is not a real setting — dropped.{hint}")
 
+    # On the CHANGE subtree, not the merged agent: a scoped write that only
+    # moves the voice must not also rewrite stage goals it never touched —
+    # write_agent's scope proof would (rightly) roll the whole write back.
+    _tokenize_spoken_address(d, notes)
     return d
 
 
@@ -1827,7 +2064,8 @@ _OBJECT_LIST_FIELDS: tuple[tuple[str, ...], ...] = (
 )
 # Only these are substituted before speech (conversation.py). Anything else
 # in braces is read out to the caller verbatim.
-_LIVE_TOKENS = {"contact_name", "customer_name", "current_time"}
+_LIVE_TOKENS = {"contact_name", "customer_name", "current_time", "honorific",
+                "title"}
 _TOKEN_RE = re.compile(r"\{\{([^{}]{1,60})\}\}|\{([A-Za-z_][A-Za-z0-9_ .\-]{0,58})\}")
 # Surfaces whose strings are spoken to the caller more or less verbatim.
 # stage goals are INSTRUCTIONS to the model, not speech, so they are excluded;
@@ -1905,7 +2143,8 @@ def _platform_invariants(merged: dict) -> list[str]:
                     out.append(
                         f"{path} contains {m.group(0)!r}, which the engine does "
                         "not substitute — it would be read aloud to the caller. "
-                        "Use {contact_name}, {customer_name} or {current_time}.")
+                        "Use {contact_name}, {customer_name}, {current_time}, "
+                        "{honorific} or {title}.")
                     break
         if _HUMAN_CLAIM_RE.search(text) and path.split("[")[0] in (
                 "personality.custom_instructions",
@@ -2647,7 +2886,22 @@ def _enforce_invariants(merged: dict, notes: list[str]) -> None:
         (v.get("speaker") for v in
          [tv.get(langs["default"])] + list(tv.values())
          if isinstance(v, dict) and v.get("speaker")), None)
-    _fill_spk = _existing_spk or recommended_speaker(langs["default"], "female")
+    # No voice chosen: default to the gender of the first person the owner
+    # WROTE ("main bol raha hoon" → a male voice), female only when the script
+    # commits to neither. The flat female default gave the Kaapd brief's
+    # "करण बोल रहा हूँ" a priya voice — a masculine script read by a woman,
+    # the exact jai_mistry-2 defect, created by the platform (RUNBOOK §42).
+    _authored = "" if _existing_spk else _authored_self_gender(
+        _spoken_texts_of(merged))
+    _fill_spk = _existing_spk or recommended_speaker(
+        langs["default"], _authored or "female")
+    if not _existing_spk and _authored and any(
+            not isinstance(tv.get(c), dict) for c in clean_sup):
+        notes.append(
+            f"no voice was chosen, so a {_authored} voice ({_fill_spk}) was "
+            f"picked — the script is written in the {_authored} first person. "
+            "Tell the user which voice was picked and that they can change it "
+            "(the agent's own he/she follows whichever voice they choose)")
     for code in clean_sup:
         if not isinstance(tv.get(code), dict):
             tv[code] = {"model": "bulbul:v3", "speaker": _fill_spk, "pace": 1.15}
@@ -2704,6 +2958,128 @@ def _enforce_invariants(merged: dict, notes: list[str]) -> None:
         agent_name = (merged.get("identity") or {}).get("agent_name") or "your assistant"
         rb["opening_greeting"] = f"Hello! I'm {agent_name}. How can I help you today?"
         notes.append("opening greeting was missing — a simple default was set (tell the user)")
+
+
+# ─── gendered address is DATA, never a literal word (RUNBOOK §42) ────────────
+# A spoken line that says "Sir" says it to every contact — the women on the
+# list and the ones with no gender on file included (jai_mistry-2 greeted
+# "SHAHANAZ Sir" and "SHREE Sir", both marked female). On every Copilot write
+# a literal address in a spoken field becomes {honorific} / {title}, so the
+# script the business reads says what the call will do. The engine also holds
+# any literal that slips through to the contact's gender at speak time; this
+# keeps the words on the page honest.
+from backend.app.voice.address import (  # noqa: E402
+    authored_self_gender as _authored_self_gender,
+    protected_names as _address_protected_names,
+    tokenize_address as _tokenize_address,
+    tokenize_spoken_fields as _tokenize_spoken_fields,
+)
+
+# The user asked for gendered address in the SCRIPT — not merely typed "sir"
+# at the Copilot ("ok sir, do it" is courtesy to us, not a request). An
+# honorific word counts only alongside an ask about what the agent says.
+_HONORIFIC_ASK_WORD_RE = re.compile(
+    r"(?<![A-Za-z])(?:sir|ma['’]?am|maam|madam|mam|mr\.?|mrs\.?|ms\.?|"
+    r"honorifics?|salutations?)(?![A-Za-z])|सर(?![ऀ-ॣ])|मैडम|मैम|"
+    r"श्रीमती|श्रीमान|સર(?![઀-૥])|મેડમ", re.IGNORECASE)
+_HONORIFIC_ASK_CONTEXT_RE = re.compile(
+    r"(?<![A-Za-z])(?:say|says|saying|said|speak|address|addressed|call(?:ing)?\s+"
+    r"(?:them|him|her|the\s+(?:caller|customer|client|contact))|greet|greeting|"
+    r"opening|script|line|sentence|add|use|include|put|write|instead|replace|"
+    r"agent|caller|customers?|contacts?|clients?|leads?|bol\w*|kah\w*|likh\w*|"
+    r"laga\w*|daal\w*|dal\w*|jod\w*)(?![A-Za-z])|/|\bor\b", re.IGNORECASE)
+_GENDER_DATA_MENTION_RE = re.compile(r"\bgender\b", re.IGNORECASE)
+_GENDER_REMINDER_MARK = "Sir/Ma'am and Mr./Mrs. are dynamic"
+
+
+def _asks_for_honorific(message: str) -> bool:
+    m = message or ""
+    return bool(_HONORIFIC_ASK_WORD_RE.search(m)
+                and _HONORIFIC_ASK_CONTEXT_RE.search(m))
+
+
+def _gender_data_reminder(owner) -> str:
+    """The standing reminder, with this account's real coverage in it — a
+    number is what makes "most contact lists have no gender" actionable."""
+    have = total = None
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            row = db.execute(
+                "SELECT COUNT(*) AS n, COUNT(*) FILTER (WHERE LOWER(TRIM("
+                "COALESCE(gender,''))) IN ('male','female')) AS g "
+                "FROM contacts WHERE owner=?", (owner or "",)).fetchone()
+        if row:
+            total, have = int(row["n"] or 0), int(row["g"] or 0)
+    except Exception:  # noqa: BLE001 — the reminder must never fail a turn
+        logger.warning("[copilot] gender coverage lookup failed", exc_info=True)
+    if total is None:
+        coverage = ""
+    elif total == 0:
+        coverage = " You have no contacts yet — include a Gender column when you upload them."
+    else:
+        coverage = (f" Right now {have} of your {total} contact"
+                    f"{'s' if total != 1 else ''} "
+                    f"{'have' if have != 1 else 'has'} a gender on file.")
+    return (f"ℹ️ {_GENDER_REMINDER_MARK} — the agent picks them from each "
+            "contact's Gender, so they only work for contacts that have one."
+            + coverage + " Add a Gender column (male/female or M/F) to your "
+            "contact upload, send `gender` through the API, or set it in "
+            "Contacts → Add/Edit. A contact without a gender is addressed by "
+            "name only — the agent never guesses, and never uses a fixed Sir.")
+
+
+def _all_strings(node) -> list[str]:
+    out: list[str] = []
+    if isinstance(node, str):
+        out.append(node)
+    elif isinstance(node, dict):
+        for v in node.values():
+            out += _all_strings(v)
+    elif isinstance(node, list):
+        for v in node:
+            out += _all_strings(v)
+    return out
+
+
+def _spoken_texts_of(d: dict) -> list[str]:
+    """Owner-written SPOKEN text only — never caller-side patterns, which are
+    in the caller's own first person ("main gaadi chala raha hoon")."""
+    out: list[str] = []
+    rb = d.get("response_bank")
+    if isinstance(rb, dict):
+        for k, v in rb.items():
+            if k == "objection_playbook" and isinstance(v, list):
+                out += [s for it in v if isinstance(it, dict)
+                        for s in _all_strings(it.get("answer"))]
+            elif k not in ("objection_patterns",):
+                out += _all_strings(v)
+    ob = d.get("outbound")
+    if isinstance(ob, dict):
+        out += [s for k, v in ob.items() if k != "wrong_number_patterns"
+                for s in _all_strings(v)]
+    cf = d.get("call_flow")
+    if isinstance(cf, dict):
+        out += [str(st.get("goal") or "") for st in (cf.get("stages") or [])
+                if isinstance(st, dict)]
+        if isinstance(cf.get("connect"), dict):
+            out += _all_strings(cf["connect"].get("intro_line"))
+    return out
+
+
+def _tokenize_spoken_address(d: dict, notes: list[str]) -> list[str]:
+    """Literal Sir/Ma'am/Mr./Mrs. in the SPOKEN fields of `d` become
+    {honorific}/{title} (address.tokenize_spoken_fields owns which fields
+    those are). Returns the changed paths and tells the model via a note."""
+    changed = _tokenize_spoken_fields(d)
+    if changed:
+        notes.append(
+            f"a literal Sir/Ma'am/Mr./Mrs. in {len(changed)} spoken line(s) was "
+            "rewritten as {honorific}/{title} — each contact is now addressed "
+            "by the Gender on their contact record, and a contact with no "
+            "gender on file is addressed by name only (tell the user, and "
+            "remind them the Gender column is what makes it work)")
+    return changed
 
 
 # ─── create-time enrichment (F10) ────────────────────────────────────────────
@@ -2914,6 +3290,21 @@ def _enrich_new_agent(d: dict, notes: list[str]) -> None:
                 label = str(slot.get("label") or "").strip()
                 if label and label.lower() not in [s.lower() for s in sig]:
                     sig.append(label)
+                # The name and the label are what the FIELD is called, not
+                # what the agent SAYS. QATracker matches these against the
+                # agent's spoken line, so a signal list of "joining timeline"
+                # / "Joining Timeline" never matched "Could you let us know
+                # how fast you could join us?" — the no-re-ask protection was
+                # inert on every builder agent until 2026-09-16, and a live
+                # caller was asked the same question twice nine seconds apart
+                # (call 851). The slot's own question IS the spoken form.
+                _q = slot.get("question")
+                if isinstance(_q, dict):
+                    for phrase in _q.values():
+                        phrase = str(phrase or "").strip().rstrip("?.!")
+                        if len(phrase) >= 12 and phrase.lower() not in [
+                                s.lower() for s in sig]:
+                            sig.append(phrase)
                 signals[sname] = sig
 
     # 6. PRICING DEFER LINE — the user's scripted rates answer becomes the
@@ -2979,9 +3370,40 @@ def _enrich_new_agent(d: dict, notes: list[str]) -> None:
             slot["confirm_readback"] = "digit_groups_2"
 
 
+def _changed_stage_ids(before: dict, after: dict) -> set[str]:
+    """Stage ids whose definition this write changed (added or edited).
+
+    Feeds the stage-scoped self-transition lint so an update result reports
+    problems in the text it JUST wrote, without nagging about stages the turn
+    never touched."""
+    def _by_id(d: dict) -> dict:
+        st = ((d or {}).get("call_flow") or {}).get("stages") or []
+        return {str(s.get("id") or ""): s for s in st if isinstance(s, dict)}
+    old, new = _by_id(before), _by_id(after)
+    return {sid for sid, sdef in new.items()
+            if sid and old.get(sid) != sdef}
+
+
+def _safe_quality(merged: dict, **kw) -> list[str]:
+    """`_quality_warnings` is ADVISORY, and it runs AFTER the write in
+    create_agent / update_agent / update_draft. A crash inside it turned a
+    write that had landed into a "FAILED — DID NOT HAPPEN" tool result
+    (RUNBOOK §60: the Viraj pair was created, reported as not created,
+    "created" again, and the wrong twin edited on the strength of that lie).
+    A lint failure is a note in the result, never the write's outcome."""
+    try:
+        return _quality_warnings(merged, **kw)
+    except Exception as exc:  # noqa: BLE001 — advisory by contract
+        logger.exception("[copilot] quality lints crashed (the write itself "
+                         "is unaffected): %s", exc)
+        return [f"quality check unavailable this turn ({type(exc).__name__}: "
+                f"{exc}) — the change itself was saved"]
+
+
 def _quality_warnings(merged: dict,
                       include_wiring_lints: bool = True,
-                      user_message: str = "") -> list[str]:
+                      user_message: str = "",
+                      touched_stages: "set[str] | None" = None) -> list[str]:
     """Deterministic depth check on the FINAL definition. The runtime only
     speaks as richly as these fields are written — a one-line stage goal or an
     empty knowledge paragraph makes a shallow call no matter how good the chat
@@ -2996,7 +3418,16 @@ def _quality_warnings(merged: dict,
 
     user_message: this turn's request, used only by the second-beat lint —
     the same words decide whether a dictated line belongs in the opening or
-    in call_flow.connect.intro_line, and the definition alone cannot tell."""
+    in call_flow.connect.intro_line, and the definition alone cannot tell.
+
+    touched_stages: stage ids THIS write changed. Linting what a turn just
+    wrote is never a nag, so the self-transition lint runs on those stages
+    even when include_wiring_lints is off. Without this the §35 lint —
+    written specifically to catch "advance to WRAP_UP" in a stage goal — was
+    silent for the entire path agents are actually edited through: on
+    2026-09-08 a Copilot goal rewrite reintroduced that exact phrasing into
+    jai_mistry-outbound's AGENCY_CHALLENGES and the tool result came back
+    "quality": [] (RUNBOOK §37)."""
     w: list[str] = []
     direction = str(merged.get("call_direction") or "inbound").strip().lower()
 
@@ -3149,8 +3580,16 @@ def _quality_warnings(merged: dict,
             "Outbound Calls. If it is the agent's own name, ignore this."
         )
 
-    # Placeholders anywhere OUTSIDE opening_greeting are never substituted —
-    # they would be spoken literally ("dollar contact name") on a real call.
+    # A placeholder the RUNTIME DOES NOT KNOW is spoken literally ("dollar
+    # contact name"). The four it does know work in every authored spoken
+    # line, not just the greeting (RUNBOOK §41 — see the header above
+    # _PLACEHOLDER_RE). This lint predates §41 and kept flagging ALL of them
+    # outside opening_greeting, telling the Copilot to "rewrite them without
+    # placeholders" — so every Copilot edit quietly undid the §42 migration:
+    # on 2026-09-18 a rewrite of jai_mistry-outbound stripped {honorific} out
+    # of objection_responses, closing_responses and graceful_close, and those
+    # contacts who DO carry a gender lost their Sir/Ma'am on every closing
+    # line. Only what the engine cannot resolve is flagged now.
     if isinstance(rb, dict):
         def _walk(node):
             if isinstance(node, str):
@@ -3164,13 +3603,15 @@ def _quality_warnings(merged: dict,
         bad_fields = sorted({
             key for key, val in rb.items()
             if key != "opening_greeting"
-            and any(_any_placeholder(s) for s in _walk(val))
+            and any(_unresolvable_placeholder(s) for s in _walk(val))
         })
         if bad_fields:
             w.append(
-                "Template placeholders only work in the opening greeting — these response fields "
-                f"contain placeholder text that would be SPOKEN LITERALLY on a call: {', '.join(bad_fields)}. "
-                "Rewrite them without placeholders (or move the personalization into the greeting)."
+                "These response fields contain placeholder text the runtime does not understand, "
+                f"so it would be SPOKEN LITERALLY on a call: {', '.join(bad_fields)}. "
+                "Exactly four placeholders work, in any spoken line: {contact_name}, "
+                "{current_time}, {honorific} and {title} (the last two resolve to nothing for a "
+                "contact with no gender on file). Write them in that exact form, or remove them."
             )
 
     # ── F12: stage-wiring lints ──────────────────────────────────────────────
@@ -3227,6 +3668,63 @@ def _quality_warnings(merged: dict,
                 "strands the call in that stage forever — add max_turns."
             )
 
+
+    # A goal that tells the model to transition itself ("advance to closing",
+    # "move to the next stage", "wrap up", "terminate the call") is asking for
+    # something it cannot see: the destination stage's actual script is never
+    # in THIS turn's prompt. On 2026-09-08 exactly this phrasing, paired with
+    # an all_collect_filled gate an early-exit answer could never satisfy,
+    # made a live agent invent an unscripted "should we end the call?" line
+    # instead of using its own closing script (RUNBOOK §35). Flagged whenever
+    # the stage ALSO lacks a `branches` entry — a stage that already branches
+    # has a real, immediate way to reach that destination, so the same wording
+    # there is describing what the ENGINE does, not asking the model to do it.
+    #
+    # NOT gated by include_wiring_lints: on updates it runs over the stages
+    # this write TOUCHED, which is never a nag about someone else's pre-
+    # existing wiring. Gating it wholesale is why the §35 lint was silent when
+    # a Copilot rewrite put "and advance to WRAP_UP" straight back into the
+    # very agent it had been written for (RUNBOOK §37).
+    _lint_stage_scope = (
+        stages if include_wiring_lints
+        else [s for s in stages if isinstance(s, dict)
+              and str(s.get("id") or "") in (touched_stages or set())])
+    if _lint_stage_scope and not _all_legacy:
+        _transition_talk = re.compile(
+            r"\b(advance|move|proceed|transition)\b[^.\n]{0,40}\b"
+            r"(closing|close|next stage|wrap.?up)\b"
+            r"|\bwrap.?up\b[^.\n]{0,30}\bcall\b"
+            # An INSTRUCTION to hang up — "then terminate the call
+            # immediately". Deliberately not a bare "…end the call…", which
+            # also matches a goal DESCRIBING platform behaviour ("the
+            # platform ends the call itself; never ask to cut it yourself"):
+            # flagging that would push authors to delete the very sentence
+            # that keeps the model from hanging up.
+            r"|(?:^|[.\n]\s*)(?:then\s+)?(?:terminate|end|hang ?up|cut)\s+"
+            r"the\s+call\b",
+            re.IGNORECASE | re.MULTILINE)
+        self_transitioning = [
+            str(s.get("id") or f"#{i}") for i, s in enumerate(_lint_stage_scope)
+            if isinstance(s, dict)
+            and _transition_talk.search(str(s.get("goal") or ""))
+            and not (s.get("branches") or [])
+        ]
+        if self_transitioning:
+            w.append(
+                "These stage goals tell the model to transition itself: "
+                f"{', '.join(self_transitioning)}. It cannot — it only sees "
+                "THIS stage's goal, never the destination's script, so "
+                "'advance to closing' gets improvised instead of spoken, and "
+                "'terminate the call' is not the model's to do (the platform "
+                "ends calls, and asks the caller's permission first). "
+                "For an early-exit answer (a 'no', a reason with no fixed "
+                "vocabulary), branch to a dedicated stage instead: "
+                "branches: [{when_intent: negation, goto: STAGE_ID}] for a "
+                "yes/no split, or {when_slot: {name: SLOT}, goto: STAGE_ID} "
+                "(no `equals`) once a free-text follow-up has any answer — "
+                "then say the actual line at the TOP of that stage's goal."
+            )
+
     # Playbook language coverage: the deterministic matcher is a literal
     # substring test, so patterns/answers missing the DEFAULT language can
     # never fire on real calls in that language.
@@ -3248,6 +3746,64 @@ def _quality_warnings(merged: dict,
             "spoken on real calls."
         )
 
+    # Playbook SCRIPT coverage: patterns are a literal substring test with no
+    # transliteration. An owner dictating a Hindi/Gujarati agent's triggers
+    # almost always types them romanized ("kya karte ho aap"), but Sarvam STT
+    # transcribes fluent speech in Devanagari/Gujarati script — a pattern
+    # list with zero native-script characters can never match a real caller,
+    # regardless of wording (RUNBOOK §36: this is exactly how a Jai Mistry
+    # caller's real question got an improvised answer instead of the owner's
+    # scripted one). Checked whenever hi/gu is supported, not just default,
+    # since a bilingual caller may ask in either.
+    _native_script_langs = {"hi", "gu"} & set(
+        (merged.get("languages") or {}).get("supported") or [])
+    if _native_script_langs and _playbook:
+        _romanized_only = [
+            str(o.get("id") or "?") for o in _playbook
+            if isinstance(o, dict)
+            and (o.get("patterns") or [])
+            and not any(re.search(r"[ऀ-ॿ઀-૿]", str(p))
+                        for p in o["patterns"])
+        ]
+        if _romanized_only:
+            w.append(
+                "These objection_playbook entries have patterns in Latin "
+                f"script only: {', '.join(_romanized_only)}. This agent "
+                f"speaks {'/'.join(sorted(_native_script_langs))}, and real "
+                "speech in that language transcribes in native script "
+                "(Devanagari/Gujarati) — add that alongside the romanized "
+                "form for each pattern, or a real caller's question can "
+                "never trigger the scripted answer."
+            )
+
+    # Same defect, in the field that decides whether a DECLINE is heard as
+    # one. knowledge_base.objection_patterns drives detect_intent's objection
+    # classification, which drives decline_count and call_flow.decline_
+    # threshold. Romanized-only there means a Hindi/Gujarati caller can say
+    # "no" as often as they like and the agent never registers a decline
+    # (RUNBOOK §37 — the platform's own defaults now cover both scripts, so
+    # this fires only on an agent that REPLACED them with a Latin-only list).
+    if _native_script_langs:
+        _kb = merged.get("knowledge_base") or {}
+        _kb_pats = [str(x) for x in (_kb.get("objection_patterns") or [])]
+        # 'extend' (the recommended mode) merges the platform defaults at
+        # runtime, and those now carry Devanagari + Gujarati — such an agent
+        # is covered and must not be nagged. Only a list that REPLACES the
+        # defaults with Latin-only text is actually blind.
+        _replaces = str(_kb.get("objection_patterns_mode")
+                        or "replace").strip().lower() != "extend"
+        if (_kb_pats and _replaces
+                and not any(re.search(r"[ऀ-ॿ઀-૿]", x) for x in _kb_pats)):
+            w.append(
+                "knowledge_base.objection_patterns is Latin-script only, but "
+                f"this agent speaks {'/'.join(sorted(_native_script_langs))}. "
+                "These patterns decide whether the platform HEARS a decline "
+                "at all — a caller declining in their own language would "
+                "never count toward decline_threshold, so the agent keeps "
+                "pitching someone who already said no. Add the native-script "
+                "forms alongside the romanized ones."
+            )
+
     # ── Cross-surface contradiction lints (2026-07-28) ──────────────────
     # A live call spoke a banned "twenty-minute demo … Tuesday at 10 AM"
     # AFTER the stage goals were edited: call_goal (rendered every turn as
@@ -3255,10 +3811,14 @@ def _quality_warnings(merged: dict,
     # behaviour. These catch the three definition shapes that let that
     # happen. Deliberately not gated by include_wiring_lints — they flag
     # real contradictions, not enrichment gaps.
-    _sched = (cf.get("scheduling") if isinstance(cf, dict) else None) or {}
+    _sched = cf.get("scheduling") if isinstance(cf, dict) else None
+    if not isinstance(_sched, dict):  # JSON text / a word / a list — §60
+        _sched = {}
     _exact_n = (str(_sched.get("style") or "exact_n") != "flexible"
                 and _sched.get("enabled") is not False)
-    _cal = merged.get("calendar") or {}
+    _cal = merged.get("calendar")
+    if not isinstance(_cal, dict):
+        _cal = {}
     _has_slots = (bool(_cal.get("mock_slots"))
                   and str(_cal.get("type") or "mock") != "none")
     _goal_surfaces = [("call_flow.call_goal",
@@ -4446,7 +5006,19 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         _twins = {d: builder.twin_slug(_family, d) for d in builder.DIRECTIONS}
         for _slug in _twins.values():
             if (_AGENTS_DIR / _slug).exists():
-                raise ValueError(f"Agent '{_slug}' already exists — use update_agent to edit it")
+                # Name the twin whose direction matches what is being built:
+                # "viraj-inbound already exists — use update_agent" sent the
+                # model to the INBOUND twin with an outbound script (§60).
+                _want = str((_iv.get("draft") or {}).get("call_direction")
+                            or definition.get("call_direction") or "inbound").lower()
+                if _want not in builder.DIRECTIONS:
+                    _want = "inbound"
+                raise ValueError(
+                    f"Agent family '{_family}' already exists "
+                    f"({_twins['inbound']} + {_twins['outbound']}) — nothing to "
+                    f"create. For {_want} calls edit '{_twins[_want]}' with "
+                    "update_agent; each twin's call type is fixed by its name, "
+                    "so never send call_direction to switch one.")
             _existing_owner = builder._slug_owner(_slug)
             if _existing_owner and _existing_owner != owner and not builder._ctx_is_admin():
                 raise ValueError(f"Agent '{_slug}' already exists")
@@ -4543,7 +5115,7 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
             "status": "created", "name": name, "agent_id": agent.agent_id,
             "family": _family, "twins": _twins,
             "notes": notes,
-            "quality": _quality_warnings(
+            "quality": _safe_quality(
                 merged, user_message=str(guard.get("user_message") or "")),
             "provenance_confirmed": sum(1 for v in (_iv.get("provenance") or {}).values()
                                         if v == "confirmed"),
@@ -4767,9 +5339,10 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         res = {
             "status": "updated", "name": name, "changed_sections": sorted(changes.keys()),
             "notes": notes,
-            "quality": _quality_warnings(
+            "quality": _safe_quality(
                 merged, include_wiring_lints=False,
-                user_message=str(guard.get("user_message") or "")),
+                user_message=str(guard.get("user_message") or ""),
+                touched_stages=_changed_stage_ids(current, merged)),
             "revision": result["revision"], "effective": "next_call",
         }
         res.update(await _fidelity_extras(merged, expected))
@@ -5045,7 +5618,7 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
             _enrich_new_agent(preview, [])
         except Exception:  # enrichment must never break a draft update
             logger.exception("[copilot] preview enrichment failed")
-        quality = _quality_warnings(preview)
+        quality = _safe_quality(preview)
         res = {
             "status": "draft_updated",
             "recorded_paths": sorted(_paths_of_changes(changes)),
@@ -5331,6 +5904,9 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
             fields = {k: v for k, v in fields.items() if k in stage_keys}
             if not fields:
                 raise ValueError("No real stage fields to update")
+            if isinstance(fields.get("goal"), str):   # RUNBOOK §42
+                fields["goal"] = _tokenize_address(
+                    fields["goal"], _address_protected_names(_all_strings(current)))
             stages[ids.index(sid)] = {**stages[ids.index(sid)], **fields}
             reason = f"update stage {sid}: {', '.join(fields)}"
         elif tool == "add_stage":
@@ -5341,6 +5917,9 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
             if sid in ids:
                 raise ValueError(f"Stage '{sid}' already exists")
             stage["id"] = sid
+            if isinstance(stage.get("goal"), str):    # RUNBOOK §42
+                stage["goal"] = _tokenize_address(
+                    stage["goal"], _address_protected_names(_all_strings(current)))
             after_id = str(args.get("after_id") or "").strip()
             idx = ids.index(after_id) + 1 if after_id in ids else len(stages)
             stages.insert(idx, stage)
@@ -5380,8 +5959,9 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
                # ban/removal edit can't silently leave it stale, and run the
                # quality lints so cross-surface contradictions show up in
                # the same turn (update_stage historically returned neither).
-               "quality": _quality_warnings(candidate,
-                                            include_wiring_lints=False),
+               "quality": _safe_quality(
+                   candidate, include_wiring_lints=False,
+                   touched_stages=_changed_stage_ids(current, candidate)),
                "call_goal": str((candidate.get("call_flow") or {})
                                .get("call_goal") or "")[:300],
                "call_goal_note": (
@@ -5436,7 +6016,7 @@ async def _execute_tool(tool: str, args: dict, guard: dict | None = None) -> tup
         res = {"status": "updated", "name": name, "diff": _render_diff(diff),
                "slots": [str(s.get("name")) for s in slots], "notes": notes,
                "revision": result["revision"], "effective": "next_call",
-               "quality": _quality_warnings(candidate,
+               "quality": _safe_quality(candidate,
                                             include_wiring_lints=False)}
         return res, f"{reason} in {_agent_display_name(name)}", True, True
 
@@ -5518,25 +6098,30 @@ with a "NOT A REAL SETTING" note you must relay to the user.
    e4. If an apply comes back saying the agent changed since the proposal, do NOT retry the same apply — it will fail identically every time. get_agent to see the current state, then either propose_update again from that fresh state, or tell the user plainly what changed underneath. Repeating a failing apply is never progress.
    f. After every successful edit, tell the user in one plain sentence WHAT is different now and that it applies from the next call (quote the revision number when the tool returns one). If nothing was changed in a turn, never claim it was.
    g. If the user says a change didn't take effect on a real call: do NOT speculate about caching or internal mechanisms. First list_agents to confirm the agent you've been editing IS the live one — if a different agent is live, say so plainly and ask whether to activate the right one. Then get_agent, hunt for the old wording, and fix every remaining mention. Special case: if the OLD OPENING LINE still played at connect, the greeting lives ONLY in response_bank.opening_greeting — check and fix THAT field; editing stage goals never changes what plays at connect.
+   e5. EDIT A FIELD, DO NOT REGENERATE IT. When the user dictates new wording for something that already exists — a stage goal, the knowledge paragraph, an objection answer — you are changing the PART they named, not rewriting the field from their message. Free-text fields accumulate constraints that nobody will dictate again because they were never the user's words: "say ONLY that line and wait", "do not manufacture a problem", "never invent specific numbers or ROI", an acknowledgment rule, a script-fidelity guard. Read the current text first, keep every such sentence verbatim, and splice the user's new wording into it. On 2026-09-08 three separate Copilot edits to jai_mistry-outbound each dropped a constraint the user had not mentioned — including the rule that stopped the agent inventing lead-count numbers — and the next live call went off-script (RUNBOOK §37). If you genuinely believe an existing constraint should go, say so and ask; never delete one silently.
+   e6. NEVER write "then terminate the call", "end the call immediately", "advance to WRAP_UP" or any other transition/hangup instruction into a stage goal. The model cannot see the destination stage's script, and it does not end calls — the PLATFORM ends them, and it asks the caller's permission first ("alright then, shall I end the call here?"). A goal that tells the model to hang up produces an improvised line instead of the scripted close. Use branches for transitions and call_flow.termination.end_conditions for when the call should end.
    h. If the user says the agent SAID something it was told not to: find_text the offending phrase — the surface that still carries it (most often call_flow.call_goal, an objection answer, or the knowledge paragraph) is the bug, NOT the stage goal you already edited. If the offence is the agent proposing meeting times, also check call_flow.scheduling: the exact_n default FORCES time offers regardless of goals — set {{"style": "flexible"}}.
 6. QUESTIONS ("which agent is live?"): use list_agents / get_agent / get_routing. Do NOT call get_agent unless the user asks about that agent or you are about to edit it — during a new-agent interview no tool calls are needed until you create.
 
 DEFINITION FIELDS you may set (all optional — deep-merged onto defaults). SHAPES ARE STRICT — get them right the first time:
 - identity: agent_name, company_name, company_tagline, role_description, contact, role_line (full replacement identity sentence)
-- personality: pronouns (she|he), energy (low|medium|high), tone, style, custom_instructions, traits [str], energy_mirroring (bool), ai_disclosure ("deflect"|"admit"|"admit_if_pressed"), verbosity_max_sentences (int)
+- personality: energy (low|medium|high), tone, style, custom_instructions, traits [str], energy_mirroring (bool), ai_disclosure ("deflect"|"admit"|"admit_if_pressed"), verbosity_max_sentences (int)
 - languages MUST be an OBJECT, never a list: {{"supported": ["hi","en"], "default": "hi", "auto_switch": true, "allow_code_mixing": true, "stt_forced_language": "", "tts_voices": {{"hi": {{"model":"bulbul:v3","speaker":"simran","pace":1.15}}, "en": {{...}}}}}}. LANGUAGE SWITCHING IS ON BY DEFAULT and is BOUNDED BY `supported`: the agent follows the caller into any language listed there, and can never be dragged into one that is not. So "supported" is the real control — adding a language means the agent will actually speak it (give it a tts_voice too), and removing one means it never will. Set auto_switch false ONLY when the business explicitly wants one fixed language regardless of what the caller speaks; say plainly what that costs. If the user asks for a language the platform does not support (only hi/en/gu exist), tell them — do not add it to the list. response_bank.lang_unsupported_responses is what the agent says when a caller asks for a language it was not built for. tts_voices lives INSIDE languages — never at the top level. pace = speaking speed 0.5–2.0 (1.0 natural, 1.15 platform default) and is PER LANGUAGE. SPEED COMPLAINTS ('talks too fast', 'too slow' — overall or in one language): do NOT silently change anything. FIRST tell the user the current setting and the scale, read from the agent (get_agent's spoken_surfaces.pace has it), e.g. 'LesCall currently speaks at pace 1.15 on a 0.5–2.0 scale, where 1.0 is natural' — THEN ask what they'd prefer (slower or faster, or an exact number) and apply their choice to that language's pace in ±0.1 steps via update_agent. Never change the voice to fix speed.
 - call_direction: the STRING "inbound" or "outbound" — never a list. If the user wants BOTH, use "inbound" — the platform automatically applies the outbound approach whenever it places the call.
-- call_flow: {{"call_goal": "one-sentence mission", "stages": [{{id, order, goal, turns_until_advance, role, collect: [slot names], advance_when: {{all_collect_filled|slots|min_turns|intent|appointment_captured, max_turns: N (time escape — the stage also advances at turn N even if the condition never fires)}}, branches: [{{when_intent: affirmation|negation|question, goto: STAGE_ID, max_takes, actions: [capture_phone|promise_whatsapp_media|book_visit|schedule_callback]}}]}}], "scheduling": {{style: exact_n|flexible — flexible means the CALLER proposes the time; SET flexible whenever the user says not to suggest times or to ask when the caller is free; exact_n (the default) makes the platform force N specific time offers every turn, offer_count, enabled: false when the business doesn't book}}, "callback_policy": {{enabled, capture_slot, responses: {{lang: str}}, counts_as_decline}}, "completed_when": {{required_slots, require_appointment}}, "termination": {{"end_conditions": ["plain-English rules for when the agent should wrap up and END the call — e.g. 'once the site visit is booked and confirmed, thank them and end', 'if the caller becomes abusive, apologise briefly and end immediately' — injected into every turn as END-CALL RULES the agent acts on"], "farewell_patterns": ["extra caller phrases in ANY language/script that mean goodbye and hang up deterministically, e.g. 'chalo rakhta hu' — NEVER single common words like 'ok'/'no'/'haan', they would cut live calls"], "llm_end_call": true (default — lets the agent itself end the call after its goodbye; set false ONLY if the business wants hangups on caller-goodbye alone), "confirm_before_end": true (default, platform-wide — before hanging up on a heard goodbye the agent asks a short "alright then, shall I end the call here?" in the call's language, and after the caller confirms speaks a brief thank-you and hangs up; set false ONLY if the business explicitly wants instant hangups and accepts that a misheard "bye" cuts a live call),"silence_hangup": {{"enabled": true, "grace_s": 10}} (after both couldn't-hear reprompts go unanswered, say goodbye and end instead of holding the line open), "max_call_minutes": N (hard call-length ceiling — one polite wrap-up line, then the platform ends the call even mid-conversation; 0/omitted = no cap)}}, "connect": {{"hello_fastpath": true (default — an early bare "hello?" from the caller gets an instant identity intro instead of a slow LLM turn), "delivery_guard": true (default — during the first seconds a short "hello?" cannot cancel an agent reply the caller has not heard yet); set either false ONLY if the business explicitly wants the protection off}}}}. Stage roles: greeting|confirm_person|discovery|pitch|recommend|scheduling|confirmation|closing. Write goals in ENGLISH as instructions (the agent replies in the caller's language). STAGE WIRING IS WHAT MAKES THE FLOW ACTUALLY RUN: every stage SHOULD carry role; a stage whose goal asks for slots lists them in collect and uses advance_when {{all_collect_filled: true, max_turns: 6}}; a yes/no confirmation stage gets turns_until_advance 2-3 or advance_when {{intent: affirmation, max_turns: 3}}; NEVER leave a mid-flow stage needing 8+ caller turns — one such stage consumes an entire call and the rest of your flow never plays (this is exactly how a live agent ignored its whole script). If you omit the wiring at create time the platform derives it from the goals and slots — but wiring you write explicitly always wins.
-- slots (TOP-LEVEL list — the qualification schema, the heart of data capture): [{{name, priority (lower asked first), required, label, question: {{hi/en/gu: exact wording}}, type: text|number|money|enum|boolean|phone|email|date|time|location, enum_values, enum_synonyms, depends_on: [slot names never asked before], merge_policy: free|correction_gated|confirm, confirm_readback: ""|verbatim|digit_groups_2 (phone in 2-digit groups)|spelled (email letter-by-letter), max_asks (2 recommended), reask_question: {{lang}}}}]. EVERY new agent gets slots for what it must collect, with questions in EVERY supported language. EMAIL/PHONE CAPTURE IS ENGINE-OWNED (platform-wide): type an email slot "email" — the ENGINE then buffers spelled letters, assembles + validates the address, reads it back letter-by-letter, and confirms or flags it unresolved for follow-up. Write stage goals so the agent asks for the email ONCE and moves on; NEVER script the agent to ask callers to "speak slowly" (slow spelling fragments worse) and never promise letter-by-letter read-back in the goal — the engine does it.
-- knowledge_base: portfolio_prompt_text (plain-English paragraph — injected every turn), portfolio_section_label, locations, objection_patterns, known_projects {{"lowercase key": ["Canonical Name", "location or price"]}}, catalog [{{id, name, location, configurations, price_range, availability, positioning_tag, pitch_points, aliases, facts}}], match_rules [{{when: {{slot: value or "<=40L"}}, recommend: [ids], reason}}], pricing_policy {{mode: on_request|state_freely|defer, defer_line: {{lang}}}}, stt_corrections {{use_builtin_tables: false for non-real-estate agents}}
+- An EXISTING agent's call type is fixed by its name: `x-inbound` answers calls, `x-outbound` places them, and both exist from creation. Never send call_direction to update_agent to "switch" one — edit the other version instead.
+- call_flow: {{"call_goal": "one-sentence mission", "stages": [{{id, order, goal, turns_until_advance, role, collect: [slot names], advance_when: {{all_collect_filled|slots|min_turns|intent|appointment_captured, max_turns: N (time escape — the stage also advances at turn N even if the condition never fires)}}, branches: [{{when_intent: affirmation|negation|question|no_more_questions (no_more_questions = the caller's "no, nothing else" to THIS stage's "any other question?" moves the flow to goto instead of closing the call), goto: STAGE_ID, max_takes, actions: [capture_phone|promise_whatsapp_media|book_visit|schedule_callback]}} or {{when_slot: {{name: SLOT}}, goto: STAGE_ID, max_takes}} — omitting when_slot.equals means "this slot has ANY answer", the gate for a free-text follow-up with no fixed vocabulary], script: {{ask_verbatim: true (optional — the engine speaks the directive's slot question word for word after a reply that did not ask it; a paraphrase is never repeated), after_answer: {{lang: line}} (optional — spoken after every reply of this stage unless the reply already asks it or asks whether there is anything else), unless: [lines whose presence in the reply suppresses after_answer]}} — for a business that hands you an exact script; omit otherwise}}], "scheduling": {{style: exact_n|flexible — flexible means the CALLER proposes the time; SET flexible whenever the user says not to suggest times or to ask when the caller is free; exact_n (the default) makes the platform force N specific time offers every turn, offer_count, enabled: false when the business doesn't book}}, "callback_policy": {{enabled, capture_slot, responses: {{lang: str}}, counts_as_decline}}, "completed_when": {{required_slots, require_appointment}}, "termination": {{"end_conditions": ["plain-English rules for when the agent should wrap up and END the call — e.g. 'once the site visit is booked and confirmed, thank them and end', 'if the caller becomes abusive, apologise briefly and end immediately' — injected into every turn as END-CALL RULES the agent acts on"], "farewell_patterns": ["extra caller phrases in ANY language/script that mean goodbye and hang up deterministically, e.g. 'chalo rakhta hu' — NEVER single common words like 'ok'/'no'/'haan', and never a word that is a homophone of an ordinary one, they would cut live calls. The built-in goodbye words (bye, alvida, aavjo…) are already handled, and only count when they END the caller's sentence: 'okay thank you, bye' closes the call, 'bye philips lighting' (speech recognition mangling an employer name) does not"], "llm_end_call": true (default — lets the agent itself end the call after its goodbye; set false ONLY if the business wants hangups on caller-goodbye alone), "confirm_before_end": true (default, platform-wide — before hanging up on a heard goodbye the agent asks a short "alright then, shall I end the call here?" in the call's language, and after the caller confirms speaks a brief thank-you and hangs up; set false ONLY if the business explicitly wants instant hangups and accepts that a misheard "bye" cuts a live call), "pre_close_question": {{lang: str}} (optional — the business's OWN "anything else before I go?" line; when set it is asked before every goodbye, including after a confirmed visit read-back, and the caller's "no / nothing else" to it ends the call on response_bank.closing_responses),"silence_hangup": {{"enabled": true, "grace_s": 10}} (after both couldn't-hear reprompts go unanswered, say goodbye and end instead of holding the line open), "max_call_minutes": N (hard call-length ceiling — one polite wrap-up line, then the platform ends the call even mid-conversation; 0/omitted = no cap)}}, "connect": {{"hello_fastpath": true (default — an early bare "hello?" from the caller gets an instant identity intro instead of a slow LLM turn), "delivery_guard": true (default — during the first seconds a short "hello?" cannot cancel an agent reply the caller has not heard yet); set either false ONLY if the business explicitly wants the protection off}}, "turn_taking": {{"pause_hold_ms": N (hold EVERY caller pause this long before answering, so a sentence split by a long pause is answered once — costs that latency on every reply), "max_merged_fragments": N, "backchannel_guard": true (a bare "haan / ji / hmm / okay" while the agent is still speaking is a listener's acknowledgement, never a turn), "sustained_barge_ms": N (a barge-in held back by the delivery guard is carried out once the caller has kept speaking this long), "tail_barge_in": true (real caller speech while the agent's audio is still playing stops that audio)}} — set ONLY when the business reports the agent answering half-sentences or talking over callers; omit otherwise}}. Stage roles: greeting|confirm_person|discovery|pitch|recommend|scheduling|confirmation|closing. Write goals in ENGLISH as instructions (the agent replies in the caller's language). STAGE WIRING IS WHAT MAKES THE FLOW ACTUALLY RUN: every stage SHOULD carry role; a stage whose goal asks for slots lists them in collect and uses advance_when {{all_collect_filled: true, max_turns: 6}}; a yes/no confirmation stage gets turns_until_advance 2-3 or advance_when {{intent: affirmation, max_turns: 3}}; NEVER leave a mid-flow stage needing 8+ caller turns — one such stage consumes an entire call and the rest of your flow never plays (this is exactly how a live agent ignored its whole script). If you omit the wiring at create time the platform derives it from the goals and slots — but wiring you write explicitly always wins.
+- slots (TOP-LEVEL list — the qualification schema, the heart of data capture): [{{name, priority (lower asked first), required, label, question: {{hi/en/gu: exact wording}}, type: text|number|money|enum|boolean|phone|email|date|time|location, enum_values, enum_synonyms, depends_on: [slot names never asked before], merge_policy: free|correction_gated|confirm, ask_gated: false (default; true = the slot is written ONLY as the answer to its own question or on an explicit correction — for a closed vocabulary of everyday domain words callers also say in questions, e.g. "what matters most: location/amenities/…"), confirm_readback: ""|verbatim|digit_groups_2 (phone in 2-digit groups)|spelled (email letter-by-letter), max_asks (2 recommended), reask_question: {{lang}}}}]. EVERY new agent gets slots for what it must collect, with questions in EVERY supported language. EMAIL/PHONE CAPTURE IS ENGINE-OWNED (platform-wide): type an email slot "email" — the ENGINE then buffers spelled letters, assembles + validates the address, reads it back letter-by-letter, and confirms or flags it unresolved for follow-up. Write stage goals so the agent asks for the email ONCE and moves on; NEVER script the agent to ask callers to "speak slowly" (slow spelling fragments worse) and never promise letter-by-letter read-back in the goal — the engine does it.
+- knowledge_base: portfolio_prompt_text (plain-English paragraph — injected every turn), portfolio_section_label, locations, objection_patterns, known_projects {{"lowercase key": ["Canonical Name", "location or price"]}}, catalog [{{id, name, location, configurations, price_range, availability, positioning_tag, pitch_points, aliases, facts}}], match_rules [{{when: {{slot: value or "<=40L"}}, recommend: [ids], reason}}], primary_project {{id: <catalog id>, mode: exclusive|lead, reason}} (the ONE catalogue item pitched proactively — exclusive: every other item is answered when asked but never volunteered; lead: it is always the first candidate), pricing_policy {{mode: on_request|state_freely|defer, defer_line: {{lang}}}}, stt_corrections {{use_builtin_tables: false for non-real-estate agents}}
 - brand: spoken_company_name, positioning_tagline, credibility_markers [str], trust_proofs [top 2-3 — objection ammo], regions_served, contact_phone, whatsapp_number
 - response_bank: opening_greeting (ONE plain string in the default language — the INBOUND opening; see THE OPENING LINE below for which field outbound calls speak), identity_responses {{lang: str}}, objection_responses {{lang: [str]}}, objection_playbook [{{id, patterns: [caller phrasings], answer: {{lang: str — may use {{trust_proofs}}}}, prompt_guidance}}], closing_responses {{lang: str}}, canned_phrases [{{patterns, responses: {{lang}}}}], graceful_close {{lang: str}}
-- outbound (for outbound agents): identity_confirm_line/good_time_check_line/pitch/wrong_person_response/busy_response/wrong_number_close (all {{lang: str}}), wrong_number_patterns [str], opening_greeting {{lang}} — when set, OUTBOUND calls open with THIS (per language), beating response_bank.opening_greeting
+- OBJECTION_PLAYBOOK PATTERNS MUST COVER THE SCRIPT THE CALLER ACTUALLY SPEAKS IN, NOT JUST THE SCRIPT THE OWNER TYPED: an owner describing a Hindi/Gujarati agent almost always dictates patterns in romanized Hinglish ("kya karte ho aap") — but Sarvam STT transcribes fluent Hindi/Gujarati speech in DEVANAGARI/GUJARATI SCRIPT ("क्या करते हो आप"), and pattern matching is a literal substring test with no transliteration. A pattern authored in only one script can never fire for a caller speaking the other, no matter how well-worded it is — this is exactly how a Jai Mistry caller's real "tell me about your agency" got a fully improvised pitch instead of the owner's exact verbatim answer despite it being scripted for precisely that question (RUNBOOK §36). For every objection_playbook pattern and every knowledge_base.objection_patterns/time_patterns entry on an agent whose languages.supported includes hi or gu: add the native-script form alongside the romanized one, not instead of it (a caller may code-switch either way). Do this automatically — don't wait for the owner to notice a script is missing.
+- OBJECTION_PLAYBOOK ENTRIES ARE MATCHED WHETHER OR NOT THE TURN CLASSIFIES AS AN OBJECTION: a neutral question ("what do you do", "are you an AI", "how did you get my number") is not a decline, and the platform checks these patterns independent of that classification — author them freely for ANY question with a fixed answer the owner wants spoken verbatim, not just pushback.
+- outbound (for outbound agents): identity_confirm_line/good_time_check_line/pitch/wrong_person_response/busy_response/wrong_number_close/wrong_number_reconfirm_line (all {{lang: str}}), wrong_number_patterns [str], opening_greeting {{lang}} — when set, OUTBOUND calls open with THIS (per language), beating response_bank.opening_greeting. A "no" / "wrong number" to the identity question is ALWAYS re-confirmed once with wrong_number_reconfirm_line (built-in default when empty) before wrong_number_close ends the call; the engine does this, never a script
 - guardrails: use_builtin_rules (bool, default true), builtin_rules_pack ("generic" | "real_estate"), never_rules [str], always_rules [str], honesty {{unknown_answer_policy, forbidden_fabrications}}, compliance {{disclaimers, consent_line, dnd_phrases (["stop calling","remove my number"] recommended for new agents), restricted_topics}}, escalation {{enabled, triggers, handoff_message: {{lang}}}}
   - builtin_rules_pack: SET IT EXPLICITLY ON EVERY NEW AGENT. "real_estate" ONLY when the business genuinely sells or leases property — it injects site-visit/property/portfolio rules. For every other business (clinic, coaching class, fabric mill, electronics, SaaS, finance...) use "generic". An agent on the wrong pack is told to push callers toward a "site visit" it does not offer.
   - The caller's OWN OPENING HOURS belong in call_flow.scheduling.days + .window (e.g. days: ["Monday",...,"Friday"], window: "09:00-17:00"). Without them the agent will happily agree to a Sunday appointment. Ask for opening hours whenever the agent books anything.
   - NEVER tell an agent to claim it is human, and never write a never_rule/always_rule/custom_instruction that says it is a "real person" or must "not reveal" that it is an AI. personality.ai_disclosure is the ONLY control (deflect = do not volunteer it; admit / admit_if_pressed = say so). No mode may deny being an AI — if the user asks for one that does, tell them plainly the platform will not claim to be human, and offer "deflect" instead.
-  - Placeholders: the ONLY tokens the engine substitutes into spoken text are {{contact_name}}, {{customer_name}}, {{current_time}} — single braces. Anything else you invent, or the same name in double braces (e.g. {{{{student_name}}}}), is SPOKEN ALOUD to the caller, braces and all — never write one.
+  - Placeholders: the ONLY tokens the engine substitutes into spoken text are {{contact_name}}, {{customer_name}}, {{current_time}}, {{honorific}}, {{title}} — single braces. Anything else you invent, or the same name in double braces (e.g. {{{{student_name}}}}), is SPOKEN ALOUD to the caller, braces and all — never write one.
 - follow_up: whatsapp_promise {{enabled, assets, promise_line: {{lang}}}}, callback {{enabled, default_delay_hours}}
 - calendar: {{"type": "mock", "mock_slots": [{{"day": "Tomorrow", "time": "11:00 AM"}}, {{"day": "Friday", "time": "4:30 PM"}}], day_synonyms, booking_confirmation_line: {{lang}}}}. Times must be REALISTIC and VARIED — never the same time repeated across days. Omit mock_slots entirely (or set type: "none") when the business doesn't book time slots — a phantom calendar steers the agent toward booking behaviour its flow doesn't have.
 - post_call: outcomes [{{id, label, kind: success|progress|failure}}], scoring {{enabled, criteria_prompt, score_labels}}
@@ -5547,19 +6132,28 @@ WHAT THE LIVE CALL ACTUALLY READS (the injection model — edits that ignore thi
 - Only the CURRENT stage's goal is injected per turn. A rule written into one stage's goal is INVISIBLE for the rest of the call. Durable behaviour rules ("never say X", "never suggest times") belong in guardrails.never_rules / always_rules — those are injected on every turn.
 - call_flow.scheduling defaults to {{"style": "exact_n", "offer_count": 2}}, which makes the platform FIRM RULES order the agent to "always give exactly TWO specific time options". When the user wants the CALLER to propose the time ("ask them when they're free", "don't suggest times"), you MUST set call_flow.scheduling to {{"style": "flexible"}} — otherwise the platform rules fight the goals. An agent with empty calendar.mock_slots has no times to offer at all; exact_n there is always wrong.
 - STAGE-BEAT PLACEMENT: the caller turn that satisfies a stage's advance_when is answered under the NEXT stage's goal. Script meant for "right after the caller confirms" goes at the TOP of the NEXT stage's goal — or raise advance_when.min_turns to 2 so the confirming stage keeps the turn. A confirm_person stage's goal should contain ONLY the confirm beat; anything written after it in that goal is never spoken.
+- EARLY-EXIT SCRIPTS NEED THEIR OWN STAGE + BRANCH, never prose inside a shared one: a script shaped "ask X; if NO, ask why then close; if YES, ask Y then Z" is NOT one stage with advance_when.all_collect_filled over both X's and Y's slots — on the NO path Y's slot never fills, so the ONLY exit is max_turns, and the goal text's own "then close" instruction fires turns before that, with NO closing script in view (the model improvises something else entirely — a real 2026-09-08 incident, RUNBOOK §35). Split it: X's own stage branches on when_intent: negation|affirmation to two DIFFERENT stages (the NO path's "ask why" stage, the YES path's "ask Y" stage); a "why"/free-text follow-up stage advances with branches: [{{when_slot: {{name: SLOT}}, goto: NEXT}}] (no `equals` — any answer converges) so the model is NEVER asked to "wrap up"/"advance to closing" without the destination stage's actual script in front of it. If a shared closing stage is the convergence point for several such paths, its goal opens by naming each path's acknowledgment line (readable from CALL STATE) BEFORE the closing script — never a bare "advance to closing"/"wrap up" left for the model to invent.
+- A QUOTED LINE find_text CANNOT FIND WAS IMPROVISED, NOT CONFIGURED. When a user pastes something the agent SAID on a call and asks you to change it, find_text it first. Zero hits does not mean "search harder with a shorter substring" and it never means the edit is done — it means no field contains that sentence and the MODEL composed it, usually from a stage goal or the knowledge paragraph nearby. Say that to the user in one plain sentence ("that exact line isn't in your script — the agent improvised it from the WRAP_UP goal"), then fix the cause: put the wording they want into a real field (an objection_playbook answer, the stage goal's verbatim line) so it is scripted rather than composed, and add a guardrails.never_rules entry only as a backstop. What you must NOT do is add a never_rule about a phrase you never located and then report it as "removed" — that tells the user a line was deleted from their configuration when nothing of the sort happened (this exact exchange happened on 2026-09-08, RUNBOOK §37). Report what you actually changed.
 - BANNED-PHRASE SWEEP (any "stop saying X" / "remove X" / "never do Y"): get_agent FRESH, then find_text the phrase (and obvious variants) to map every surface — call_goal, every stage goal, objection_playbook answers, portfolio_prompt_text, catalog pitch_points, outbound.* lines, brand.trust_proofs, existing rules. Fix EVERY hit, add a guardrails.never_rules entry for the ban, then find_text AGAIN and only claim success on a 0-hit result — report remaining hits honestly.
 
 THE OPENING LINE & PLACEHOLDERS (get this right — it burned a real user TWICE):
 - WHICH FIELD OPENS THE CALL DEPENDS ON DIRECTION. Inbound calls open with response_bank.opening_greeting, word-for-word. Outbound calls open with outbound.opening_greeting for the call's language whenever it is non-empty, and fall back to response_bank.opening_greeting only when it is not — so on an outbound agent, editing response_bank.opening_greeting alone usually changes NOTHING the caller hears (a real user's "Hello?" edit was applied, reported as done, and never spoken, 2026-08-01). When the user talks about the greeting / the first line / "as soon as the call connects": inbound agent → edit response_bank.opening_greeting; outbound agent → edit outbound.opening_greeting in EVERY supported language (and keep response_bank.opening_greeting in step so the fallback matches). Scheduled follow-up calls always open with a platform-composed callback line — no greeting field changes those. Stage goals are INSTRUCTIONS to the AI (always written in English), never a script — editing a stage goal will NOT change what plays at connect.
 - VERIFY GREETING EDITS: after any greeting change the tool result carries "hearable" with TWO lines — "opening_next_call" (what the call opens with) and "second_line_next_call" (what the agent says the instant the caller first responds). QUOTE BOTH to the user (e.g. "the next outbound call now starts with: '…', then when they answer she says: '…'"). Use the preview_opening tool whenever the user asks what the agent says at the start of a call, or to double-check a greeting edit took. get_agent's spoken_surfaces.opening_line_next_call shows the same engine-resolved truth, second line included.
-- Exactly TWO placeholders exist, both single curly braces and ONLY inside opening_greeting:
-  * {{contact_name}} — on outbound calls, replaced with the dialed contact's name from Outbound Calls (fallback "sir/ma'am"). When the user wants the agent to greet whoever it calls by name, write e.g. "Hello, am I speaking with {{contact_name}}?"
+- Exactly FOUR placeholders exist, all single curly braces, and they work in ANY authored spoken line — opening_greeting, outbound.* lines, call_flow.connect.intro_line, closing_responses, canned_phrases, objection_playbook answers, graceful_close — AND inside the verbatim script lines a stage goal quotes (the platform resolves them for each call before the model reads the goal):
+  * {{contact_name}} — on outbound calls, replaced with the dialed contact's name from Outbound Calls. A contact with NO name on file: a clause that only asks who they are is dropped ("Hello, am I speaking with {{contact_name}}?" is spoken as "Hello.", and if nothing is left the platform opens with the agent's own intro), and anywhere else the token simply disappears ("Thank you {{contact_name}}!" → "Thank you!"). It is NEVER replaced with "sir/ma'am". When the user wants the agent to greet whoever it calls by name, write e.g. "Hello, am I speaking with {{contact_name}}?"
   * {{current_time}} — replaced at call time with morning/afternoon/evening (India time). E.g. "Good {{current_time}}, am I speaking with {{contact_name}}?" becomes "Good morning, am I speaking with Rajesh?". If the greeting is written in Hindi or Gujarati script, the word comes out in that language automatically.
-- NEVER invent any other placeholder or syntax — ${{...}}, {{{{...}}}}, [name], <contact>, {{date}} do not exist and would be SPOKEN ALOUD literally. Placeholders in stage goals, knowledge text, or canned responses are never substituted (exception: {{trust_proofs}} inside objection_playbook answers).
+  * {{honorific}} — "Sir" or "Ma'am" from the contact's Gender. Stands ALONE: "Yes {{honorific}}", "Thank you {{honorific}}".
+  * {{title}} — "Mr." or "Mrs." from the same Gender. Goes BEFORE THE NAME and nowhere else: "{{title}} {{contact_name}}". Never write "{{title}}" on its own — "Thank you Mr." is not a sentence.
+  * BOTH GENDERED TOKENS ARE OPTIONAL DATA, and this is the thing to get right. Gender is an optional column in the contact upload (a "Gender" or "Sex" header; male/female/M/F), MOST CONTACT LISTS DO NOT HAVE IT, and a contact without one is simply never addressed by title — the token and the gap it leaves are removed. So "Good {{current_time}} {{honorific}}, am I speaking with {{title}} {{contact_name}}?" is spoken as "Good morning Sir, am I speaking with Mr. Rajesh?" for a contact marked male, and "Good morning, am I speaking with Rajesh?" for a contact with no gender. In Hindi/Gujarati they come out as सर/मैडम, श्री/श्रीमती (સર/મેડમ, શ્રી/શ્રીમતી) automatically. SAFE TO ADD BY DEFAULT for that reason — but tell the user they only speak for contacts whose sheet had a gender column, and NEVER write a line whose grammar collapses without them (e.g. "Am I speaking to {{honorific}}?" reads as "Am I speaking to?"). They are a courtesy, never a substitute for the name.
+  * The agent ALSO applies gendered address to its OWN improvised sentences for the whole call whenever the gender is known — the placeholders are only for the lines the user writes out by hand. Do not add guardrails rules telling it to say "Sir"; that is automatic.
+  * GENDERED ADDRESS IS ALWAYS DYNAMIC — PLATFORM-WIDE, NO EXCEPTIONS. NEVER write a literal Sir / Ma'am / Madam / Mr. / Mrs. (or सर / मैडम / श्री / श्रीमती) into a spoken line: write {{honorific}} / {{title}}. The platform converts any literal you leave into the placeholder on save, and at call time holds EVERY Sir/Ma'am the agent says — scripted, canned or improvised — to that contact's Gender: the right word when it is known, and NO gendered word at all when it is not (the agent uses the name, or 'ji'). A fixed "Sir" for everyone does not exist on this platform; do not offer one.
+  * THE GENDER-DATA REMINDER — REQUIRED. Whenever the user explicitly asks for Sir/Ma'am, Madam, Mr./Mrs., सर/मैडम or any honorific in the script, do it with {{honorific}}/{{title}} AND tell them plainly, in your reply: this is dynamic — it only works for contacts that have a Gender in their data; add a Gender column (male/female or M/F) to the contact upload, set gender in the API, or pick it in Add Contact; contacts WITHOUT a gender are addressed by name only — never guessed, never a fixed Sir. The server checks your reply for this and appends it if you leave it out, so say it yourself, once, in your own words.
+- THE AGENT'S OWN GENDER FOLLOWS ITS VOICE (platform-wide, every agent). Pick a male voice (shubh, ratan, aditya, …) and the agent speaks as a man — pronouns he, Hindi "kar raha hoon", "samajh gaya", Gujarati "રહ્યો છું"; a female voice (simran, priya, ishita, …) and it speaks as a woman — "kar rahi hoon", "samajh gayi", "રહી છું". This is applied in the prompt AND to every scripted line at speak time, automatically; there is NO pronouns setting to change (personality.pronouns / identity.pronouns are derived from the voice and anything you write there is overwritten). So: to change the agent's gender, change the voice — and never rewrite scripts to switch verb gender, the platform does it. When the user switches the voice to the other gender, say in one sentence that the agent's own grammar now follows automatically; if the agent's NAME is plainly the other gender (e.g. "Jai Mistry" with a female voice), point it out and offer to rename it — never rename silently.
+- NEVER invent any other placeholder or syntax — ${{...}}, {{{{...}}}}, [name], <contact>, {{date}} do not exist and would be SPOKEN ALOUD literally. Placeholders in the knowledge text are NOT substituted (that text is shared by every call; a gendered token there is simply removed) — put per-caller wording in a spoken field or a stage goal's verbatim line instead.
 CALL-REPAIR BEHAVIOUR THE PLATFORM APPLIES TO EVERY AGENT (know this before you "fix" a greeting — these are NOT settings and you cannot edit them):
 - Bare "hello?" from the caller within ~25s of the opening line: the agent replays its last utterance (up to twice), on the assumption the caller didn't hear it. This deliberately does NOT fire when the opening line is itself just "Hello?" — a hello answering a hello means contact is established, so the agent moves straight on to its script.
 - ~6s of caller silence: the agent says it couldn't hear and re-asks.
-- ENDING CALLS (platform-wide): before wrapping up, every agent asks the caller's permission ("anything else I can help you with?") and only says goodbye after the caller confirms they're done — then the PLATFORM hangs the call up automatically after the goodbye. Because speech recognition mishears goodbyes ("okay, by the way..." → "okay bye"), the platform ALSO asks one short confirmation — "alright then, shall I end the call here?" (in the call's language) — before acting on any heard goodbye; after a clear yes it speaks a brief thank-you ("thank you for talking with me — have a wonderful day") and hangs up. This is on for every agent by default (call_flow.termination.confirm_before_end) and needs no configuration; per-agent copy overrides live in response_bank.localized_responses under 'close_confirm' and 'close_confirmed'. The platform also ends the call on the caller's own goodbye, after the couldn't-hear reprompts go unanswered (silence hangup), and — by default — whenever the agent itself judges the conversation is over per its END-CALL RULES (see call_flow.termination).
+- ENDING CALLS (platform-wide): before wrapping up, every agent asks the caller's permission ("anything else I can help you with?") and only says goodbye after the caller confirms they're done — then the PLATFORM hangs the call up automatically after the goodbye. Because speech recognition mishears goodbyes ("okay, by the way..." → "okay bye"), the platform ALSO asks one short confirmation — "alright then, shall I end the call here?" (in the call's language) — before acting on any heard goodbye, and only treats a goodbye as one at all when it ENDS the caller's sentence (a "bye" with an answer after it is a mis-transcription, not a hang-up); after a clear yes it speaks a brief thank-you ("thank you for talking with me — have a wonderful day") and hangs up. This is on for every agent by default (call_flow.termination.confirm_before_end) and needs no configuration; per-agent copy overrides live in response_bank.localized_responses under 'close_confirm' and 'close_confirmed'. The platform also ends the call on the caller's own goodbye, after the couldn't-hear reprompts go unanswered (silence hangup), and — by default — whenever the agent itself judges the conversation is over per its END-CALL RULES (see call_flow.termination).
 - CALLBACK REQUESTS & BUSY CALLERS (platform-wide): when a caller says "call me later / in 10 minutes / tomorrow" or brushes off with "sorry, not free right now", every agent stops pitching, pins down ONE specific time, confirms it with a goodbye, and the platform HANGS UP the call by itself right after that confirmation — then automatically places a real follow-up call at the agreed time, opening with a polite reference to the earlier conversation. This is on for all agents by default; a business can opt an agent out of the automatic calling (follow_up.auto_execute enabled false) but the time pin-down stays.
 - CALL-ENDING REQUIREMENTS GO IN call_flow.termination, NOT IN PROMPT TEXT: when a user asks for anything about cutting/ending/hanging up calls — "end the call once the booking is done", "hang up if they abuse the agent", "don't let calls run past 10 minutes", "cut the call when they say chalo rakhta hu" — map it into call_flow.termination (end_conditions for judgment-based rules, farewell_patterns for exact caller phrases, max_call_minutes for duration caps, silence_hangup for no-response behaviour). That section is real engine wiring: the platform physically ends the call from it. A guardrails rule or stage-goal sentence saying "end the call" does NOTHING by itself — never implement a termination request as prompt text alone, and never claim call-cutting behaviour you did not write into termination. Do NOT add rules like "never reschedule / never ask for a better time", which fight the platform's callback pin-down. After setting it, tell the user plainly which of their conditions now end the call.
 - OPENING STYLE — SHORT GREETING, THEN WAIT (platform-wide): a short opening like "Hello" is the intended default. The agent greets, WAITS for the caller, and the moment the caller responds the agent speaks a SECOND LINE — instantly, with no LLM turn and cached audio. That second line IS SETTABLE WORD-FOR-WORD: call_flow.connect.intro_line, a per-language map ({{"en": "...", "hi": "..."}}) where {{contact_name}} IS substituted. Leave it empty and the platform composes one from identity.agent_name + identity.company_name. On OUTBOUND agents, outbound.identity_confirm_line is ALSO spoken as that second line when no intro_line is set — so a business that already wrote an identity line hears its own words, not the generic one. WHEN THE USER DICTATES WHAT THE AGENT SAYS AFTER THE CALLER FIRST SPEAKS OR SAYS HELLO ("say Hello, wait for them, THEN say ..."), that sentence goes in call_flow.connect.intro_line — NOT in response_bank.opening_greeting (that is the FIRST line, spoken before the caller has said anything) and NEVER in a stage goal (stage goals are instructions to the AI and are never spoken). This is engine wiring, so a short opening does NOT stall or loop the call. NEVER rewrite a user's opening — not short-to-long, not long-to-short — unless they ask for different words. A business that wants the full intro spoken up front simply writes the full line into the opening field its direction reads (response_bank.opening_greeting for inbound, outbound.opening_greeting for outbound); both styles are fully supported. For agents with a short opening, make sure identity.agent_name and identity.company_name are filled in — the connect intro is composed from them. Connect-window protections (call_flow.connect: hello_fastpath, delivery_guard) default ON for every agent — configure them only when the business explicitly asks.
@@ -5929,7 +6523,8 @@ def _adapt_tool_calls_for_provider(messages: list[dict], cli) -> list[dict]:
 
 
 async def _chat_completion(client, model: str, messages: list[dict],
-                           trace: dict | None = None):
+                           trace: dict | None = None, owner=None,
+                           spend: dict | None = None):
     """One LLM call with retries for Groq's `tool_use_failed` (the model emitted
     a malformed/truncated tool call — a known llama flakiness). On failure we
     re-ask with a corrective nudge appended; the nudge is never persisted.
@@ -5972,6 +6567,15 @@ async def _chat_completion(client, model: str, messages: list[dict],
                     max_tokens=max_toks,
                     **_extra,
                 )
+                # Charged HERE, inside the attempt loop, rather than at the
+                # call site: a nudged retry and a walk down the fallback chain
+                # are additional real requests against the shared model quota,
+                # and a budget that only counts the successful one would let a
+                # tenant provoking malformed tool calls spend three times what
+                # it records. Done before the return so no path skips it.
+                _charged = _charge_tokens(owner, getattr(completion, "usage", None))
+                if spend is not None:
+                    spend["tokens"] = spend.get("tokens", 0) + _charged
                 return completion.choices[0].message
             except BadRequestError as exc:
                 if "tool_use_failed" not in str(exc):
@@ -6050,8 +6654,12 @@ async def copilot_chat(request: Request) -> dict:
     # E9 — the copilot's LLM budget is SHARED with live calls (COPILOT_LLM_TPM
     # and the provider's daily ceiling), so an unmetered chat lets one tenant
     # degrade every other tenant's phone calls at zero cost to themselves.
-    # A daily turn budget per plan; refusal is a 402 the SPA renders inline.
-    _billing_llm_gate(request, "copilot_chat")
+    # A daily turn AND token budget per plan; refusal is a 402 the SPA renders
+    # inline. The size estimate is the raw message only — _approx_tokens()
+    # would fold in the tool schemas that ride every request and report a
+    # one-word "hi" as thousands of tokens, refusing it on a per-message cap.
+    _billing_llm_gate(request, "copilot_chat",
+                      request_tokens=int(len(message) / 3.5))
     # v2: attached documents ride along as doc ids; the LLM ingests them via
     # ingest_document (the note is machine-added, not user text).
     attachments = [str(a) for a in (body.get("attachments") or [])
@@ -6148,8 +6756,31 @@ async def _copilot_chat_turn(request: Request, sid: str, owner,
     _read_signatures: dict[str, int] = {}
     # Which model actually served this turn, and every silent downgrade.
     _llm_trace: dict = {}
+    # The daily budget is checked ONCE, before the turn. That is the right
+    # place for it — but a turn is a tool loop of up to _MAX_TOOL_ROUNDS full
+    # requests, so a tenant one token short of the ceiling could still spend
+    # twenty rounds' worth in a single send. This bounds that overshoot to one
+    # round WITHOUT a database read per iteration: the remaining budget is
+    # fetched once here and drawn down locally from the usage each round
+    # already reports.
+    _budget_left = _remaining_tokens(owner)
+    _spend: dict = {"tokens": 0}
+    _budget_stop = ""
     try:
         while _charged < _MAX_TOOL_ITERATIONS and _rounds < _MAX_TOOL_ROUNDS:
+            if _budget_left is not None and _spend["tokens"] >= _budget_left:
+                # Stop the loop, keep the turn. Whatever the tools already did
+                # is saved; raising here would discard completed work and the
+                # user would be charged for it anyway.
+                _budget_stop = (
+                    "I have used up today's AI-assistant allowance part-way "
+                    "through this request, so I stopped here. Anything I "
+                    "already saved is saved. The allowance resets at midnight "
+                    "IST — or upgrade from Billing for a higher one.")
+                logger.info("[copilot] token budget exhausted mid-turn "
+                            "(owner=%s spent=%s left=%s)",
+                            owner, _spend["tokens"], _budget_left)
+                break
             _rounds += 1
             msg = await _chat_completion(
                 client,
@@ -6157,6 +6788,8 @@ async def _copilot_chat_turn(request: Request, sid: str, owner,
                 [{"role": "system", "content": _system_prompt(session)}]
                 + _context_window(session["messages"]),
                 trace=_llm_trace,
+                owner=owner,
+                spend=_spend,
             )
 
             if not msg.tool_calls:
@@ -6233,6 +6866,14 @@ async def _copilot_chat_turn(request: Request, sid: str, owner,
                         f"Couldn't {_TOOL_VERBS.get(tool_name, tool_name)}: {exc.detail}", False, False,
                     )
                 except Exception as exc:
+                    # A ValueError here is the handler's own refusal (expected,
+                    # worded for the model). Anything else is OUR crash and it
+                    # used to vanish: the only record of the §60 'str'.get()
+                    # failure was the session file.
+                    if isinstance(exc, ValueError):
+                        logger.warning("[copilot] tool %s refused: %s", tool_name, exc)
+                    else:
+                        logger.exception("[copilot] tool %s crashed: %s", tool_name, exc)
                     result, summary, ok, mutated = (
                         _failure_payload(tool_name, str(exc)),
                         f"Couldn't {_TOOL_VERBS.get(tool_name, tool_name)}: {exc}", False, False,
@@ -6340,6 +6981,11 @@ async def _copilot_chat_turn(request: Request, sid: str, owner,
             _save_session(sid)
             raise HTTPException(status_code=502, detail=f"Copilot LLM error: {exc}")
 
+    if _budget_stop:
+        # Prepended, not substituted: when the loop did work before it ran out,
+        # the model's own account of that work is the useful half of the reply
+        # and the budget notice is the reason it stops there.
+        reply = f"{reply}\n\n{_budget_stop}".strip() if reply else _budget_stop
     if not reply:
         reply = "Done." if actions else "Sorry, I didn't produce a reply — please try again."
 
@@ -6402,6 +7048,19 @@ async def _copilot_chat_turn(request: Request, sid: str, owner,
         except Exception:  # noqa: BLE001 — advisory only
             logger.warning("[copilot] verbatim backstop failed", exc_info=True)
 
+    # ── Gender-data reminder (RUNBOOK §42) ──────────────────────────────────
+    # Sir/Ma'am and Mr./Mrs. are resolved per contact from contacts.gender and
+    # are silent without it — so a user who asks for them has to hear, every
+    # time, that the data is what makes them work. The system prompt asks the
+    # model to say so; this guarantees it, with the account's real coverage.
+    try:
+        if (_asks_for_honorific(message)
+                and not _GENDER_DATA_MENTION_RE.search(reply or "")):
+            reply += "\n\n" + _gender_data_reminder(owner)
+            logger.info("[copilot] gender-data reminder appended (sid=%s)", sid)
+    except Exception:  # noqa: BLE001 — advisory only
+        logger.warning("[copilot] gender-data reminder failed", exc_info=True)
+
     # ── Hide self-corrected retries from the user-facing action list ────────
     # The LLM often gets a save rejected (e.g. invented setting name), reads
     # the error, and immediately retries correctly. A "Couldn't update …"
@@ -6462,6 +7121,15 @@ async def _copilot_chat_turn(request: Request, sid: str, owner,
     }
     if voice_samples:
         out["voice_samples"] = voice_samples
+    out.update(_rail_payload(session))
+    return out
+
+
+def _rail_payload(session: dict) -> dict:
+    """interview + pending_changes for the progress rail, preview and diff
+    cards — shared by the chat turn and the page-reload GET (the rail used
+    to vanish on reload because only the POST carried it)."""
+    out: dict = {}
     iv = session.get("interview") or {}
     if iv.get("phase") in ("interviewing", "built") or iv.get("draft"):
         progress = interview_progress(iv.get("draft") or {}, iv.get("skipped") or [])
@@ -6953,8 +7621,11 @@ async def copilot_try_agent(name: str, request: Request) -> dict:
     body = await request.json()
     body = body if isinstance(body, dict) else {}
     # E10 — try-agent drives a REAL ConversationRouter, the most expensive
-    # LLM surface here per call.
-    _billing_llm_gate(request, "copilot_try")
+    # LLM surface here per call. It reports no usage back (the router owns its
+    # own client), so it spends the turn budget and is bounded by whatever the
+    # chat surface has already charged against the token budget.
+    _billing_llm_gate(request, "copilot_try",
+                      request_tokens=int(len(str(body.get("message") or "")) / 3.5))
 
     sim_id = str(body.get("sim_id") or "").strip()
     if sim_id:
@@ -7110,4 +7781,302 @@ async def copilot_session(session_id: str, request: Request) -> dict:
         "session_id": session_id,
         "transcript": transcript,
         "meta": session.get("meta", {}),
+        "session": _session_summary(session_id, session),
+        **_rail_payload(session),
     }
+
+
+# ── Quick controls: voice + speaking speed by click (RUNBOOK §67) ──────────
+#
+# The two settings owners change most, and the two the chat handled worst:
+# a speaker name has to be typed exactly, a pace has to be guessed as a
+# number, and every tweak cost a full LLM turn against the quota live calls
+# share. The panel writes the SAME fields the model would
+# (languages.tts_voices.<lang>.{speaker,pace}) through the same store path,
+# so a revision is recorded and the agent's he/she re-derives from the voice
+# on load (schema.from_dict). Before the agent exists the draft is edited
+# instead. Either way the session's model context gets a note, so the chat
+# never "corrects" a choice it did not make.
+
+PACE_MIN, PACE_MAX, PACE_STEP = 0.5, 2.0, 0.05
+_PACE_DEFAULT = 1.15            # the Copilot's default for a new agent
+_V3_MODEL = "bulbul:v3"
+_LANG_NAMES = {"en": "English", "hi": "Hindi", "gu": "Gujarati",
+               "mr": "Marathi", "ta": "Tamil", "te": "Telugu",
+               "kn": "Kannada", "ml": "Malayalam", "bn": "Bengali",
+               "pa": "Punjabi", "od": "Odia"}
+
+
+def _voice_roster() -> list[dict]:
+    """Every speaker a new voice can be (bulbul:v3), with a sample when one
+    was generated and the languages Sarvam recommends it for."""
+    try:
+        sampled = {str(v.get("speaker")) for v in
+                   json.loads(_VOICE_SAMPLES_FILE.read_text())
+                   if isinstance(v, dict)}
+    except Exception:
+        sampled = set()
+    rec: dict[str, list[str]] = {}
+    for (lang, _g), spk in RECOMMENDED_SPEAKERS.items():
+        rec.setdefault(spk, []).append(lang)
+    out = []
+    for spk, info in SPEAKER_CATALOG.items():
+        if _V3_MODEL not in info.get("models", ()):
+            continue                      # v2-only legacy — cannot be chosen
+        out.append({
+            "speaker": spk, "gender": info.get("gender", ""),
+            "sample_url": (f"/api/voices/sample/{spk}" if spk in sampled
+                           else None),
+            "recommended_for": sorted(rec.get(spk, [])),
+        })
+    out.sort(key=lambda v: (v["gender"] != "female", not v["sample_url"],
+                            v["speaker"]))
+    return out
+
+
+def _qc_target(session: dict) -> dict:
+    """What the panel edits: the chat's agent once it exists on disk, else
+    the interview draft, else nothing yet."""
+    meta = session.get("meta") or {}
+    iv = session.get("interview") or {}
+    slug = str(meta.get("agent") or iv.get("built_slug") or "").strip()
+    if slug and (_AGENTS_DIR / slug / "agent.yaml").exists() \
+            and _visible_slug(slug):
+        twin = builder.counterpart_of(slug)
+        if not (twin and (_AGENTS_DIR / twin / "agent.yaml").exists()
+                and _visible_slug(twin)):
+            twin = None
+        return {"kind": "agent", "slug": slug, "twin": twin,
+                "display_name": _agent_display_name(slug)}
+    if iv.get("phase") == "interviewing" or iv.get("draft"):
+        return {"kind": "draft", "slug": None, "twin": None,
+                "display_name": str(((iv.get("draft") or {}).get("identity")
+                                     or {}).get("agent_name") or "")}
+    return {"kind": "none", "slug": None, "twin": None, "display_name": ""}
+
+
+def _qc_languages(defn: dict) -> tuple[list[str], str]:
+    langs = defn.get("languages") if isinstance(defn.get("languages"), dict) \
+        else {}
+    sup = [c for c in (langs.get("supported") or []) if isinstance(c, str) and c]
+    tv = langs.get("tts_voices") if isinstance(langs.get("tts_voices"), dict) \
+        else {}
+    if not sup:
+        sup = [c for c in tv.keys() if isinstance(c, str)]
+    default = langs.get("default") if langs.get("default") in sup else (
+        sup[0] if sup else "")
+    return sup, default
+
+
+def _qc_state(defn: dict) -> dict:
+    """Voice / pace / pronouns as the panel shows them."""
+    sup, default = _qc_languages(defn)
+    tv = ((defn.get("languages") or {}).get("tts_voices") or {}) \
+        if isinstance(defn.get("languages"), dict) else {}
+    voices = {c: tv.get(c) for c in sup if isinstance(tv.get(c), dict)}
+    speakers = [str(v.get("speaker") or "").lower() for v in voices.values()
+                if v.get("speaker")]
+    main = str((voices.get(default) or {}).get("speaker") or
+               (speakers[0] if speakers else "")).lower()
+    gender = speaker_gender(main)
+    pace = {}
+    for c in sup:
+        try:
+            pace[c] = round(float((voices.get(c) or {}).get("pace")
+                                  or _PACE_DEFAULT), 2)
+        except (TypeError, ValueError):
+            pace[c] = _PACE_DEFAULT
+    return {
+        "languages": [{"code": c, "name": _LANG_NAMES.get(c, c)} for c in sup],
+        "default_language": default,
+        "speaker": main or None,
+        "mixed_speakers": len(set(speakers)) > 1,
+        "gender": gender,
+        "pronouns": {"male": "he/him", "female": "she/her"}.get(gender, ""),
+        "model": str((voices.get(default) or {}).get("model")
+                     or DEFAULT_TTS_MODEL),
+        "pace": pace,
+    }
+
+
+def _qc_changes(defn: dict, speaker: str | None,
+                pace: dict[str, float]) -> tuple[dict, list[str]]:
+    """The partial definition to merge, and the paths it touches."""
+    sup, _ = _qc_languages(defn)
+    tv = ((defn.get("languages") or {}).get("tts_voices") or {}) \
+        if isinstance(defn.get("languages"), dict) else {}
+    out: dict = {}
+    for c in sup or list(pace.keys()):
+        cur = tv.get(c) if isinstance(tv.get(c), dict) else {}
+        entry: dict = {}
+        if speaker:
+            entry["speaker"] = speaker
+            model = str(cur.get("model") or DEFAULT_TTS_MODEL)
+            # A v3 speaker on a v2 model 400s every utterance: move it up.
+            if model not in SPEAKER_CATALOG[speaker]["models"]:
+                entry["model"] = _V3_MODEL
+            elif not cur.get("model"):
+                entry["model"] = model
+            if not cur.get("pace") and c not in pace:
+                entry["pace"] = _PACE_DEFAULT
+        if c in pace:
+            entry["pace"] = pace[c]
+        if entry:
+            out[c] = entry
+    changes = {"languages": {"tts_voices": out}} if out else {}
+    paths = [f"languages.tts_voices.{c}.{k}" for c, e in out.items() for k in e]
+    return changes, paths
+
+
+def _qc_parse(body: dict, langs: list[str]) -> tuple[str | None, dict]:
+    speaker = body.get("speaker")
+    if speaker is not None:
+        speaker = str(speaker).strip().lower()
+        info = SPEAKER_CATALOG.get(speaker)
+        if not info or _V3_MODEL not in info.get("models", ()):
+            raise HTTPException(status_code=400,
+                                detail=f"unknown voice '{speaker}'")
+    raw = body.get("pace")
+    pace: dict[str, float] = {}
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        raw = {c: raw for c in (langs or ["en"])}
+    if isinstance(raw, dict):
+        for c, v in raw.items():
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"bad pace for {c}")
+            if not (PACE_MIN <= f <= PACE_MAX):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"speed must be between {PACE_MIN} and {PACE_MAX}")
+            pace[str(c)] = round(round(f / PACE_STEP) * PACE_STEP, 2)
+    elif raw is not None:
+        raise HTTPException(status_code=400, detail="bad pace")
+    if not speaker and not pace:
+        raise HTTPException(status_code=400, detail="nothing to change")
+    return speaker, pace
+
+
+def _qc_note(session: dict, speaker: str | None, pace: dict,
+             where: str) -> None:
+    """Tell the chat's model what the user set by hand."""
+    bits = []
+    if speaker:
+        g = speaker_gender(speaker)
+        bits.append(f"voice = {speaker} ({g}; the agent's pronouns now follow "
+                    f"it: {'he' if g == 'male' else 'she'})")
+    if pace:
+        bits.append("speaking speed = " + ", ".join(
+            f"{_LANG_NAMES.get(c, c)} {v:.2f}" for c, v in pace.items()))
+    session.setdefault("messages", []).append({
+        "role": "user",
+        "content": ("[Quick controls — the user set this directly and it is "
+                    f"ALREADY SAVED on {where}: " + "; ".join(bits)
+                    + ". Do not change or re-ask it unless they bring it up. "
+                      "No reply needed for this note.]"),
+    })
+
+
+@router.get("/api/copilot/sessions/{session_id}/quick-controls")
+async def copilot_quick_controls(session_id: str, request: Request) -> dict:
+    """Voice roster + the current voice/speed of whatever this chat edits."""
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    session = _load_session(session_id)
+    target = _qc_target(session)
+    state: dict = {}
+    if target["kind"] == "agent":
+        defn, _rev = await asyncio.to_thread(_read_full_definition,
+                                             target["slug"])
+        state = _qc_state(defn)
+    elif target["kind"] == "draft":
+        state = _qc_state((session.get("interview") or {}).get("draft") or {})
+    return {
+        "target": target,
+        "state": state,
+        "roster": _voice_roster(),
+        "pace_range": {"min": PACE_MIN, "max": PACE_MAX, "step": PACE_STEP,
+                       "default": _PACE_DEFAULT},
+    }
+
+
+@router.post("/api/copilot/sessions/{session_id}/quick-controls")
+async def copilot_quick_controls_apply(session_id: str,
+                                       request: Request) -> dict:
+    """Body: {speaker?: str, pace?: number | {lang: number},
+    both_directions?: bool (default true)}. Saves at once — a live agent's
+    next call uses it."""
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="expected an object")
+    async with _session_lock(session_id):
+        session = _load_session(session_id)
+        target = _qc_target(session)
+        if target["kind"] == "none":
+            raise HTTPException(
+                status_code=409,
+                detail="Start describing the agent first — there is nothing "
+                       "to set a voice on yet.")
+        result: dict = {"target": target}
+        if target["kind"] == "agent":
+            slug = target["slug"]
+            current, base_rev = await asyncio.to_thread(
+                _read_full_definition, slug)
+            speaker, pace = _qc_parse(body, _qc_languages(current)[0])
+            changes, paths = _qc_changes(current, speaker, pace)
+            if not changes:
+                raise HTTPException(status_code=400, detail="nothing to change")
+            merged = _deep_merge(copy.deepcopy(current), changes)
+            violations = _invariant_violations(merged)
+            if violations:
+                raise HTTPException(status_code=422,
+                                    detail="; ".join(violations))
+            try:
+                wr = await asyncio.to_thread(
+                    agent_store.write_agent, slug, merged,
+                    actor=f"{builder._ctx_owner()}:copilot-quick",
+                    base_rev=base_rev,
+                    reason="quick controls: " + ", ".join(
+                        (["voice"] if speaker else [])
+                        + (["speed"] if pace else [])),
+                    owner=builder._ctx_owner(),
+                    is_admin=builder._ctx_is_admin(),
+                    expected_paths=paths, agents_dir=_AGENTS_DIR)
+            except agent_store.ConflictError:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The agent changed while you were editing — "
+                           "reload the panel and try again.")
+            result["revision"] = wr["revision"]
+            logger.info("[copilot] quick controls on '%s': %s rev=%s",
+                        slug, ", ".join(paths), wr["revision"])
+            if target["twin"] and body.get("both_directions", True):
+                result["twin_write"] = await _mirror_to_twin(slug, changes,
+                                                             paths)
+            defn, _ = await asyncio.to_thread(_read_full_definition, slug)
+            result["state"] = _qc_state(defn)
+            where = f"agent '{slug}'" + (
+                " and its other direction"
+                if (result.get("twin_write") or {}).get("applied") else "")
+        else:
+            iv = _interview_state(session)
+            draft = iv.setdefault("draft", {})
+            speaker, pace = _qc_parse(body, _qc_languages(draft)[0])
+            sup, _ = _qc_languages(draft)
+            if not sup:
+                # Nothing about languages yet: park the voice on the
+                # platform default; the build fills every language from it.
+                draft.setdefault("languages", {}).setdefault(
+                    "tts_voices", {}).setdefault("en", {})
+            changes, _paths = _qc_changes(draft, speaker, pace)
+            iv["draft"] = _deep_merge(draft, changes)
+            result["state"] = _qc_state(iv["draft"])
+            where = "the draft (it will be used when the agent is created)"
+        _qc_note(session, speaker, pace, where)
+        session.setdefault("meta", {})["updated_at"] = _now_iso()
+        _save_session(session_id)
+        result.update(_rail_payload(session))
+        return result

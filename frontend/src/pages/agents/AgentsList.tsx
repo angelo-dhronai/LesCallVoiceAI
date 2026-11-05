@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useGet, useRefresh } from '../../api/hooks/useApi'
-import { archiveAgent, createTwin, type AgentSummary, type AgentsList as AgentsListT } from '../../api/agents'
+import { archiveAgent, archiveConfirmCopy, createTwin, type AgentSummary, type AgentsList as AgentsListT } from '../../api/agents'
 import { Card, Button, Badge, EmptyState, IconButton, LiveDot, Spinner, SkeletonBlock, cx } from '../../components/ui'
 import { PageHeader, AsyncState } from '../../components/kit'
 import {
@@ -31,10 +31,17 @@ export default function AgentsList() {
   // Plan cap, so the New Agent button can say WHY it is unavailable instead of
   // letting the user fill in a whole form and hit a 402 on submit.
   const { data: billing } = useGet<{
-    agents_used: number | null; max_agent_families: number | null; enforcement: boolean
+    agents_used: number | null; max_agent_families: number | null
+    enforcement: boolean; trial: boolean
   }>(['billing', 'summary'], '/billing/summary')
-  const atCap = !!billing?.enforcement
-    && billing.max_agent_families != null
+  // `enforcement || trial`, not `enforcement`. The free plan's 1-agent cap is
+  // an anti-abuse limit and binds while the global billing switch stays off,
+  // so gating this on `enforcement` alone left the button enabled against a
+  // cap the server was already enforcing — the user filled in the whole form
+  // and met a 402 on submit.
+  const capApplies = !!billing?.enforcement || !!billing?.trial
+  const atCap = capApplies
+    && billing?.max_agent_families != null
     && (billing.agents_used ?? 0) >= billing.max_agent_families
   const nav = useNavigate()
   const refresh = useRefresh()
@@ -73,10 +80,10 @@ export default function AgentsList() {
   const boundTo = (a: AgentSummary) =>
     numbers.filter((n) => n[slotFor(a.call_direction)] === a.name)
 
-  const onArchive = async (name: string) => {
+  const onArchive = async (name: string, sibling?: string) => {
     const ok = await confirm({
       title: `Archive "${name}"?`,
-      description: 'The agent is moved to agents/_archived and stops being selectable. Any number it is connected to is left without an agent.',
+      description: archiveConfirmCopy(name, sibling),
       confirmLabel: 'Archive',
       destructive: true,
     })
@@ -134,7 +141,9 @@ export default function AgentsList() {
               // is the difference between "broken" and "understood".
               <div className="flex items-center gap-2">
                 <Button variant="primary" disabled
-                        title={`Your plan includes ${billing?.max_agent_families} agents. Archive one to free a slot, or upgrade.`}>
+                        title={billing?.trial
+                          ? `The free plan includes ${billing?.max_agent_families} agent${billing?.max_agent_families === 1 ? '' : 's'}. Archive it to build a different one, or upgrade for more.`
+                          : `Your plan includes ${billing?.max_agent_families} agents. Archive one to free a slot, or upgrade.`}>
                   <Plus size={15} /> New Agent
                 </Button>
                 <Link to="/billing" className="text-xs font-semibold text-indigo-600 hover:underline dark:text-indigo-300">
@@ -296,7 +305,9 @@ export default function AgentsList() {
                             </DropdownMenuTrigger>
                             <DropdownMenuContent align="end">
                               <DropdownMenuItem
-                                onSelect={() => { void onArchive(v.name) }}
+                                onSelect={() => {
+                                  void onArchive(v.name, f.variants.find((o) => o.name !== v.name)?.name)
+                                }}
                                 className="gap-2 text-rose-600 focus:text-rose-600 dark:text-rose-300 dark:focus:text-rose-300"
                               >
                                 <Archive size={13} /> Archive "{v.name}"

@@ -1,13 +1,13 @@
 {
-  "provider": "openai",
-  "model": "text-embedding-3-small",
-  "dim": 1536,
+  "provider": "gemini",
+  "model": "gemini-embedding-2",
+  "dim": 768,
   "chunk_count": 5,
   "chunks_sha": "a2bff14a231e9c85441d09307c66f8b9",
   "normalized": true,
   "format_version": 2,
-  "built_at": "2026-08-12T17:20:54Z",
-  "tokens": 1490,
+  "built_at": "2026-09-25T05:42:38Z",
+  "tokens": 1510,
   "chunk_words": 250,
   "chunk_overlap": 60
 }

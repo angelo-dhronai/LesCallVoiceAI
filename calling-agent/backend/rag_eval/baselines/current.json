@@ -1,11 +1,11 @@
 {
-  "generated_at": "2026-08-12T18:06:15",
-  "label": "current (hardened)",
+  "generated_at": "2026-09-25T05:47:43",
+  "label": "gemini-embedding-2",
   "config": {
     "retriever": "current",
     "mode": "frozen",
     "latency_is_real": false,
-    "embed_model": "text-embedding-3-small",
+    "embed_model": "gemini-embedding-2",
     "chunk_words": "default",
     "documents": 10,
     "chunks": 17,
@@ -21,33 +21,33 @@
     "must_abstain": 9,
     "retrieval": {
       "recall@1": 0.7857,
-      "recall@3": 0.9821,
-      "recall@5": 0.9821,
-      "recall@10": 0.9821,
+      "recall@3": 1.0,
+      "recall@5": 1.0,
+      "recall@10": 1.0,
       "recall@candidates": 1.0,
-      "precision@3": 0.5298,
-      "precision@5": 0.5298,
-      "mrr": 0.8929,
-      "ndcg@5": 0.9016,
-      "contamination": 0.0536
+      "precision@3": 0.5179,
+      "precision@5": 0.5179,
+      "mrr": 0.9048,
+      "ndcg@5": 0.9133,
+      "contamination": 0.125
     },
     "abstention": {
       "correct_abstention_rate": 0.2222,
       "over_abstention_rate": 0.0
     },
     "latency_ms": {
-      "p50": 2.05,
+      "p50": 2.01,
       "p90": 2.56,
-      "p95": 2.69,
-      "p99": 10.98,
-      "mean": 2.21,
+      "p95": 2.79,
+      "p99": 10.05,
+      "mean": 2.17,
       "stages_p95": {
-        "cache_lookup": 0.14,
-        "embed": 0.16,
-        "index": 0.88,
-        "rerank": 0.05,
-        "search": 0.25,
-        "total": 2.21
+        "cache_lookup": 0.13,
+        "embed": 0.19,
+        "index": 0.9,
+        "rerank": 0.04,
+        "search": 0.23,
+        "total": 2.28
       }
     },
     "cost": {
@@ -57,7 +57,7 @@
     },
     "citations": {
       "accuracy": 1.0,
-      "avg_per_answer": 2.6571
+      "avg_per_answer": 2.7429
     },
     "by_category": {
       "ambiguous": {
@@ -70,29 +70,29 @@
         "n": 3,
         "recall@5": 1.0,
         "mrr": 1.0,
-        "contamination": 0.0
+        "contamination": 0.222
       },
       "direct_factual": {
         "n": 14,
         "recall@5": 1.0,
-        "mrr": 0.964,
-        "contamination": 0.024
+        "mrr": 0.917,
+        "contamination": 0.119
       },
       "edge_case": {
         "n": 5,
         "recall@5": 1.0,
-        "mrr": 0.556,
+        "mrr": 0.833,
         "contamination": 0.0
       },
       "long_context": {
         "n": 1,
         "recall@5": 1.0,
-        "mrr": 0.333,
+        "mrr": 0.5,
         "contamination": 0.0
       },
       "multi_hop": {
         "n": 5,
-        "recall@5": 0.9,
+        "recall@5": 1.0,
         "mrr": 0.9,
         "contamination": 0.1
       },
@@ -123,15 +123,15 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0328,
-      "total_ms": 10.98,
+      "top_score": 0.0325,
+      "total_ms": 10.05,
       "stage_ms": {
-        "index": 9.18,
+        "index": 8.15,
         "cache_lookup": 0.03,
-        "embed": 0.11,
-        "search": 0.23,
-        "rerank": 0.14,
-        "total": 10.48
+        "embed": 0.12,
+        "search": 0.29,
+        "rerank": 0.03,
+        "total": 9.45
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -139,17 +139,17 @@
         {
           "doc": "dhronai_profile",
           "chunk": 0,
-          "score": 0.0328
+          "score": 0.0325
         },
         {
           "doc": "dhronai_profile",
           "chunk": 1,
-          "score": 0.0323
+          "score": 0.0318
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 4,
-          "score": 0.0317
+          "chunk": 2,
+          "score": 0.0313
         }
       ],
       "recall@1": 1.0,
@@ -178,15 +178,15 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.032,
-      "total_ms": 2.35,
+      "top_score": 0.0325,
+      "total_ms": 2.56,
       "stage_ms": {
-        "index": 0.58,
-        "cache_lookup": 0.05,
-        "embed": 0.16,
-        "search": 0.15,
+        "index": 0.72,
+        "cache_lookup": 0.07,
+        "embed": 0.19,
+        "search": 0.18,
         "rerank": 0.02,
-        "total": 1.72
+        "total": 1.86
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -194,17 +194,17 @@
         {
           "doc": "dhronai_profile",
           "chunk": 0,
-          "score": 0.032
+          "score": 0.0325
         },
         {
           "doc": "dhronai_profile",
           "chunk": 4,
-          "score": 0.0318
+          "score": 0.0312
         },
         {
-          "doc": "dhronai_profile",
-          "chunk": 1,
-          "score": 0.0308
+          "doc": "dhron_eye",
+          "chunk": 0,
+          "score": 0.031
         }
       ],
       "recall@1": 1.0,
@@ -215,7 +215,7 @@
       "precision@3": 0.3333333333333333,
       "precision@5": 0.3333333333333333,
       "mrr": 1.0,
-      "contamination": 0.0,
+      "contamination": 0.3333333333333333,
       "ndcg@5": 1.0,
       "over_abstained": false,
       "citation_accuracy": 1.0,
@@ -234,14 +234,14 @@
       "n_candidates": 17,
       "n_hits": 3,
       "top_score": 0.0328,
-      "total_ms": 2.07,
+      "total_ms": 2.37,
       "stage_ms": {
-        "index": 0.56,
-        "cache_lookup": 0.04,
-        "embed": 0.12,
-        "search": 0.16,
+        "index": 0.75,
+        "cache_lookup": 0.06,
+        "embed": 0.16,
+        "search": 0.17,
         "rerank": 0.02,
-        "total": 1.58
+        "total": 1.85
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -253,13 +253,13 @@
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 4,
-          "score": 0.032
+          "chunk": 0,
+          "score": 0.0323
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 0,
-          "score": 0.0318
+          "chunk": 4,
+          "score": 0.0317
         }
       ],
       "recall@1": 1.0,
@@ -289,14 +289,14 @@
       "n_candidates": 17,
       "n_hits": 3,
       "top_score": 0.0328,
-      "total_ms": 2.69,
+      "total_ms": 2.6,
       "stage_ms": {
-        "index": 0.88,
-        "cache_lookup": 0.06,
+        "index": 0.76,
+        "cache_lookup": 0.07,
         "embed": 0.16,
-        "search": 0.2,
-        "rerank": 0.03,
-        "total": 2.17
+        "search": 0.17,
+        "rerank": 0.02,
+        "total": 2.05
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -309,12 +309,12 @@
         {
           "doc": "dhronai_profile",
           "chunk": 2,
-          "score": 0.0323
+          "score": 0.0313
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 3,
-          "score": 0.0315
+          "chunk": 0,
+          "score": 0.0311
         }
       ],
       "recall@1": 1.0,
@@ -342,16 +342,16 @@
       "degraded": false,
       "cache_hit": false,
       "n_candidates": 17,
-      "n_hits": 1,
-      "top_score": 0.0328,
-      "total_ms": 1.98,
+      "n_hits": 3,
+      "top_score": 0.0325,
+      "total_ms": 2.02,
       "stage_ms": {
         "index": 0.56,
-        "cache_lookup": 0.05,
-        "embed": 0.13,
+        "cache_lookup": 0.06,
+        "embed": 0.15,
         "search": 0.12,
         "rerank": 0.02,
-        "total": 1.45
+        "total": 1.54
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -359,7 +359,17 @@
         {
           "doc": "dhronai_profile",
           "chunk": 2,
-          "score": 0.0328
+          "score": 0.0325
+        },
+        {
+          "doc": "dhron_eye",
+          "chunk": 0,
+          "score": 0.0164
+        },
+        {
+          "doc": "b2_market",
+          "chunk": 0,
+          "score": 0.0159
         }
       ],
       "recall@1": 1.0,
@@ -367,14 +377,14 @@
       "recall@5": 1.0,
       "recall@10": 1.0,
       "recall@candidates": 1.0,
-      "precision@3": 1.0,
-      "precision@5": 1.0,
+      "precision@3": 0.3333333333333333,
+      "precision@5": 0.3333333333333333,
       "mrr": 1.0,
-      "contamination": 0.0,
+      "contamination": 0.6666666666666666,
       "ndcg@5": 1.0,
       "over_abstained": false,
       "citation_accuracy": 1.0,
-      "n_citations": 1
+      "n_citations": 3
     },
     {
       "id": "rag_eval_006",
@@ -389,14 +399,14 @@
       "n_candidates": 17,
       "n_hits": 2,
       "top_score": 0.0328,
-      "total_ms": 2.48,
+      "total_ms": 2.08,
       "stage_ms": {
-        "index": 0.84,
-        "cache_lookup": 0.07,
-        "embed": 0.14,
+        "index": 0.61,
+        "cache_lookup": 0.06,
+        "embed": 0.17,
         "search": 0.14,
-        "rerank": 0.02,
-        "total": 1.93
+        "rerank": 0.09,
+        "total": 1.63
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -438,45 +448,45 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0325,
-      "total_ms": 2.1,
+      "top_score": 0.0328,
+      "total_ms": 1.96,
       "stage_ms": {
-        "index": 0.61,
+        "index": 0.54,
         "cache_lookup": 0.05,
-        "embed": 0.12,
-        "search": 0.22,
+        "embed": 0.13,
+        "search": 0.14,
         "rerank": 0.02,
-        "total": 1.69
+        "total": 1.5
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
       "retrieved": [
         {
-          "doc": "dhronai_profile",
-          "chunk": 2,
-          "score": 0.0325
-        },
-        {
           "doc": "dhron_ai_angelobot",
           "chunk": 0,
-          "score": 0.0325
+          "score": 0.0328
         },
         {
           "doc": "dhronai_profile",
           "chunk": 3,
-          "score": 0.0317
+          "score": 0.032
+        },
+        {
+          "doc": "dhronai_profile",
+          "chunk": 2,
+          "score": 0.0313
         }
       ],
-      "recall@1": 1.0,
+      "recall@1": 0.0,
       "recall@3": 1.0,
       "recall@5": 1.0,
       "recall@10": 1.0,
       "recall@candidates": 1.0,
       "precision@3": 0.3333333333333333,
       "precision@5": 0.3333333333333333,
-      "mrr": 1.0,
+      "mrr": 0.3333333333333333,
       "contamination": 0.3333333333333333,
-      "ndcg@5": 1.0,
+      "ndcg@5": 0.5,
       "over_abstained": false,
       "citation_accuracy": 1.0,
       "n_citations": 3
@@ -493,15 +503,15 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0318,
-      "total_ms": 2.34,
+      "top_score": 0.0328,
+      "total_ms": 2.19,
       "stage_ms": {
-        "index": 0.55,
-        "cache_lookup": 0.05,
-        "embed": 0.12,
-        "search": 0.13,
+        "index": 0.56,
+        "cache_lookup": 0.06,
+        "embed": 0.16,
+        "search": 0.14,
         "rerank": 0.02,
-        "total": 1.77
+        "total": 1.7
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -509,17 +519,17 @@
         {
           "doc": "dhronai_profile",
           "chunk": 2,
-          "score": 0.0318
-        },
-        {
-          "doc": "dhronai_profile",
-          "chunk": 4,
-          "score": 0.0318
+          "score": 0.0328
         },
         {
           "doc": "dhronai_profile",
           "chunk": 1,
           "score": 0.0317
+        },
+        {
+          "doc": "dhronai_profile",
+          "chunk": 4,
+          "score": 0.031
         }
       ],
       "recall@1": 1.0,
@@ -549,14 +559,14 @@
       "n_candidates": 17,
       "n_hits": 3,
       "top_score": 0.0328,
-      "total_ms": 2.11,
+      "total_ms": 2.14,
       "stage_ms": {
         "index": 0.55,
-        "cache_lookup": 0.06,
-        "embed": 0.13,
+        "cache_lookup": 0.05,
+        "embed": 0.15,
         "search": 0.14,
         "rerank": 0.02,
-        "total": 1.71
+        "total": 1.59
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -568,12 +578,12 @@
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 3,
-          "score": 0.032
+          "chunk": 0,
+          "score": 0.0323
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 0,
+          "chunk": 3,
           "score": 0.0315
         }
       ],
@@ -603,45 +613,45 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0325,
-      "total_ms": 2.27,
+      "top_score": 0.0328,
+      "total_ms": 1.99,
       "stage_ms": {
-        "index": 0.61,
-        "cache_lookup": 0.06,
-        "embed": 0.13,
-        "search": 0.14,
+        "index": 0.54,
+        "cache_lookup": 0.07,
+        "embed": 0.15,
+        "search": 0.13,
         "rerank": 0.02,
-        "total": 1.74
+        "total": 1.58
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
       "retrieved": [
         {
           "doc": "dhronai_profile",
-          "chunk": 3,
-          "score": 0.0325
+          "chunk": 4,
+          "score": 0.0328
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 4,
+          "chunk": 3,
           "score": 0.0323
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 2,
-          "score": 0.0312
+          "chunk": 0,
+          "score": 0.0317
         }
       ],
-      "recall@1": 0.0,
+      "recall@1": 1.0,
       "recall@3": 1.0,
       "recall@5": 1.0,
       "recall@10": 1.0,
       "recall@candidates": 1.0,
       "precision@3": 0.3333333333333333,
       "precision@5": 0.3333333333333333,
-      "mrr": 0.5,
+      "mrr": 1.0,
       "contamination": 0.0,
-      "ndcg@5": 0.6309297535714574,
+      "ndcg@5": 1.0,
       "over_abstained": false,
       "citation_accuracy": 1.0,
       "n_citations": 3
@@ -658,15 +668,15 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0328,
-      "total_ms": 2.55,
+      "top_score": 0.0325,
+      "total_ms": 2.22,
       "stage_ms": {
-        "index": 0.68,
+        "index": 0.54,
         "cache_lookup": 0.07,
         "embed": 0.16,
-        "search": 0.25,
-        "rerank": 0.03,
-        "total": 2.09
+        "search": 0.16,
+        "rerank": 0.02,
+        "total": 1.8
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -674,29 +684,29 @@
         {
           "doc": "dhronai_profile",
           "chunk": 3,
-          "score": 0.0328
+          "score": 0.0325
+        },
+        {
+          "doc": "dhronai_profile",
+          "chunk": 2,
+          "score": 0.0318
         },
         {
           "doc": "dhronai_profile",
           "chunk": 4,
-          "score": 0.0323
-        },
-        {
-          "doc": "dhronai_profile",
-          "chunk": 0,
-          "score": 0.0315
+          "score": 0.0318
         }
       ],
       "recall@1": 0.0,
-      "recall@3": 0.5,
-      "recall@5": 0.5,
-      "recall@10": 0.5,
+      "recall@3": 1.0,
+      "recall@5": 1.0,
+      "recall@10": 1.0,
       "recall@candidates": 1.0,
-      "precision@3": 0.3333333333333333,
-      "precision@5": 0.3333333333333333,
+      "precision@3": 0.6666666666666666,
+      "precision@5": 0.6666666666666666,
       "mrr": 0.5,
       "contamination": 0.0,
-      "ndcg@5": 0.52129602861432,
+      "ndcg@5": 0.58688267143572,
       "over_abstained": false,
       "citation_accuracy": 1.0,
       "n_citations": 3
@@ -713,33 +723,33 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0328,
-      "total_ms": 2.15,
+      "top_score": 0.0325,
+      "total_ms": 2.07,
       "stage_ms": {
-        "index": 0.59,
-        "cache_lookup": 0.06,
-        "embed": 0.13,
-        "search": 0.26,
+        "index": 0.56,
+        "cache_lookup": 0.07,
+        "embed": 0.14,
+        "search": 0.14,
         "rerank": 0.02,
-        "total": 1.7
+        "total": 1.63
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
       "retrieved": [
         {
           "doc": "dhronai_profile",
-          "chunk": 3,
-          "score": 0.0328
-        },
-        {
-          "doc": "dhronai_profile",
           "chunk": 4,
-          "score": 0.0323
+          "score": 0.0325
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 2,
-          "score": 0.0315
+          "chunk": 3,
+          "score": 0.0318
+        },
+        {
+          "doc": "dhronai_profile",
+          "chunk": 0,
+          "score": 0.0317
         }
       ],
       "recall@1": 1.0,
@@ -768,15 +778,15 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0328,
-      "total_ms": 2.08,
+      "top_score": 0.0325,
+      "total_ms": 2.06,
       "stage_ms": {
         "index": 0.54,
-        "cache_lookup": 0.14,
+        "cache_lookup": 0.07,
         "embed": 0.14,
-        "search": 0.16,
+        "search": 0.17,
         "rerank": 0.02,
-        "total": 1.65
+        "total": 1.6
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -784,17 +794,17 @@
         {
           "doc": "dhronai_profile",
           "chunk": 4,
-          "score": 0.0328
+          "score": 0.0325
         },
         {
           "doc": "dhronai_profile",
           "chunk": 1,
-          "score": 0.031
+          "score": 0.0315
         },
         {
-          "doc": "dhronai_profile",
-          "chunk": 3,
-          "score": 0.0161
+          "doc": "dhron_eye",
+          "chunk": 0,
+          "score": 0.031
         }
       ],
       "recall@1": 1.0,
@@ -805,7 +815,7 @@
       "precision@3": 0.3333333333333333,
       "precision@5": 0.3333333333333333,
       "mrr": 1.0,
-      "contamination": 0.0,
+      "contamination": 0.3333333333333333,
       "ndcg@5": 1.0,
       "over_abstained": false,
       "citation_accuracy": 1.0,
@@ -823,45 +833,45 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0328,
-      "total_ms": 1.89,
+      "top_score": 0.0325,
+      "total_ms": 2.16,
       "stage_ms": {
-        "index": 0.54,
-        "cache_lookup": 0.07,
-        "embed": 0.12,
-        "search": 0.13,
-        "rerank": 0.02,
-        "total": 1.5
+        "index": 0.61,
+        "cache_lookup": 0.14,
+        "embed": 0.15,
+        "search": 0.14,
+        "rerank": 0.01,
+        "total": 1.75
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
       "retrieved": [
         {
           "doc": "dhronai_profile",
-          "chunk": 3,
-          "score": 0.0328
-        },
-        {
-          "doc": "dhronai_profile",
           "chunk": 4,
-          "score": 0.0323
+          "score": 0.0325
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 2,
+          "chunk": 3,
+          "score": 0.0325
+        },
+        {
+          "doc": "dhronai_profile",
+          "chunk": 0,
           "score": 0.0159
         }
       ],
-      "recall@1": 1.0,
+      "recall@1": 0.0,
       "recall@3": 1.0,
       "recall@5": 1.0,
       "recall@10": 1.0,
       "recall@candidates": 1.0,
       "precision@3": 0.3333333333333333,
       "precision@5": 0.3333333333333333,
-      "mrr": 1.0,
+      "mrr": 0.5,
       "contamination": 0.0,
-      "ndcg@5": 1.0,
+      "ndcg@5": 0.6309297535714574,
       "over_abstained": false,
       "citation_accuracy": 1.0,
       "n_citations": 3
@@ -878,33 +888,33 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0328,
-      "total_ms": 2.18,
+      "top_score": 0.0325,
+      "total_ms": 2.03,
       "stage_ms": {
-        "index": 0.68,
+        "index": 0.52,
         "cache_lookup": 0.07,
-        "embed": 0.15,
-        "search": 0.16,
+        "embed": 0.14,
+        "search": 0.15,
         "rerank": 0.02,
-        "total": 1.75
+        "total": 1.55
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
       "retrieved": [
         {
           "doc": "dhronai_profile",
-          "chunk": 3,
-          "score": 0.0328
-        },
-        {
-          "doc": "dhronai_profile",
           "chunk": 4,
-          "score": 0.0323
+          "score": 0.0325
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 1,
-          "score": 0.0315
+          "chunk": 0,
+          "score": 0.032
+        },
+        {
+          "doc": "dhronai_profile",
+          "chunk": 3,
+          "score": 0.0318
         }
       ],
       "recall@1": 1.0,
@@ -933,28 +943,28 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0328,
-      "total_ms": 2.18,
+      "top_score": 0.0325,
+      "total_ms": 2.17,
       "stage_ms": {
-        "index": 0.59,
+        "index": 0.56,
         "cache_lookup": 0.07,
-        "embed": 0.2,
-        "search": 0.13,
+        "embed": 0.13,
+        "search": 0.12,
         "rerank": 0.02,
-        "total": 1.83
+        "total": 1.76
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
       "retrieved": [
         {
           "doc": "dhronai_profile",
-          "chunk": 3,
-          "score": 0.0328
+          "chunk": 2,
+          "score": 0.0325
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 2,
-          "score": 0.0323
+          "chunk": 3,
+          "score": 0.0325
         },
         {
           "doc": "dhronai_profile",
@@ -988,15 +998,15 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.032,
-      "total_ms": 2.05,
+      "top_score": 0.0328,
+      "total_ms": 2.79,
       "stage_ms": {
-        "index": 0.59,
-        "cache_lookup": 0.08,
-        "embed": 0.12,
-        "search": 0.14,
+        "index": 0.9,
+        "cache_lookup": 0.11,
+        "embed": 0.18,
+        "search": 0.22,
         "rerank": 0.02,
-        "total": 1.67
+        "total": 2.28
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1004,17 +1014,17 @@
         {
           "doc": "dhronai_profile",
           "chunk": 1,
-          "score": 0.032
-        },
-        {
-          "doc": "dhronai_profile",
-          "chunk": 4,
-          "score": 0.032
+          "score": 0.0328
         },
         {
           "doc": "dhronai_profile",
           "chunk": 0,
           "score": 0.032
+        },
+        {
+          "doc": "dhronai_profile",
+          "chunk": 2,
+          "score": 0.0313
         }
       ],
       "recall@1": 0.0,
@@ -1024,9 +1034,9 @@
       "recall@candidates": 1.0,
       "precision@3": 0.3333333333333333,
       "precision@5": 0.3333333333333333,
-      "mrr": 0.3333333333333333,
+      "mrr": 0.5,
       "contamination": 0.0,
-      "ndcg@5": 0.5,
+      "ndcg@5": 0.6309297535714574,
       "over_abstained": false,
       "citation_accuracy": 1.0,
       "n_citations": 3
@@ -1043,45 +1053,45 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0323,
-      "total_ms": 2.14,
+      "top_score": 0.0325,
+      "total_ms": 1.99,
       "stage_ms": {
-        "index": 0.55,
-        "cache_lookup": 0.08,
-        "embed": 0.13,
+        "index": 0.54,
+        "cache_lookup": 0.09,
+        "embed": 0.14,
         "search": 0.13,
-        "rerank": 0.02,
-        "total": 1.72
+        "rerank": 0.04,
+        "total": 1.57
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
       "retrieved": [
         {
           "doc": "dhronai_profile",
-          "chunk": 3,
-          "score": 0.0323
+          "chunk": 1,
+          "score": 0.0325
         },
         {
           "doc": "dhronai_profile",
           "chunk": 0,
-          "score": 0.0323
+          "score": 0.0325
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 1,
-          "score": 0.0323
+          "chunk": 3,
+          "score": 0.0313
         }
       ],
-      "recall@1": 0.0,
+      "recall@1": 1.0,
       "recall@3": 1.0,
       "recall@5": 1.0,
       "recall@10": 1.0,
       "recall@candidates": 1.0,
       "precision@3": 0.3333333333333333,
       "precision@5": 0.3333333333333333,
-      "mrr": 0.3333333333333333,
+      "mrr": 1.0,
       "contamination": 0.0,
-      "ndcg@5": 0.5,
+      "ndcg@5": 1.0,
       "over_abstained": false,
       "citation_accuracy": 1.0,
       "n_citations": 3
@@ -1098,15 +1108,15 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0317,
-      "total_ms": 2.17,
+      "top_score": 0.0323,
+      "total_ms": 2.34,
       "stage_ms": {
-        "index": 0.54,
-        "cache_lookup": 0.1,
-        "embed": 0.13,
-        "search": 0.21,
+        "index": 0.64,
+        "cache_lookup": 0.11,
+        "embed": 0.19,
+        "search": 0.23,
         "rerank": 0.02,
-        "total": 1.73
+        "total": 1.92
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1114,17 +1124,17 @@
         {
           "doc": "dhronai_profile",
           "chunk": 4,
-          "score": 0.0317
-        },
-        {
-          "doc": "dhronai_profile",
-          "chunk": 3,
-          "score": 0.0315
+          "score": 0.0323
         },
         {
           "doc": "dhronai_profile",
           "chunk": 1,
-          "score": 0.0315
+          "score": 0.0323
+        },
+        {
+          "doc": "dhronai_profile",
+          "chunk": 0,
+          "score": 0.0318
         }
       ],
       "recall@1": 0.0,
@@ -1134,9 +1144,9 @@
       "recall@candidates": 1.0,
       "precision@3": 0.3333333333333333,
       "precision@5": 0.3333333333333333,
-      "mrr": 0.3333333333333333,
+      "mrr": 0.5,
       "contamination": 0.0,
-      "ndcg@5": 0.5,
+      "ndcg@5": 0.6309297535714574,
       "over_abstained": false,
       "citation_accuracy": 1.0,
       "n_citations": 3
@@ -1154,14 +1164,14 @@
       "n_candidates": 17,
       "n_hits": 3,
       "top_score": 0.0328,
-      "total_ms": 1.89,
+      "total_ms": 2.08,
       "stage_ms": {
-        "index": 0.54,
-        "cache_lookup": 0.08,
-        "embed": 0.12,
+        "index": 0.58,
+        "cache_lookup": 0.09,
+        "embed": 0.13,
         "search": 0.14,
         "rerank": 0.02,
-        "total": 1.46
+        "total": 1.57
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1174,12 +1184,12 @@
         {
           "doc": "dhronai_profile",
           "chunk": 1,
-          "score": 0.0323
+          "score": 0.032
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 4,
-          "score": 0.031
+          "chunk": 2,
+          "score": 0.0318
         }
       ],
       "recall@1": 1.0,
@@ -1209,14 +1219,14 @@
       "n_candidates": 17,
       "n_hits": 3,
       "top_score": 0.0328,
-      "total_ms": 2.65,
+      "total_ms": 1.93,
       "stage_ms": {
-        "index": 0.88,
-        "cache_lookup": 0.11,
+        "index": 0.53,
+        "cache_lookup": 0.09,
         "embed": 0.13,
-        "search": 0.19,
-        "rerank": 0.02,
-        "total": 2.21
+        "search": 0.14,
+        "rerank": 0.01,
+        "total": 1.43
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1264,14 +1274,14 @@
       "n_candidates": 17,
       "n_hits": 1,
       "top_score": 0.0328,
-      "total_ms": 1.62,
+      "total_ms": 1.67,
       "stage_ms": {
-        "index": 0.53,
+        "index": 0.56,
         "cache_lookup": 0.1,
-        "embed": 0.12,
-        "search": 0.12,
-        "rerank": 0.02,
-        "total": 1.24
+        "embed": 0.15,
+        "search": 0.14,
+        "rerank": 0.01,
+        "total": 1.28
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1309,14 +1319,14 @@
       "n_candidates": 17,
       "n_hits": 1,
       "top_score": 0.0328,
-      "total_ms": 1.65,
+      "total_ms": 1.7,
       "stage_ms": {
-        "index": 0.52,
+        "index": 0.54,
         "cache_lookup": 0.09,
-        "embed": 0.1,
-        "search": 0.13,
-        "rerank": 0.05,
-        "total": 1.21
+        "embed": 0.18,
+        "search": 0.14,
+        "rerank": 0.02,
+        "total": 1.31
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1354,14 +1364,14 @@
       "n_candidates": 17,
       "n_hits": 2,
       "top_score": 0.0328,
-      "total_ms": 1.56,
+      "total_ms": 1.66,
       "stage_ms": {
-        "index": 0.5,
+        "index": 0.54,
         "cache_lookup": 0.09,
-        "embed": 0.1,
-        "search": 0.15,
+        "embed": 0.12,
+        "search": 0.16,
         "rerank": 0.02,
-        "total": 1.23
+        "total": 1.29
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1404,14 +1414,14 @@
       "n_candidates": 17,
       "n_hits": 1,
       "top_score": 0.0328,
-      "total_ms": 1.59,
+      "total_ms": 1.92,
       "stage_ms": {
-        "index": 0.51,
-        "cache_lookup": 0.08,
-        "embed": 0.1,
-        "search": 0.11,
-        "rerank": 0.01,
-        "total": 1.21
+        "index": 0.7,
+        "cache_lookup": 0.13,
+        "embed": 0.15,
+        "search": 0.17,
+        "rerank": 0.02,
+        "total": 1.55
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1447,16 +1457,16 @@
       "degraded": false,
       "cache_hit": false,
       "n_candidates": 17,
-      "n_hits": 3,
+      "n_hits": 2,
       "top_score": 0.0323,
-      "total_ms": 1.79,
+      "total_ms": 1.84,
       "stage_ms": {
-        "index": 0.52,
-        "cache_lookup": 0.08,
-        "embed": 0.09,
-        "search": 0.1,
+        "index": 0.58,
+        "cache_lookup": 0.09,
+        "embed": 0.11,
+        "search": 0.11,
         "rerank": 0.01,
-        "total": 1.44
+        "total": 1.4
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1470,11 +1480,6 @@
           "doc": "dhron_eye",
           "chunk": 0,
           "score": 0.0164
-        },
-        {
-          "doc": "dhronai_profile",
-          "chunk": 0,
-          "score": 0.0159
         }
       ],
       "recall@1": null,
@@ -1489,7 +1494,7 @@
       "ndcg@5": null,
       "abstention_correct": false,
       "citation_accuracy": 1.0,
-      "n_citations": 3
+      "n_citations": 2
     },
     {
       "id": "rag_eval_027",
@@ -1504,14 +1509,14 @@
       "n_candidates": 17,
       "n_hits": 3,
       "top_score": 0.0328,
-      "total_ms": 2.04,
+      "total_ms": 2.01,
       "stage_ms": {
-        "index": 0.62,
-        "cache_lookup": 0.08,
-        "embed": 0.09,
-        "search": 0.1,
+        "index": 0.64,
+        "cache_lookup": 0.09,
+        "embed": 0.11,
+        "search": 0.11,
         "rerank": 0.01,
-        "total": 1.7
+        "total": 1.63
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1523,13 +1528,13 @@
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 1,
-          "score": 0.0318
+          "chunk": 2,
+          "score": 0.0315
         },
         {
           "doc": "dhronai_profile",
           "chunk": 4,
-          "score": 0.0317
+          "score": 0.0313
         }
       ],
       "recall@1": null,
@@ -1558,15 +1563,15 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0328,
-      "total_ms": 1.78,
+      "top_score": 0.0323,
+      "total_ms": 2.13,
       "stage_ms": {
-        "index": 0.56,
+        "index": 0.65,
         "cache_lookup": 0.09,
-        "embed": 0.08,
-        "search": 0.09,
+        "embed": 0.12,
+        "search": 0.1,
         "rerank": 0.01,
-        "total": 1.45
+        "total": 1.71
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1574,17 +1579,17 @@
         {
           "doc": "dhronai_profile",
           "chunk": 0,
-          "score": 0.0328
+          "score": 0.0323
+        },
+        {
+          "doc": "dhronai_profile",
+          "chunk": 2,
+          "score": 0.0315
         },
         {
           "doc": "dhronai_profile",
           "chunk": 1,
-          "score": 0.032
-        },
-        {
-          "doc": "dhronai_profile",
-          "chunk": 4,
-          "score": 0.032
+          "score": 0.0315
         }
       ],
       "recall@1": null,
@@ -1614,14 +1619,14 @@
       "n_candidates": 17,
       "n_hits": 3,
       "top_score": 0.0328,
-      "total_ms": 1.86,
+      "total_ms": 1.94,
       "stage_ms": {
-        "index": 0.61,
+        "index": 0.66,
         "cache_lookup": 0.09,
-        "embed": 0.09,
-        "search": 0.12,
+        "embed": 0.1,
+        "search": 0.11,
         "rerank": 0.01,
-        "total": 1.52
+        "total": 1.57
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1639,7 +1644,7 @@
         {
           "doc": "dhronai_profile",
           "chunk": 4,
-          "score": 0.032
+          "score": 0.0313
         }
       ],
       "recall@1": null,
@@ -1667,24 +1672,34 @@
       "degraded": false,
       "cache_hit": false,
       "n_candidates": 17,
-      "n_hits": 1,
-      "top_score": 0.0313,
-      "total_ms": 1.53,
+      "n_hits": 3,
+      "top_score": 0.0325,
+      "total_ms": 1.9,
       "stage_ms": {
-        "index": 0.53,
+        "index": 0.57,
         "cache_lookup": 0.1,
-        "embed": 0.08,
-        "search": 0.11,
-        "rerank": 0.02,
-        "total": 1.15
+        "embed": 0.1,
+        "search": 0.13,
+        "rerank": 0.01,
+        "total": 1.51
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
       "retrieved": [
         {
           "doc": "dhronai_profile",
+          "chunk": 1,
+          "score": 0.0325
+        },
+        {
+          "doc": "dhronai_profile",
+          "chunk": 0,
+          "score": 0.0317
+        },
+        {
+          "doc": "dhronai_profile",
           "chunk": 4,
-          "score": 0.0313
+          "score": 0.0311
         }
       ],
       "recall@1": null,
@@ -1699,7 +1714,7 @@
       "ndcg@5": null,
       "abstention_correct": false,
       "citation_accuracy": 1.0,
-      "n_citations": 1
+      "n_citations": 3
     },
     {
       "id": "rag_eval_031",
@@ -1714,14 +1729,14 @@
       "n_candidates": 17,
       "n_hits": 3,
       "top_score": 0.0328,
-      "total_ms": 1.96,
+      "total_ms": 1.75,
       "stage_ms": {
-        "index": 0.69,
+        "index": 0.48,
         "cache_lookup": 0.09,
         "embed": 0.09,
-        "search": 0.12,
+        "search": 0.13,
         "rerank": 0.01,
-        "total": 1.62
+        "total": 1.4
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1768,15 +1783,15 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0328,
-      "total_ms": 1.83,
+      "top_score": 0.0325,
+      "total_ms": 2.0,
       "stage_ms": {
-        "index": 0.56,
-        "cache_lookup": 0.12,
-        "embed": 0.11,
+        "index": 0.54,
+        "cache_lookup": 0.11,
+        "embed": 0.18,
         "search": 0.12,
-        "rerank": 0.02,
-        "total": 1.47
+        "rerank": 0.03,
+        "total": 1.59
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1784,17 +1799,17 @@
         {
           "doc": "gamezone_india",
           "chunk": 0,
-          "score": 0.0328
-        },
-        {
-          "doc": "gamezone_india",
-          "chunk": 1,
-          "score": 0.0323
+          "score": 0.0325
         },
         {
           "doc": "gamezone_india",
           "chunk": 2,
-          "score": 0.0317
+          "score": 0.0323
+        },
+        {
+          "doc": "gamezone_india",
+          "chunk": 1,
+          "score": 0.032
         }
       ],
       "recall@1": null,
@@ -1823,33 +1838,33 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0323,
-      "total_ms": 2.04,
+      "top_score": 0.0313,
+      "total_ms": 1.79,
       "stage_ms": {
-        "index": 0.54,
+        "index": 0.5,
         "cache_lookup": 0.1,
         "embed": 0.1,
-        "search": 0.1,
-        "rerank": 0.02,
-        "total": 1.65
+        "search": 0.11,
+        "rerank": 0.01,
+        "total": 1.44
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
       "retrieved": [
         {
           "doc": "gamezone_india",
-          "chunk": 1,
-          "score": 0.0323
+          "chunk": 0,
+          "score": 0.0313
         },
         {
           "doc": "gamezone_india",
-          "chunk": 0,
-          "score": 0.0315
+          "chunk": 1,
+          "score": 0.0311
         },
         {
           "doc": "nike_india",
           "chunk": 0,
-          "score": 0.0311
+          "score": 0.0306
         }
       ],
       "recall@1": null,
@@ -1879,7 +1894,7 @@
       "n_candidates": 0,
       "n_hits": 0,
       "top_score": null,
-      "total_ms": 0.31,
+      "total_ms": 0.29,
       "stage_ms": {
         "total": 0.03
       },
@@ -1943,14 +1958,14 @@
       "n_candidates": 17,
       "n_hits": 3,
       "top_score": 0.0328,
-      "total_ms": 1.94,
+      "total_ms": 1.84,
       "stage_ms": {
-        "index": 0.51,
-        "cache_lookup": 0.1,
-        "embed": 0.1,
-        "search": 0.11,
+        "index": 0.54,
+        "cache_lookup": 0.12,
+        "embed": 0.11,
+        "search": 0.13,
         "rerank": 0.01,
-        "total": 1.6
+        "total": 1.51
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
@@ -1961,14 +1976,14 @@
           "score": 0.0328
         },
         {
-          "doc": "dhronai_profile",
-          "chunk": 2,
-          "score": 0.032
+          "doc": "serene_health",
+          "chunk": 0,
+          "score": 0.0311
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 4,
-          "score": 0.0159
+          "chunk": 2,
+          "score": 0.031
         }
       ],
       "recall@1": 1.0,
@@ -1979,7 +1994,7 @@
       "precision@3": 0.3333333333333333,
       "precision@5": 0.3333333333333333,
       "mrr": 1.0,
-      "contamination": 0.0,
+      "contamination": 0.3333333333333333,
       "ndcg@5": 1.0,
       "over_abstained": false,
       "citation_accuracy": 1.0,
@@ -1997,33 +2012,33 @@
       "cache_hit": false,
       "n_candidates": 17,
       "n_hits": 3,
-      "top_score": 0.0323,
-      "total_ms": 2.56,
+      "top_score": 0.0308,
+      "total_ms": 1.97,
       "stage_ms": {
-        "index": 0.52,
-        "cache_lookup": 0.17,
-        "embed": 0.1,
-        "search": 0.14,
-        "rerank": 0.02,
-        "total": 2.13
+        "index": 0.51,
+        "cache_lookup": 0.11,
+        "embed": 0.11,
+        "search": 0.12,
+        "rerank": 0.01,
+        "total": 1.51
       },
       "embed_tokens": 0,
       "embed_cost_inr": null,
       "retrieved": [
         {
           "doc": "dhronai_profile",
-          "chunk": 3,
-          "score": 0.0323
-        },
-        {
-          "doc": "dhronai_profile",
           "chunk": 2,
-          "score": 0.0315
+          "score": 0.0308
+        },
+        {
+          "doc": "gamezone_india",
+          "chunk": 0,
+          "score": 0.0305
         },
         {
           "doc": "dhronai_profile",
-          "chunk": 1,
-          "score": 0.0161
+          "chunk": 3,
+          "score": 0.0304
         }
       ],
       "recall@1": 1.0,
@@ -2034,7 +2049,7 @@
       "precision@3": 0.6666666666666666,
       "precision@5": 0.6666666666666666,
       "mrr": 1.0,
-      "contamination": 0.0,
+      "contamination": 0.3333333333333333,
       "ndcg@5": 1.0,
       "over_abstained": false,
       "citation_accuracy": 1.0,

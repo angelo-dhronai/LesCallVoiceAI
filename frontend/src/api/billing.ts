@@ -81,11 +81,23 @@ export type BillingSummary = {
   max_agent_families: number | null
   max_concurrent_calls: number | null
   copilot_turns_per_day: number | null
+  /** Daily AI-assistant token allowance; null = unlimited. */
+  copilot_tokens_per_day: number | null
+  copilot_tokens_used: number
+  copilot_tokens_remaining: number | null
   features: PlanFeatures
   agents_used: number | null
   subscription: Subscription | null
   pilot_used: boolean
   enforcement: boolean
+  /**
+   * The free plan's caps bind whether or not global billing `enforcement` is
+   * on — they are anti-abuse limits, not plan tiering. Any UI that decides
+   * whether a cap applies must read `enforcement || trial`; reading
+   * `enforcement` alone hides a limit that is actually being enforced, and the
+   * user meets it as an unexplained 402 on submit.
+   */
+  trial: boolean
   gateway: GatewayStatus
   unresolved_payments: number
   banner: Banner

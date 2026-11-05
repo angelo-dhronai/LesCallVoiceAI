@@ -51,6 +51,65 @@ EMBED_MODEL = os.environ.get("INTEL_EMBED_MODEL", "gemini-embedding-001")
 EMBED_DIM = _int("INTEL_EMBED_DIM", 768)
 EMBED_CHUNK_TOKENS = _int("INTEL_EMBED_CHUNK_TOKENS", 600)
 
+# ---------------------------------------------------------------------------
+# Verified smart filter (Intelligence → natural-language call filter)
+#
+# Hybrid retrieval answers "which calls are ABOUT this?". That is not the
+# question a filter asks. "whoever relocated to Vapi" and "whoever agreed to
+# relocate to Delhi" have nearly identical embeddings, and every call that
+# discusses relocation scores high on both — so the second query returned
+# Vapi calls instead of the empty result that is the truthful answer.
+#
+# So retrieval is demoted to CANDIDATE GENERATION and a small model decides
+# membership per call, against an explicit requirement list, with a verbatim
+# quote it must be able to produce. Recall comes from the retrieval arms;
+# precision comes from the judge. An empty result is a valid answer here and
+# the UI says so rather than falling back to "close enough".
+# ---------------------------------------------------------------------------
+
+FILTER_VERIFY_ENABLED = _flag("INTEL_FILTER_VERIFY_ENABLED", True)
+# Deliberately the SMALLEST model on the key: this is one call per candidate,
+# and the task is a yes/no read of a 1.7k-char transcript against a checklist
+# — not a task a bigger model does better, just slower and dearer.
+FILTER_LLM_MODEL = os.environ.get("INTEL_FILTER_LLM_MODEL", "gemini-3.5-flash-lite")
+FILTER_LLM_BASE_URL = os.environ.get("INTEL_FILTER_LLM_BASE_URL") or LLM_BASE_URL
+FILTER_LLM_API_KEY = os.environ.get("INTEL_FILTER_LLM_API_KEY") or LLM_API_KEY
+FILTER_LLM_REASONING_EFFORT = os.environ.get("INTEL_FILTER_REASONING_EFFORT", "minimal")
+FILTER_LLM_MAX_OUTPUT_TOKENS = _int("INTEL_FILTER_MAX_OUTPUT_TOKENS", 1200)
+# Per-request ceiling. A judge that has not answered in this long is not going
+# to say anything useful about a 40-second phone call.
+FILTER_LLM_TIMEOUT_S = _int("INTEL_FILTER_LLM_TIMEOUT_S", 25)
+# How many retrieved calls the judge is allowed to examine. Recall is bounded
+# HERE, not by the number of rows shown — the two used to be the same number,
+# which is why widening the result list also had to widen the cost.
+# 120 was too small for a real campaign: on 2026-08-29 a 609-call account with
+# 98 genuine matches could seat at most 120 candidates, and the arms only
+# reached 103 of them (see ARM_LIMIT in search.py). Raising the arms without
+# raising this would just move the ceiling here.
+FILTER_MAX_CANDIDATES = _int("INTEL_FILTER_MAX_CANDIDATES", 300)
+# Judged in parallel; Gemini flash-lite answers in ~1.3s, so 16 in flight
+# turns 300 candidates into ~25s worst case, and the verdict cache makes the
+# second run of the same filter free.
+FILTER_CONCURRENCY = _int("INTEL_FILTER_CONCURRENCY", 16)
+# Whole-pass wall-clock budget. On exhaustion the pass STOPS and reports how
+# many candidates it examined rather than quietly admitting unjudged rows —
+# a filter that says "checked 60 of 120" is honest; one that pads the tail
+# with unchecked matches is the bug this feature exists to fix.
+# Raised with the candidate pool: 300 candidates at 16 in flight is ~25s of
+# real work, and a 60s budget left no headroom for a slow provider — the pass
+# would truncate and quietly return a short answer, which is the same silent
+# under-reporting the wider pool was meant to fix.
+FILTER_BUDGET_S = _int("INTEL_FILTER_BUDGET_S", 120)
+# Below this the judge's own stated confidence is treated as a non-match.
+FILTER_MIN_CONFIDENCE = float(os.environ.get("INTEL_FILTER_MIN_CONFIDENCE", "0.55"))
+# Transcript budget per judged call (chars). p99 of the live corpus is ~13k.
+FILTER_MAX_TRANSCRIPT_CHARS = _int("INTEL_FILTER_MAX_TRANSCRIPT_CHARS", 14000)
+# Bump when the planner/judge prompt changes meaning: it is part of the cache
+# key, so old verdicts stop being reused instead of silently outliving the
+# rubric that produced them.
+FILTER_RUBRIC_VERSION = "v1"
+
+
 # Worker tuning.
 WORKER_CONCURRENCY = _int("INTEL_WORKER_CONCURRENCY", 2)
 POLL_INTERVAL_S = _int("INTEL_POLL_INTERVAL_S", 5)

@@ -13,6 +13,7 @@ import { Badge, Button, Card, Spinner } from '../components/ui'
 import { AsyncState, Field, Input, PageHeader, Table, TD, TH, THead, TR } from '../components/kit'
 import { useToast } from '../components/Toast'
 import { useConfirm } from '../components/confirm'
+import { fmtDateTime, parseTs } from '../lib/format'
 
 /* ── usage meter ───────────────────────────────────────────────────────────
    Amber at 80%, rose at 100% — the same thresholds the Overview chip uses, so
@@ -168,8 +169,9 @@ export default function Billing() {
   const trial = s?.subscription?.kind === 'one_time' && s.subscription.status === 'active'
   const daysLeft = useMemo(() => {
     const end = s?.subscription?.current_end
-    if (!end) return null
-    return Math.max(0, Math.ceil((new Date(end).getTime() - Date.now()) / 86_400_000))
+    const at = parseTs(end)
+    if (!at) return null
+    return Math.max(0, Math.ceil((at.getTime() - Date.now()) / 86_400_000))
   }, [s?.subscription?.current_end])
 
   return (
@@ -256,6 +258,17 @@ export default function Billing() {
               <div className="mt-5 grid gap-4 sm:grid-cols-2">
                 <Meter used={s.minutes_used} limit={s.minutes_limit} label="Minutes this period" />
                 <Meter used={s.agents_used ?? 0} limit={s.max_agent_families} label="Agents" />
+                {/* The AI-assistant allowance is spent by the Copilot's
+                    server-side tool loop, so a user has no way to feel it
+                    being consumed — which makes a meter the only honest way to
+                    show it. Without one, the first sign of the budget is a
+                    refusal mid-build. Resets at midnight IST, not with the
+                    billing period, so it says so. */}
+                {s.copilot_tokens_per_day != null && (
+                  <Meter used={s.copilot_tokens_used ?? 0}
+                         limit={s.copilot_tokens_per_day}
+                         label="AI assistant today (resets midnight IST)" />
+                )}
               </div>
 
               {/* Additional minutes are not sold. Running out offers exactly
@@ -452,7 +465,7 @@ export default function Billing() {
               <tbody>
                 {attemptsQ.data.attempts.filter((a) => a.status !== 'captured').map((a) => (
                   <TR key={a.id}>
-                    <TD>{(a.created_at || '').slice(0, 16).replace('T', ' ')}</TD>
+                    <TD>{fmtDateTime(a.created_at)}</TD>
                     <TD>{a.plan_code || a.kind}</TD>
                     <TD className="text-right tabular-nums">{inr(a.amount_paise)}</TD>
                     <TD>

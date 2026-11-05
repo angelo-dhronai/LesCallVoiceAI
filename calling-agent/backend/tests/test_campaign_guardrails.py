@@ -186,10 +186,33 @@ def test_dnd_recheck_fails_closed(monkeypatch):
 def test_the_run_loop_still_rechecks_hours_and_dnd():
     """Both re-checks live inside the dial loop, not just at start: a run that
     began at 18:55 must stop at 19:00, and someone who opts out on call 3 must
-    not be dialled on call 40 of the same run."""
+    not be dialled on call 40 of the same run.
+
+    Read from `_campaign_launch`, which is where the loop lives. `campaign_start`
+    is a thin HTTP wrapper over it so that the scheduler runs the SAME loop —
+    the guardrails asserted here are exactly what a scheduled campaign inherits
+    by not having its own copy.
+    """
     import inspect
 
-    src = inspect.getsource(server.campaign_start)
+    src = inspect.getsource(server._campaign_launch)
     body = src.split("async def _run()", 1)[1]
     assert "within_window" in body
     assert "_contact_is_dnd" in body
+
+
+def test_the_start_endpoint_is_only_a_wrapper_over_the_shared_launcher():
+    """If Start ever grows its own planning again, the scheduler stops sharing
+    its guardrails — which is the whole reason the body was extracted."""
+    import inspect
+
+    src = inspect.getsource(server.campaign_start)
+    assert "_campaign_launch" in src
+    assert "async def _run()" not in src
+
+
+def test_a_scheduled_campaign_uses_the_same_launcher():
+    import inspect
+
+    assert "_campaign_launch" in inspect.getsource(server._fire_schedule)
+    assert "_place_call" in inspect.getsource(server._fire_schedule)

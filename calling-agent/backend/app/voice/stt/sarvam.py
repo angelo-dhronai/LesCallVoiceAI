@@ -223,10 +223,12 @@ class SarvamSTT(STTProvider):
                 "[SARVAM:CREDITS] HTTP 402 Payment Required — Sarvam STT credits exhausted. "
                 "Attempting auto-rotation from key pool."
             )
-            from ..key_rotator import rotate as _rotate_key
-            from ..key_rotator import mark_exhausted as _mark_exhausted
-            _mark_exhausted(self._api_key)   # leased key: stop leasing it
-            new_key = _rotate_key()
+            from ..key_rotator import retire as _retire_key
+            # Rotate first (a burst of 402s on ONE dead key costs the pool
+            # ONE key — key_rotator.rotate), then stop leasing the dead key.
+            # Marked BEFORE the rotation it still counted as active, was not
+            # marked, and the retry was handed it again (key_rotator.retire).
+            new_key = _retire_key(self._api_key)
             if new_key:
                 self._api_key = new_key
                 self._reset_client()  # force fresh TLS with new key

@@ -53,6 +53,27 @@ POLL_SECONDS      = 3.0
 # from one dead key doesn't burn through several keys at once.
 ROTATE_DEBOUNCE_S = 12.0
 
+# ── Verify-before-bury / resurrection (2026-09-08, RUNBOOK §34) ──────────
+# A key used to be declared dead on INFERENCE: "the active key changed, so
+# whatever it changed away from must be exhausted". That inference is wrong
+# whenever the pipeline rotated for any other reason — and a concurrent
+# burst of 402s on ONE dead key rotated several times in seconds, so live
+# keys were promoted, never used, and buried. It cost 6 of 28 keys and 8
+# days of mute calls. Death is now MEASURED, with one 2-character TTS
+# request, and burial is never permanent: dead keys are re-probed on a
+# timer, so a refill (or a wrong burial) heals itself without an operator.
+VERIFY_BEFORE_BURY = os.environ.get(
+    "SARVAM_VERIFY_BEFORE_BURY", "true").lower() == "true"
+PROBE_TIMEOUT_S    = float(os.environ.get("SARVAM_PROBE_TIMEOUT_S", "10"))
+# How often to re-probe the dead list. Far more often while nothing is left
+# to serve calls with — that is the state worth escaping fastest.
+RESURRECT_EVERY_S      = float(os.environ.get("SARVAM_RESURRECT_EVERY_S", "1800"))
+RESURRECT_EXHAUSTED_S  = float(os.environ.get("SARVAM_RESURRECT_EXHAUSTED_S", "300"))
+# Cap the keys probed per sweep so a huge dead list can't stall the loop.
+RESURRECT_BATCH   = int(os.environ.get("SARVAM_RESURRECT_BATCH", "40"))
+
+_TTS_URL = "https://api.sarvam.ai/text-to-speech"
+
 _EXHAUSTION_RE = re.compile(
     r"(No credits available|insufficient_quota|HTTP 402|402 Payment Required"
     r"|Credits exhausted|TTS HTTP 402)",
@@ -183,6 +204,84 @@ class LogTailer:
             return []
 
 
+def probe_key(key: str) -> str:
+    """Ask Sarvam whether this key can still do work.
+
+    Returns "live" (HTTP 200), "dead" (402 / insufficient_quota) or
+    "unknown" (anything else: 401/403, 5xx, rate limit, network, no httpx).
+    "unknown" NEVER buries and never resurrects — an unreachable API must not
+    be able to empty the key pool, which is the failure this whole guard
+    exists to prevent. Costs two characters of TTS.
+    """
+    if not key:
+        return "unknown"
+    try:
+        import httpx
+    except Exception:
+        return "unknown"
+    try:
+        r = httpx.post(
+            _TTS_URL,
+            headers={"api-subscription-key": key},
+            json={"text": "ok", "target_language_code": "en-IN",
+                  "model": "bulbul:v3", "speaker": "shubh"},
+            timeout=PROBE_TIMEOUT_S,
+        )
+    except Exception as exc:
+        log.warning("probe %s: network error %r — treating as unknown",
+                    _mask(key), exc)
+        return "unknown"
+    if r.status_code == 200:
+        return "live"
+    if r.status_code == 402:
+        return "dead"
+    log.warning("probe %s: HTTP %d — treating as unknown (not buried)",
+                _mask(key), r.status_code)
+    return "unknown"
+
+
+def bury(key: str, dead: set[str], why: str) -> bool:
+    """Add a key to the dead list, but only once it has FAILED a probe.
+
+    Returns True if the key was buried. With verification off, or when the
+    probe is inconclusive, the key is left alive — the cost of keeping a dead
+    key is one wasted 402 and another rotation; the cost of burying a live one
+    is silent, permanent and exactly what happened on 2026-08-31.
+    """
+    if not key or key in dead:
+        return False
+    if VERIFY_BEFORE_BURY:
+        verdict = probe_key(key)
+        if verdict != "dead":
+            log.warning("NOT burying %s (%s) — probe says %s", _mask(key), why, verdict)
+            return False
+    dead.add(key)
+    save_dead(dead)
+    log.warning("buried %s (%s) — verified out of credits", _mask(key), why)
+    return True
+
+
+def resurrect(master: list[str], dead: set[str]) -> int:
+    """Re-probe dead keys and revive the ones that answer.
+
+    Credits get topped up and keys get buried by mistake; without this the
+    dead list is a one-way door and the platform stays mute until a human
+    notices. Only keys still present in master are probed.
+    """
+    candidates = [k for k in master if k in dead][:RESURRECT_BATCH]
+    revived = 0
+    for k in candidates:
+        if probe_key(k) == "live":
+            dead.discard(k)
+            revived += 1
+            log.warning("RESURRECTED %s — key has credits again", _mask(k))
+    if revived:
+        save_dead(dead)
+    log.info("resurrection sweep: probed %d dead key(s), revived %d",
+             len(candidates), revived)
+    return revived
+
+
 def reconcile_pool(master: list[str], dead: set[str], active: str) -> list[str]:
     """Pool = master − dead − active, order preserved. Keeps the in-process
     rotate() fed with only live keys, never a dead or duplicate-active one."""
@@ -219,6 +318,7 @@ def main() -> None:
     tailers = [LogTailer(p) for p in WATCH_LOGS]
     last_active = active
     last_rotation = 0.0
+    last_resurrect = 0.0
 
     log.info(
         "watchdog started — active=%s pool=%d dead=%d master=%d",
@@ -235,10 +335,12 @@ def main() -> None:
             #     retire the key it moved off of — cooperative, no double-hop.
             if active != last_active:
                 if last_active and last_active not in dead:
-                    dead.add(last_active)
-                    save_dead(dead)
-                    log.info("in-process rotation detected — retired %s, now on %s",
-                             _mask(last_active), _mask(active))
+                    # The pipeline moving off a key is NOT proof the key is
+                    # spent — it also happens when a concurrent burst rotates
+                    # more than once. Probe before burying.
+                    log.info("in-process rotation detected — %s → %s, verifying "
+                             "the old key", _mask(last_active), _mask(active))
+                    bury(last_active, dead, "in-process rotation")
                 last_active = active
                 last_rotation = time.time()
 
@@ -253,9 +355,19 @@ def main() -> None:
             # (3) If exhaustion is being reported and we haven't just rotated,
             #     the current active key is dead → promote the next live key.
             if hit and (now - last_rotation) > ROTATE_DEBOUNCE_S:
+                # A 402 in the log does not name its key: with per-call
+                # leasing it may have come from a LEASED backup, not from the
+                # active key. Probe the active key rather than assume.
                 if active and active not in dead:
-                    dead.add(active)
-                    save_dead(dead)
+                    if not bury(active, dead, "402 reported in runtime log"):
+                        # Active key is fine — the 402 came from somewhere
+                        # else. Nothing to rotate.
+                        last_rotation = now
+                        pool = reconcile_pool(master, dead, active)
+                        write_status(active, pool, dead,
+                                     not pool and active in dead)
+                        time.sleep(POLL_SECONDS)
+                        continue
                 live = [k for k in master if k not in dead]
                 if live:
                     new_key = live[0]
@@ -275,6 +387,30 @@ def main() -> None:
             # (4) Keep the backup pool exactly = master − dead − active.
             pool = reconcile_pool(master, dead, active)
             exhausted = not pool and (not active or active in dead)
+
+            # (5) Re-probe the dead list on a timer — fast while there is
+            #     nothing left to serve calls with. This is what turns "all
+            #     keys exhausted" from an outage that waits for a human into
+            #     a state the platform climbs out of by itself, whether the
+            #     cause was a refill or a wrong burial.
+            interval = RESURRECT_EXHAUSTED_S if exhausted else RESURRECT_EVERY_S
+            if dead and (now - last_resurrect) >= interval:
+                last_resurrect = now
+                if resurrect(master, dead):
+                    active = read_active()
+                    if exhausted:
+                        # Nothing usable was active — promote a revived key
+                        # so the very next call can speak.
+                        live = [k for k in master if k not in dead]
+                        if live and (not active or active in dead):
+                            write_active(live[0])
+                            active = live[0]
+                            last_active = active
+                            log.warning("promoted revived key %s to active",
+                                        _mask(active))
+                    pool = reconcile_pool(master, dead, active)
+                    exhausted = not pool and (not active or active in dead)
+
             write_status(active, pool, dead, exhausted)
 
         except Exception:

@@ -551,6 +551,12 @@ def extract_rtp_info(headers: dict) -> dict:
     campaign_id = re.sub(r"[^\d]", "", unquote(raw_campaign))[:20] if raw_campaign else ""
     raw_slug = g("variable_lescall_agent_slug", "")
     agent_slug = re.sub(r"[^A-Za-z0-9_-]", "", unquote(raw_slug))[:64] if raw_slug else ""
+    # The number this outbound leg is calling, set by the dashboard's originate.
+    # Caller-Destination-Number is NOT it on an originated leg — FreeSWITCH
+    # puts the dialplan extension there — and the channel's caller id is our
+    # own DID, so without this variable the bridge cannot tell who it reached.
+    raw_dest = g("variable_lescall_dest", "")
+    dest = re.sub(r"[^\d]", "", unquote(raw_dest))[:20] if raw_dest else ""
 
     return {
         "uuid":             g("Channel-Call-UUID") or g("Unique-ID", "unknown"),
@@ -559,6 +565,7 @@ def extract_rtp_info(headers: dict) -> dict:
         "did":              did,
         "campaign_id":      campaign_id,
         "agent_slug":       agent_slug,
+        "dest":             dest,
         "local_ip":         g("variable_local_media_ip", ""),
         "local_port":       g("variable_local_media_port", ""),
         "remote_ip":        g("variable_remote_media_ip", ""),
@@ -729,7 +736,8 @@ def build_audio_stream_payload(channel_uuid: str, ws_url: str,
                                caller_number: str = "",
                                did: str = "",
                                campaign_id: str = "",
-                               agent_slug: str = "") -> bytes:
+                               agent_slug: str = "",
+                               dest: str = "") -> bytes:
     """P9-A: bgapi uuid_audio_stream <uuid> start <ws_url> mono <sr>.
 
     mod_audio_stream is registered as an FS API command (NOT a
@@ -756,7 +764,7 @@ def build_audio_stream_payload(channel_uuid: str, ws_url: str,
     Multi-tenant plumbing: did (dialed number, digits-only),
     campaign_id (digits-only) and agent_slug ([A-Za-z0-9_-] only, from
     the lescall_agent_slug channel variable) travel as positional path
-    segments 3-5: /<uuid>/<caller>/<did>/<campaign>/<agent_slug>.
+    segments 3-6: /<uuid>/<caller>/<did>/<campaign>/<agent_slug>/<dest>.
     Empty middle segments are sent as "-" so positions never shift;
     trailing empties are omitted. ws_audio_receiver.py treats "-" or a
     charset-invalid segment as absent, so old/new sender+receiver
@@ -782,7 +790,8 @@ def build_audio_stream_payload(channel_uuid: str, ws_url: str,
         rest = url[scheme_end + 3:] if scheme_end >= 0 else url
         if "/" not in rest:
             extras = [caller_number.strip(), did.strip(),
-                      campaign_id.strip(), agent_slug.strip()]
+                      campaign_id.strip(), agent_slug.strip(),
+                      dest.strip()]
             while extras and not extras[-1]:
                 extras.pop()  # drop trailing empties, keep positions stable
             segs = [cu] + [s if s else "-" for s in extras]
@@ -2013,7 +2022,8 @@ def handle(conn: socket.socket, addr) -> None:
                     rtp.get("caller_number", ""),
                     did=rtp.get("did", ""),
                     campaign_id=rtp.get("campaign_id", ""),
-                    agent_slug=rtp.get("agent_slug", ""))
+                    agent_slug=rtp.get("agent_slug", ""),
+                    dest=rtp.get("dest", ""))
                 send_raw(conn, payload, "AUDIO_STREAM_START", t0)
                 _t = time.monotonic() - t0
                 cp["T3c_audio_stream_sent"] = _t

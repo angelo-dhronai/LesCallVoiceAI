@@ -5,11 +5,17 @@ import { LogOut, Search } from 'lucide-react'
 import { NAV } from '../lib/nav'
 import { cx } from '../components/ui'
 import { useMe } from '../api/hooks/useMe'
+import { useGet } from '../api/hooks/useApi'
 
 export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
   collapsed: boolean; liveCount: number; mobileOpen?: boolean; onCloseMobile?: () => void
 }) {
   const { data: me } = useMe()
+  // WhatsApp messages waiting for a person to approve them. Polled slowly: it
+  // changes when a call ends, not second by second.
+  const waPending = useGet<{ pending: number }>(
+    ['wa', 'pending-count'], '/integrations/whatsapp/pending-count',
+    { refetchInterval: 60_000 }).data?.pending ?? 0
   const [filter, setFilter] = useState('')   // mobile-drawer quick filter
   const needle = filter.trim().toLowerCase()
   const groups = NAV
@@ -101,13 +107,22 @@ export function Sidebar({ collapsed, liveCount, mobileOpen, onCloseMobile }: {
                         <span className="relative shrink-0">
                           <item.icon size={16} strokeWidth={2} className={cx('shrink-0', isActive ? 'text-mint-600 dark:text-mint-400' : 'text-dim group-hover:text-soft')} />
                           {/* Collapsed rail still shows the live-call count as a dot badge */}
-                          {collapsed && item.badge && liveCount > 0 && (
+                          {collapsed && item.badge === 'live' && liveCount > 0 && (
                             <span aria-label={`${liveCount} live ${liveCount === 1 ? 'call' : 'calls'}`}
                               className="absolute -right-2 -top-1.5 hidden h-[15px] min-w-[15px] items-center justify-center rounded-full bg-rose-500 px-1 text-2xs font-bold leading-none text-white ring-2 ring-[var(--bg)] lg:inline-flex">{liveCount}</span>
                           )}
                         </span>
                         <span className={cx('relative truncate', collapsed && 'lg:hidden')}>{item.label}</span>
-                        {item.badge && liveCount > 0 && (
+                        {/* Approvals are work waiting, not an alarm: a quiet amber
+                            count, no pulse. Collapsed, it becomes a dot. */}
+                        {item.badge === 'wa' && waPending > 0 && (
+                          <span aria-label={`${waPending} WhatsApp ${waPending === 1 ? 'message' : 'messages'} waiting for approval`}
+                            className={cx('relative ml-auto inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-amber-500 px-1 text-2xs font-semibold text-white',
+                              collapsed && 'lg:absolute lg:right-2 lg:top-1 lg:h-2 lg:min-w-0 lg:w-2 lg:p-0')}>
+                            <span className={cx(collapsed && 'lg:hidden')}>{waPending}</span>
+                          </span>
+                        )}
+                        {item.badge === 'live' && liveCount > 0 && (
                           <span className={cx('relative ml-auto inline-flex', collapsed && 'lg:hidden')}>
                             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-400 opacity-40" />
                             <span className="relative inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-rose-500 px-1 text-2xs font-semibold text-white">{liveCount}</span>

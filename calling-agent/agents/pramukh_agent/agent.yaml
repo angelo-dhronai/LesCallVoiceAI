@@ -9,7 +9,7 @@ identity:
     in Surat, Vapi, and Silvassa, pioneering the real estate sector of Gujarat by
     exceeding client expectations.
   contact: ''
-  pronouns: she
+  pronouns: he
   role_line: ''
 languages:
   supported:
@@ -43,8 +43,12 @@ languages:
       terms in English. Address the caller respectfully (tame).
   stt_forced_language: ''
   allow_code_mixing: true
+  tts_lang_from_text: true
+  evidence_switch: true
+  auto_switch: true
   greeting_language: ''
   bilingual_greeting: false
+  closing_language_policy: ''
 call_flow:
   stages:
   - id: CONFIRM_IDENTITY
@@ -153,12 +157,15 @@ call_flow:
     - Thursday
     - Friday
     window: 09:00-17:00
+  recommend_before_schedule: auto
   callback_policy:
     enabled: true
     capture_slot: follow_up_time
     responses:
       lang: en
     counts_as_decline: false
+  termination: {}
+  connect: {}
 knowledge_base:
   known_projects:
     Pramukh Aura:
@@ -193,6 +200,7 @@ knowledge_base:
   - क्या आप बाद में कॉल कर सकते हैं
   - मैं अभी कोई संपत्ति खरीदने के लिए नहीं देख रहा हूँ
   - मुझे खेद है, रुचि नहीं है
+  objection_patterns_mode: replace
   time_patterns:
   - morning
   - afternoon
@@ -276,6 +284,7 @@ response_bank:
     hi: जी बिल्कुल, हम हिंदी में बात करते हैं।
     en: Sure, let's continue in English.
     gu: ચોક્કસ, આપણે ગુજરાતીમાં વાત કરીએ.
+  lang_unsupported_responses: {}
   lang_fallbacks:
     hi: माफ़ कीजिए, क्या आप दोबारा बोल सकते हैं?
     en: Sorry, could you repeat that?
@@ -284,6 +293,7 @@ response_bank:
     hi: मैं इस पर वापस आती हूँ।
     en: Let me get back to you on that.
     gu: હું આના પર પાછી આવું છું.
+  tool_ack_fallbacks: {}
   response_fallback: माफ़ कीजिए, क्या आप दोबारा बोल सकते हैं?
   graceful_close:
     hi: आपके समय के लिए बहुत धन्यवाद! आपका दिन शुभ हो।
@@ -325,11 +335,15 @@ llm_config:
   filler_timeout_s: 0.6
   intent_classify_timeout_s: 1.0
   max_response_length: 400
+  filler_min_gap_turns: 0
+  filler_max_per_call: 0
+  filler_ack_extended: false
+  enable_tools: shadow
   extra_never_rules: []
   extra_always_rules:
   - Always keep replies to 1-2 short spoken sentences.
 personality:
-  pronouns: she
+  pronouns: he
   energy: medium
   tone: friendly
   style: conversational
@@ -539,6 +553,7 @@ outbound:
     property size, budget), recommend suitable properties, and schedule a site visit.
 guardrails:
   use_builtin_rules: true
+  builtin_rules_pack: real_estate
   never_rules: []
   always_rules: []
   honesty:
@@ -551,10 +566,13 @@ guardrails:
     restricted_topics:
     - Negative comments about other properties.
   escalation: {}
-  builtin_rules_pack: real_estate
 follow_up:
   whatsapp_promise: {}
   callback: {}
+  clarify_commitments:
+    enabled: true
+  auto_execute:
+    enabled: true
 post_call:
   success_definition: {}
   outcomes:
@@ -572,6 +590,7 @@ post_call:
     kind: success
   scoring: {}
   lead_profile: {}
-revision: 6
-updated_at: '2026-07-15T12:16:40Z'
-updated_by: angelo@dhronai.com:repair
+memory: {}
+revision: 7
+updated_at: '2026-09-11T07:08:36Z'
+updated_by: platform:runbook-42

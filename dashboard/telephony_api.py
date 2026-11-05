@@ -11,6 +11,7 @@ IS the tenant boundary (single-tenant fallback until Google OAuth env is set).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -28,9 +29,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 from auth import current_owner  # noqa: E402 - same-dir module, like agent_builder_api
 from shared.db.database import get_db  # noqa: E402
-from shared.phone import significant_digits  # noqa: E402
+from shared.phone import significant_digits, to_e164  # noqa: E402
 from shared import freeswitch_config as fsc  # noqa: E402
 from shared import kamailio_acl  # noqa: E402
+from shared import call_forwarding as cf  # noqa: E402
 
 AGENTS_DIR = _REPO_ROOT / "calling-agent" / "agents"
 PUBLIC_SIP_IP = os.environ.get("PUBLIC_SIP_IP", "35.207.225.237")
@@ -337,6 +339,10 @@ def apply_trunk(trunk_id: int, owner: str = Depends(paid_owner)):
             db.execute(
                 "UPDATE phone_numbers SET config_status=?, last_applied_at=CURRENT_TIMESTAMP "
                 "WHERE trunk_id=?", (status, trunk_id))
+    if numbers:
+        # Re-sync forwarding files: a newly applied or renamed gateway must be
+        # reflected in them too.
+        result["forwarding"] = cf.sync_numbers([n["id"] for n in numbers])
     return {"status": status, **result}
 
 
@@ -447,6 +453,8 @@ async def update_number(number_id: int, request: Request,
         if "label" in body:
             updates.append("label=?")
             params.append(str(body["label"]))
+        forward_touched = _collect_forward_updates(db, dict(row), body, owner,
+                                                   updates, params)
         if not updates:
             raise HTTPException(status_code=400, detail="nothing to update")
         params.append(number_id)
@@ -454,6 +462,13 @@ async def update_number(number_id: int, request: Request,
                    tuple(params))
         out = dict(db.execute("SELECT * FROM phone_numbers WHERE id=?",
                               (number_id,)).fetchone())
+    if forward_touched:
+        # The setting is saved either way; `forwarding` tells the owner whether
+        # it is actually live, and why not when it is not.
+        try:
+            out["forwarding"] = await asyncio.to_thread(cf.sync_number, number_id)
+        except cf.ForwardingError as exc:
+            out["forwarding"] = {"state": "error", "reason": str(exc)}
     return out
 
 
@@ -465,9 +480,211 @@ def delete_number(number_id: int, owner: str = Depends(paid_owner)):
         if not row:
             raise HTTPException(status_code=404, detail="number not found")
         db.execute("DELETE FROM phone_numbers WHERE id=?", (number_id,))
+    try:
+        cf.remove_forward_file(dict(row))
+    except OSError as exc:
+        logger.warning("forward file removal failed for number %s: %r", number_id, exc)
     return {"deleted": number_id,
             "note": "generated dialplan file (if applied) is not auto-removed; "
                     "see deploy/RUNBOOK.md"}
+
+
+# ---------------------------------------------------------------------------
+# Conditional call forwarding (RUNBOOK §84) — see shared/call_forwarding.py
+#
+# A number is answered by its agent (forward_mode='agent', the default) or
+# forwarded (forward_mode='forward'): FreeSWITCH first rings one of the owner's
+# own VERIFIED Indian mobiles; the person presses 1 and talks to the caller;
+# otherwise the agent answers (or the call ends). Saving a setting writes or
+# deletes that number's file in dialplan/public_forward and reloads FreeSWITCH.
+# ---------------------------------------------------------------------------
+
+def _fwd_error(exc: "cf.ForwardingError") -> HTTPException:
+    return HTTPException(status_code=exc.status, detail=str(exc))
+
+
+def _contact_owned(db, contact_id: int, owner: str) -> dict:
+    row = db.execute(
+        "SELECT id, owner, label, number, sig_digits, verified_at, created_at "
+        "FROM forward_contacts WHERE id=? AND owner=?",
+        (int(contact_id), owner)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="forward phone not found")
+    return dict(row)
+
+
+def _collect_forward_updates(db, row: dict, body: dict, owner: str,
+                             updates: list, params: list) -> bool:
+    """Validate and stage the forward_* columns of a PATCH /api/numbers call.
+
+    Returns True when any forwarding field is being changed (the caller then
+    re-syncs FreeSWITCH). The one cross-field rule: a number in 'forward' mode
+    must point at a VERIFIED phone of this account — otherwise an inbound call
+    would ring nobody, or a stranger.
+    """
+    touched = False
+    try:
+        if "forward_contact_id" in body:
+            cid = body["forward_contact_id"]
+            if cid in (None, "", 0):
+                params.append(None)
+            else:
+                contact = _contact_owned(db, int(cid), owner)
+                if not contact.get("verified_at"):
+                    raise cf.ForwardingError(
+                        "Verify this phone first — we call it once with a code.")
+                params.append(int(cid))
+            updates.append("forward_contact_id=?")
+            touched = True
+        if "forward_ring_s" in body:
+            updates.append("forward_ring_s=?")
+            params.append(cf.clamp_ring(body["forward_ring_s"]))
+            touched = True
+        if "forward_confirm" in body:
+            updates.append("forward_confirm=?")
+            params.append(bool(body["forward_confirm"]))
+            touched = True
+        if "forward_fallback" in body:
+            fb = str(body["forward_fallback"])
+            if fb not in cf.FALLBACKS:
+                raise cf.ForwardingError(f"forward_fallback must be one of {cf.FALLBACKS}")
+            updates.append("forward_fallback=?")
+            params.append(fb)
+            touched = True
+        if "forward_line_name" in body:
+            updates.append("forward_line_name=?")
+            params.append(cf.clean_line_name(body["forward_line_name"]))
+            touched = True
+        if "forward_mode" in body:
+            mode = str(body["forward_mode"])
+            if mode not in cf.MODES:
+                raise cf.ForwardingError(f"forward_mode must be one of {cf.MODES}")
+            updates.append("forward_mode=?")
+            params.append(mode)
+            touched = True
+        else:
+            mode = row.get("forward_mode") or "agent"
+    except cf.ForwardingError as exc:
+        raise _fwd_error(exc)
+
+    if mode == "forward":
+        if "forward_contact_id" in body:
+            cid = body["forward_contact_id"]
+            contact_after = None if cid in (None, "", 0) else int(cid)
+        else:
+            contact_after = row.get("forward_contact_id")
+        if not contact_after:
+            raise HTTPException(
+                status_code=400,
+                detail="Pick the phone to ring first (add and verify one if needed).")
+        if "forward_contact_id" not in body:
+            # Unchanged contact: still has to be this account's and verified.
+            contact = _contact_owned(db, int(contact_after), owner)
+            if not contact.get("verified_at"):
+                raise HTTPException(status_code=400,
+                                    detail="Verify this phone first — we call it once with a code.")
+    return touched
+
+
+@router.get("/api/forward-contacts")
+def list_forward_contacts(owner: str = Depends(current_owner)):
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT id, owner, label, number, sig_digits, verified_at, created_at "
+            "FROM forward_contacts WHERE owner=? ORDER BY id",
+            (owner,)).fetchall()
+    contacts = [{**dict(r), "verified": bool(r["verified_at"])} for r in rows]
+    missing = cf.infrastructure_missing()
+    return {"contacts": contacts, "max": cf.MAX_CONTACTS,
+            "server_ready": not missing, "server_missing": missing}
+
+
+@router.post("/api/forward-contacts")
+async def create_forward_contact(request: Request, owner: str = Depends(paid_owner)):
+    body = await _body(request)
+    try:
+        number = cf.indian_number(body.get("number"))
+    except cf.ForwardingError as exc:
+        raise _fwd_error(exc)
+    sig = significant_digits(number)
+    label = re.sub(r"\s+", " ", str(body.get("label") or "")).strip()[:60]
+    with get_db() as db:
+        try:
+            cf.refuse_own_lines(db, number)
+        except cf.ForwardingError as exc:
+            raise _fwd_error(exc)
+        n = db.execute("SELECT COUNT(*) AS n FROM forward_contacts WHERE owner=?",
+                       (owner,)).fetchone()["n"]
+        if n >= cf.MAX_CONTACTS:
+            raise HTTPException(status_code=409,
+                                detail=f"You can save up to {cf.MAX_CONTACTS} phones. "
+                                       "Remove one to add another.")
+        if db.execute("SELECT 1 FROM forward_contacts WHERE owner=? AND sig_digits=?",
+                      (owner, sig)).fetchone():
+            raise HTTPException(status_code=409, detail="This phone is already saved.")
+        row = db.execute(
+            "INSERT INTO forward_contacts (owner, label, number, sig_digits) "
+            "VALUES (?,?,?,?) RETURNING id", (owner, label, number, sig)).fetchone()
+    logger.info("forward phone added for %s (%s)", owner, cf.mask(number))
+    return {"id": row["id"], "label": label, "number": number,
+            "sig_digits": sig, "verified": False}
+
+
+@router.post("/api/forward-contacts/{contact_id}/verify-call")
+async def forward_contact_verify_call(contact_id: int, owner: str = Depends(paid_owner)):
+    """Ring the phone; a voice reads a 4-digit code twice."""
+    try:
+        started = await asyncio.to_thread(cf.start_verification, contact_id, owner)
+    except cf.ForwardingError as exc:
+        raise _fwd_error(exc)
+
+    async def _ring():
+        reply = await asyncio.to_thread(cf.place_call, started["command"])
+        logger.info("forward verification call for %s -> %s", owner, reply[:80])
+
+    asyncio.create_task(_ring())
+    return {"calling": started["phone"], "expires_in_s": started["expires_in_s"],
+            "calls_left_today": started["calls_left_today"]}
+
+
+@router.post("/api/forward-contacts/{contact_id}/verify")
+async def forward_contact_verify(contact_id: int, request: Request,
+                                 owner: str = Depends(paid_owner)):
+    body = await _body(request)
+    try:
+        return cf.check_verification(contact_id, owner, str(body.get("code") or ""))
+    except cf.ForwardingError as exc:
+        raise _fwd_error(exc)
+
+
+@router.delete("/api/forward-contacts/{contact_id}")
+def delete_forward_contact(contact_id: int, owner: str = Depends(paid_owner)):
+    with get_db() as db:
+        _contact_owned(db, contact_id, owner)
+        affected = [r["id"] for r in db.execute(
+            "SELECT id FROM phone_numbers WHERE owner=? AND forward_contact_id=?",
+            (owner, contact_id)).fetchall()]
+        # Any number pointing here goes back to its agent, so no call ever
+        # routes to a phone that is no longer saved.
+        db.execute(
+            "UPDATE phone_numbers SET forward_mode='agent', forward_contact_id=NULL "
+            "WHERE owner=? AND forward_contact_id=?", (owner, contact_id))
+        db.execute("DELETE FROM forward_contacts WHERE id=?", (contact_id,))
+    synced = cf.sync_numbers(affected) if affected else {}
+    return {"deleted": contact_id, "numbers_back_to_agent": affected, "forwarding": synced}
+
+
+@router.get("/api/forwarded-calls")
+def list_forwarded_calls(limit: int = 50, owner: str = Depends(current_owner)):
+    limit = max(1, min(int(limit or 50), 200))
+    with get_db() as db:
+        rows = [dict(r) for r in db.execute(
+            "SELECT f.id, f.number_id, f.did, f.caller, f.contact_number, f.outcome, "
+            "f.cause, f.fallback, f.ring_s, f.talk_s, f.started_at, p.number AS line "
+            "FROM forwarded_calls f LEFT JOIN phone_numbers p ON p.id = f.number_id "
+            "WHERE f.owner=? ORDER BY f.started_at DESC NULLS LAST LIMIT ?",
+            (owner, limit)).fetchall()]
+    return {"calls": rows, "summary": cf.month_summary(owner)}
 
 
 # ---------------------------------------------------------------------------

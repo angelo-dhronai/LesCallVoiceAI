@@ -1,8 +1,10 @@
-import { useId, type ReactNode } from 'react'
+import { useId, useState, type ReactNode } from 'react'
 import { motion } from 'motion/react'
-import { ChevronRight, Search, X } from 'lucide-react'
+import { ChevronDown, ChevronRight, Search, X } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { Badge, cx } from './ui'
+import { Checkbox } from './ui/checkbox'
+import { Popover, PopoverContent, PopoverTrigger } from './ui/popover'
 
 /* ------------------------------------------------------------------ Page header */
 
@@ -60,13 +62,20 @@ export function TH({ children, className }: { children?: ReactNode; className?: 
     </th>
   )
 }
-export function TR({ children, className, onClick }: { children: ReactNode; className?: string; onClick?: () => void }) {
+export function TR({ children, className, onClick, current }: {
+  children: ReactNode; className?: string; onClick?: () => void
+  /** The row the user was last working on (e.g. the call they just came back
+   *  from). Tinted, and exposed as aria-current so it is announced too. */
+  current?: boolean
+}) {
   return (
     <tr onClick={onClick}
+      aria-current={current ? 'true' : undefined}
       tabIndex={onClick ? 0 : undefined}
       onKeyDown={onClick ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick() } } : undefined}
       className={cx('border-b border-[var(--border)] transition-colors hover:bg-[var(--surface-2)]',
-        onClick && 'cursor-pointer focus-within:bg-[var(--surface-2)]', className)}>
+        onClick && 'cursor-pointer focus-within:bg-[var(--surface-2)]',
+        current && 'bg-mint-400/10', className)}>
       {children}
     </tr>
   )
@@ -77,25 +86,68 @@ export function TD({ children, className, colSpan, title }: { children?: ReactNo
 
 /* ------------------------------------------------------------------ Pagination */
 
+/**
+ * Numbered pagination.
+ *
+ * Was Prev/Next only, which is fine for browsing and useless for a list you
+ * are working through: on 12 pages, reaching page 9 took eight clicks and
+ * there was no way to see how far the list went or to come back to where you
+ * were. Numbers make the size of the result visible and every page one click
+ * away.
+ *
+ * The window is elided rather than unbounded — a 40-page list must not render
+ * 40 buttons and wrap the toolbar. First and last are always reachable, the
+ * current page always sits inside the window, and gaps render as an inert "…"
+ * so the jump is legible instead of looking like missing pages.
+ */
+function pageWindow(page: number, pages: number, span = 1): (number | 'gap')[] {
+  if (pages <= 7) return Array.from({ length: pages }, (_, i) => i + 1)
+  const out: (number | 'gap')[] = [1]
+  const from = Math.max(2, page - span)
+  const to = Math.min(pages - 1, page + span)
+  if (from > 2) out.push('gap')
+  for (let i = from; i <= to; i++) out.push(i)
+  if (to < pages - 1) out.push('gap')
+  out.push(pages)
+  return out
+}
+
 export function Pagination({
   page, pages, total, onPage,
 }: { page: number; pages: number; total?: number; onPage: (p: number) => void }) {
   if (pages <= 1 && !total) return null
+  const last = Math.max(1, pages)
+  const current = Math.min(Math.max(1, page), last)
+  const step = 'min-h-[36px] min-w-[36px] rounded-md px-2.5 py-1.5 text-xs font-semibold '
+    + 'ring-1 ring-[var(--border)] transition hover:bg-[var(--surface-2)] '
+    + 'disabled:opacity-40 disabled:hover:bg-transparent sm:min-h-0'
   return (
-    <div className="mt-3 flex items-center justify-between gap-3 text-xs text-dim">
+    <nav className="mt-3 flex flex-wrap items-center justify-between gap-3 text-xs text-dim"
+      aria-label="Pagination">
       <div>{total != null ? `${total.toLocaleString('en-IN')} total` : ''}</div>
-      <div className="flex items-center gap-2">
-        <button disabled={page <= 1} onClick={() => onPage(page - 1)}
-          className="min-h-[36px] rounded-md px-3 py-1.5 font-semibold ring-1 ring-[var(--border)] transition hover:bg-[var(--surface-2)] disabled:opacity-40 sm:min-h-0">
-          Prev
-        </button>
-        <span className="tabular-nums">Page {page} / {Math.max(1, pages)}</span>
-        <button disabled={page >= pages} onClick={() => onPage(page + 1)}
-          className="min-h-[36px] rounded-md px-3 py-1.5 font-semibold ring-1 ring-[var(--border)] transition hover:bg-[var(--surface-2)] disabled:opacity-40 sm:min-h-0">
-          Next
-        </button>
+      <div className="flex flex-wrap items-center gap-1">
+        <button disabled={current <= 1} onClick={() => onPage(current - 1)}
+          className={step} aria-label="Previous page">Prev</button>
+        {pageWindow(current, last).map((p, i) => (
+          p === 'gap' ? (
+            <span key={`gap${i}`} className="px-1 tabular-nums text-dim"
+              aria-hidden="true">…</span>
+          ) : (
+            <button key={p} onClick={() => onPage(p)}
+              aria-current={p === current ? 'page' : undefined}
+              aria-label={`Page ${p}`}
+              className={cx(step, 'tabular-nums',
+                p === current
+                  ? 'bg-mint-500/15 text-[var(--text)] ring-mint-400/40'
+                  : 'text-soft')}>
+              {p}
+            </button>
+          )
+        ))}
+        <button disabled={current >= last} onClick={() => onPage(current + 1)}
+          className={step} aria-label="Next page">Next</button>
       </div>
-    </div>
+    </nav>
   )
 }
 
@@ -134,7 +186,7 @@ const STATUS_TONE: Record<string, Tone> = {
   answered: 'mint', completed: 'mint', called: 'mint', interested: 'mint', site_visit_booked: 'mint',
   no_answer: 'amber', busy: 'amber', missed: 'amber', pending: 'amber', scheduled: 'amber',
   to_contact_later: 'amber', in_doubt: 'amber', inquiry: 'indigo', calling: 'indigo', dialing: 'indigo',
-  failed: 'rose', declined: 'rose', rejected: 'rose', cancelled: 'rose', down: 'rose', dismissed: 'neutral',
+  failed: 'rose', declined: 'rose', invalid_number: 'rose', rejected: 'rose', cancelled: 'rose', down: 'rose', dismissed: 'neutral',
   not_called: 'neutral', not_classified: 'neutral',
   // Connected but nobody actually spoke (silence / noise / voicemail / instant
   // hang-up). Amber, not mint: the leg answered, the conversation did not.
@@ -221,6 +273,81 @@ export function Field({ label, children }: { label: string; children: ReactNode 
       <span className="mb-1 block text-xs font-semibold text-soft">{label}</span>
       {children}
     </label>
+  )
+}
+
+/* ------------------------------------------------------------------ Multi-select */
+
+/**
+ * Pick several options at once, as checkboxes in a popover.
+ *
+ * A native <Select> can only hold ONE agent, so "how did shubhangi AND maya do"
+ * meant running the page twice and adding the numbers up by hand. Values are
+ * carried as a comma-separated string because that is what the URL and the API
+ * already speak (`?agent=a,b`), which keeps deep links and the single-agent
+ * form working unchanged.
+ *
+ * `summary` is what the trigger says: the caller names the thing being picked,
+ * so the button reads "3 agents" rather than a truncated list nobody can parse.
+ */
+export function MultiSelect({
+  options, value, onChange, allLabel, label, summary, className,
+}: {
+  options: string[]
+  value: string[]
+  onChange: (next: string[]) => void
+  allLabel: string
+  label: string
+  summary?: (n: number) => string
+  className?: string
+}) {
+  const [open, setOpen] = useState(false)
+  const chosen = new Set(value)
+  const text = value.length === 0
+    ? allLabel
+    : value.length === 1
+      ? value[0]
+      : summary ? summary(value.length) : `${value.length} selected`
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button type="button" aria-label={label}
+          className={cx('flex min-h-[38px] items-center justify-between gap-2 rounded-md',
+            'bg-[var(--surface-2)] px-3 py-2 text-sm font-medium text-[var(--text)]',
+            'outline-none ring-1 ring-[var(--border)] transition focus:ring-mint-400/40',
+            className)}>
+          <span className="truncate">{text}</span>
+          <ChevronDown size={14} className="shrink-0 text-dim" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-64 p-0">
+        <div className="flex items-center justify-between gap-2 border-b border-[var(--ui-border)] px-3 py-2">
+          <span className="text-xs font-semibold text-soft">{label}</span>
+          {value.length > 0 && (
+            <button type="button" onClick={() => onChange([])}
+              className="text-2xs font-semibold text-mint-600 hover:underline dark:text-mint-400">
+              Clear
+            </button>
+          )}
+        </div>
+        {options.length === 0 ? (
+          <p className="px-3 py-4 text-xs text-dim">Nothing to choose from yet.</p>
+        ) : (
+          <div className="max-h-64 overflow-y-auto py-1">
+            {options.map((o) => (
+              <label key={o}
+                className="flex cursor-pointer items-center gap-2.5 px-3 py-1.5 text-sm text-[var(--text)] transition hover:bg-[var(--surface-2)]">
+                <Checkbox checked={chosen.has(o)}
+                  onCheckedChange={() => onChange(chosen.has(o)
+                    ? value.filter((v) => v !== o)
+                    : [...value, o])} />
+                <span className="truncate" title={o}>{o}</span>
+              </label>
+            ))}
+          </div>
+        )}
+      </PopoverContent>
+    </Popover>
   )
 }
 

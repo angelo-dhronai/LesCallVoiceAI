@@ -4,6 +4,7 @@ Layout: agents/<agent_folder>/documents/<doc_id>/{metadata.json, text.txt, chunk
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
@@ -120,6 +121,11 @@ def save_document(
         "uploaded_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
         "chunk_count": len(chunks),
         "char_count": len(extracted_text),
+        # Content hash of the RAW file — what `find_document_by_hash` matches
+        # so the same brochure uploaded twice is answered with the existing
+        # document instead of a second copy competing with itself.
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size_bytes": len(content),
     }
     (doc_dir / "metadata.json").write_text(
         json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -181,6 +187,18 @@ def delete_document(agent_folder: str, doc_id: str) -> bool:
 
 def has_documents(agent_folder: str) -> bool:
     return bool(list_documents(agent_folder))
+
+
+def find_document_by_hash(agent_folder: str, sha256: str) -> dict | None:
+    """The already-uploaded document with this raw-content hash, if any.
+    Entries written before the hash existed never match — they are not
+    duplicates we can prove."""
+    if not sha256:
+        return None
+    for doc in list_documents(agent_folder):
+        if doc.get("sha256") == sha256:
+            return doc
+    return None
 
 
 def get_document_text(agent_folder: str, doc_id: str) -> str:

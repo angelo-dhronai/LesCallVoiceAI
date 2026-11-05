@@ -163,6 +163,30 @@ def open_gcs_stream(gcs_object: str):
     return _bucket().blob(gcs_object).open("rb")
 
 
+def probe_bucket() -> str | None:
+    """Cheap auth+reachability probe. Returns an error string, or None if OK.
+
+    The catch-up sync used to report `uploaded=0` and exit 0 while its GCS
+    client could not authenticate at all: `sync_pending` only touches GCS for
+    rows that still have a local WAV, so a pass with no such rows never
+    exercised auth. That is how a dead credential stayed invisible for weeks
+    (2026-08-07: the stale `~/.config/gcloud` ADC file outranked metadata for
+    every host process). Probe on EVERY pass, work or not.
+
+    Uses objects.list (one object, discarded) rather than buckets.get: the
+    attached SA is an object-level role, so `bucket.exists()` can 403 on a
+    bucket it can read and write perfectly well.
+    """
+    if not gcs_enabled():
+        return "GCS_RECORDINGS_BUCKET unset"
+    try:
+        client = _bucket().client
+        next(iter(client.list_blobs(bucket_name(), max_results=1)), None)
+        return None
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
 # ---------------------------------------------------------------------------
 # Upload + DB bookkeeping
 # ---------------------------------------------------------------------------
@@ -221,6 +245,31 @@ def _stamp_uploaded(call_key: str, audio_obj: str) -> None:
             (audio_obj, now, call_key))
 
 
+def adopt_uploaded(call_key: str) -> bool:
+    """Stamp a row whose audio is ALREADY in the bucket but was never recorded
+    as uploaded. Verifies the object exists first — never stamps on faith.
+
+    Without this, a row that lost its local WAV before being stamped is stuck
+    forever: `sync_pending` skips it (nothing to upload) and `cleanup_local`
+    skips it (not stamped), so its full-call WAV is retained past retention
+    and the pending count never reaches zero. Eight 2026-07-14 rows sat in
+    exactly that state.
+    """
+    if not (call_key and gcs_enabled()):
+        return False
+    audio_obj = _object_name(call_key, AUDIO_FILENAME)
+    try:
+        if not _bucket().blob(audio_obj).exists():
+            return False
+        _stamp_uploaded(call_key, audio_obj)
+        logger.info("adopted already-uploaded %s -> gs://%s/%s",
+                    call_key, bucket_name(), audio_obj)
+        return True
+    except Exception as exc:
+        logger.warning("adopt check failed for %s: %r", call_key, exc)
+        return False
+
+
 def ensure_download_token(call_key: str) -> str | None:
     """Assign (or return) the row's download token; None if no row exists."""
     from shared.db.database import get_db
@@ -244,9 +293,14 @@ def ensure_download_token(call_key: str) -> str | None:
 # Catch-up sync + local retention cleanup
 # ---------------------------------------------------------------------------
 
-def sync_pending(limit: int = 200) -> int:
+def sync_pending(limit: int = 200) -> dict:
     """Upload every call row that has local audio but no GCS stamp; also
-    backfill missing download tokens. Returns the number uploaded."""
+    backfill missing download tokens.
+
+    Returns counts: `uploaded` (this pass), `adopted` (already in the bucket,
+    stamp backfilled), `failed` (upload attempted and did NOT land). `failed`
+    is what makes a broken pass visible — it drives the CLI's exit code.
+    """
     from shared.db.database import get_db
 
     with get_db() as db:
@@ -254,7 +308,7 @@ def sync_pending(limit: int = 200) -> int:
             "SELECT call_key, conn_id, download_token FROM calls "
             "WHERE call_key IS NOT NULL AND gcs_uploaded_at IS NULL "
             "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-    uploaded = 0
+    counts = {"uploaded": 0, "adopted": 0, "failed": 0}
     for r in rows:
         call_key = r["call_key"]
         if not r["download_token"]:
@@ -263,9 +317,14 @@ def sync_pending(limit: int = 200) -> int:
         # missed (crash, race) and the FS WAV still exists, grab it now.
         if r["conn_id"] and not local_full_audio_path(call_key).exists():
             capture_fs_recording(r["conn_id"], call_key, wait_s=0.5)
-        if local_audio_path(call_key).exists() and upload_recording(call_key):
-            uploaded += 1
-    return uploaded
+        if local_audio_path(call_key).exists():
+            if upload_recording(call_key):
+                counts["uploaded"] += 1
+            else:
+                counts["failed"] += 1
+        elif adopt_uploaded(call_key):
+            counts["adopted"] += 1
+    return counts
 
 
 def cleanup_local(max_age_days: float | None = None) -> int:
@@ -309,7 +368,11 @@ def cleanup_local(max_age_days: float | None = None) -> int:
     return deleted
 
 
-def _run_once() -> None:
+def _run_once() -> int:
+    """One sync pass. Returns a process exit code: 0 healthy, 2 GCS
+    unreachable, 1 some upload failed. A pass that cannot reach GCS must NOT
+    exit 0 — a green `systemctl status` on a dead credential is how this
+    silently stopped being a backup at all."""
     if not gcs_enabled():
         logger.warning("GCS_RECORDINGS_BUCKET unset — token backfill only, "
                        "no uploads/cleanup")
@@ -321,10 +384,30 @@ def _run_once() -> None:
         for r in rows:
             ensure_download_token(r["call_key"])
         logger.info("backfilled %d download tokens", len(rows))
-        return
-    n = sync_pending()
+        return 0
+    err = probe_bucket()
+    if err is not None:
+        logger.error("GCS unreachable for bucket %r — recordings are NOT "
+                     "being backed up: %s", bucket_name(), err)
+        return 2
+    c = sync_pending()
     d = cleanup_local()
-    logger.info("sync complete: uploaded=%d local_deleted=%d", n, d)
+    # Generated .xlsx exports share this timer rather than getting one of
+    # their own: same bucket, same "local copy is a fallback, not an archive"
+    # rule, and one fewer thing to notice has stopped running.
+    x = 0
+    try:
+        from shared import export_store
+        x = export_store.cleanup_local()
+    except Exception as exc:
+        logger.warning("export cleanup skipped: %r", exc)
+    logger.info("sync complete: uploaded=%d adopted=%d failed=%d "
+                "local_deleted=%d exports_deleted=%d",
+                c["uploaded"], c["adopted"], c["failed"], d, x)
+    if c["failed"]:
+        logger.error("%d recording(s) failed to upload this pass", c["failed"])
+        return 1
+    return 0
 
 
 def main() -> None:
@@ -345,7 +428,14 @@ def main() -> None:
                 logger.exception("sync pass failed")
             time.sleep(args.interval)
     else:
-        _run_once()
+        import sys
+        try:
+            sys.exit(_run_once())
+        except SystemExit:
+            raise
+        except Exception:
+            logger.exception("sync pass failed")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

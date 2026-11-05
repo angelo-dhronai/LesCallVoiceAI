@@ -8,7 +8,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { useTheme } from '../theme/ThemeProvider'
 import { HealthPill, type Service } from '../components/HealthPill'
 import { cx } from '../components/ui'
-import { clockTime, num } from '../lib/format'
+import { clockTime, num, parseTs } from '../lib/format'
 import { NAV } from '../lib/nav'
 import { useGet, useRefresh } from '../api/hooks/useApi'
 import { patch, post } from '../api/mutate'
@@ -49,10 +49,9 @@ type Notif = {
 }
 
 function ago(iso?: string): string {
-  if (!iso) return ''
-  const t = new Date(iso).getTime()
-  if (!Number.isFinite(t)) return ''
-  const s = Math.max(0, (Date.now() - t) / 1000)
+  const at = parseTs(iso)
+  if (!at) return ''
+  const s = Math.max(0, (Date.now() - at.getTime()) / 1000)
   if (s < 60) return 'now'
   if (s < 3600) return `${Math.floor(s / 60)}m`
   if (s < 86400) return `${Math.floor(s / 3600)}h`

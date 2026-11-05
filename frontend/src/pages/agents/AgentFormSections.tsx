@@ -84,7 +84,11 @@ export function BasicsSection({ d, set, showSlug = true, showErrors = false }: S
  * Inbound and outbound calls demand opposite approaches, so every agent
  * explicitly declares which kind it handles. The runtime injects a strong
  * direction-specific playbook into the system prompt based on this. */
-export function CallDirectionSection({ d, set }: SectionProps) {
+/* `locked`: an EXISTING twin's direction is its slug (`x-inbound` answers,
+ * `x-outbound` places calls) and the server refuses a flip — RUNBOOK §60.
+ * Show that here instead of letting the user fill the form and meet a 422. */
+export function CallDirectionSection({ d, set, locked = false }: SectionProps & { locked?: boolean }) {
+  const other = d.call_direction === 'outbound' ? 'inbound' : 'outbound'
   const opts: {
     value: WizardData['call_direction']
     label: string
@@ -105,6 +109,7 @@ export function CallDirectionSection({ d, set }: SectionProps) {
     },
   ]
   return (
+    <div className="space-y-3">
     <div className="grid gap-3 sm:grid-cols-2">
       {opts.map((o) => {
         const active = d.call_direction === o.value
@@ -114,12 +119,14 @@ export function CallDirectionSection({ d, set }: SectionProps) {
             key={o.value}
             type="button"
             aria-pressed={active}
-            onClick={() => set({ call_direction: o.value })}
+            disabled={locked && !active}
+            onClick={() => { if (!locked) set({ call_direction: o.value }) }}
             className={cx(
               'rounded-xl p-4 text-left ring-1 transition',
               active
                 ? 'bg-mint-400/10 ring-mint-400/40'
                 : 'bg-[var(--surface-2)] ring-[var(--border)] hover:ring-mint-400/20',
+              locked && !active && 'cursor-not-allowed opacity-50 hover:ring-[var(--border)]',
             )}
           >
             <div className={cx('mb-1.5 flex items-center gap-2 text-sm font-semibold', active ? 'text-mint-700 dark:text-mint-300' : '')}>
@@ -129,6 +136,13 @@ export function CallDirectionSection({ d, set }: SectionProps) {
           </button>
         )
       })}
+    </div>
+    {locked && (
+      <p className="text-xs text-soft">
+        This is the {d.call_direction} version of the agent, and its call type is fixed by its name.
+        To work on {other} calls, open the {other} version from the Agents page (or add it there).
+      </p>
+    )}
     </div>
   )
 }
@@ -245,12 +259,14 @@ export function LanguagesSection({ d, set }: SectionProps) {
             {d.supported.map((l) => <option key={l} value={l}>{l}</option>)}
           </Select>
         </Field>
+        {/* Pronouns are DERIVED from the voice (RUNBOOK §42): a male speaker
+            speaks as a man, a female one as a woman — in the prompt and in
+            every scripted line. A free choice here used to drift from the
+            voice (seven shubh agents were set to "she"). Read-only; it
+            refreshes from the speaker on save. */}
         <Field label="Pronouns">
-          <Select value={d.pronouns} onChange={(e) => set({ pronouns: e.target.value })}>
-            <option value="she">she</option>
-            <option value="he">he</option>
-            <option value="they">they</option>
-          </Select>
+          <Input value={d.pronouns || '—'} readOnly aria-readonly className="cursor-default opacity-80" />
+          <span className="mt-1 block text-2xs text-dim">Follows the voice — set from the TTS speaker when you save.</span>
         </Field>
         <Field label="TTS model">
           <Input value={d.tts_model} onChange={(e) => set({ tts_model: e.target.value })} />

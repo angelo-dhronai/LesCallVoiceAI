@@ -632,3 +632,100 @@ def build_xlsx(report: dict, rows: list[dict], owner: str) -> bytes:
 def safe_filename(title: str, ext: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "-", str(title or "report")).strip("-").lower()
     return f"{slug or 'report'}.{ext}"
+
+
+# --- plain-text family ----------------------------------------------------
+# The synthesized document is already markdown, so .md is the source itself
+# with a provenance header — no re-rendering, nothing to drift. .txt is the
+# same content with the markup taken off, for pasting into a mail client or an
+# CRM note field that would otherwise show literal asterisks.
+
+def _front_matter(report: dict, rows: list[dict], owner: str) -> list[str]:
+    head = [str(report.get("title") or "Call report"),
+            f"{len(rows)} call(s) · generated "
+            f"{datetime.utcnow():%Y-%m-%d %H:%M} UTC · {owner}"]
+    if report.get("query_prompt"):
+        head.append(f"Query: {report['query_prompt']}")
+    return head
+
+
+def build_md(report: dict, rows: list[dict], owner: str) -> bytes:
+    title, meta, *rest = _front_matter(report, rows, owner)
+    parts = [f"# {title}", "", f"_{meta}_"]
+    if rest:
+        parts += ["", f"_{rest[0]}_"]
+    parts += ["", "---", "", str(report.get("document") or "").strip(), ""]
+    return "\n".join(parts).encode("utf-8")
+
+
+def _strip_markdown(md: str) -> str:
+    """Markdown → readable plain text.
+
+    Headings keep their text and gain an underline, tables become aligned
+    columns, list bullets normalise to '- '. Deliberately small: the input is
+    our own generator's output, not arbitrary markdown.
+    """
+    out: list[str] = []
+    table: list[list[str]] = []
+
+    def flush_table() -> None:
+        if not table:
+            return
+        widths = [max(len(r[i]) if i < len(r) else 0 for r in table)
+                  for i in range(max(len(r) for r in table))]
+        for ri, row in enumerate(table):
+            out.append("  ".join(
+                (row[i] if i < len(row) else "").ljust(widths[i])
+                for i in range(len(widths))).rstrip())
+            if ri == 0:
+                out.append("  ".join("-" * w for w in widths).rstrip())
+        out.append("")
+        table.clear()
+
+    for raw in str(md or "").splitlines():
+        line = raw.rstrip()
+        if re.match(r"^\s*\|.*\|\s*$", line):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if not all(re.fullmatch(r":?-{2,}:?", c or "-") for c in cells):
+                table.append([_inline_plain(c) for c in cells])
+            continue
+        flush_table()
+        h = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if h:
+            text = _inline_plain(h[2])
+            out += ["", text, ("=" if len(h[1]) == 1 else "-") * len(text)]
+            continue
+        if re.fullmatch(r"\s*-{3,}\s*", line):
+            out.append("-" * 60)
+            continue
+        li = re.match(r"^(\s*)[-*]\s+(.*)$", line)
+        if li:
+            out.append(f"{li[1]}- {_inline_plain(li[2])}")
+            continue
+        out.append(_inline_plain(line))
+    flush_table()
+    # Collapse the runs of blank lines the heading rule introduces.
+    text, blank = [], False
+    for line in out:
+        if not line.strip():
+            if blank:
+                continue
+            blank = True
+        else:
+            blank = False
+        text.append(line)
+    return "\n".join(text).strip() + "\n"
+
+
+def _inline_plain(s: str) -> str:
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", s)
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    return re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)
+
+
+def build_txt(report: dict, rows: list[dict], owner: str) -> bytes:
+    head = _front_matter(report, rows, owner)
+    banner = [head[0], "=" * len(head[0])] + head[1:] + ["", "-" * 60, ""]
+    body = _strip_markdown(report.get("document") or "")
+    return ("\n".join(banner) + body).encode("utf-8")

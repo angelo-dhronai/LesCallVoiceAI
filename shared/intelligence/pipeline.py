@@ -13,6 +13,9 @@ Stage set:
     timeline  — contact_events emit (unified contact timeline)
     automation— rule evaluation
     notify    — notifications
+    whatsapp  — WhatsApp follow-up sends (shared/whatsapp/stage.py): only
+                calls under an hour old, so the sweeper's backfill of this
+                stage over history sends nothing
 
 Idempotency contracts:
     * call_intelligence upserts ON CONFLICT (call_id)
@@ -41,7 +44,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 AGENTS_DIR = REPO_ROOT / "calling-agent" / "agents"
 
 STAGE_ORDER = ("extract", "embed", "followup", "memory", "digest", "timeline",
-               "automation", "notify")
+               "automation", "notify", "whatsapp")
 
 
 def _load_call(call_id: int) -> dict[str, Any] | None:
@@ -296,6 +299,14 @@ def _lazy(module: str, attr: str):
     return handler
 
 
+async def _whatsapp_stage(call):
+    # Lives in shared/whatsapp, not shared/intelligence: the feature owns its
+    # tables and its sender, the pipeline only decides WHEN it runs.
+    from shared.whatsapp.stage import stage_whatsapp
+
+    await stage_whatsapp(call)
+
+
 _STAGE_HANDLERS = {
     "extract": stage_extract,
     "embed": _lazy("embed", "stage_embed"),
@@ -309,6 +320,7 @@ _STAGE_HANDLERS = {
     "timeline": _lazy("timeline", "stage_timeline"),
     "automation": _lazy("automation", "stage_automation"),
     "notify": _lazy("notify", "stage_notify"),
+    "whatsapp": _whatsapp_stage,
 }
 
 

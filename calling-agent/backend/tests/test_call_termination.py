@@ -236,10 +236,12 @@ def _pipeline_state(conv, **over):
         _tts_queue=asyncio.Queue(),
         sink=types.SimpleNamespace(playback_busy_until=0.0),
         _tts_end_time=0.0, _last_voice_activity=0.0, _last_reprompt_ts=0.0,
+        _last_heard_activity=0.0,
         _silence_hangup_fired=False, _maxdur_fired=False, _call_start_ts=0.0,
     )
     for helper in ("_pipeline_quiet", "_silence_anchor", "_termination_cfg",
-                   "_silence_hangup_due", "_max_duration_due"):
+                   "_silence_hangup_due", "_max_duration_due",
+                   "_silence_reprompt_due"):
         setattr(ns, helper, types.MethodType(getattr(VoicePipeline, helper), ns))
     for k, v in over.items():
         setattr(ns, k, v)
@@ -507,3 +509,37 @@ def test_closure_block_mentions_the_platform_confirm():
     # The platform speaks the final thank-you after the confirm, so the LLM
     # is told to keep its own goodbye to one sentence (double-farewell fix).
     assert "ONE short sentence" in joined
+
+
+# ── dead-air repair must not talk over a decided close ──────────────────────
+# Live call 6ad891a4 (2026-08-25): 10s after the agent spoke "Thank you for
+# your time, Angelo, and have a wonderful day!" the repair arm asked "Sorry,
+# I couldn't hear you. Is it alright if we close the call now?" — a fifth
+# close question after the farewell. _silence_hangup_due has refused to fire
+# into a pending close since 2026-07-29; the reprompt arm never got the guard.
+
+def test_reprompt_skips_when_a_close_is_pending(_watchdog_enabled):
+    now = 1000.0
+    conv = make_router()
+    conv.hangup_pending = True
+    ns = _pipeline_state(conv, _tts_end_time=now - 30.0)
+    assert ns._silence_reprompt_due(now) is False
+
+
+def test_reprompt_skips_once_the_router_is_closing(_watchdog_enabled):
+    """hangup_pending can be cleared while the goodbye is still draining —
+    is_closing is the durable statement that the call is wrapping up."""
+    now = 1000.0
+    conv = make_router()
+    conv.state.is_closing = True
+    ns = _pipeline_state(conv, _tts_end_time=now - 30.0)
+    assert ns._silence_reprompt_due(now) is False
+
+
+def test_reprompt_still_fires_on_ordinary_dead_air(_watchdog_enabled):
+    """The guard must not disable repair on a live call — this is the case
+    the reprompt exists for."""
+    now = 1000.0
+    ns = _pipeline_state(make_router(), _tts_end_time=now - 30.0)
+    assert ns._silence_reprompt_due(now) is True
+

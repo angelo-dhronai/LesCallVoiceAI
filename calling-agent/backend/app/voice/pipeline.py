@@ -18,6 +18,8 @@ import os
 import re
 import signal
 import time
+from collections import deque
+import dataclasses
 from dataclasses import dataclass
 
 import numpy as np
@@ -31,6 +33,7 @@ from .turn_manager import TurnManager, TurnManagerConfig
 from .conversation import ConversationRouter
 from .memory import ConversationMemory
 from .event_hub import EventHub
+from . import machine_line as _machine_line
 
 from ..audio_transport.base import AudioSource, AudioSink
 from ..audio_transport.local_mic_source import LocalMicSource
@@ -59,9 +62,18 @@ class AudioSegment:
     # segment (continuation-merge timing anchors; 0.0 = unknown).
     speech_start_ts: float = 0.0
     speech_end_ts: float = 0.0
+    # True when speech_start_ts is a RECONSTRUCTION (end − buffered speech)
+    # rather than the measured onset. Turn-taking may use it; the ASR-replay
+    # corpus may not (see the plausibility gate in _flush_segment).
+    span_estimated: bool = False
     # True when part of this audio was captured over agent playback (shadow
     # ring) — such transcripts pass the agent-echo text guard before use.
     shadow: bool = False
+    # Milliseconds of frames the VAD stack called REAL speech inside this
+    # segment (0.0 = not measured). duration_ms counts the whole buffered
+    # span, hangover and pre-roll included — a 860 ms segment can hold 300 ms
+    # of voice, and "the caller clearly spoke" must be judged on this.
+    speech_ms: float = 0.0
 
 
 @dataclass
@@ -74,12 +86,27 @@ class Transcript:
     # Carried through from AudioSegment (continuation-merge timing anchors).
     speech_start_ts: float = 0.0
     speech_end_ts: float = 0.0
+    span_estimated: bool = False
     # Derived STT confidence (0..1) from the router; None = unknown.
     confidence: "float | None" = None
     # Which STT path produced the text ("primary" | "primary-script-retry" |
     # "fallback"). Recovered paths are mishear-prone: they never vote on the
     # conversation language (A3, 2026-07-30).
     stt_source: str = "primary"
+
+
+def _spoken_numbers_text(text: str, enabled: bool) -> str:
+    """The TTS text with figures in English when the agent opted in
+    (`languages.tts_numbers_english`, RUNBOOK §82); the text itself
+    otherwise. The transcript keeps the figures as written — only what
+    Bulbul is handed changes."""
+    if not enabled or not text:
+        return text
+    from .spoken_numbers import english_numbers
+    out = english_numbers(text)
+    if out != text:
+        logger.info("[TTS:NUMBERS] %r -> %r", text[:70], out[:90])
+    return out
 
 
 @dataclass
@@ -108,6 +135,10 @@ class Response:
     # response started playing after this replay was created, the silence is
     # gone and the replay must be dropped, not double-spoken.
     replay: bool = False
+    # The connect intro spoken on the caller's first sustained speech
+    # (_maybe_connect_onset). Its playback end separates the pickup hello it
+    # answered from the caller's reaction to it — see _onset_play_end_ts.
+    onset_intro: bool = False
 
 
 QUEUE_SIZE_AUDIO = 40
@@ -169,6 +200,51 @@ CONNECT_MIN_REAL_SPEECH_MS = float(
 # asserts only that speech rose ABOVE the ambient at all.
 MIN_SPEECH_SNR = float(os.environ.get("MIN_SPEECH_SNR", "1.2"))
 SNR_MIN_NOISE_FRAMES = int(os.environ.get("SNR_MIN_NOISE_FRAMES", "10"))
+# ── How the two terms are MEASURED (2026-08-17 deafness audit) ─────────────
+# The first version of this guard compared mean(frames the model labelled
+# speech) against mean(frames it did not). That is only valid if the model's
+# labels line up with the audio, and on this stack they do not:
+# FsmnVadStack.is_speech() returns `_speech_open`, state written by a worker
+# thread consuming 100ms hops, so the labelled window lands 200-280ms LATE
+# (measured by replaying recordings/*/caller_audio.wav through the live
+# stack), and FSMN_MAX_END_SIL_MS holds it open past the end on top of that.
+# For an utterance under ~400ms — i.e. every bare "hello" — the labelled
+# window therefore sits mostly on the silence AFTER the voice.
+#
+# On call ffbdc517 that inverted the ratio completely: the caller's burst
+# (mean-abs ~3000) landed in the NOISE bucket because the model had not
+# opened yet, the DTX comfort fill after it (constant |x|=8) landed in the
+# SPEECH bucket, and the guard computed speech=7.4 / noise=261 = 0.03x on
+# audio whose true SNR was ~500x. All 20 discards across 5 calls that day
+# were this arm; on two of them the caller was never heard at all.
+#
+# Both terms are now measured from a rolling window of raw frame energy and
+# never consult a label:
+#   floor  — a PERCENTILE of recent frame energy. A burst is a small slice of
+#            any multi-second window, so the estimate cannot be dragged up by
+#            the speech it is supposed to be measured against.
+#   speech — the mean of the loudest SNR_SPEECH_TOP_FRAMES frames INSIDE the
+#            segment. Peak-ish rather than mean, so a late label window full
+#            of comfort noise can no longer drag it down to the floor; still
+#            an average over 100ms, so a single click cannot fake it.
+SNR_AMBIENT_WINDOW_FRAMES = int(
+    os.environ.get("SNR_AMBIENT_WINDOW_FRAMES", "250"))   # 5s
+SNR_AMBIENT_PCTL = float(os.environ.get("SNR_AMBIENT_PCTL", "10"))
+SNR_SPEECH_TOP_FRAMES = int(os.environ.get("SNR_SPEECH_TOP_FRAMES", "5"))
+# Absolute backstop: a segment this loud is unambiguously somebody talking,
+# so it is never energy-judged no matter what the floor estimate says. Scaled
+# off the barge-in threshold because that is already the stack's "this is
+# definitely not echo or line noise" level. 0 disables.
+SNR_LOUD_EXEMPT_FACTOR = float(os.environ.get("SNR_LOUD_EXEMPT_FACTOR", "1.0"))
+# Consecutive SNR drops that each carried real model-confirmed speech before
+# the call is called out as probably-deaf. One is line noise; a run is the
+# 2026-08-17 signature.
+SNR_DROP_STREAK_WARN = int(os.environ.get("SNR_DROP_STREAK_WARN", "2"))
+
+
+def _fmt_energy(v: float | None) -> str:
+    """Energy for a log line — 'n/a' rather than a misleading 0."""
+    return "n/a" if v is None else f"{v:.0f}"
 # ...and it polices SHORT segments only. Hallucination risk concentrates in
 # brief blips (the 80ms "₹1 lakh."), and that is also where a false drop costs
 # least. Anything with this much model-confirmed speech is taken on the model's
@@ -355,11 +431,43 @@ CONNECT_DELIVERY_GUARD = os.environ.get(
     "CONNECT_DELIVERY_GUARD",
     "true" if TELEPHONY_MODE else "false").lower() == "true"
 CONNECT_WINDOW_S = float(os.environ.get("CONNECT_WINDOW_S", "12"))
+# Speech ending this long after the onset intro finished playing is the
+# caller's answer to it, not the pickup hello it answered (RUNBOOK §65).
+ONSET_REACTION_GRACE_S = float(os.environ.get("ONSET_REACTION_GRACE_S", "0.2"))
 CONNECT_MIN_PLAYED_S = float(os.environ.get("CONNECT_MIN_PLAYED_S", "1.0"))
+# RUNBOOK §70 (call 1033): the delivery guard used to protect only replies in
+# the first CONNECT_WINDOW_S of the call. Two later replies were killed 0.15 s
+# and 0.43 s into playback by echo/line noise (relaxed continuation-window
+# threshold), the caller heard nothing, and sat through 7-10 s of dead air
+# until they said hello. A barge-in against a reply the caller has not yet
+# heard (< CONNECT_MIN_PLAYED_S audible) now ALWAYS waits for the STT verdict:
+# real words kill the reply, a hello or nothing at all lets it play on.
+BARGE_GUARD_ALL_REPLIES = os.environ.get(
+    "BARGE_GUARD_ALL_REPLIES", "true").lower() == "true"
 CONNECT_MIN_SPEECH_MS = float(os.environ.get("CONNECT_MIN_SPEECH_MS", "200"))
 CONNECT_FORCE_LANG = os.environ.get(
     "CONNECT_FORCE_LANG", "true").lower() == "true"
 CONNECT_SHORT_SEG_MS = float(os.environ.get("CONNECT_SHORT_SEG_MS", "800"))
+# ── Connect onset trigger (2026-08-17) ──────────────────────────────────────
+# The three protections above all still run DOWNSTREAM of a transcript, and a
+# transcript is exactly what the caller could not produce on ffbdc517: five
+# hellos in a row were discarded before STT and the agent sat mute for 14s
+# while its answer was ready the whole time (it went out in 1ms once a
+# transcript finally landed).
+#
+# Inside the connect window the second beat does not depend on WHAT the caller
+# said — their first sustained speech is the whole cue. So fire it on VAD
+# onset: no endpoint wait, no STT round trip, nothing that can silently drop
+# the turn. The segment still goes to STT normally; the conversation absorbs
+# the hello that arrives behind it (CONNECT_ONSET_ABSORB_S) so one caller
+# utterance never gets two agent lines.
+CONNECT_ONSET_TRIGGER = os.environ.get(
+    "CONNECT_ONSET_TRIGGER",
+    "true" if TELEPHONY_MODE else "false").lower() == "true"
+# Model-confirmed speech before the intro fires. 140ms is ~7 frames — long
+# enough that a click or a single echo frame cannot trip it, short enough to
+# land inside the caller's first syllable.
+CONNECT_ONSET_MS = float(os.environ.get("CONNECT_ONSET_MS", "140"))
 # Empty-transcript streak damper: speak "sorry, couldn't hear you" only on
 # the SECOND consecutive empty (first stays silent, later ones defer to the
 # dead-air watchdog). Four sorries in a row once fed an echo→empty→sorry
@@ -426,6 +534,81 @@ MERGE_HOLD_CONTINUATION_MS = float(os.environ.get(
 # still on its way.
 MERGE_HOLD_MAX_TOTAL_S = float(os.environ.get(
     "MERGE_HOLD_MAX_TOTAL_S", "6.0"))
+
+# ── Pause tolerance: read the SPEAKER, not just the clause ─────────────────
+# The idle fast-path above concludes a turn with ZERO hold whenever the
+# caller has gone quiet and nothing is in flight. That is right for a caller
+# answering questions ("Vapi", "3 BHK", "50 lakh") and wrong for a caller
+# telling you something: a screening candidate describing their background
+# pauses for breath after a grammatically complete clause and carries
+# straight on. Measured 2026-09-16 on the shubhangi calls — 45 engine
+# replies, 33 idle skips, and 27 of those turns produced a continuation the
+# engine had to merge (17) or silently swallow (10 "stale fragment
+# absorbed, not answered": the caller said something and got no answer at
+# all, because the reply to the FIRST half was already on the wire).
+#
+# `_ends_with_continuation_cue` only catches a dangling conjunction. These
+# two signals catch the rest, and both are properties of the SPEAKER:
+#
+#   narrative — this segment alone ran longer than anyone spends answering a
+#               question. Someone mid-story pauses; someone answering does
+#               not need to.
+#   splitter  — this caller has ALREADY resumed through a pause on this
+#               call. One is a habit, not an accident, and the cost of
+#               believing them is one hold; the cost of not believing them
+#               is interrupting every remaining turn.
+#
+# Neither fires on a caller who never splits, so the short-answer flows keep
+# today's latency exactly. TURN_PAUSE_TOLERANCE=false restores the old
+# behaviour wholesale.
+TURN_PAUSE_TOLERANCE = os.environ.get(
+    "TURN_PAUSE_TOLERANCE", "true").lower() == "true"
+TURN_NARRATIVE_SPEECH_MS = float(os.environ.get(
+    "TURN_NARRATIVE_SPEECH_MS", "2500"))
+TURN_SPLIT_MEMORY = os.environ.get(
+    "TURN_SPLIT_MEMORY", "true").lower() == "true"
+# How long to hold the merge window for a pause we expect to be spoken
+# through. Sits between MERGE_HOLD_CONTINUATION_MS (1200ms, for an explicit
+# dangling cue — a stronger signal) and the 550ms default.
+TURN_CONTINUATION_HOLD_MS = float(os.environ.get(
+    "TURN_CONTINUATION_HOLD_MS", "900"))
+# Pieces one utterance may be reassembled from inside a single merge window
+# when the caller is speaking through pauses. The window re-opens after each
+# one, so this is a ceiling on reassembly, not on waiting —
+# MERGE_HOLD_MAX_TOTAL_S still bounds the wall clock.
+TURN_MAX_MERGED_FRAGMENTS = int(os.environ.get(
+    "TURN_MAX_MERGED_FRAGMENTS", "4"))
+
+# ── Per-agent turn-taking (call_flow.turn_taking, RUNBOOK §78) ─────────────
+# A back-channel is an acknowledgement spoken while OUR audio still has at
+# least this long to play: nobody answers a question a full second before it
+# ends, so the margin separates "हाँ" mid-pitch from "हाँ" to a yes/no.
+BACKCHANNEL_MIN_REMAINING_S = float(os.environ.get(
+    "BACKCHANNEL_MIN_REMAINING_S", "1.0"))
+# Caller speech (not a back-channel) that lands while our audio is still
+# playing after synthesis finished stops it — only when enough is left for
+# the stop to be audible at all.
+TAIL_CUT_MIN_REMAINING_S = float(os.environ.get("TAIL_CUT_MIN_REMAINING_S", "0.8"))
+
+# ── Whole-turn re-transcription (RUNBOOK §69) ───────────────────────────────
+# The VAD cuts a caller's sentence at every ~300 ms pause and each piece is
+# transcribed ALONE. Sarvam needs context: a one-second piece comes back
+# garbled ("की बात कर सर।" for "किसकी बात कर रहा हूँ?") or EMPTY — and an
+# empty piece's words are simply gone. The merge window then glues the
+# separately-mangled texts together. Measured 2026-10-07 (call 1032): 35 STT
+# requests, ~half empty; re-transcribing the same caller audio in whole
+# sentences recovered every utterance the agent misread.
+# When a turn is assembled from ≥2 pieces (empty pieces count), the pieces'
+# audio is joined and transcribed ONCE, and that text is what the engine
+# reads. The request starts speculatively as each piece arrives, so on most
+# turns it is already back by the time the merge window closes.
+TURN_RETRANSCRIBE = os.environ.get("TURN_RETRANSCRIBE", "true").lower() == "true"
+TURN_RETRANSCRIBE_TIMEOUT_S = float(os.environ.get(
+    "TURN_RETRANSCRIBE_TIMEOUT_S", "1.6"))
+TURN_RETRANSCRIBE_LOOKBACK_S = float(os.environ.get(
+    "TURN_RETRANSCRIBE_LOOKBACK_S", "10.0"))
+TURN_RETRANSCRIBE_MAX_S = float(os.environ.get(
+    "TURN_RETRANSCRIBE_MAX_S", "20.0"))
 # Stale-fragment suppression (post-deploy fleet 2026-08-03: double replies
 # 12→25 once the deafness fix started surfacing previously-lost tails). A
 # fragment whose speech BEGAN before our delivered reply started playing is
@@ -434,6 +617,14 @@ MERGE_HOLD_MAX_TOTAL_S = float(os.environ.get(
 # A barged (cut) reply never suppresses: the caller interrupted on purpose.
 STALE_FRAGMENT_SUPPRESS = os.environ.get(
     "STALE_FRAGMENT_SUPPRESS", "true").lower() == "true"
+# A "stale fragment" is the TAIL of a turn the delivered reply already
+# answered. Speech longer than this is not a tail — call 909 (2026-09-24,
+# RUNBOOK §55.5) absorbed a 6.1 s, fifteen-word question ("tell me a project
+# name… which projects are available") and the caller never got an answer.
+STALE_FRAGMENT_MAX_MS = float(os.environ.get("STALE_FRAGMENT_MAX_MS", "3000"))
+# RUNBOOK §81: the enum-answer re-read without the STT language lock waits
+# at most this long; past it the locked transcript stands.
+ENUM_RECHECK_TIMEOUT_S = float(os.environ.get("ENUM_RECHECK_TIMEOUT_S", "1.5"))
 
 # Words a finished thought does not end on — dangling conjunctions,
 # postpositions and discourse connectors in the three call languages
@@ -563,6 +754,35 @@ DEAD_MEDIA_ENABLED = os.environ.get(
 # short enough to save the 53s of wasted spend.
 DEAD_MEDIA_S = float(os.environ.get("DEAD_MEDIA_S", "5.0"))
 
+# ── Mailbox beep as audio evidence (RUNBOOK §83) ─────────────────────────────
+# The audio-event classifier confirms a record cue (one frequency, 0.3-1.2 s,
+# then it stops — audio_events.BEEP_*). It ends the call ONLY on an outbound
+# leg where no PERSON has spoken yet (every caller line so far was a
+# machine's, or STT rendered none — a Tamil or Marathi greeting is rejected
+# as an unsupported script and never reaches the text gate) and only after
+# at least MACHINE_BEEP_MIN_SPEECH_MS of caller-side speech was heard before
+# it: a greeting played, then the tone. A beep after a human line is a sound
+# in their room. Telephony-only like the other close rules.
+MACHINE_BEEP_CLOSE_ENABLED = os.environ.get(
+    "MACHINE_BEEP_CLOSE_ENABLED",
+    "true" if TELEPHONY_MODE else "false").lower() == "true"
+MACHINE_BEEP_MIN_SPEECH_MS = float(
+    os.environ.get("MACHINE_BEEP_MIN_SPEECH_MS", "1500"))
+
+
+def _machine_holds_line(pipeline, now: float) -> bool:
+    """A call screener or hold announcement has the line (RUNBOOK §63):
+    silence is the machine ringing the person, not a caller who missed our
+    question — the dead-air repair and silence hangup stand down."""
+    fn = getattr(getattr(pipeline, "conversation", None),
+                 "awaiting_machine_handoff", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn(now))
+    except Exception:
+        return False
+
 
 class VoicePipeline:
     """
@@ -601,7 +821,8 @@ class VoicePipeline:
                                       "inbound") or "inbound",
                     event_hub=event_hub)
                 classifier = AudioEventClassifier(
-                    on_label=self._session.on_audio_label)
+                    on_label=self._session.on_audio_label,
+                    on_beep=self._session.on_beep)
                 vad = FsmnVadStack(
                     minimum_threshold=260.0 if TELEPHONY_MODE else 150.0,
                     minimum_rms_floor=60.0 if TELEPHONY_MODE else 50.0,
@@ -711,6 +932,7 @@ class VoicePipeline:
         self._utt_first_flush_ts: float = 0.0
         self._bargein_deferred: bool = False
         self._bargein_deferred_utt: int = -1
+        self._bargein_deferred_ts: float = 0.0
         # Continuation-merge state (see ENABLE_CONTINUATION_MERGE):
         # window during which resumed caller speech is a probable
         # continuation, timing anchors, and the per-chain merge counter.
@@ -718,6 +940,19 @@ class VoicePipeline:
         self._cur_speech_start_ts: float = 0.0
         self._turn_txn_speech_end: float = 0.0
         self._merge_chain_count: int = 0
+        # When the last reply started playing, and whether the caller let it
+        # finish. `_barge_in_occurred` is consumed by the TTS finally block,
+        # so it cannot answer "was the last reply cut?" one turn later —
+        # these two can, and the continuation gate needs that answer.
+        self._last_reply_tts_start: float = 0.0
+        self._last_reply_completed_clean: bool = False
+        # The agent line recorded for the reply currently in flight. Cleared
+        # the moment any of it reaches the wire; retracted if the reply is
+        # superseded first (see _retract_unheard_agent_line).
+        self._unheard_agent_line: str = ""
+        # How many times THIS caller has carried on through a pause we had
+        # already treated as the end of their turn. See TURN_SPLIT_MEMORY.
+        self._caller_split_turns: int = 0
         # Number of segments currently being transcribed (merge-window skip
         # signal: a follow-on transcript can only arrive if audio is queued,
         # in flight through STT, or the caller is speaking right now).
@@ -743,12 +978,34 @@ class VoicePipeline:
         # caller speech, consecutive reprompts without a real caller turn, and
         # when the last reprompt fired.
         self._last_voice_activity: float = 0.0
+        # ...and the last time the caller was actually HEARD: a segment that
+        # survived the admission gates and reached STT. _last_voice_activity
+        # is bumped by every raw VAD frame INCLUDING ones whose segment is
+        # then discarded, so on 2026-08-17 it read "caller is talking" for 14
+        # straight seconds while every word was being thrown away, and the
+        # dead-air reprompt never came due. Repair anchors on this one; the
+        # raw signal stays where it belongs (barge-in, echo, merge timing).
+        self._last_heard_activity: float = 0.0
+        # Connect onset trigger: once per call (see CONNECT_ONSET_TRIGGER).
+        self._connect_onset_fired: bool = False
+        # When the onset intro finished PLAYING (monotonic; 0 = none yet) and
+        # whether the last delivered reply was that intro. Speech that ends
+        # after this instant is the caller answering the intro, never the
+        # pickup hello it was spoken over (RUNBOOK §65).
+        self._onset_play_end_ts: float = 0.0
+        self._last_reply_was_onset: bool = False
         self._reprompt_count: int = 0
         self._last_reprompt_ts: float = 0.0
         # Call-termination watchdog state: one-shot latches for the silence
         # hangup (re-armed if the caller comes back) and the max-duration
         # close (never re-armed — it's a hard cap), plus the call-age anchor.
         self._silence_hangup_fired: bool = False
+        # §83: a machine has the line — the agent's audio was cut once (the
+        # abort is idempotent), caller-side speech heard so far on the call,
+        # and the last confirmed beep the watchdog already judged.
+        self._machine_abort_done: bool = False
+        self._speech_total_ms: float = 0.0
+        self._beep_consumed_mono: float = 0.0
         # Dead-media latch: when the caller channel flatlined, and whether the
         # close already fired. Re-arms if real audio comes back.
         self._dead_media_since: float = 0.0
@@ -764,12 +1021,15 @@ class VoicePipeline:
         # what MIN_REAL_SPEECH_MS gates on — see the constant for why the
         # padded number could never reject a segment.
         self._raw_speech_ms = 0.0
-        # Rolling per-segment energy split, for the SNR guard (see
-        # MIN_SPEECH_SNR). Speech frames vs the caller's own ambient.
-        self._speech_energy_sum = 0.0
-        self._speech_energy_n = 0
-        self._noise_energy_sum = 0.0
-        self._noise_energy_n = 0
+        # Rolling raw frame energy for the SNR guard (see MIN_SPEECH_SNR and
+        # SNR_AMBIENT_WINDOW_FRAMES). Label-free by design: every frame goes
+        # in, and both terms are derived from the window at flush time.
+        self._energy_window: deque[float] = deque(
+            maxlen=SNR_AMBIENT_WINDOW_FRAMES)
+        # Frames observed since the last segment boundary. Caps how far back
+        # the segment slice may reach, so a stale _speech_duration_ms can
+        # never pull in audio from before the previous flush.
+        self._frames_since_segment = 0
         self._prev_speech = False
         self._speech_frame_streak = 0
         # Tracks whether the previously-started TTS utterance was a filler, so
@@ -804,6 +1064,11 @@ class VoicePipeline:
         self._stt_queue_drops: int = 0
         # Segments the real-speech floor rejected — paid STT calls not made.
         self._segments_dropped_no_speech: int = 0
+        # Subset of the above dropped by the SNR arm while carrying real
+        # model-confirmed speech — the deafness signature, counted separately
+        # so the fleet rate is measurable instead of buried (2026-08-17).
+        self._segments_dropped_snr: int = 0
+        self._snr_drop_streak: int = 0
         # Tail of the previous fragment of the turn in progress, for the
         # endpointer's semantic profiles (see _endpoint_hint_text).
         self._last_fragment_text: str = ""
@@ -1010,10 +1275,10 @@ class VoicePipeline:
             logger.info(
                 "[AUDIO] Layer stopped: frames=%d vad_seen=%d vad_speech=%d "
                 "segments_created=%d segments_sent_to_stt=%d "
-                "dropped_no_real_speech=%d",
+                "dropped_no_real_speech=%d dropped_as_line_noise=%d",
                 self._frame_count, self._vad_frames_seen, self._vad_speech_frames,
                 self._segments_created, self._segments_sent_to_stt,
-                self._segments_dropped_no_speech,
+                self._segments_dropped_no_speech, self._segments_dropped_snr,
             )
 
     @property
@@ -1056,6 +1321,11 @@ class VoicePipeline:
 
         self._vad_frames_seen += 1
         raw_speech = self.vad.is_speech(frame)
+        # SNR guard bookkeeping — BEFORE every early return below (playback
+        # mute, echo cooldown), so the floor estimate sees the whole call and
+        # a segment that claimed shadow audio can still find its own frames.
+        self._energy_window.append(self.vad.last_energy)
+        self._frames_since_segment += 1
         if raw_speech:
             self._vad_speech_frames += 1
         self._user_speaking = bool(raw_speech) and not self._tts_playing
@@ -1143,6 +1413,7 @@ class VoicePipeline:
                     if not self._bargein_deferred:
                         self._bargein_deferred = True
                         self._bargein_deferred_utt = self._utt_seq
+                        self._bargein_deferred_ts = _defer_now
                         logger.info(
                             "[BARGE-IN] Deferred (delivery window) "
                             "frames=%d energy=%.0f played=%.2fs — "
@@ -1152,8 +1423,20 @@ class VoicePipeline:
                             max(0.0, _defer_now - self._utt_first_flush_ts)
                             if self._utt_first_flush_ts > 0.0 else 0.0,
                         )
-                    self._speech_frame_streak = 0
-                    return
+                    # RUNBOOK §78 (opt-in): the guard exists for a 300 ms
+                    # "hello?"; a caller still producing sustained speech
+                    # this long after the deferral latched is interrupting,
+                    # and the STT verdict may never come (call b5452b23:
+                    # 1.3 s of speech sat in the echo gate for 10 s, came
+                    # back empty, and the reply played over the caller).
+                    if not self._deferred_barge_override_due(_defer_now):
+                        self._speech_frame_streak = 0
+                        return
+                    logger.info(
+                        "[BARGE-IN] Deferred kill overridden — caller speech "
+                        "sustained %.0fms past the deferral",
+                        (_defer_now - self._bargein_deferred_ts) * 1000.0)
+                    self._bargein_deferred = False
 
                 logger.info(
                     "[BARGE-IN] Interrupting TTS "
@@ -1334,13 +1617,11 @@ class VoicePipeline:
             # suppresses `speech` for the first frame) and the hysteresis hold
             # (which keeps `speech` true through 200ms of trailing silence).
             self._raw_speech_ms += 20.0
-            self._speech_energy_sum += self.vad.last_energy
-            self._speech_energy_n += 1
+            self._speech_total_ms += 20.0
+            self._maybe_connect_onset()
         else:
             self._silence_frames += 1
             self._speech_onset_frames = 0
-            self._noise_energy_sum += self.vad.last_energy
-            self._noise_energy_n += 1
             # Look-back ring so onset clip is recoverable. Energy engine:
             # 2 frames (decision is instant). FSMN engine: 20 frames
             # (400ms) — the model confirms speech ~100-300ms after true
@@ -1473,19 +1754,26 @@ class VoicePipeline:
             # transcript the LLM then answers.
             _no_speech = self._raw_speech_ms < self._min_real_speech_ms(_now_gate)
             _snr = self._segment_snr()
-            # Fails open twice over: _segment_snr() returns None when too
-            # little ambient was measured to judge, and a segment carrying
-            # substantial speech is never judged on energy at all.
+            # Measured once: the ratio alone is what made the 2026-08-17
+            # inversion invisible in the log, so both terms travel with it.
+            _speech_e = _fmt_energy(self._segment_speech_energy())
+            _floor_e = _fmt_energy(self._ambient_energy())
+            # Fails open three times over: _segment_snr() returns None when
+            # there is too little to judge, a segment carrying substantial
+            # speech is never judged on energy at all, and neither is one
+            # that is loud in absolute terms.
             _dead_line = (
                 _snr is not None
                 and self._raw_speech_ms < SNR_ENFORCE_BELOW_MS
-                and _snr < MIN_SPEECH_SNR)
+                and _snr < MIN_SPEECH_SNR
+                and not self._segment_is_loud())
             if _too_short or _no_speech or _dead_line:
                 logger.info(
                     "[TURN] Discarded: padded=%.0fms real_speech=%.0fms "
-                    "snr=%s (floors %.0f/%.0f/%.1f) — %s",
+                    "snr=%s (speech=%s floor=%s) (floors %.0f/%.0f/%.1f) — %s",
                     self._speech_duration_ms, self._raw_speech_ms,
                     f"{_snr:.1f}x" if _snr is not None else "n/a",
+                    _speech_e, _floor_e,
                     self._min_speech_ms(_now_gate),
                     self._min_real_speech_ms(_now_gate), MIN_SPEECH_SNR,
                     "too short" if _too_short
@@ -1494,6 +1782,25 @@ class VoicePipeline:
                 )
                 if not _too_short:
                     self._segments_dropped_no_speech += 1
+                # A drop on the SNR arm carrying real model-confirmed speech
+                # is the 2026-08-17 deafness signature. One is ordinary line
+                # noise; a streak means the caller is talking and we are
+                # throwing it away — say so while the call is still live,
+                # instead of only in the end-of-session counter.
+                if _dead_line and not _too_short and not _no_speech:
+                    self._segments_dropped_snr += 1
+                    self._snr_drop_streak += 1
+                    if self._snr_drop_streak >= SNR_DROP_STREAK_WARN:
+                        logger.warning(
+                            "[TURN] %d consecutive segments dropped as line "
+                            "noise while carrying real speech (last: "
+                            "%.0fms real, snr=%.2fx, speech=%s floor=%s) — "
+                            "the caller may be inaudible to this call",
+                            self._snr_drop_streak, self._raw_speech_ms,
+                            _snr if _snr is not None else -1.0,
+                            _speech_e, _floor_e)
+                else:
+                    self._snr_drop_streak = 0
                 self._audio_buffer.clear()
                 self._speech_duration_ms = 0.0
                 self._raw_speech_ms = 0.0
@@ -1506,27 +1813,49 @@ class VoicePipeline:
             _now_flush = time.monotonic()
             _speech_end_ts = _now_flush - self._silence_frames * 0.02
             # A span must be consistent with the audio it labels. When the
-            # anchor is missing or the arithmetic disagrees with the buffered
-            # duration by more than a second, emit no span rather than a
-            # wrong one — a corpus row with a bad span is worse than a
+            # ONSET anchor is missing or the arithmetic disagrees with the
+            # buffered duration by more than a second, that anchor is not
+            # corpus-grade — a corpus row with a bad span is worse than a
             # corpus row with none.
+            #
+            # But only the ONSET is ever in doubt. `_speech_end_ts` is derived
+            # from the flush moment minus the counted silence, so it is sound
+            # whatever the onset did, and zeroing it too is what broke the
+            # anti-double-reply machinery: every continuation gate
+            # (`_turn_txn_speech_end`, the CONT-MERGE gap, stale-fragment
+            # suppression) requires a non-zero span, and the callers who
+            # trigger the gate — the ones who pause inside a segment, so
+            # wall-clock ≫ counted speech — are exactly the callers those
+            # gates exist for. One dropped span also POISONED the next turns:
+            # `_turn_txn_speech_end` kept a stale value, so the following
+            # utterance measured a ~10s gap and was answered separately.
+            # Live 2026-09-09 05:43:21 — 5.70s measured vs 0.86s buffered,
+            # then two full pitches back to back.
+            #
+            # So: keep the end, and reconstruct the onset as the tightest
+            # honest lower bound (end − buffered speech). Flag it so the
+            # corpus keeps publishing nothing rather than a guess.
+            _span_estimated = False
             if self._cur_speech_start_ts <= 0.0 or abs(
                     (_speech_end_ts - self._cur_speech_start_ts) * 1000.0
                     - self._speech_duration_ms) > 1000.0:
                 if self._cur_speech_start_ts > 0.0:
                     logger.warning(
-                        "[VAD] Dropping implausible speech span "
-                        "(%.2fs measured vs %.2fs buffered)",
+                        "[VAD] Implausible speech span "
+                        "(%.2fs measured vs %.2fs buffered) — onset "
+                        "reconstructed for turn-taking, withheld from corpus",
                         _speech_end_ts - self._cur_speech_start_ts,
                         self._speech_duration_ms / 1000.0)
-                self._cur_speech_start_ts = 0.0
-                _speech_end_ts = 0.0
+                self._cur_speech_start_ts = max(
+                    0.0, _speech_end_ts - self._speech_duration_ms / 1000.0)
+                _span_estimated = True
             segment = AudioSegment(
                 audio=bytes(self._audio_buffer),
                 duration_ms=self._speech_duration_ms,
                 timestamp=_now_flush,
                 speech_start_ts=self._cur_speech_start_ts,
                 speech_end_ts=_speech_end_ts,
+                span_estimated=_span_estimated,
                 shadow=self._segment_has_shadow,
             )
             self._segment_has_shadow = False
@@ -1537,12 +1866,22 @@ class VoicePipeline:
             # past the caller's speech end, resumed speech is treated as a
             # probable continuation (relaxed hearing above; merge decision in
             # the conversation layer).
+            #
+            # NOT widened for splitter callers, deliberately. Inside this
+            # window the barge-in bar drops to ~1.3x the VAD floor and the
+            # sustained-speech requirement halves, so stretching it to 6s
+            # would give the agent's OWN echo three times as long to cancel
+            # its own reply. Measured 2026-09-16: barge-in fired on all 9
+            # real interruptions across today's calls — the caller resuming
+            # is heard. What was broken is the agent STARTING during the
+            # pause, which the merge hold above now prevents.
             if ENABLE_CONTINUATION_MERGE:
                 self._continuation_likely_until = (
                     _speech_end_ts + CONTINUATION_WINDOW_MS / 1000.0
                 )
 
             _real_ms = self._raw_speech_ms
+            segment.speech_ms = float(_real_ms or 0.0)
             self._audio_buffer.clear()
             self._speech_duration_ms = 0.0
             self._raw_speech_ms = 0.0
@@ -1553,6 +1892,8 @@ class VoicePipeline:
             try:
                 self._stt_queue.put_nowait(segment)
                 self._segments_sent_to_stt += 1
+                self._last_heard_activity = time.monotonic()
+                self._snr_drop_streak = 0
 
                 logger.info(
                     "[TURN] Enqueued audio segment (%.0fms, %.0fms real speech "
@@ -1678,19 +2019,104 @@ class VoicePipeline:
         import re as _re
 
         def _toks(s: str) -> set:
-            return {t for t in _re.sub(r"[^\w\s]", " ", (s or "").lower())
-                    .split() if len(t) > 1}
+            # Split on whitespace + punctuation, NOT on \W: Python's \w does
+            # not cover Devanagari/Gujarati vowel signs, so "कौन" was shredded
+            # into "क"/"न" and dropped — Hindi overlap was measured on
+            # consonant fragments (§70).
+            return {t for t in _re.sub(r"[.,!?;:।॥\"'“”‘’()\[\]—–\-…]", " ",
+                                       (s or "").lower()).split()
+                    if len(t) > 1}
 
         spoken = _toks(text)
         if len(spoken) < 2:
             return False
+        # §70 (call 1033): "कौन बात कर रहे हैं?" shares 4 of 5 words with the
+        # agent's "…कहाँ से बात कर रहे हैं?" and was discarded as echo — the
+        # caller's question was never heard. An echo reproduces the agent's
+        # words; a caller adds their own. Short transcripts must be covered
+        # COMPLETELY (one word the agent never said = the caller said it);
+        # longer ones keep the ratio.
+        allowed_missing = (0 if len(spoken) <= 6
+                           else int(len(spoken) * (1.0 - SHADOW_ECHO_TEXT_RATIO)))
         for agent_text in (self._current_tts_text, self._prev_tts_text):
             agent = _toks(agent_text)
             if not agent:
                 continue
-            overlap = len(spoken & agent) / len(spoken)
-            if overlap >= SHADOW_ECHO_TEXT_RATIO:
+            if len(spoken - agent) <= allowed_missing:
                 return True
+        return False
+
+    @staticmethod
+    def _turn_end_anchor(transcript: "Transcript") -> float:
+        """When this turn's caller speech ended — the anchor every later
+        continuation gap is measured against.
+
+        Falls back to *now* when the segment carries no end timestamp. Keeping
+        the PREVIOUS turn's value there is the one option that must never
+        happen: the next utterance would then measure its gap against speech
+        that ended turns ago, read as a brand-new turn, and be answered
+        separately. That is how one dropped span turned into two full replies
+        in a row (2026-09-09 05:43). The caller fell silent a moment before
+        this transcript reached us, so *now* is far closer to the truth than a
+        stale anchor, and never further from it.
+        """
+        if transcript.speech_end_ts > 0.0:
+            return transcript.speech_end_ts
+        return time.monotonic()
+
+    def _retract_unheard_agent_line(self, reason: str) -> None:
+        """Take back the agent line for a reply the caller never heard.
+
+        The engine records an agent utterance the moment generation finishes.
+        A continuation merge can cut that reply microseconds later — the
+        caller was still speaking, nothing was ever injected into the channel
+        — and the merged reply is what they actually hear. Both lines used to
+        land on the transcript, so a call where the agent asked ONE question
+        read back as it asking six (live 2026-09-16, call 849: the caller's
+        whole self-introduction went uninterrupted, and the audit showed five
+        cancelled "what is your current location?" lines that no one heard).
+
+        Callers must check `_reply_still_inaudible()` BEFORE the cut mutates
+        playback state; this only performs the retraction.
+        """
+        line, self._unheard_agent_line = self._unheard_agent_line, ""
+        if not line or self._hub is None:
+            return
+        logger.info("[ENGINE] Retracting unheard agent line (%s): %r",
+                    reason, line[:60])
+        self._hub.emit_nowait({"type": "agent_retract", "text": line})
+
+    def _reply_still_inaudible(self) -> bool:
+        """True while the reply to the pending turn cannot have been heard.
+
+        A reply that is still generating, still queued for TTS, or playing
+        with nothing yet written to the playback clock has reached no ear —
+        cutting it costs the caller nothing.
+
+        This is what separates a CONTINUATION from a genuine new turn without
+        any arithmetic on timestamps. The gap windows exist to tell "the
+        caller resumed their own sentence" from "the caller is answering the
+        line we just spoke"; while nothing has been spoken there is no line
+        to answer, so the second reading is impossible and the gap does not
+        need to be trusted. Precisely the case the old gate got wrong: a
+        segment whose span was dropped measured a ~10s gap against a stale
+        anchor and was answered separately, and the caller heard two full
+        pitches back to back (2026-09-09 05:43).
+        """
+        if (self._current_generation_task is not None
+                and not self._current_generation_task.done()):
+            return True
+        if not self._tts_queue.empty():
+            return True
+        if self._tts_playing:
+            # Telephony: audio is audible only once the sink has written it
+            # to the playback clock. CLI (LocalSpeakerSink) exposes no such
+            # clock — there, "playing" is the best evidence we have and a
+            # playing reply counts as heard.
+            busy_until = getattr(self.sink, "playback_busy_until", None)
+            if busy_until is None:
+                return False
+            return busy_until <= time.monotonic()
         return False
 
     def _maybe_commit_pending_turn(self) -> None:
@@ -1996,6 +2422,7 @@ class VoicePipeline:
                     raise
                 transcript_text = stt_result.text
                 stt_latency = (time.monotonic() - latency_start) * 1000
+                _retx_entry = self._retx_remember(segment, transcript_text)
 
                 # Update conversation language from Sarvam's native detection
                 # result. Guarded by default (LANG_MIRROR_GUARDED): the write
@@ -2014,6 +2441,13 @@ class VoicePipeline:
                 ):
                     _bcp47_to_short = {"en-IN": "en", "hi-IN": "hi", "gu-IN": "gu"}
                     short = _bcp47_to_short.get(stt_result.detected_language)
+                    # RUNBOOK §73: the mirror is bounded by the agent's own
+                    # languages exactly like every conversation-side switch.
+                    if short and hasattr(self.conversation, "language_allowed") \
+                            and not self.conversation.language_allowed(short):
+                        logger.info("[STT] Language mirror %s refused — agent "
+                                    "does not speak it", short)
+                        short = None
                     if short:
                         if LANG_MIRROR_GUARDED:
                             _pending_mirror = short
@@ -2087,7 +2521,7 @@ class VoicePipeline:
                     #   2. _greeting_done     — greeting has finished playing
                     #   3. not _tts_playing   — agent is not currently speaking
                     #   4. _vad_mute_until elapsed — not inside echo-cooldown window
-                    if segment.duration_ms >= _STT_FALLBACK_MIN_SPEECH_MS:
+                    if self._segment_speech_ms(segment) >= _STT_FALLBACK_MIN_SPEECH_MS:
                         if not self._greeting_done:
                             logger.info(
                                 "[STT] Skipping fallback — greeting not yet complete "
@@ -2154,7 +2588,7 @@ class VoicePipeline:
                                     self._stt_consecutive_fallbacks, _MAX_STT_FALLBACKS,
                                 )
                             else:
-                                fallback = _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
+                                fallback = self._stt_fallback_phrase(lang)
                                 logger.info(
                                     "[STT] Unrecognized speech (%.0fms, lang=%s, attempt %d/%d) — queuing fallback",
                                     segment.duration_ms, lang,
@@ -2192,6 +2626,15 @@ class VoicePipeline:
                 # A3 (2026-07-30): recovered transcripts (script-retry /
                 # Whisper) are mishear-prone — a Whisper ", angie?" for
                 # "हाँजी?" must never flip the conversation language.
+                # A machine's voice (call screener, voicemail, network
+                # announcement — RUNBOOK §63) says nothing about the language
+                # of the person we called: an iPhone screener pinned a Hindi
+                # call to English before the customer said a word.
+                _machine_kind = _machine_line.classify(transcript_text)
+                if _machine_kind and _pending_mirror:
+                    logger.info("[STT] Language mirror skipped (%s line)",
+                                _machine_kind)
+                    _pending_mirror = None
                 if getattr(stt_result, "source", "primary") != "primary":
                     if _pending_mirror:
                         logger.info(
@@ -2228,9 +2671,12 @@ class VoicePipeline:
                         "[SHADOW] [ECHO-TEXT] Discarding transcript that "
                         "matches the agent's own speech: %r",
                         transcript_text[:60])
+                    if _retx_entry is not None:
+                        _retx_entry["echo"] = True
                     continue
 
-                self._update_stt_lang_pin()
+                if not _machine_kind:
+                    self._update_stt_lang_pin()
 
                 if self._hub is not None:
                     self._hub.emit_nowait({
@@ -2241,8 +2687,14 @@ class VoicePipeline:
                         # converts to recording-relative time so the audit
                         # transcript self-documents each turn's audio span
                         # (corpus cutting + ASR-bench alignment).
-                        "speech_start_mono": segment.speech_start_ts,
-                        "speech_end_mono": segment.speech_end_ts,
+                        # Reconstructed onsets are for turn-taking only —
+                        # the corpus gets 0.0 rather than a guess.
+                        "speech_start_mono": (
+                            0.0 if segment.span_estimated
+                            else segment.speech_start_ts),
+                        "speech_end_mono": (
+                            0.0 if segment.span_estimated
+                            else segment.speech_end_ts),
                     })
 
                 transcript = Transcript(
@@ -2252,6 +2704,7 @@ class VoicePipeline:
                     stt_latency_ms=stt_latency,
                     speech_start_ts=segment.speech_start_ts,
                     speech_end_ts=segment.speech_end_ts,
+                    span_estimated=segment.span_estimated,
                     confidence=getattr(stt_result, "confidence", None),
                     stt_source=getattr(stt_result, "source", "primary"),
                 )
@@ -2278,6 +2731,241 @@ class VoicePipeline:
     # Layer 3: Conversation Engine
     # -----------------------------------------------------------------------
 
+    # ── Whole-turn re-transcription (§69) ───────────────────────────────
+    def _retx_remember(self, segment, text: str):
+        """Keep this segment's audio for the turn-level pass. Returns the
+        entry so a later guard can mark it (echo)."""
+        if not TURN_RETRANSCRIBE:
+            return None
+        try:
+            buf = self.__dict__.setdefault("_retx_segments", deque(maxlen=48))
+            seq = self.__dict__.get("_retx_seq", 0) + 1
+            self._retx_seq = seq
+            end = segment.speech_end_ts or segment.timestamp
+            start = segment.speech_start_ts or (end - segment.duration_ms / 1000.0)
+            entry = {"seq": seq, "start": start, "end": end,
+                     "audio": segment.audio, "text": (text or "").strip(),
+                     "shadow": bool(segment.shadow), "echo": False,
+                     # Did this audio start while (or just after) our own
+                     # voice was on the wire? playback_busy_until is the real
+                     # end of playback on a phone line; _last_tts_end is only
+                     # when synthesis finished.
+                     # Entirely inside our own playback (+0.3 s tail): an
+                     # EMPTY piece like that is far more likely our echo.
+                     "over_agent": end <= max(
+                         self._last_tts_end,
+                         float(getattr(self.sink, "playback_busy_until", 0.0)
+                               or 0.0)) + 0.3,
+                     "ms": float(segment.duration_ms)}
+            buf.append(entry)
+            return entry
+        except Exception:
+            logger.debug("[STT-TURN] remember failed", exc_info=True)
+            return None
+
+    def _retx_pieces(self, transcript) -> list:
+        """The caller-audio pieces that make up `transcript`'s turn."""
+        buf = self.__dict__.get("_retx_segments") or ()
+        floor = self.__dict__.get("_retx_floor", 0.0)
+        end = transcript.speech_end_ts or transcript.timestamp
+        lo = max(floor, end - TURN_RETRANSCRIBE_LOOKBACK_S)
+        out = []
+        for e in buf:
+            # Every piece that came back BEFORE this turn is committed belongs
+            # to it — including trailing pieces the merge window waited for
+            # and Sarvam returned empty (§70, call 1033: "हाँ" + a "Vapi में"
+            # that came back empty after it, then dropped).
+            if e["echo"] or e["end"] <= lo:
+                continue
+            if not e["text"] and (e["shadow"] or e["over_agent"]):
+                # An EMPTY piece over or just after our own playback is far
+                # more likely our echo than the caller — never join it.
+                continue
+            out.append(e)
+        # Newest pieces win the length budget.
+        total, keep = 0.0, []
+        for e in reversed(out):
+            total += e["ms"] / 1000.0
+            if total > TURN_RETRANSCRIBE_MAX_S:
+                break
+            keep.append(e)
+        return list(reversed(keep))
+
+    def _retx_language(self) -> tuple:
+        conv_lang = None
+        if self.conversation is not None:
+            conv_lang = getattr(getattr(self.conversation, "state", None),
+                                "language", None) or None
+        lang = self._stt_lang_pin or "unknown"
+        return lang, conv_lang
+
+    def _retx_start(self, pieces: list):
+        key = tuple(e["seq"] for e in pieces)
+        tasks = self.__dict__.setdefault("_retx_tasks", {})
+        if key in tasks:
+            return tasks[key]
+        gap = np.zeros(int(SAMPLE_RATE * 0.12), dtype=np.int16).tobytes()
+        audio = gap.join(e["audio"] for e in pieces)
+        lang, conv_lang = self._retx_language()
+        kw = {}
+        if self._stt_accepts_hint:
+            kw["fallback_hint"] = ""
+        task = asyncio.create_task(self.stt.transcribe(
+            audio, sample_rate=SAMPLE_RATE, language=lang,
+            default_language=conv_lang, **kw))
+        tasks[key] = task
+        # Bounded: only the last few speculative passes are worth keeping.
+        if len(tasks) > 6:
+            for k in list(tasks)[:-6]:
+                t = tasks.pop(k)
+                if not t.done():
+                    t.cancel()
+        return task
+
+    def _retx_prefetch(self, transcript) -> None:
+        """Start the joined-audio pass speculatively (merge window open)."""
+        if not TURN_RETRANSCRIBE:
+            return
+        try:
+            pieces = self._retx_pieces(transcript)
+            if len(pieces) >= 2:
+                self._retx_start(pieces)
+        except Exception:
+            logger.debug("[STT-TURN] prefetch failed", exc_info=True)
+
+    async def _enum_recheck(self, transcript):
+        """RUNBOOK §81 — one re-transcription of this turn's audio without
+        the agent's STT language lock, when the router says the turn answers
+        an enum question and names none of its values. The re-read replaces
+        the text only if IT names a value; everything else keeps the
+        original. Opt-in per agent (`languages.stt_enum_recheck`)."""
+        conv = self.conversation
+        fn = getattr(conv, "stt_recheck_slot", None) if conv else None
+        if fn is None:
+            return transcript
+        slot = fn(transcript.text)
+        if not slot:
+            return transcript
+        pieces = self._retx_pieces(transcript)
+        if not pieces:
+            return transcript
+        gap = np.zeros(int(SAMPLE_RATE * 0.12), dtype=np.int16).tobytes()
+        audio = gap.join(e["audio"] for e in pieces)
+        kw = {"fallback_hint": ""} if self._stt_accepts_hint else {}
+        t0 = time.monotonic()
+        try:
+            res = await asyncio.wait_for(
+                self.stt.transcribe(audio, sample_rate=SAMPLE_RATE,
+                                    language="unknown",
+                                    default_language=None, **kw),
+                timeout=ENUM_RECHECK_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.info("[STT-RECHECK] %s: re-read not back in %.1fs — "
+                        "keeping %r", slot, ENUM_RECHECK_TIMEOUT_S,
+                        transcript.text[:40])
+            return transcript
+        new = (getattr(res, "text", "") or "").strip()
+        waited = (time.monotonic() - t0) * 1000.0
+        old = transcript.text.strip()
+        if not new or new == old or not conv.stt_recheck_accepts(slot, new):
+            logger.info("[STT-RECHECK] %s: %r re-read as %r in +%.0fms — "
+                        "no value, keeping it", slot, old[:40], new[:40],
+                        waited)
+            return transcript
+        logger.info("[STT-RECHECK] %s: %r → %r (+%.0fms, no language lock)",
+                    slot, old[:40], new[:60], waited)
+        hub = getattr(self, "_hub", None)
+        if hub is not None:
+            starts = [e["start"] for e in pieces if e["start"]]
+            hub.emit_nowait({
+                "type": "user_retranscribed",
+                "pieces": [old],
+                "text": new,
+                "speech_start_mono": min(starts) if starts else 0.0,
+                "speech_end_mono": float(transcript.speech_end_ts or 0.0),
+            })
+        return dataclasses.replace(transcript, text=new)
+
+    async def _retx_apply(self, transcript):
+        """Replace a multi-piece turn's glued text with ONE transcription of
+        its joined audio. Single-piece turns and bare hellos pass through."""
+        end = transcript.speech_end_ts or transcript.timestamp
+        try:
+            pieces = self._retx_pieces(transcript)
+            if len(pieces) < 2 or self._bare_hello(transcript.text):
+                return transcript
+            t0 = time.monotonic()
+            task = self._retx_start(pieces)
+            try:
+                res = await asyncio.wait_for(asyncio.shield(task),
+                                             timeout=TURN_RETRANSCRIBE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.info("[STT-TURN] joined pass not back in %.1fs — using "
+                            "the fragment text", TURN_RETRANSCRIBE_TIMEOUT_S)
+                return transcript
+            new = (getattr(res, "text", "") or "").strip()
+            old = transcript.text.strip()
+            waited = (time.monotonic() - t0) * 1000.0
+            if not new:
+                logger.info("[STT-TURN] joined pass empty — keeping %r", old[:60])
+                return transcript
+            if (len(old.split()) >= 4
+                    and len(new.split()) < 0.4 * len(old.split())):
+                logger.info("[STT-TURN] joined pass much shorter (%r vs %r) "
+                            "— keeping the fragments", new[:40], old[:40])
+                return transcript
+            try:
+                if self._is_agent_echo_text(new):
+                    logger.info("[STT-TURN] joined pass reads as our own "
+                                "speech — keeping %r", old[:60])
+                    return transcript
+            except Exception:
+                pass
+            starts = [e["start"] for e in pieces if e["start"]]
+            if new != old:
+                logger.info(
+                    "[STT-TURN] %d pieces (%d empty) re-transcribed whole in "
+                    "+%.0fms: %r → %r", len(pieces),
+                    sum(1 for e in pieces if not e["text"]), waited,
+                    old[:60], new[:80])
+                # The audit transcript holds the pieces as they were heard
+                # one by one; the engine acts on THIS text. The owner read
+                # "…परिष्टों में इंटरेस्ट है।" on call b5452b23 and concluded
+                # "4 BHK" was never heard — the joined pass had it.
+                hub = getattr(self, "_hub", None)
+                if hub is not None:
+                    hub.emit_nowait({
+                        "type": "user_retranscribed",
+                        "pieces": [e["text"] for e in pieces if e["text"]],
+                        "text": new,
+                        "speech_start_mono": min(starts) if starts else 0.0,
+                        "speech_end_mono": float(transcript.speech_end_ts
+                                                 or 0.0),
+                    })
+            return Transcript(
+                text=new,
+                duration_ms=sum(e["ms"] for e in pieces),
+                timestamp=transcript.timestamp,
+                stt_latency_ms=transcript.stt_latency_ms,
+                speech_start_ts=(min(starts) if starts
+                                 else transcript.speech_start_ts),
+                speech_end_ts=transcript.speech_end_ts,
+                span_estimated=transcript.span_estimated,
+                confidence=getattr(res, "confidence", None),
+                stt_source=getattr(res, "source", "primary"),
+            )
+        finally:
+            self._retx_close_window(transcript)
+
+    def _retx_close_window(self, transcript) -> None:
+        """This turn's pieces are spent: the next turn's window starts after
+        them, and speculative passes over them are dropped."""
+        end = transcript.speech_end_ts or transcript.timestamp
+        _ends = [e["end"] for e in (self.__dict__.get("_retx_segments") or ())]
+        self._retx_floor = max(self.__dict__.get("_retx_floor", 0.0), end,
+                               max(_ends) if _ends else 0.0)
+        self.__dict__.get("_retx_tasks", {}).clear()
+
     def _pipeline_quiet(self, now: float) -> bool:
         """Shared precondition for every dead-air decision: the agent has
         spoken, nothing is playing or in flight anywhere in the pipeline,
@@ -2297,10 +2985,16 @@ class VoicePipeline:
 
     def _silence_anchor(self) -> float:
         """Timestamp of the last activity in either direction — silence is
-        measured from here."""
+        measured from here.
+
+        Uses _last_heard_activity, NOT _last_voice_activity: audio we
+        discarded is not activity, it is the failure this watchdog exists to
+        repair. Speech genuinely in progress still cannot trip a reprompt —
+        _pipeline_quiet() gates on _prev_speech / _user_speaking / in-flight
+        STT independently of this anchor."""
         busy_until = getattr(self.sink, 'playback_busy_until', 0.0)
         return max(self._tts_end_time, busy_until,
-                   self._last_voice_activity, self._last_reprompt_ts)
+                   self._last_heard_activity, self._last_reprompt_ts)
 
     def _termination_cfg(self) -> dict:
         """The active agent's call_flow.termination ({} when absent — e.g.
@@ -2322,6 +3016,99 @@ class VoicePipeline:
             except Exception:
                 return {}
         return {}
+
+    # ── Per-agent turn-taking (call_flow.turn_taking, RUNBOOK §78) ─────────
+
+    def _tt_cfg(self) -> dict:
+        """The active agent's call_flow.turn_taking ({} when absent)."""
+        fn = getattr(self.conversation, "_turn_taking_cfg", None)
+        if callable(fn):
+            try:
+                return fn() or {}
+            except Exception:
+                return {}
+        return {}
+
+    def _tt_num(self, key: str, default: float = 0.0) -> float:
+        try:
+            return float(self._tt_cfg().get(key, default) or 0.0)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _tt_flag(self, key: str) -> bool:
+        return bool(self._tt_cfg().get(key, False))
+
+    def _pause_hold_s(self) -> float:
+        """How long a mid-thought pause is held: the platform hold, or the
+        agent's own `pause_hold_ms` when that is longer."""
+        return max(TURN_CONTINUATION_HOLD_MS,
+                   self._tt_num("pause_hold_ms")) / 1000.0
+
+    def _agent_audio_remaining(self, at_ts: float) -> float:
+        """Seconds of OUR audio still to play at `at_ts` — the sink's playback
+        clock, which outlives `_tts_playing` (synthesis finishes long before
+        FreeSWITCH has played the WAVs; a 25 s pitch reads "tts done" at
+        5 s)."""
+        busy = getattr(self.sink, "playback_busy_until", None)
+        if not busy:
+            return 0.0
+        return float(busy) - float(at_ts)
+
+    def _bare_ack(self, text: str) -> bool:
+        """Delegate to the router's bare-acknowledgement check."""
+        fn = getattr(self.conversation, "_is_bare_ack_text", None)
+        if callable(fn):
+            try:
+                return bool(fn(text))
+            except Exception:
+                return False
+        return False
+
+    def _is_backchannel(self, transcript: "Transcript") -> bool:
+        """A bare acknowledgement the caller spoke while our line still had
+        BACKCHANNEL_MIN_REMAINING_S of audio to go — a listener's "हाँ", not
+        a turn (opt-in: call_flow.turn_taking.backchannel_guard)."""
+        if not self._tt_flag("backchannel_guard"):
+            return False
+        start = float(getattr(transcript, "speech_start_ts", 0.0) or 0.0)
+        if start <= 0.0 or not self._bare_ack(transcript.text):
+            return False
+        if start < float(getattr(self, "_last_reply_tts_start", 0.0) or 0.0):
+            return False
+        return self._agent_audio_remaining(start) >= BACKCHANNEL_MIN_REMAINING_S
+
+    def _deferred_barge_override_due(self, now: float) -> bool:
+        """A deferred barge-in (delivery guard) is carried out once the
+        caller has kept speaking `sustained_barge_ms` past the deferral
+        (opt-in; 0 = never, today's behaviour)."""
+        sustain_s = self._tt_num("sustained_barge_ms") / 1000.0
+        return sustain_s > 0.0 and (now - self._bargein_deferred_ts) >= sustain_s
+
+    def _tail_cut_due(self, transcript: "Transcript") -> bool:
+        """Real caller speech while our audio is still playing after
+        synthesis ended (opt-in: call_flow.turn_taking.tail_barge_in)."""
+        if not self._tt_flag("tail_barge_in") or self._tts_playing:
+            return False
+        if self._bare_ack(transcript.text) or self._bare_hello(transcript.text):
+            return False
+        # A pickup greeting over the identity line is not an interruption
+        # (call 64629614: "हेलो नमस्ते" cut the onset intro at 2.4 s left).
+        if (self._greeting_only(transcript.text)
+                or getattr(self, "_last_reply_was_onset", False)
+                or time.monotonic() - self._call_start_ts < CONNECT_WINDOW_S):
+            return False
+        return (self._agent_audio_remaining(time.monotonic())
+                >= TAIL_CUT_MIN_REMAINING_S)
+
+    def _greeting_only(self, text: str) -> bool:
+        """Delegate to the router's greeting-only check (hello, namaste…)."""
+        fn = getattr(self.conversation, "_is_greeting_only_text", None)
+        if callable(fn):
+            try:
+                return bool(fn(text))
+            except Exception:
+                return False
+        return False
 
     def _bare_hello(self, text: str) -> bool:
         """Delegate to the router's script-aware bare-hello check."""
@@ -2374,27 +3161,70 @@ class VoicePipeline:
             return False  # a close is already draining
         return True
 
-    def _segment_snr(self) -> float | None:
-        """Mean energy of the segment's speech frames over the caller's own
-        ambient. None when too little ambient was measured to judge — the
-        caller then always gets the benefit of the doubt."""
-        if (self._noise_energy_n < SNR_MIN_NOISE_FRAMES
-                or self._speech_energy_n <= 0):
+    def _segment_speech_energy(self) -> float | None:
+        """Loudest SNR_SPEECH_TOP_FRAMES frames of the current segment,
+        averaged. None when the segment holds no frames yet.
+
+        The slice is the most recent `_speech_duration_ms / 20` entries of the
+        energy window: `_speech_duration_ms` advances by exactly 20ms for
+        every frame appended to `_audio_buffer` (pre-speech ring, live speech
+        frames and any claimed shadow alike), so that count IS the segment's
+        frame count. `_frames_since_segment` caps it so a stale duration can
+        never reach back past the previous flush."""
+        n = min(int(self._speech_duration_ms / 20.0),
+                self._frames_since_segment, len(self._energy_window))
+        if n <= 0:
             return None
-        noise = self._noise_energy_sum / self._noise_energy_n
-        speech = self._speech_energy_sum / self._speech_energy_n
+        seg = list(self._energy_window)[-n:]
+        seg.sort(reverse=True)
+        top = seg[:max(1, SNR_SPEECH_TOP_FRAMES)]
+        return sum(top) / len(top)
+
+    def _ambient_energy(self) -> float | None:
+        """The caller's line floor: a low percentile of recent frame energy.
+
+        Deliberately label-free — see SNR_AMBIENT_WINDOW_FRAMES for why the
+        old "frames the model didn't call speech" definition inverted the
+        guard. A percentile is immune to the speech it is measured against
+        because speech is a small fraction of a multi-second window."""
+        if len(self._energy_window) < SNR_MIN_NOISE_FRAMES:
+            return None
+        vals = sorted(self._energy_window)
+        idx = int(len(vals) * SNR_AMBIENT_PCTL / 100.0)
+        return vals[min(idx, len(vals) - 1)]
+
+    def _segment_snr(self) -> float | None:
+        """Segment speech energy over the caller's own line floor. None when
+        there is not enough to judge — the caller then always gets the
+        benefit of the doubt."""
+        speech = self._segment_speech_energy()
+        noise = self._ambient_energy()
+        if speech is None or noise is None:
+            return None
         if noise <= 0.0:
-            # Digitally silent ambient: any real speech is infinitely above it,
-            # but so is a stuck-at-1 dead line — fall back to "is there
-            # anything at all here", the one place an absolute is unavoidable.
+            # Digitally silent floor (a DTX line between bursts): any real
+            # speech is infinitely above it, but so is a stuck-at-1 dead
+            # line — fall back to "is there anything at all here", the one
+            # place an absolute is unavoidable.
             return float("inf") if speech >= 2.0 else 0.0
         return speech / noise
 
+    def _segment_is_loud(self) -> bool:
+        """Absolute backstop: this much energy is somebody talking, whatever
+        the floor estimate says. Guards against a poisoned or pathological
+        floor silently deafening the call (see SNR_LOUD_EXEMPT_FACTOR)."""
+        if SNR_LOUD_EXEMPT_FACTOR <= 0.0:
+            return False
+        speech = self._segment_speech_energy()
+        if speech is None:
+            return False
+        return speech >= self.vad.barge_in_threshold * SNR_LOUD_EXEMPT_FACTOR
+
     def _reset_segment_energy(self) -> None:
-        self._speech_energy_sum = 0.0
-        self._speech_energy_n = 0
-        self._noise_energy_sum = 0.0
-        self._noise_energy_n = 0
+        """Close the current segment's slice of the energy window. The window
+        itself is rolling and call-level — resetting the FLOOR estimate per
+        segment is what let a single burst dominate it."""
+        self._frames_since_segment = 0
 
     def _min_real_speech_ms(self, now: float) -> float:
         """Model-confirmed speech a segment must carry to be worth a paid STT
@@ -2402,6 +3232,70 @@ class VoicePipeline:
         if now - self._call_start_ts < CONNECT_WINDOW_S:
             return min(CONNECT_MIN_REAL_SPEECH_MS, MIN_REAL_SPEECH_MS)
         return MIN_REAL_SPEECH_MS
+
+    def _note_caller_split(self, why: str) -> None:
+        """Record that the caller carried on through a pause we had closed.
+
+        Read by `_pause_may_continue`: the FIRST split is the evidence that
+        this caller speaks in fragments, and from then on their pauses get
+        the benefit of the doubt for the rest of the call.
+        """
+        if not TURN_SPLIT_MEMORY:
+            return
+        # The pickup is not evidence of how this caller speaks (RUNBOOK §65):
+        # a "hello" spoken over the connect intro followed by "हाँ जी" is two
+        # answers to two lines, not one sentence with a pause. Counting it
+        # armed a 900ms hold on every later turn of 20/46 Ravi calls.
+        if self._in_pickup_phase():
+            logger.info("[TURN-TAKING] split during pickup ignored (%s)", why)
+            return
+        self._caller_split_turns += 1
+        if self._caller_split_turns == 1:
+            logger.info(
+                "[TURN-TAKING] caller resumed through a pause (%s) — their "
+                "pauses now get a %.0fms hold for the rest of this call",
+                why, TURN_CONTINUATION_HOLD_MS)
+
+    def _in_pickup_phase(self) -> bool:
+        """Before the caller's first real turn, inside the connect window."""
+        if time.monotonic() - self._call_start_ts >= CONNECT_WINDOW_S:
+            return False
+        state = getattr(self.conversation, "state", None)
+        return int(getattr(state, "turn_count", 1) or 0) == 0
+
+    def _onset_reaction(self, transcript: "Transcript") -> bool:
+        """Did this speech run on past the end of the onset intro — i.e. is
+        it (at least partly) the caller answering it?
+
+        End, not start: the pipeline merges a pickup "hello" with the "जी हां"
+        that follows it (call 994), and the merged transcript keeps the
+        hello's onset. The pickup hello itself ends while the intro is still
+        playing — it began 140ms before it."""
+        if self._onset_play_end_ts <= 0.0:
+            return False
+        end = float(getattr(transcript, "speech_end_ts", 0.0) or 0.0)
+        return end > self._onset_play_end_ts + ONSET_REACTION_GRACE_S
+
+    def _pause_may_continue(self, transcript: "Transcript") -> str:
+        """Why this pause is probably mid-thought — "" when it is not.
+
+        Consulted before the idle fast-path concludes a turn with no hold at
+        all. Deliberately cheap and speaker-shaped: no semantics beyond what
+        `_ends_with_continuation_cue` already covers, because the cases this
+        exists for ("yeah, so basically I work as an artificial intelligence
+        engineer." → 2.5s pause → "so I've had experience working on AI…")
+        are complete sentences by every grammatical test.
+        """
+        # The agent asked for every pause to be held (RUNBOOK §78).
+        if self._tt_num("pause_hold_ms") > 0.0:
+            return "agent"
+        if not TURN_PAUSE_TOLERANCE:
+            return ""
+        if transcript.duration_ms >= TURN_NARRATIVE_SPEECH_MS:
+            return "narrative"
+        if TURN_SPLIT_MEMORY and self._caller_split_turns >= 1:
+            return "splitter"
+        return ""
 
     def _endpoint_hint_text(self) -> str:
         """Text the EndpointController may reason over for the utterance
@@ -2419,6 +3313,14 @@ class VoicePipeline:
         if time.monotonic() - self._last_fragment_ts > window_s:
             return ""
         return self._last_fragment_text
+
+    def _tts_numbers_english(self) -> bool:
+        """`languages.tts_numbers_english` of the live agent (RUNBOOK §82);
+        False with no agent (CLI mode) or any shape surprise."""
+        try:
+            return bool(self.conversation._def.languages.tts_numbers_english)
+        except Exception:
+            return False
 
     def _resolve_tts_language(self, response: "Response", text: str) -> tuple[str, str]:
         """(language, source) the TTS speaks this utterance in. A language
@@ -2442,6 +3344,31 @@ class VoicePipeline:
             except Exception:
                 return state_lang, "state"
         return state_lang, "state"
+
+    @staticmethod
+    def _segment_speech_ms(segment: "AudioSegment") -> float:
+        """How much of this segment was actually voice: the VAD's real-speech
+        count when it was measured, else the whole buffered span."""
+        real = float(getattr(segment, "speech_ms", 0.0) or 0.0)
+        return real if real > 0.0 else float(segment.duration_ms)
+
+    def _stt_fallback_phrase(self, lang: str) -> str:
+        """The "couldn't hear you, say that again" line, in the agent's OWN
+        words when it wrote one (response_bank.lang_fallbacks), else the
+        platform default. Call 971: an agent whose register forbids sarkari
+        Hindi said the platform's "कृपया दोबारा बताइए" while its own line
+        read "एक बार फिर बताइए?"."""
+        lang = (lang or "en")[:2]
+        if lang not in ("en", "hi", "gu"):
+            lang = "en"
+        try:
+            rb = self.conversation._def.response_bank if self.conversation else None
+            own = (rb.lang_fallbacks or {}).get(lang) if rb is not None else ""
+            if isinstance(own, str) and len(own.strip()) >= 8:
+                return own.strip()
+        except Exception:
+            pass
+        return _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
 
     @staticmethod
     def _empty_fallback_speaks(streak: int) -> bool:
@@ -2469,6 +3396,7 @@ class VoicePipeline:
         if not self._tts_playing:
             return False
         if not (self._utt_protected
+                or BARGE_GUARD_ALL_REPLIES
                 or now - self._call_start_ts < CONNECT_WINDOW_S):
             return False
         busy_until = getattr(self.sink, "playback_busy_until", 0.0)
@@ -2486,8 +3414,20 @@ class VoicePipeline:
         activity for SILENCE_REPROMPT_S, and the repair cap isn't spent."""
         if self._reprompt_count >= SILENCE_REPROMPT_MAX:
             return False
+        if _machine_holds_line(self, now):
+            return False
         # Call is wrapping up (farewell/outcome decided) — silence is normal.
         if getattr(self.conversation, "call_outcome", ""):
+            return False
+        # A close is already decided — the goodbye may be mid-flight or spoken
+        # and the caller has nothing left to answer. Asking "is it alright if
+        # we close the call now?" AFTER the farewell is the worst repair the
+        # agent can make, and it is what live call 6ad891a4 (2026-08-25) did.
+        # _silence_hangup_due has carried this guard since 2026-07-29; the
+        # reprompt arm never got it.
+        if (getattr(self.conversation, "hangup_pending", False)
+                or getattr(getattr(self.conversation, "state", None),
+                           "is_closing", False)):
             return False
         if not self._pipeline_quiet(now):
             return False
@@ -2511,6 +3451,8 @@ class VoicePipeline:
             return False
         if getattr(conv, "hangup_pending", False):
             return False  # a close is already draining — don't double-fire
+        if _machine_holds_line(self, now):
+            return False
         cap_spent = (not SILENCE_REPROMPT_ENABLED
                      or self._reprompt_count >= SILENCE_REPROMPT_MAX
                      or bool(getattr(conv, "call_outcome", "")))
@@ -2546,6 +3488,98 @@ class VoicePipeline:
             return False
         return self._pipeline_quiet(now)
 
+    async def _abort_agent_speech(self, why: str) -> None:
+        """A machine has the line (RUNBOOK §83): stop whatever the agent is
+        saying NOW — the opening greeting, the onset intro, a reply to a
+        garbled hold fragment — and generate nothing more. Same media-layer
+        order as barge-in (uuid_break at FreeSWITCH first, then the local
+        queues), minus every barge-in guard: nothing we are saying is for
+        anyone. Idempotent; the bridge hangs up on hangup_immediate."""
+        if self._machine_abort_done:
+            return
+        self._machine_abort_done = True
+        logger.info("[MACHINE] aborting agent speech — %s", why)
+        gen = self._current_generation_task
+        if (gen is not None and not gen.done()
+                and gen is not asyncio.current_task()):
+            gen.cancel()
+        self._flush_pipeline_queues()
+        interrupt = getattr(self.sink, "interrupt_playback", None)
+        if interrupt is not None:
+            try:
+                await interrupt()
+            except Exception:
+                logger.exception("[MACHINE] playback interrupt failed")
+        try:
+            await self.tts.stop()
+        except Exception:
+            logger.exception("[MACHINE] tts stop failed")
+        self._tts_playing = False
+
+    def _machine_beep_close_due(self, now: float) -> bool:
+        """Pure decision: did the classifier confirm a NEW mailbox beep that
+        the engine allows to end this call (outbound, nobody has spoken,
+        a greeting's worth of audio preceded it)? Each beep is judged once."""
+        if not MACHINE_BEEP_CLOSE_ENABLED or self._session is None:
+            return False
+        beep = getattr(self._session, "last_beep", None)
+        if not beep:
+            return False
+        at = float(beep.get("at_mono") or 0.0)
+        if at <= self._beep_consumed_mono:
+            return False
+        self._beep_consumed_mono = at
+        conv = self.conversation
+        allowed = getattr(conv, "machine_audio_close_allowed", None)
+        if not callable(allowed) or not allowed():
+            logger.info("[MACHINE] beep %.0fms @%.0fHz ignored — a person has "
+                        "spoken, or not an outbound leg",
+                        beep.get("duration_ms", 0.0), beep.get("freq_hz", 0.0))
+            return False
+        if self._speech_total_ms < MACHINE_BEEP_MIN_SPEECH_MS:
+            logger.info("[MACHINE] beep %.0fms @%.0fHz ignored — only %.0fms "
+                        "of caller audio before it (no greeting played)",
+                        beep.get("duration_ms", 0.0), beep.get("freq_hz", 0.0),
+                        self._speech_total_ms)
+            return False
+        logger.info("[MACHINE] mailbox beep confirmed %.0fms @%.0fHz after "
+                    "%.0fms of machine audio, no person yet — closing",
+                    beep.get("duration_ms", 0.0), beep.get("freq_hz", 0.0),
+                    self._speech_total_ms)
+        return True
+
+    async def _machine_close_tick(self, now: float) -> bool:
+        """Watchdog arm for RUNBOOK §83. True when this tick ended the call
+        (or found it already ending), so the repair cycle below stands down."""
+        conv = self.conversation
+        if conv is None:
+            return False
+        if getattr(conv, "hangup_immediate", False):
+            if not self._machine_abort_done:
+                await self._abort_agent_speech("machine close armed")
+            return True
+        expired = getattr(conv, "machine_wait_expired", None)
+        kind = expired(now) if callable(expired) else None
+        if kind:
+            logger.info("[MACHINE] %s episode ended with no person on the "
+                        "line — closing", kind)
+            try:
+                conv.arm_machine_timeout_close(kind)
+            except Exception:
+                logger.exception("[MACHINE] timeout close failed")
+                return False
+            await self._abort_agent_speech(f"{kind} timeout")
+            return True
+        if self._machine_beep_close_due(now):
+            try:
+                conv.arm_machine_audio_close("beep")
+            except Exception:
+                logger.exception("[MACHINE] beep close failed")
+                return False
+            await self._abort_agent_speech("mailbox beep")
+            return True
+        return False
+
     async def _silence_watchdog(self) -> None:
         """Dead-air repair + call termination (platform rules): re-ask a
         quiet caller (at most SILENCE_REPROMPT_MAX times per silence), then
@@ -2555,6 +3589,12 @@ class VoicePipeline:
             try:
                 await asyncio.sleep(0.5)
                 now = time.monotonic()
+
+                # A machine has the line (RUNBOOK §83): a hold / screener
+                # episode that ran its course, a confirmed mailbox beep, or
+                # an immediate close the engine armed — cut the audio, end.
+                if await self._machine_close_tick(now):
+                    continue
 
                 # Dead media outranks everything: with the channel flat there
                 # is nobody to re-ask and nobody to say goodbye to, so the
@@ -2614,10 +3654,10 @@ class VoicePipeline:
                 if not text:
                     lang = (getattr(self.conversation.state, "language", "en")
                             or "en")[:2]
-                    text = _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
+                    text = self._stt_fallback_phrase(lang)
                 self._reprompt_count += 1
                 self._last_reprompt_ts = now
-                anchor = max(self._tts_end_time, self._last_voice_activity)
+                anchor = max(self._tts_end_time, self._last_heard_activity)
                 logger.info("[REPAIR] Dead air %.1fs — reprompt %d/%d: %r",
                             now - anchor if anchor else 0.0,
                             self._reprompt_count, SILENCE_REPROMPT_MAX,
@@ -2644,6 +3684,47 @@ class VoicePipeline:
             "llm_latency_ms": 0, "first_chunk_ms": 0,
             "total_latency_ms": 0,
         })
+
+    def _maybe_connect_onset(self) -> None:
+        """Speak the connect intro on the caller's first sustained speech.
+
+        Called from the VAD frame path, so it must stay cheap and must never
+        raise into audio processing. Everything about WHETHER there is an
+        intro to speak belongs to the conversation (connect_onset_line);
+        this decides only that the caller has started talking."""
+        if self._connect_onset_fired or not CONNECT_ONSET_TRIGGER:
+            return
+        if self._raw_speech_ms < CONNECT_ONSET_MS:
+            return
+        now = time.monotonic()
+        if now - self._call_start_ts >= CONNECT_WINDOW_S:
+            # One-shot latch either way: past the window this call never
+            # re-checks, so the frame path stops paying for it.
+            self._connect_onset_fired = True
+            return
+        if self._tts_playing or self.conversation is None:
+            return
+        try:
+            text = self.conversation.connect_onset_line()
+        except Exception:
+            logger.exception("[CONNECT] onset line failed")
+            self._connect_onset_fired = True
+            return
+        if not text:
+            return
+        self._connect_onset_fired = True
+        logger.info(
+            "[CONNECT] Onset intro at %.0fms of speech (%.1fs into call) — "
+            "not waiting for a transcript: %r",
+            self._raw_speech_ms, now - self._call_start_ts, text[:60])
+        try:
+            self.conversation.note_connect_intro_spoken(text)
+        except Exception:
+            logger.exception("[CONNECT] onset bookkeeping failed")
+        self._tts_queue.put_nowait(Response(
+            text=text, is_shortcut=True, timestamp=now, protected=True,
+            onset_intro=True))
+        self._emit_agent_line(text)
 
     def _queue_watchdog_line(self, text: str, now: float) -> None:
         """Speak a watchdog-originated line (reprompt / silence goodbye /
@@ -2689,6 +3770,7 @@ class VoicePipeline:
             except asyncio.CancelledError:
                 break
 
+            self._retx_prefetch(transcript)
             # A real caller turn arrived — the dead-air repair cycle resets,
             # and a caller who came back after the silence goodbye gets the
             # full repair + close cycle again before any future silence close.
@@ -2755,6 +3837,21 @@ class VoicePipeline:
             if _dangling:
                 merge_wait_s = max(merge_wait_s,
                                    MERGE_HOLD_CONTINUATION_MS / 1000.0)
+            # This caller pauses mid-thought — either they are mid-narrative
+            # or they have already done it once on this call. Hold the window
+            # so their next breath lands in the SAME turn (see
+            # TURN_PAUSE_TOLERANCE).
+            # A bare "hello?" is exempt for the same reason it is exempt from
+            # the fragment hold below: the caller is checking the line is
+            # alive, and holding buys nothing while adding the very silence
+            # they are probing. Without this carve-out a splitter caller's
+            # are-you-there probe would pay the full hold.
+            _continues = (
+                "" if (_capture_active
+                       or _is_self_contained_greeting(transcript.text))
+                else self._pause_may_continue(transcript))
+            if _continues:
+                merge_wait_s = max(merge_wait_s, self._pause_hold_s())
             # A short transcript that arrived while the caller has only just
             # gone quiet is the head of a split, not a finished turn. The idle
             # test below cannot see this: _prev_speech is a point-in-time
@@ -2775,6 +3872,7 @@ class VoicePipeline:
                 TRANSCRIPT_MERGE_SKIP_WHEN_IDLE
                 and not _capture_active
                 and not _dangling
+                and not _continues
                 and not _fragment
                 and self._transcript_queue.empty()
                 and self._stt_queue.empty()
@@ -2783,6 +3881,12 @@ class VoicePipeline:
             ):
                 merge_wait_s = 0.0
                 logger.info("[ENGINE] Merge window skipped (idle)")
+            elif _continues and not _dangling:
+                logger.info(
+                    "[ENGINE] Merge window held %.0fms (%s — this caller "
+                    "speaks through pauses; %.1fs segment, %d split(s) so "
+                    "far)", merge_wait_s * 1000.0, _continues,
+                    transcript.duration_ms / 1000.0, self._caller_split_turns)
             elif _dangling:
                 logger.info(
                     "[ENGINE] Merge window held %.0fms (dangling ending %r)",
@@ -2802,10 +3906,23 @@ class VoicePipeline:
                 )
             if merge_wait_s > 0.0:
                 # In capture mode every merged fragment re-opens the window
-                # (up to 8) so a full spelled email lands as one turn.
-                _max_follow_ons = 8 if _capture_active else 1
+                # (up to 8) so a full spelled email lands as one turn. A
+                # caller who speaks through pauses gets the same treatment in
+                # miniature: their utterance arrives in three or four pieces,
+                # and stopping after ONE means the rest races the LLM again.
+                # Still bounded by MERGE_HOLD_MAX_TOTAL_S, and each extra
+                # piece only costs time if the caller is actually still
+                # talking — a finished caller times the window out once.
+                if _capture_active:
+                    _max_follow_ons = 8
+                elif _continues or _dangling:
+                    _max_follow_ons = int(self._tt_num("max_merged_fragments")
+                                          or TURN_MAX_MERGED_FRAGMENTS)
+                else:
+                    _max_follow_ons = 1
                 _hold_started = time.monotonic()
                 _follow_ons_taken = 0
+                _merged_now = False
                 while _follow_ons_taken < _max_follow_ons:
                     try:
                         follow_on = await asyncio.wait_for(
@@ -2837,6 +3954,21 @@ class VoicePipeline:
                     time_gap = follow_on.timestamp - transcript.timestamp
                     _gap_cap = 3.0 if not _capture_active else (
                         CAPTURE_MERGE_WINDOW_MS / 1000.0 + 1.0)
+                    # The hold above may re-arm for up to MERGE_HOLD_MAX_TOTAL_S
+                    # (6s) precisely BECAUSE the caller is demonstrably still
+                    # speaking — so a follow-on can legitimately arrive well
+                    # past a fixed 3s cap and still be the continuation we
+                    # deliberately waited for. With the two numbers
+                    # independent, every follow-on landing between 3s and 6s
+                    # of holding was discarded: the engine waited for the
+                    # caller's answer and then threw it away, answering the
+                    # 3-char fragment instead and re-asking the same question.
+                    # Measured live 2026-09-08 (RUNBOOK §37): "हा." held 4.0s,
+                    # the real answer arrived and was dropped, and the agent
+                    # asked the same question a third time. The cap must
+                    # therefore cover the whole time we were willing to wait.
+                    _gap_cap = max(_gap_cap,
+                                   time.monotonic() - _hold_started + 0.5)
                     if (time_gap < _gap_cap and self._bare_hello(transcript.text)
                             and self._bare_hello(follow_on.text)):
                         # Two bare hellos are ONE repair signal, not a
@@ -2852,6 +3984,8 @@ class VoicePipeline:
                             "[ENGINE] Merging split segments (%.1fs gap): %r + %r",
                             time_gap, transcript.text[:35], follow_on.text[:35],
                         )
+                        self._note_caller_split("merged inside the window")
+                        _merged_now = True
                         transcript = Transcript(
                             text=merged_text,
                             duration_ms=transcript.duration_ms + follow_on.duration_ms,
@@ -2860,18 +3994,28 @@ class VoicePipeline:
                             # First fragment's onset, last fragment's end.
                             speech_start_ts=transcript.speech_start_ts,
                             speech_end_ts=follow_on.speech_end_ts,
+                            span_estimated=(transcript.span_estimated
+                                            or follow_on.span_estimated),
                             # Any recovered fragment taints the merged turn.
                             stt_source=(transcript.stt_source
                                         if transcript.stt_source != "primary"
                                         else follow_on.stt_source),
                         )
                     else:
-                        # Gap too large — from a genuinely separate prior turn; discard.
+                        # Gap too large — from a genuinely separate prior turn;
+                        # discard. (The text logged is the FOLLOW-ON being
+                        # dropped, not the turn being answered — the old
+                        # "Dropping old segment" wording read as the opposite
+                        # and cost real time during the §37 investigation.)
                         logger.info(
-                            "[ENGINE] Dropping old segment (%.1fs gap): %r",
-                            time_gap, follow_on.text[:40],
+                            "[ENGINE] Dropping follow-on as stale (%.1fs gap "
+                            "> cap %.1fs): %r",
+                            time_gap, _gap_cap, follow_on.text[:40],
                         )
                     _follow_ons_taken += 1
+                    if _merged_now:
+                        _merged_now = False
+                        self._retx_prefetch(transcript)
 
             # Drain any remaining queued transcripts.
             # Transcripts that arrived recently (within 3 s) are very likely
@@ -2899,6 +4043,8 @@ class VoicePipeline:
                             stt_latency_ms=candidate.stt_latency_ms,
                             speech_start_ts=transcript.speech_start_ts,
                             speech_end_ts=candidate.speech_end_ts,
+                            span_estimated=(transcript.span_estimated
+                                            or candidate.span_estimated),
                             stt_source=(transcript.stt_source
                                         if transcript.stt_source != "primary"
                                         else candidate.stt_source),
@@ -2907,6 +4053,7 @@ class VoicePipeline:
                             "[ENGINE] Merging late continuation (%.1fs): %r + %r",
                             age_s, transcript.text[:40], candidate.text[:40],
                         )
+                        self._note_caller_split("late continuation")
                     else:
                         logger.info(
                             "[ENGINE] Discarding stale transcript (%.1fs old): %r",
@@ -2914,6 +4061,29 @@ class VoicePipeline:
                         )
                 except asyncio.QueueEmpty:
                     break
+
+            # Enum answer re-check (§81): a locked-language transcript of a
+            # short answer that names none of the asked slot's values is
+            # re-read once without the lock. First — the whole-turn pass
+            # below moves the piece window past this turn.
+            _rechecked = False
+            try:
+                _rc = await self._enum_recheck(transcript)
+                _rechecked = _rc is not transcript
+                transcript = _rc
+            except Exception:
+                logger.exception("[STT-RECHECK] failed — using the transcript")
+            if _rechecked:
+                self._retx_close_window(transcript)
+
+            # Whole-turn re-transcription (§69): one STT pass over every
+            # piece of this turn's audio, replacing the glued fragment texts.
+            if TURN_RETRANSCRIBE and not _rechecked:
+                try:
+                    transcript = await self._retx_apply(transcript)
+                except Exception:
+                    logger.exception("[STT-TURN] re-transcription failed — "
+                                     "using the fragment text")
 
             # ── Continuation merge (pause-tolerant turns) ────────────────────
             # The caller paused mid-utterance, got a fast reply to the partial
@@ -2930,6 +4100,58 @@ class VoicePipeline:
             # hello' is >4 tokens and stops matching entirely).
             _hello_turn = self._bare_hello(transcript.text)
 
+            # Onset intro answered (RUNBOOK §65): speech that ran on past the
+            # end of the intro's playback is the caller's reply to it. The
+            # router must not absorb it as the pickup hello — "हेलो। हां जी
+            # हां जी।" is a yes to "क्या मेरी बात … से हो रही है?", and
+            # absorbing it cost calls 994/998/1008 6-8 s of silence and a
+            # re-asked identity question.
+            _onset_answer = (self._last_reply_was_onset
+                             and self._onset_reaction(transcript))
+            if _onset_answer:
+                _close = getattr(self.conversation,
+                                 "end_connect_onset_absorb", None)
+                if callable(_close):
+                    _close()
+
+            # Per-agent turn-taking (RUNBOOK §78). A bare "हाँ" while our
+            # line still has a second or more to play is a listener's
+            # acknowledgement — on call b5452b23 it was taken as a turn,
+            # advanced the stage and queued the next question behind the
+            # pitch. Real speech in that tail stops the audio instead of
+            # letting the reply queue behind it.
+            if not _hello_turn and self._is_backchannel(transcript):
+                logger.info("[ENGINE] Back-channel absorbed — agent still "
+                            "speaking %.1fs more: %r",
+                            self._agent_audio_remaining(
+                                transcript.speech_start_ts),
+                            transcript.text[:40])
+                continue
+            if not _hello_turn and self._tail_cut_due(transcript):
+                interrupt = getattr(self.sink, "interrupt_playback", None)
+                if interrupt is not None:
+                    logger.info("[BARGE-IN] Tail cut — caller spoke %r with "
+                                "%.1fs of our audio still playing",
+                                transcript.text[:40],
+                                self._agent_audio_remaining(time.monotonic()))
+                    await interrupt()
+                    # The caller did not hear the end of that reply.
+                    self._last_reply_completed_clean = False
+
+            # The pickup greeting the onset intro was spoken over: that intro
+            # already answered it. It is neither a turn nor context for the
+            # next one — prepended, "नमस्कार" turned the caller's "हाँ" into
+            # a greeting and the yes was dropped (call 998).
+            if (self._last_reply_was_onset and not _onset_answer
+                    and transcript.speech_start_ts > 0.0
+                    and transcript.speech_start_ts
+                    < getattr(self, "_last_reply_tts_start", 0.0)
+                    and self._greeting_only(transcript.text)):
+                logger.info("[CONNECT] Pickup greeting spoken over the onset "
+                            "intro — already answered: %r",
+                            transcript.text[:40])
+                continue
+
             # Stale-fragment suppression: this speech BEGAN before the reply
             # we have since fully delivered started playing — it is the tail
             # of the turn that reply answered, not a reaction to it. Absorb
@@ -2937,18 +4159,29 @@ class VoicePipeline:
             # slots included) and do not speak a second answer.
             if (STALE_FRAGMENT_SUPPRESS and self._greeting_done
                     and not _hello_turn and not _capture_active
+                    and not _onset_answer
                     and transcript.speech_start_ts > 0.0
+                    and float(transcript.duration_ms or 0.0) <= STALE_FRAGMENT_MAX_MS
                     and getattr(self, "_last_reply_tts_start", 0.0) > 0.0
                     and transcript.speech_start_ts
                     < self._last_reply_tts_start
                     and getattr(self, "_last_reply_completed_clean", False)):
                 self._turn_accumulator = (
                     (self._turn_accumulator + " " + transcript.text).strip())
+                # If a reply is playing right now, its clean completion must
+                # NOT wipe this: nothing has answered these words yet (call
+                # 909 — absorbed at +0.9 s into a 10 s reply, cleared when
+                # that reply finished, then "I couldn't hear you").
+                self._absorbed_during_reply = bool(self._tts_playing)
                 logger.info(
                     "[ENGINE] Stale fragment absorbed, not answered "
                     "(spoke %.1fs before delivered reply): %r",
                     self._last_reply_tts_start - transcript.speech_start_ts,
                     transcript.text[:60])
+                # The clearest split there is: they kept talking and we had
+                # already answered the first half. Never let it happen twice
+                # on the same call without widening the hold.
+                self._note_caller_split("tail arrived after the reply")
                 continue
 
             if ENABLE_CONTINUATION_MERGE and self._greeting_done:
@@ -2967,26 +4200,78 @@ class VoicePipeline:
                         or not self._tts_queue.empty()
                         or self._tts_playing
                         or self._barge_in_occurred
+                        # A reply the caller CUT is undelivered for as long as
+                        # it matters. `_barge_in_occurred` is cleared by the
+                        # TTS finally block the instant playback unwinds —
+                        # typically seconds before the continuation's
+                        # transcript arrives — so on its own it never survives
+                        # to be read here.
+                        or not self._last_reply_completed_clean
                     )
-                    if (
-                        not _hello_turn
-                        and transcript.speech_start_ts > 0.0
+                    # Nothing of the reply has reached the caller: this
+                    # transcript cannot be a response to it, so it is the rest
+                    # of the utterance we already started answering. Merge on
+                    # that fact alone — no gap arithmetic, which is exactly
+                    # what a dropped or reconstructed span makes unreliable.
+                    #
+                    # Excluded: a reply the caller CUT was one they were
+                    # hearing, and the barge-in path already owns that case
+                    # (it keeps the accumulator so the next transcript carries
+                    # the pre-interruption words). Cancelling a task does not
+                    # mark it done immediately, so without the guard the
+                    # moments right after a barge-in read as "still
+                    # generating" and would merge here instead.
+                    _inaudible = (not self._barge_in_occurred
+                                  and self._reply_still_inaudible())
+                    _gap_ok = (
+                        transcript.speech_start_ts > 0.0
                         and self._turn_txn_speech_end > 0.0
                         and 0.0 <= gap_ms
                         and (gap_ms <= CONTINUATION_WINDOW_MS
                              or (_reply_undelivered
                                  and gap_ms <= CONTINUATION_LONG_WINDOW_MS))
+                    )
+                    if (
+                        not _hello_turn
+                        and (_gap_ok or _inaudible)
                         and self._merge_chain_count < CONTINUATION_MAX_MERGES
                     ):
+                        # Read "did any of it reach the caller?" BEFORE the
+                        # cut below clears the playback state that answers it.
+                        # An inaudible reply must also come off the
+                        # transcript, or the call reads back as the agent
+                        # repeating a question it only ever asked once.
+                        if self._reply_still_inaudible():
+                            self._retract_unheard_agent_line(
+                                "superseded by continuation merge")
                         # Cut the agent's superseded reply wherever it is:
                         # still generating, queued for TTS, or playing.
                         # A5: the epoch bump also catches the reply the TTS
                         # player has DEQUEUED but not yet started synthesizing
                         # — the 300ms window the queue drain below can't reach.
                         self._delivery_epoch += 1
-                        if self._tts_playing:
-                            await self.tts.stop()
-                            self._tts_playing = False
+                        # Synthesis may be over while FreeSWITCH is still
+                        # playing the WAVs (RUNBOOK §78): call 64629614 heard
+                        # the budget question twice, 3 s apart, because the
+                        # superseded reply had "tts done" and was left to
+                        # play out before the merged one.
+                        _still_audible = (
+                            self._agent_audio_remaining(time.monotonic()) > 0.3)
+                        if self._tts_playing or _still_audible:
+                            # WAVs already injected into FreeSWITCH keep
+                            # playing whatever we cancel locally, so the
+                            # media layer is aborted FIRST — same order as
+                            # the barge-in path. Without it a superseded
+                            # reply could still be heard alongside the
+                            # merged one, which is the very thing this
+                            # rollback exists to prevent.
+                            interrupt = getattr(
+                                self.sink, "interrupt_playback", None)
+                            if interrupt is not None:
+                                await interrupt()
+                            if self._tts_playing:
+                                await self.tts.stop()
+                                self._tts_playing = False
                         if (
                             self._current_generation_task
                             and not self._current_generation_task.done()
@@ -3010,9 +4295,12 @@ class VoicePipeline:
                             # accumulator-keeping barge-in path.
                             self._turn_accumulator = ""
                             self._barge_in_occurred = False
+                            self._note_caller_split("rollback merge")
                             logger.info(
-                                "[CONT-MERGE] gap=%.0fms chain=%d: %r + %r → %r",
+                                "[CONT-MERGE] gap=%.0fms chain=%d via=%s: "
+                                "%r + %r → %r",
                                 gap_ms, self._merge_chain_count,
+                                "gap" if _gap_ok else "reply-inaudible",
                                 prev_text[:40], transcript.text[:40],
                                 effective_text[:80],
                             )
@@ -3076,8 +4364,8 @@ class VoicePipeline:
                 self._last_user_text = effective_text
             # Anchor for the next continuation-gap measurement: when the
             # caller's speech for THIS turn actually ended.
+            self._turn_txn_speech_end = self._turn_end_anchor(transcript)
             if transcript.speech_end_ts > 0.0:
-                self._turn_txn_speech_end = transcript.speech_end_ts
                 # Single-grep latency instrument: total dead air between the
                 # caller falling silent and the engine starting (endpoint
                 # gate + STT + merge window + queue time).
@@ -3123,7 +4411,10 @@ class VoicePipeline:
                     if transcript.speech_end_ts > 0.0 else None),
             }
             if self._session is not None:
-                self._session.mark_exchange()
+                # A machine's line is not an exchange (RUNBOOK §83): the
+                # session's monologue / beep interpretation stays armed.
+                if _machine_line.classify(effective_text) is None:
+                    self._session.mark_exchange()
                 trace["session_state"] = self._session.state
             if self._endpointer is not None:
                 trace["endpoint_profile"] = self._endpointer.last_profile
@@ -3333,6 +4624,12 @@ class VoicePipeline:
                         )
 
                         if self._hub is not None:
+                            # Provisional until the caller hears some of it:
+                            # a continuation merge can still cut this reply
+                            # before a frame reaches the wire, and then it
+                            # must come back OFF the transcript (see
+                            # _retract_unheard_agent_line).
+                            self._unheard_agent_line = full_text
                             self._hub.emit_nowait({
                                 "type": "agent",
                                 "text": full_text,
@@ -3348,6 +4645,11 @@ class VoicePipeline:
                 )
 
                 await self._current_generation_task
+
+                # §83: the gate just closed on a machine — stop the opening /
+                # onset intro that is still playing into it, right now.
+                if getattr(self.conversation, "hangup_immediate", False):
+                    await self._abort_agent_speech("machine on the line")
 
             except asyncio.CancelledError:
 
@@ -3434,7 +4736,7 @@ class VoicePipeline:
                 # Silence protection (feature 5): never send blank text to TTS
                 if not response.text.strip():
                     lang = self.conversation.state.language if self.conversation else "en"
-                    fallback = _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
+                    fallback = self._stt_fallback_phrase(lang)
                     logger.warning("[TTS] Empty response text — substituting fallback phrase (lang=%s)", lang)
                     response = Response(
                         text=fallback,
@@ -3449,7 +4751,11 @@ class VoicePipeline:
 
                 # Preprocess text to avoid gibberish: normalize punctuation that
                 # can confuse Sarvam TTS (em-dashes produce audio glitches).
-                tts_text = response.text
+                # Figures first (RUNBOOK §82, per-agent opt-in): a "50–55"
+                # range must become "fifty to fifty five" BEFORE the dash
+                # below turns it into "fifty, fifty five".
+                tts_text = _spoken_numbers_text(
+                    response.text, self._tts_numbers_english())
                 tts_text = tts_text.replace("—", ", ").replace("–", ", ")
                 tts_text = tts_text.replace("…", ".").replace("…", ".")
                 tts_text = tts_text.replace("•", "").replace("·", "")
@@ -3550,7 +4856,7 @@ class VoicePipeline:
                     pass
                 # Silence protection (feature 5): play fallback phrase to avoid dead air
                 lang = self.conversation.state.language if self.conversation else "en"
-                fallback = _STT_FALLBACK_PHRASES.get(lang, _STT_FALLBACK_PHRASES["en"])
+                fallback = self._stt_fallback_phrase(lang)
                 logger.info("[TTS] Playing silence-protection fallback phrase (lang=%s)", lang)
                 try:
                     await self.tts.speak(fallback)
@@ -3579,9 +4885,27 @@ class VoicePipeline:
 
                 # Stale-fragment anchors: when this reply started playing and
                 # whether the caller let it finish (a cut reply must never
-                # suppress the interrupting speech).
-                self._last_reply_tts_start = self._tts_start_time
-                self._last_reply_completed_clean = not self._barge_in_occurred
+                # suppress the interrupting speech). A FILLER ("one second…")
+                # answers nothing and must not become the anchor: on call 909
+                # the filler that preceded a reply counted as "the reply we
+                # delivered", so the caller's next question, begun 6 s before
+                # it, was absorbed as that turn's tail.
+                if not response.is_filler:
+                    self._last_reply_tts_start = self._tts_start_time
+                    self._last_reply_completed_clean = not self._barge_in_occurred
+                    self._last_reply_was_onset = bool(response.onset_intro)
+                if response.onset_intro:
+                    # Synthesis ends long before the caller has heard the
+                    # line; the sink knows when playback really ends.
+                    self._onset_play_end_ts = max(
+                        time.monotonic(),
+                        float(getattr(self.sink, "playback_busy_until", 0.0)
+                              or 0.0))
+                # Playback ran to its end (or the caller cut in, which means
+                # they HEARD it): this utterance is no longer retractable.
+                # Without clearing, a later merge would take a line off the
+                # transcript that the caller did hear.
+                self._unheard_agent_line = ""
                 if self._barge_in_occurred:
                     self._barge_in_occurred = False
                     # Accumulator intentionally kept: the next transcript will be
@@ -3590,7 +4914,15 @@ class VoicePipeline:
                     # Clean completion — caller was fully answered. Clear the
                     # turn accumulator so the next turn starts fresh. Record
                     # when TTS ended for post-response continuation detection.
-                    self._turn_accumulator = ""
+                    # Unless a fragment was absorbed WHILE this reply played:
+                    # those words were spoken before the reply and answered by
+                    # nothing — they ride into the next turn as context.
+                    if getattr(self, "_absorbed_during_reply", False):
+                        self._absorbed_during_reply = False
+                        logger.info("[ENGINE] Keeping absorbed fragment for the "
+                                    "next turn: %r", self._turn_accumulator[:60])
+                    else:
+                        self._turn_accumulator = ""
                     self._last_tts_end = time.monotonic()
                     # Issue 3: In telephony mode the echo of TTS audio returns
                     # via mod_audio_stream with a delay of:

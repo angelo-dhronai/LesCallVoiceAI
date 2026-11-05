@@ -12,20 +12,22 @@
  * discover it, because the wrong guess ("they're editing MY agent") is the one
  * that stops someone from sharing at all.
  */
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import {
-  AlertTriangle, ArrowRight, Check, Copy, Download, FileText, GitBranch,
-  Languages, Link2, PhoneIncoming, PhoneOutgoing, Share2, Trash2, Users,
+  AlertTriangle, ArrowRight, Check, Copy, CopyPlus, Download, FileText,
+  GitBranch, Languages, Link2, PhoneIncoming, PhoneOutgoing, RefreshCw, Share2,
+  Trash2, Users,
 } from 'lucide-react'
 import { Badge, Button, Spinner, cx } from './ui'
 import { Modal } from './Modal'
 import { useToast } from './Toast'
 import { useConfirm } from './confirm'
 import { useRefresh } from '../api/hooks/useApi'
+import { fmtDate, parseTs } from '../lib/format'
 import {
   createShareLink, getShareLink, importShare, previewShare, revokeShareLink,
-  type ImportResult, type ShareLink, type SharePreview,
+  type ImportResult, type ShareCopy, type ShareLink, type SharePreview,
 } from '../api/share'
 
 const errText = (e: any) => String(e?.reason || e?.message || e || 'Something went wrong')
@@ -41,9 +43,8 @@ function DirectionBadge({ direction }: { direction: string }) {
 }
 
 function formatExpiry(iso: string | null): string {
-  if (!iso) return 'never expires'
-  const at = new Date(iso)
-  if (Number.isNaN(at.getTime())) return 'never expires'
+  const at = parseTs(iso)
+  if (!at) return 'never expires'
   const days = Math.round((at.getTime() - Date.now()) / 86_400_000)
   if (days < 0) return 'expired'
   if (days === 0) return 'expires today'
@@ -199,10 +200,74 @@ export function ShareAgentModal({
 
 /* ════════════════════════════════════ recipient ═══════════════════════════ */
 
+/** What the primary button will do. `replace:<family>` names the copy, because
+    an account can hold several copies of one link. */
+type Choice = 'new' | `replace:${string}`
+
+/** A selectable option that is a real radio underneath, so arrow keys, focus
+    and screen readers work without any of it being re-implemented. */
+function ChoiceCard({
+  checked, disabled, onSelect, icon, title, children,
+}: {
+  checked: boolean
+  disabled?: boolean
+  onSelect: () => void
+  icon: ReactNode
+  title: ReactNode
+  children: ReactNode
+}) {
+  return (
+    <label
+      className={cx(
+        'flex items-start gap-3 rounded-2xl px-3.5 py-3 ring-1 transition-colors',
+        // The radio itself is sr-only, so its focus outline is a 1px dot.
+        // Keyboard focus has to be drawn on the card.
+        'has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-[var(--accent-2)]',
+        disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer',
+        checked
+          // NOT bg-[var(--accent)]/10: --accent is a hex, Tailwind v3 cannot
+          // alpha it, and the class compiles to nothing at all.
+          ? 'bg-mint-400/10 ring-2 ring-[var(--accent)]'
+          : 'ring-[var(--border)] hover:bg-[var(--surface-2)]',
+      )}
+    >
+      <input
+        type="radio"
+        name="import-choice"
+        className="sr-only"
+        checked={checked}
+        disabled={disabled}
+        onChange={onSelect}
+      />
+      <span className={cx('mt-0.5 shrink-0', checked ? 'text-[var(--accent)]' : 'text-dim')}>
+        {icon}
+      </span>
+      <span className="min-w-0">
+        <span className="block text-sm font-semibold text-soft">{title}</span>
+        <span className="mt-0.5 block text-xs text-dim">{children}</span>
+      </span>
+    </label>
+  )
+}
+
+/** Directions the shared agent has that this copy no longer does — they are
+    created from the shared version on replace, and the dialog has to say so
+    BEFORE the click, not in the toast after it. */
+function missingDirections(preview: SharePreview, copy: ShareCopy): string[] {
+  return preview.agent.variants
+    .map((v) => v.direction)
+    .filter((d) => !copy.slugs.some((s) => s.endsWith(`-${d}`)))
+}
+
 /**
  * The popup a share link lands on. Mounted by the Agents page whenever the URL
  * carries `?import=<token>`; it clears that parameter on close so a refresh
  * does not reopen a dialog the user already dismissed.
+ *
+ * Opening a link you have ALREADY imported is the normal case, not an error:
+ * agents are shared by people who are still improving them. So it offers a
+ * choice — replace the copy you hold, or take another — rather than pointing
+ * at the old version and stopping.
  */
 export function ImportAgentModal({
   token, open, onClose,
@@ -213,36 +278,74 @@ export function ImportAgentModal({
 }) {
   const nav = useNavigate()
   const toast = useToast()
+  const confirm = useConfirm()
   const refresh = useRefresh()
   const [preview, setPreview] = useState<SharePreview | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [done, setDone] = useState<ImportResult | null>(null)
+  const [choice, setChoice] = useState<Choice>('new')
+
+  const adopt = (p: SharePreview) => {
+    setPreview(p)
+    // Replace is the default when there is something to replace: it is why
+    // someone re-opens a link, and it is the option that cannot fill the
+    // account with near-identical agents.
+    setChoice(p.copies.length ? `replace:${p.copies[p.copies.length - 1].family}` : 'new')
+  }
 
   useEffect(() => {
     if (!open || !token) return
     let live = true
     setLoading(true); setError(''); setPreview(null); setDone(null)
     previewShare(token)
-      .then((p) => { if (live) setPreview(p) })
+      .then((p) => { if (live) adopt(p) })
       .catch((e) => { if (live) setError(errText(e)) })
       .finally(() => { if (live) setLoading(false) })
     return () => { live = false }
   }, [open, token])
 
-  async function doImport() {
+  const a = preview?.agent
+  const copies = preview?.copies ?? []
+  const hasCopy = copies.length > 0
+  const atCap = preview?.code === 'cap_agents'
+  const target = choice.startsWith('replace:') ? choice.slice('replace:'.length) : ''
+  const targetCopy = copies.find((c) => c.family === target)
+  const sharer = preview?.shared_by.name || preview?.shared_by.email || 'the sharer'
+
+  async function run() {
+    if (!preview) return
+    if (targetCopy) {
+      const back = missingDirections(preview, targetCopy)
+      const ok = await confirm({
+        title: `Replace “${targetCopy.family}”?`,
+        description:
+          `Its script, stages, voice and shared knowledge are overwritten with the version from ${sharer}, including any edits you made. `
+          + 'The version you have now can be restored from the agent’s History tab. '
+          + 'Your phone numbers, bookings, call history and the documents you uploaded yourself are not touched.'
+          + (back.length ? ` The ${back.join(' and ')} version is added back from the shared agent.` : ''),
+        confirmLabel: 'Replace',
+        destructive: true,
+      })
+      if (!ok) return
+    }
     setBusy(true); setError('')
     try {
-      const r = await importShare(token)
+      const r = await importShare(
+        token,
+        targetCopy ? { mode: 'replace', target: targetCopy.family }
+          : hasCopy ? { mode: 'new' } : undefined,
+      )
       setDone(r)
       refresh(['agents'], ['billing', 'summary'])
-      toast(`Imported as “${r.primary}”`, 'success')
+      toast(r.status === 'replaced' ? `Replaced “${r.family}”` : `Imported as “${r.primary}”`, 'success')
     } catch (e: any) {
       setError(errText(e))
-      // A refused import may have changed what the preview should say (a
-      // concurrent import filled the last plan slot), so re-read it.
-      previewShare(token).then(setPreview).catch(() => {})
+      // A refusal may have changed what the preview should say (a concurrent
+      // import filled the last plan slot, the copy was archived in another
+      // tab), so re-read it.
+      previewShare(token).then(adopt).catch(() => {})
     } finally {
       setBusy(false)
     }
@@ -250,14 +353,17 @@ export function ImportAgentModal({
 
   if (!open) return null
 
-  const a = preview?.agent
-  const atCap = preview?.code === 'cap_agents'
+  // With a copy in hand the cap only disables ONE option, so the footer keeps
+  // its action; with none, the cap is the whole story and the way out is plans.
+  const blocked = !hasCopy && !preview?.can_import
+  const replaced = done?.status === 'replaced'
 
   return (
     <Modal
       open
       onClose={onClose}
-      title={done ? 'Agent imported' : 'Import this agent?'}
+      title={done ? (replaced ? 'Agent replaced' : 'Agent imported')
+        : hasCopy ? 'You already have this agent' : 'Import this agent?'}
       wide
       footer={
         done ? (
@@ -270,15 +376,16 @@ export function ImportAgentModal({
         ) : (
           <>
             <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
-            {atCap ? (
+            {blocked && atCap ? (
               <Link to="/billing" onClick={onClose}>
                 <Button variant="primary">See plans <ArrowRight size={14} /></Button>
               </Link>
             ) : (
-              <Button variant="primary" disabled={busy || loading || !preview?.can_import}
-                      onClick={() => { void doImport() }}>
-                {busy ? <Spinner className="h-3.5 w-3.5" /> : <Download size={15} />}
-                Import to my account
+              <Button variant="primary" disabled={busy || loading || !preview || blocked}
+                      onClick={() => { void run() }}>
+                {busy ? <Spinner className="h-3.5 w-3.5" />
+                  : targetCopy ? <RefreshCw size={15} /> : <Download size={15} />}
+                {targetCopy ? 'Replace my copy' : hasCopy ? 'Import as a new agent' : 'Import to my account'}
               </Button>
             )}
           </>
@@ -291,23 +398,41 @@ export function ImportAgentModal({
         </div>
       ) : done ? (
         <div className="space-y-3">
-          <p className="text-sm text-soft">
-            “{a?.agent_name || done.family}” is now in your account as{' '}
-            <code className="rounded bg-[var(--surface-2)] px-1.5 py-0.5 font-mono text-2xs">{done.family}</code>.
-            It is entirely yours — edit it freely; the person who shared it will
-            never see your changes.
-          </p>
-          <p className="text-xs text-dim">
-            It is not connected to any phone number yet. Open it, review the
-            opening line, then Activate it on one of your numbers.
-          </p>
+          {replaced ? (
+            <>
+              <p className="text-sm text-soft">
+                <code className="rounded bg-[var(--surface-2)] px-1.5 py-0.5 font-mono text-2xs">{done.family}</code>{' '}
+                now runs the version {sharer} shared. It takes effect on the next call.
+                {!!done.added?.length && ` Added from the shared agent: ${done.added.join(', ')}.`}
+              </p>
+              <p className="text-xs text-dim">
+                It is still entirely yours, and still a one-off copy — later
+                changes on their side will not reach it unless you replace it
+                again. The version you had is in the agent’s History tab.
+                {done.documents?.failed && ' Its documents could not be updated and were left as they were.'}
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-sm text-soft">
+                “{a?.agent_name || done.family}” is now in your account as{' '}
+                <code className="rounded bg-[var(--surface-2)] px-1.5 py-0.5 font-mono text-2xs">{done.family}</code>.
+                It is entirely yours — edit it freely; the person who shared it will
+                never see your changes.
+              </p>
+              <p className="text-xs text-dim">
+                It is not connected to any phone number yet. Open it, review the
+                opening line, then Activate it on one of your numbers.
+              </p>
+            </>
+          )}
         </div>
-      ) : error ? (
+      ) : !a ? (
         <div role="alert" className="flex items-start gap-2 rounded-xl bg-rose-500/10 px-3.5 py-3 text-sm text-rose-600 ring-1 ring-rose-500/20 dark:text-rose-300">
           <AlertTriangle size={15} className="mt-0.5 shrink-0" />
-          <span>{error}</span>
+          <span>{error || 'This share link could not be loaded.'}</span>
         </div>
-      ) : a ? (
+      ) : (
         <div className="space-y-4">
           <div>
             <div className="font-display text-xl font-bold tracking-tight">
@@ -318,6 +443,7 @@ export function ImportAgentModal({
               Shared by {preview?.shared_by.name
                 ? `${preview.shared_by.name} (${preview.shared_by.email})`
                 : preview?.shared_by.email}
+              {preview?.source_updated_at && ` · last changed ${fmtDate(preview.source_updated_at)}`}
             </div>
           </div>
 
@@ -336,14 +462,70 @@ export function ImportAgentModal({
             )}
           </div>
 
-          <div className="rounded-xl bg-indigo-500/10 px-3.5 py-3 text-xs text-soft ring-1 ring-indigo-500/20">
-            You get your own copy under a new name. It is independent from the
-            original: your changes stay yours, and nothing you do here is
-            visible to the person who shared it.
-            {a.variants.length > 1 && ' Both directions arrive together and count as one agent on your plan.'}
-          </div>
+          {/* A failed attempt keeps the choice on screen — the error explains
+              what happened, the options are how to try again. */}
+          {error && (
+            <div role="alert" className="flex items-start gap-2 rounded-xl bg-rose-500/10 px-3.5 py-3 text-sm text-rose-600 ring-1 ring-rose-500/20 dark:text-rose-300">
+              <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
 
-          {!preview?.can_import && preview?.reason && (
+          {hasCopy ? (
+            <div role="radiogroup" aria-label="What to do with this shared agent" className="space-y-2">
+              {copies.map((c) => {
+                const back = preview ? missingDirections(preview, c) : []
+                return (
+                  <ChoiceCard
+                    key={c.family}
+                    checked={choice === `replace:${c.family}`}
+                    onSelect={() => setChoice(`replace:${c.family}`)}
+                    icon={<RefreshCw size={16} />}
+                    title={<>Replace “{c.family}” with this version</>}
+                  >
+                    Your copy from {fmtDate(c.replaced_at || c.imported_at)} keeps its
+                    name, phone numbers, bookings and call history; its script,
+                    voice and shared knowledge are overwritten.
+                    {back.length > 0 && ` The ${back.join(' and ')} version comes back from the shared agent.`}
+                    {' '}
+                    <Link to={`/build/agents/${c.primary}`} onClick={onClose}
+                          className="font-semibold underline">
+                      Open it
+                    </Link>
+                  </ChoiceCard>
+                )
+              })}
+              <ChoiceCard
+                checked={choice === 'new'}
+                disabled={!preview?.can_import}
+                onSelect={() => setChoice('new')}
+                icon={<CopyPlus size={16} />}
+                title="Import as a new agent"
+              >
+                {preview?.can_import ? (
+                  <>A second, separate copy under a new name. {copies.length === 1 ? `“${copies[0].family}” is` : 'Your existing copies are'} left exactly as {copies.length === 1 ? 'it is' : 'they are'}.</>
+                ) : (
+                  <>
+                    {preview?.reason}
+                    {atCap && preview?.billing?.agents_limit != null && (
+                      <> Using {preview.billing.agents_used}/{preview.billing.agents_limit} agents —{' '}
+                        <Link to="/billing" onClick={onClose} className="font-semibold underline">see plans</Link>.
+                      </>
+                    )}
+                  </>
+                )}
+              </ChoiceCard>
+            </div>
+          ) : (
+            <div className="rounded-xl bg-indigo-500/10 px-3.5 py-3 text-xs text-soft ring-1 ring-indigo-500/20">
+              You get your own copy under a new name. It is independent from the
+              original: your changes stay yours, and nothing you do here is
+              visible to the person who shared it.
+              {a.variants.length > 1 && ' Both directions arrive together and count as one agent on your plan.'}
+            </div>
+          )}
+
+          {!hasCopy && !preview?.can_import && preview?.reason && (
             <div
               role="alert"
               className={cx(
@@ -362,20 +544,11 @@ export function ImportAgentModal({
                     Archive one to free a slot, or upgrade your plan.
                   </div>
                 )}
-                {preview.code === 'already_imported' && preview.already_imported && (
-                  <Link
-                    to={`/build/agents/${preview.already_imported.slugs[0]}`}
-                    onClick={onClose}
-                    className="mt-1 inline-block text-xs font-semibold underline"
-                  >
-                    Open your copy
-                  </Link>
-                )}
               </div>
             </div>
           )}
         </div>
-      ) : null}
+      )}
     </Modal>
   )
 }

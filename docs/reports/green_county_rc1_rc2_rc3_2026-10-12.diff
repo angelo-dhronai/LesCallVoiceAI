@@ -1,0 +1,942 @@
+--- a/calling-agent/backend/app/voice/conversation.py
++++ b/calling-agent/backend/app/voice/conversation.py
+@@ -2442,6 +2442,19 @@
+             logger.info("[CONTEXT] customer context suppressed by agent flag")
+             return
+         self.customer_context = dict(ctx)
++        # RUNBOOK §77: a primary-project agent is not shown history items
++        # that name another catalogue project. Logged once per call here;
++        # the band re-scopes on every render.
++        try:
++            from . import prompt_blocks as _pb
++            _, _dropped = _pb.scope_digest_to_primary(
++                str(ctx.get("digest") or ""), self._def.knowledge_base)
++            if _dropped:
++                logger.info("[CONTEXT] %d memory item(s) naming another "
++                            "project withheld from the prompt: %s",
++                            len(_dropped), " | ".join(d[:70] for d in _dropped))
++        except Exception:
++            logger.debug("[CONTEXT] digest scoping failed", exc_info=True)
+         # A known caller's phone book entry may carry a gender; an INBOUND call
+         # has no dial record, so this is the only place the honorific can come
+         # from. Never overrides a dial-time value — that one is the verified
+@@ -4482,6 +4495,7 @@
+                     if _gt:
+                         _cancel_llm()
+                         self._good_time_spoken = True
++                        self.commit_pending_turn()  # §77: never rolled back
+                         self.memory.add_assistant(_gt, language=self.state.language)
+                         self._store_last_response(_gt)
+                         yield EngineResult(text=_gt, is_shortcut=True,
+@@ -4946,6 +4960,13 @@
+         if _gt:
+             _cancel_llm()
+             self._good_time_spoken = True
++            # RUNBOOK §77: a beat the caller is already hearing is never
++            # rolled back. A fragment that landed while this line played
++            # ("ठीक है?", call 1061) superseded the turn — the line left
++            # history, the flag reset with it, and the model re-introduced
++            # itself from the stage goal. Committed, the fragment is simply
++            # the next turn, exactly as closing turns already do.
++            self.commit_pending_turn()
+             logger.info("[CONNECT] Identity confirmed — authored good-time "
+                         "line, no LLM: %r", _gt[:60])
+             self.memory.add_assistant(_gt, language=self.state.language)
+@@ -8023,7 +8044,7 @@
+         _call_parts = [
+             # ── PER-CALL — stable from the first turn to the last ───────────
+             *_direction_lines,
+-            *pb.customer_context_block(self.customer_context),
++            *pb.customer_context_block(self.customer_context, self._def),
+             *self._call_style_lines(),
+         ]
+         parts = [
+@@ -8113,6 +8134,9 @@
+             # RUNBOOK §73: a declined site visit stands — details on
+             # WhatsApp, never a second invitation. [] until a decline.
+             *self._visit_declined_band(),
++            # RUNBOOK §77: a callback was asked for and the call is not
++            # closing yet — settle the time, ask nothing else. [] otherwise.
++            *self._callback_pending_band(),
+             # A book_appointment the gates refused (F4): the caller may have
+             # heard "booked" already. [] on every other turn.
+             *self._booking_unconfirmed_band(),
+@@ -8649,6 +8673,60 @@
+         r"\b(call (?:me )?(?:back|later|tomorrow|after|in)|callback|call karna|"
+         r"phone karna|baad mein (?:call|baat)|baad me (?:call|baat)|"
+         r"phir (?:call|baat)|dobara call)\b", re.IGNORECASE)
++    # Devanagari / Gujarati request shapes (RUNBOOK §77). Every form above
++    # is Latin, so "पांच मिनट में कॉल बैक कर सकते हैं", "बाद में कॉल कर सकते
++    # हो?" and "कल ग्यारह बजे कॉल कर दीजिए" (calls 1061, 1073) were never a
++    # callback: the first reached the model as `general` and the next
++    # qualification question followed, the others classified `objection`
++    # and got the canned deferral. Every alternative needs a REQUEST verb
++    # form next to the call word, so a caller REPORTING a call ("कॉल आया
++    # था", "क्यों कॉल किया आपने?"), describing one ("हमारी टीम कॉल करती
++    # है") or refusing one ("मत करना कॉल") does not match. Script guards,
++    # never `\b`, next to Indic text. Swept 2026-10-12 over 11,621 corpus
++    # caller lines: 36 hits before, all Latin; 63 after — the 27 new ones
++    # all Devanagari, 25 requests or deferrals, one "I will call you" and
++    # one narration of a request, both tolerated; nothing lost.
++    # tests/test_callback_indic.py pins both lists.
++    _CB_NA = r"(?![\u0900-\u097F])"
++    _CB_VERB = (r"(?:कर(?:ना|ो|ें|िए|िये|\s*दो|\s*दीजिए|\s*दीजिये|\s*दें|"
++                r"\s*देना|\s*सकते|\s*सकती|\s*सकता|\s*लेना|\s*लीजिए|\s*लो)"
++                r"|कीजिए|कीजिये|करिए|करिये|करें)")
++    _CB_NOT_PAST = (r"(?!\s*(?:की\s*थी|किया|करा|आया|आयी|आई|हुई|हुआ|"
++                    r"करती\s*(?:है|थी)|करता\s*(?:है|था)|करते\s*थे|करके|है"
++                    + _CB_NA + r"))")
++    # "कॉल करना है" is a statement, "मत कॉल करो" a refusal: not requests.
++    _CB_NOT_STMT = (r"(?!\s*(?:है" + _CB_NA + r"|था|थी|पड़|मत|नहीं|नही|ना"
++                    + _CB_NA + r"))")
++    _CB_NOT_NEG_BEFORE = r"(?<!मत )(?<!नहीं )(?<!नही )(?<!ना )"
++    _CB_WIN = (r"(?:(?!मत" + _CB_NA + r"|नहीं|नही|ना" + _CB_NA +
++               r"|किया|करा|आया|आई|आयी|करती|करता|करते)\S+\s*){0,3}?")
++    _CB_KAL = r"(?<![\u0900-\u097F])कल" + _CB_NA
++    _CB_TIME = r"(?:मिनट|घंटे|घंटा|बजे|परसों|सुबह|शाम|दोपहर|" + _CB_KAL + r")"
++    _CB_DAYPART = r"(?:परसों|सुबह|शाम|दोपहर|" + _CB_KAL + r")"
++    _CALLBACK_ASK_INDIC_RE = re.compile("|".join([
++        # "call back", any spelling
++        r"कॉल\s*बैक|कॉलबैक|कॉल\s*बेक|फोन\s*बैक|કૉલ\s*બેક|કોલ\s*બેક",
++        # later / again + call | talk — not a past "बाद में कॉल की थी"
++        r"(?:बाद\s*में|बाद\s*मे|थोड़ी\s*देर\s*(?:बाद|में)|कुछ\s*देर\s*(?:बाद|में)|"
++        r"दोबारा|दुबारा|फिर\s*से)\s*(?:मुझे\s*|हमें\s*|आप\s*)?(?:कॉल|फोन|फ़ोन|बात)"
++        + _CB_NOT_PAST,
++        # "(call) me": मुझे / हमें … कॉल + a request verb
++        r"(?:मुझे|हमें|मेरे\s*को)\s*" + _CB_WIN + _CB_NOT_NEG_BEFORE
++        + r"(?:कॉल|फोन|फ़ोन)\s*" + _CB_VERB + _CB_NOT_STMT,
++        # a bare imperative — "कॉल कर दो", "कॉल कीजिए", "कॉल कर सकते हो" —
++        # but not the statement "कॉल करना है"
++        _CB_NOT_NEG_BEFORE + r"(?:कॉल|फोन|फ़ोन)\s*" + _CB_VERB + _CB_NOT_STMT,
++        # a time + call: "कल ग्यारह बजे कॉल कर दीजिए", "10 मिनट बाद कॉल करना"
++        _CB_TIME + r"\s*(?:के\s*बाद\s*|बाद\s*|में\s*|को\s*|तक\s*)?(?:ही\s*)?"
++        r"(?:मुझे\s*|आप\s*)?" + _CB_NOT_NEG_BEFORE + r"(?:कॉल|फोन|फ़ोन)\s*"
++        + _CB_VERB + _CB_NOT_STMT,
++        # a time + talk: "कल सुबह बात करते हैं" — not "बात करते थे"
++        _CB_DAYPART + r"\s*(?:को\s*|में\s*|बाद\s*|तक\s*)?(?:ही\s*)?बात\s*कर"
++        r"(?:ते|ेंगे|ें|ना|ो|िए|िये|\s*लेंगे|\s*लेते)(?!\s*(?:थे|थी|था))",
++        # Gujarati
++        r"(?:મને|અમને)\s*(?:\S+\s*){0,3}?(?:કૉલ|કોલ|ફોન)\s*કર",
++        r"પછી\s*(?:મને\s*)?(?:કૉલ|કોલ|ફોન|વાત)\s*કર",
++    ]), re.IGNORECASE)
+ 
+     # "I can't talk NOW" without any callback wording — a brush-off, not an
+     # objection. Routed into the callback pin-down flow (ask when to call
+@@ -8676,7 +8754,8 @@
+         near the word "call" — is withheld from a caller who is merely
+         telling us they were called.
+         """
+-        if self._CALLBACK_ASK_RE.search(text):
++        if self._CALLBACK_ASK_RE.search(text) \
++                or self._CALLBACK_ASK_INDIC_RE.search(text):
+             return True
+         if self._BUSY_NOW_RE.search(text):
+             return True
+@@ -9139,6 +9218,16 @@
+         reason = self._booking_unconfirmed_reason()
+         return pb.booking_unconfirmed_block(reason) if reason else []
+ 
++    def _callback_pending_band(self) -> list[str]:
++        """━━ CALLBACK REQUESTED ━━ (RUNBOOK §77): [] unless the caller has
++        asked to be called back and the call is not closing yet — the turn
++        after the one clarification question, or a branch-scheduled callback."""
++        flags = self.state_mgr.extra_flags
++        if not flags.get("callback_requested") or self.state.is_closing:
++            return []
++        from . import prompt_blocks as pb
++        return pb.callback_pending_block(str(flags.get("callback_time") or ""))
++
+     def _visit_declined_band(self) -> list[str]:
+         if self._visit_declined_turn < 0:
+             if self._visit_answer_first_turn == self.state.turn_count:
+@@ -9967,17 +10056,21 @@
+ 
+     @staticmethod
+     def _offset_phrase(offset_min: int, lang: str = "en") -> str:
+-        """'in 10 minutes' / '10 minute mein' — spoken confirmation form."""
++        """'in about 10 minutes' / '10 मिनट में' — spoken confirmation form,
++        in the caller's script (RUNBOOK §77: the hi/gu forms were romanized,
++        which Sarvam renders poorly and no authored Pramukh line uses)."""
+         if offset_min % 60 == 0:
+             n = offset_min // 60
+-            unit = {"en": ("hour", "hours"), "hi": ("ghante", "ghante"),
+-                    "gu": ("kalak", "kalak")}.get(lang, ("hour", "hours"))
++            unit = {"en": ("hour", "hours"), "hi": ("घंटे", "घंटे"),
++                    "gu": ("કલાક", "કલાક")}.get(lang, ("hour", "hours"))
+             amount = f"{n} {unit[0] if n == 1 else unit[1]}"
+         else:
+-            amount = f"{offset_min} minute" + ("s" if lang == "en" and offset_min != 1 else "")
++            unit_m = {"hi": "मिनट", "gu": "મિનિટ"}.get(lang)
++            amount = (f"{offset_min} {unit_m}" if unit_m else
++                      f"{offset_min} minute" + ("s" if offset_min != 1 else ""))
+         return {"en": f"in about {amount}",
+-                "hi": f"{amount} mein",
+-                "gu": f"{amount} ma"}.get(lang, f"in about {amount}")
++                "hi": f"{amount} में",
++                "gu": f"{amount}માં"}.get(lang, f"in about {amount}")
+ 
+     def _handle_callback_request(self, text: str, policy: dict) -> str | None:
+         """Capture a callback time preference WITHOUT booking a calendar slot
+@@ -10000,9 +10093,13 @@
+         logger.info("[CALLBACK] captured preference %r (no calendar booking)", preference)
+         self._arm_callback_close()
+         resp = self._lang_response(policy.get("responses") or {})
+-        return resp or (
+-            f"No problem at all — we'll call you back {preference}. "
+-            "Thank you, and have a great day!")
++        if resp:
++            return resp
++        if (self.state.language or "en")[:2] in ("hi", "gu"):
++            # RUNBOOK §77: the built-in below was English on every Hindi call.
++            return self._clarify_confirmation(day, tm, offset_min)
++        return (f"No problem at all — we'll call you back {preference}. "
++                "Thank you, and have a great day!")
+ 
+     # ── v3 in-call commitment clarification (PLAN-intelligence-layer §2.8) ──
+ 
+@@ -10064,38 +10161,88 @@
+         self.hangup_pending = True
+         logger.info("[HANGUP] callback confirmed — closing with caller consent")
+ 
++    # RUNBOOK §77: the parser's English labels ("Tomorrow", "evening",
++    # "11 baje") in the caller's script for a spoken line. English unchanged.
++    _DAY_WORDS = {
++        "hi": {"today": "आज", "tomorrow": "कल", "day after tomorrow": "परसों",
++               "monday": "सोमवार", "tuesday": "मंगलवार", "wednesday": "बुधवार",
++               "thursday": "गुरुवार", "friday": "शुक्रवार", "saturday": "शनिवार",
++               "sunday": "रविवार"},
++        "gu": {"today": "આજે", "tomorrow": "કાલે", "day after tomorrow": "પરમ દિવસે",
++               "monday": "સોમવારે", "tuesday": "મંગળવારે", "wednesday": "બુધવારે",
++               "thursday": "ગુરુવારે", "friday": "શુક્રવારે", "saturday": "શનિવારે",
++               "sunday": "રવિવારે"},
++    }
++    _TIME_WORDS = {"hi": {"morning": "सुबह", "afternoon": "दोपहर", "evening": "शाम"},
++                   "gu": {"morning": "સવારે", "afternoon": "બપોરે", "evening": "સાંજે"}}
++
++    @classmethod
++    def _spoken_day_time(cls, day: str, tm: str, lang: str) -> tuple[str, str]:
++        if lang not in cls._DAY_WORDS:
++            return day, tm
++        d = cls._DAY_WORDS[lang].get((day or "").strip().lower(), day)
++        t = cls._TIME_WORDS[lang].get((tm or "").strip().lower())
++        if t is None:
++            t = re.sub(r"\s*\bbaje\b", " बजे" if lang == "hi" else " વાગે",
++                       tm or "", flags=re.IGNORECASE).strip()
++        return d, t
++
++    def _authored_busy_line(self) -> str:
++        """The agent's own `outbound.busy_response`, personalised — "" when
++        there is none or this is not an outbound agent. The Pramukh builders
++        author it in Devanagari; it is the owner's wording for exactly the
++        moment the busy-flavoured clarification covers."""
++        ob = getattr(self._def, "outbound", None)
++        if ob is None or getattr(self._def, "call_direction", "") != "outbound":
++            return ""
++        try:
++            line = self._personalize(
++                str(self._lang_response(getattr(ob, "busy_response", {}) or {})
++                    or "").strip(), "outbound.busy_response")
++        except Exception:
++            logger.exception("[CALLBACK] authored busy line failed")
++            return ""
++        return line if len(line) >= 10 else ""
++
+     def _clarify_question(self, day: str, tm: str, relative: bool = False,
+                           busy: bool = False) -> str:
++        # RUNBOOK §77: hi/gu lines in native script (they were romanized,
++        # which Sarvam renders poorly and the Devanagari always-rule forbids).
+         lang = (self.state.language or "en")[:2]
++        d, _t = self._spoken_day_time(day, tm, lang)
+         if busy:
+             # "sorry, not free right now" — apologise for the timing and pin
+-            # down when to call back; never keep pitching a busy caller.
++            # down when to call back; never keep pitching a busy caller. The
++            # agent's authored busy line first, when it has one.
++            authored = self._authored_busy_line()
++            if authored:
++                return authored
+             bank = {"en": "No problem at all — about how many minutes later "
+                           "should I call you back, or is there a time that suits you?",
+-                    "hi": "Koi baat nahi — main kitne minute baad call karun, "
+-                          "ya koi time batayein jo aapko theek lage?",
+-                    "gu": "Kai vandho nahi — ketli minute pachhi call karu, "
+-                          "ke koi time kaho je tamne thik lage?"}
++                    "hi": "कोई बात नहीं — मैं कितने मिनट बाद कॉल करूँ, या कोई "
++                          "समय बताइए जो आपको ठीक लगे?",
++                    "gu": "કોઈ વાંધો નહીં — કેટલી મિનિટ પછી કૉલ કરું, કે કોઈ "
++                          "સમય કહો જે તમને ઠીક લાગે?"}
+         elif relative:
+             # "call me in a bit / thodi der baad" — pin down the delay, not a day.
+             bank = {"en": "Of course — about how many minutes should I wait "
+                           "before calling you back, or is there a time that suits you?",
+-                    "hi": "Zaroor — main kitne minute baad call karun, ya koi "
+-                          "time batayein jo aapko theek lage?",
+-                    "gu": "Chokkas — ketli minute pachhi call karu, ke koi "
+-                          "time kaho je tamne thik lage?"}
++                    "hi": "ज़रूर — मैं कितने मिनट बाद कॉल करूँ, या कोई समय "
++                          "बताइए जो आपको ठीक लगे?",
++                    "gu": "ચોક્કસ — કેટલી મિનિટ પછી કૉલ કરું, કે કોઈ સમય કહો "
++                          "જે તમને ઠીક લાગે?"}
+         elif day and not tm:
+             bank = {"en": f"Sure — what time on {day.lower()} works best for you?",
+-                    "hi": f"Zaroor — {day.lower()} ko kitne baje call karna theek rahega?",
+-                    "gu": f"Chokkas — {day.lower()} na roj ketla vage call karvo thik rahese?"}
++                    "hi": f"ज़रूर — {d} कितने बजे कॉल करना ठीक रहेगा?",
++                    "gu": f"ચોક્કસ — {d} કેટલા વાગે કૉલ કરવો ઠીક રહેશે?"}
+         elif tm and not day:
+             bank = {"en": "Sure — which day works best for you?",
+-                    "hi": "Zaroor — kis din call karna theek rahega?",
+-                    "gu": "Chokkas — kya divse call karvo thik rahese?"}
++                    "hi": "ज़रूर — किस दिन कॉल करना ठीक रहेगा?",
++                    "gu": "ચોક્કસ — કયા દિવસે કૉલ કરવો ઠીક રહેશે?"}
+         else:
+             bank = {"en": "Sure — which day and what time would work best for us to call you?",
+-                    "hi": "Zaroor — kis din aur kitne baje call karna theek rahega?",
+-                    "gu": "Chokkas — kya divse ane ketla vage call karvo thik rahese?"}
++                    "hi": "ज़रूर — किस दिन और कितने बजे कॉल करना ठीक रहेगा?",
++                    "gu": "ચોક્કસ — કયા દિવસે અને કેટલા વાગે કૉલ કરવો ઠીક રહેશે?"}
+         return bank.get(lang, bank["en"])
+ 
+     def _clarify_confirmation(self, day: str, tm: str,
+@@ -10104,15 +10251,17 @@
+         if offset_min:
+             preference = self._offset_phrase(offset_min, lang)
+         else:
+-            preference = " ".join(x for x in (day, tm) if x) or "soon"
++            d, t = self._spoken_day_time(day, tm, lang)
++            preference = (" ".join(x for x in (d, t) if x)
++                          or {"hi": "जल्द ही", "gu": "જલ્દી"}.get(lang, "soon"))
+         # Goodbye tail included: this confirmation is a closing line — the
+         # platform hangs up after it plays (_arm_callback_close).
+         bank = {"en": f"Perfect — I'll call you back {preference}. "
+                       "Thank you, and have a great day!",
+-                "hi": f"Bilkul — hum aapko {preference} call karenge. "
+-                      "Dhanyavaad, aapka din shubh rahe!",
+-                "gu": f"Saras — ame tamne {preference} call karishu. "
+-                      "Aabhar, tamaro divas saras rahe!"}
++                "hi": f"बिल्कुल — हम आपको {preference} कॉल करेंगे। "
++                      "धन्यवाद, आपका दिन शुभ रहे!",
++                "gu": f"ચોક્કસ — અમે તમને {preference} કૉલ કરીશું. "
++                      "આભાર, તમારો દિવસ સરસ રહે!"}
+         return bank.get(lang, bank["en"])
+ 
+     def _maybe_ask_clarification(self, text: str) -> str | None:
+--- a/calling-agent/backend/app/voice/prompt_blocks.py
++++ b/calling-agent/backend/app/voice/prompt_blocks.py
+@@ -511,13 +511,76 @@
+ # Known customer (persistent memory — Customer Intelligence Hub)
+ # ---------------------------------------------------------------------------
+ 
+-def customer_context_block(ctx: dict | None) -> list[str]:
++_DIGEST_LIST_HEADS = ("Interested in:", "Purchased:", "Open promises:",
++                      "Past objections:", "Decision makers:")
++_DIGEST_SPLIT_RE = re.compile(
++    r"\s+(?=(?:Last intent:|Prefers |Style:|Interested in:|Purchased:|"
++    r"Open promises:|Past objections:|Decision makers:|HIGH churn risk))")
++
++
++def scope_digest_to_primary(digest: str, kb) -> tuple[str, list[str]]:
++    """The returning-customer digest with every item that names a catalogue
++    project OTHER than the agent's primary removed → (scoped digest, dropped).
++
++    RUNBOOK §77: customer_memory is kept per owner + contact and shared by
++    every agent of that owner, so a Swarit visit booked on one call reached
++    the Green County agent's next call as "Interested in: Pramukh Swarit
++    bungalows" — and the model opened with "you showed interest in our
++    Pramukh Swarit bungalows". The memory row is untouched; only what a
++    primary-project agent is SHOWN is scoped. The digest is one line of
++    `render_digest` sections; list sections are filtered item by item, any
++    other section naming another project is dropped whole. No primary, no
++    catalogue, or nothing to drop → the digest comes back unchanged."""
++    pp = primary_project(kb)
++    if not pp or not digest:
++        return digest, []
++    others = [i for i in (getattr(kb, "catalog", None) or [])
++              if isinstance(i, dict)
++              and str(i.get("id") or "").strip().lower() != pp["id"]]
++    if not others:
++        return digest, []
++    from .pitch_switch import mentions
++
++    def _names_other(text: str) -> bool:
++        return any(mentions(text, it) for it in others)
++
++    dropped: list[str] = []
++    kept: list[str] = []
++    for seg in _DIGEST_SPLIT_RE.split(digest.strip()):
++        seg = seg.strip()
++        if not seg:
++            continue
++        head = next((h for h in _DIGEST_LIST_HEADS if seg.startswith(h)), None)
++        if head:
++            items = [x.strip().rstrip(".").strip()
++                     for x in seg[len(head):].split(";")]
++            keep: list[str] = []
++            for item in (x for x in items if x):
++                (dropped if _names_other(item) else keep).append(item)
++            if keep:
++                kept.append(f"{head} " + "; ".join(keep) + ".")
++            continue
++        if _names_other(seg):
++            dropped.append(seg.rstrip("."))
++            continue
++        kept.append(seg)
++    if not dropped:
++        return digest, []
++    return " ".join(kept), dropped
++
++
++def customer_context_block(ctx: dict | None,
++                           agent_def: AgentDefinition | None = None) -> list[str]:
+     """━━ KNOWN CUSTOMER ━━ — pre-call context for a returning customer.
+ 
+     `ctx` is the bridge's pre-fetched bundle: {name, calls_count, last_call_at,
+     last_outcome, open_followups, open_commitments, digest}. Empty/None (new
+     caller, flag off, fetch failed) renders nothing — a brand-new caller's
+-    prompt is byte-identical to before this feature."""
++    prompt is byte-identical to before this feature.
++
++    With `agent_def` carrying a primary project (RUNBOOK §77) the digest is
++    scoped to that project and one line names it as the reason for the call;
++    every other agent renders exactly as before."""
+     if not ctx or not (ctx.get("digest") or ctx.get("calls_count")):
+         return []
+     lines: list[str] = ["", "━━ KNOWN CUSTOMER ━━"]
+@@ -533,8 +596,23 @@
+                     + (f" (outcome: {ctx['last_outcome']})" if ctx.get("last_outcome") else ""))
+     if head:
+         lines.append(" · ".join(head))
+-    if ctx.get("digest"):
+-        lines.append(str(ctx["digest"]))
++    digest = str(ctx.get("digest") or "")
++    primary_line = ""
++    kb = getattr(agent_def, "knowledge_base", None) if agent_def is not None else None
++    pp = primary_project(kb) if kb is not None else None
++    if pp:
++        digest, _dropped = scope_digest_to_primary(digest, kb)
++        primary_line = (
++            f"▸ This call is about {pp['name']}. Say they enquired about one "
++            "of our projects — never name another project as the reason for "
++            "this call, and never say they were interested in one. Earlier "
++            "interest in another project is left out of this summary on "
++            "purpose; answer about it from the knowledge base only if they "
++            "bring it up.")
++    if digest:
++        lines.append(digest)
++    if primary_line:
++        lines.append(primary_line)
+     counters: list[str] = []
+     if ctx.get("open_commitments"):
+         counters.append(f"Open promises: {ctx['open_commitments']}")
+@@ -1137,6 +1215,27 @@
+     ]
+ 
+ 
++def callback_pending_block(preference: str = "") -> list[str]:
++    """━━ CALLBACK REQUESTED ━━ — per-turn, while a callback has been asked
++    for and the call is not closing yet (the clarification-answer turn, or an
++    answer the engine could not parse). [] on every other turn, so every
++    golden prompt is byte-identical. RUNBOOK §77: on call 1073 the request
++    reached the model with nothing in the prompt about it, and the model
++    asked the next qualification question — twice."""
++    when = f" ({preference})" if preference and preference != "later" else ""
++    return [
++        "",
++        "━━ CALLBACK REQUESTED ━━",
++        f"▸ The caller has asked to be called back{when}. From here this call "
++        "is about that and nothing else: do NOT ask a qualification question, "
++        "do NOT pitch, do NOT invite a visit, and do not pursue your CURRENT "
++        "GOAL.",
++        "▸ If the day or time is still unclear, ask only for it — one short "
++        "question. Once it is clear, confirm it once in a few words and let "
++        "them go.",
++    ]
++
++
+ def booking_unconfirmed_block(reason: str) -> list[str]:
+     """━━ NOT BOOKED ━━ — per-turn, from the turn a book_appointment proposal
+     was REFUSED by the engine's gates until the next turn has been answered.
+--- a/calling-agent/backend/tests/test_precall_context.py
++++ b/calling-agent/backend/tests/test_precall_context.py
+@@ -149,3 +149,88 @@
+         assert ctx2 == ctx
+     finally:
+         os.environ["LESCALL_DB_URL"] = old
++
++
++# ── RUNBOOK §77: a primary-project agent is not shown other projects ────────
++# customer_memory is per owner + contact and shared by every agent of that
++# owner. Call 1047 (Green County agent) switched the pitch to Swarit on a
++# ₹2.5 Cr budget; the memory then said "Interested in: Pramukh Swarit
++# bungalows (primary)" and calls 1060/1061 opened with "you showed interest
++# in our Pramukh Swarit bungalows". The band is scoped; the row is not.
++GC = {"id": "pramukh-green-county", "name": "Pramukh Green County",
++      "aliases": ["Green County"], "location": "Chharwada, Vapi",
++      "configurations": ["3 BHK", "4 BHK"], "price_range": "about ₹78–85 lakh"}
++SWARIT = {"id": "pramukh-swarit", "name": "Pramukh Swarit",
++          "aliases": ["Swarit", "Swarit Bungalows"], "location": "New Chala, Vapi",
++          "configurations": ["4 BHK", "5 BHK"], "price_range": "about ₹2.15 Cr"}
++KB = {"known_projects": {}, "locations": ["Vapi"], "portfolio_prompt_text": "",
++      "catalog": [GC, SWARIT], "match_rules": []}
++DIGEST_1060 = (
++    "1 previous call(s). Last intent: Book a site visit.. Prefers Hindi. "
++    "Interested in: Pramukh Swarit bungalows (primary); investment. "
++    "Open promises: customer: Customer will visit Pramukh Swarit on Wednesday "
++    "14th October at 4 PM. (2026-10-09); agent: send the brochure (2026-10-09). "
++    "Past objections: budget mismatch (Pramukh Green County). "
++    "Decision makers: Shubhangi.")
++
++
++def _primary_router(primary: bool = True) -> ConversationRouter:
++    kb = dict(KB)
++    if primary:
++        kb["primary_project"] = {"id": "pramukh-green-county", "mode": "exclusive"}
++    return make_router(knowledge_base=kb)
++
++
++def _band(prompt: str) -> str:
++    i = prompt.find("━━ KNOWN CUSTOMER ━━")
++    assert i >= 0
++    j = prompt.find("\n━━", i + 1)
++    return prompt[i:j if j > 0 else None]
++
++
++def test_scope_digest_drops_only_items_naming_other_projects():
++    from app.voice.prompt_blocks import scope_digest_to_primary
++    r = _primary_router()
++    scoped, dropped = scope_digest_to_primary(DIGEST_1060, r._def.knowledge_base)
++    assert "Swarit" not in scoped
++    for kept in ("1 previous call(s).", "Last intent: Book a site visit..",
++                 "Prefers Hindi.", "Interested in: investment.",
++                 "Open promises: agent: send the brochure (2026-10-09).",
++                 "Past objections: budget mismatch (Pramukh Green County).",
++                 "Decision makers: Shubhangi."):
++        assert kept in scoped, kept
++    assert dropped == [
++        "Pramukh Swarit bungalows (primary)",
++        "customer: Customer will visit Pramukh Swarit on Wednesday 14th "
++        "October at 4 PM. (2026-10-09)",
++    ]
++
++
++def test_known_customer_band_is_scoped_for_a_primary_project_agent():
++    r = _primary_router()
++    r.set_customer_context(dict(CTX, digest=DIGEST_1060))
++    band = _band(r._build_system_prompt())
++    assert "Swarit" not in band
++    assert "▸ This call is about Pramukh Green County." in band
++    assert "Interested in: investment." in band
++    assert "Do NOT re-ask what you already know here" in band
++
++
++def test_without_a_primary_the_band_is_byte_identical():
++    from app.voice import prompt_blocks as pb
++    a = _primary_router(primary=False)
++    a.set_customer_context(dict(CTX, digest=DIGEST_1060))
++    b = make_router()
++    b.set_customer_context(dict(CTX, digest=DIGEST_1060))
++    assert (pb.customer_context_block(a.customer_context, a._def)
++            == pb.customer_context_block(b.customer_context))
++    assert "Swarit" in "\n".join(pb.customer_context_block(a.customer_context, a._def))
++
++
++def test_nothing_to_drop_leaves_the_digest_untouched():
++    from app.voice.prompt_blocks import scope_digest_to_primary
++    r = _primary_router()
++    d = ("2 previous call(s). Interested in: 3 BHK; Pramukh Green County. "
++         "Decision makers: Shubhangi.")
++    assert scope_digest_to_primary(d, r._def.knowledge_base) == (d, [])
++    assert scope_digest_to_primary("", r._def.knowledge_base) == ("", [])
+--- a/deploy/RUNBOOK.md
++++ b/deploy/RUNBOOK.md
+@@ -8972,3 +8972,69 @@
+ shubhangi@ copies), then `docker restart lescall-api`, then
+ `docker restart lescall-runtime` — F1 and F4 are engine code and need only the
+ restarts; they reach every agent.
++
++## 77. Green County (Dhaval) test calls 1060/1061/1073: Swarit came from the customer memory, Hindi callback requests were invisible, the good-time beat was rolled back (2026-10-12) — IMPLEMENTED, NOT DEPLOYED, awaiting review
++
++Investigation: `docs/reports/green_county_outbound_investigation_2026-10-12.md`.
++Three engine fixes, all platform-wide, none applied to a container; no agent
++regenerated. The budget switch, honorific behaviour and F3 are untouched.
++
++### 77.1 A primary-project agent is not shown other projects' history (RC1)
++
++`customer_memory` is kept per owner + contact and shared by every agent of
++that owner. Call 1047 (the Green County agent itself) switched its pitch to
++Swarit on a ₹2.5 Cr budget and booked a Swarit visit; the intel pipeline wrote
++"Pramukh Swarit bungalows (primary)" as a preference, and calls 1060/1061
++opened with "आपने हमारे Pramukh Swarit bungalows में interest दिखाया था" —
++the ━━ KNOWN CUSTOMER ━━ digest said so while the INTRO goal said "they'd shown
++interest in one of our projects". The primary pin, exclusive mode and the
++MATCH RULES band all held. `prompt_blocks.scope_digest_to_primary` now
++removes, item by item, every digest entry that names a catalogue project
++other than the agent's primary (the script-aware `pitch_switch.mentions`),
++and the band carries one line: this call is about {primary}; never name
++another project as its reason. `customer_context_block(ctx, agent_def)`;
++`set_customer_context` logs what was withheld. The memory row, the post-call
++pipeline and every agent without a primary are byte-identical.
++Tests: `test_precall_context.py` (§77 block).
++
++### 77.2 Callback requests in Devanagari / Gujarati (RC2)
++
++`_CALLBACK_ASK_RE` was Latin-only and the weak time-word branch required a
++Latin call/baat/phone: "पांच मिनट में कॉल बैक कर सकते हैं" reached the model
++as `general` (family size asked next, twice), "बाद में कॉल कर सकते हो?" and
++"कल ग्यारह बजे कॉल कर दीजिए" classified `objection` and got the canned
++deferral; nothing was recorded. `_CALLBACK_ASK_INDIC_RE` adds the REQUEST
++shapes (कॉल बैक; बाद में / थोड़ी देर बाद + कॉल|बात; मुझे … कॉल + a request
++verb; a bare imperative; a time word + कॉल; a day part + बात करते/करेंगे;
++Gujarati મને … કૉલ કર, પછી કૉલ કર), each refusing मत/नहीं, past and
++received forms — never `\b` next to Indic text. Corpus sweep 2026-10-12
++(11,621 caller lines): 36 hits before, all Latin; 63 after — the 27 new ones
++all Devanagari, 25 requests or deferrals, one "I will call you" and one
++narration of a request, both tolerated; nothing lost.
++`tests/test_callback_indic.py` pins both lists. With the
++detector working, the built-in clarification and confirmation lines
++(`_clarify_question`, `_clarify_confirmation`, `_offset_phrase`, the
++`_handle_callback_request` fallback) now speak native script for hi/gu with
++localised day and time words (`_spoken_day_time`) — they were romanized
++Hindi and English — and the busy flavour prefers the agent's authored
++`outbound.busy_response`. A per-turn ━━ CALLBACK REQUESTED ━━ band
++(`prompt_blocks.callback_pending_block`) renders while
++`extra_flags.callback_requested` is set and the call is not closing, so an
++unparseable answer to the one clarification question no longer hands the
++model back to qualification. Known limit left alone: `_parse_day_time` does
++not read Hindi number words ("ग्यारह बजे"); the day is captured, the hour
++is asked for.
++
++### 77.3 The good-time beat is never rolled back (RC3)
++
++Call 1061: the fast path spoke the authored good-time line; "ठीक है?" landed
++while it played; the continuation merge rolled the provisional turn back
++(stage to GREETING, `_good_time_spoken` restored, the line gone from
++history), the merged "हां जी। ठीक है?" failed `_is_identity_yes` on the "?",
++and the model re-introduced itself from the INTRO goal. The fast path and
++the "it's me after all" resume now call `commit_pending_turn()` before
++speaking, as closing turns already do; the fragment becomes the next turn.
++Tests: `tests/test_good_time_commit.py`.
++
++Deploy, once reviewed: `docker restart lescall-api` then
++`docker restart lescall-runtime` — engine code only, no builder run needed.
+diff --git a/calling-agent/backend/tests/test_commitment_clarify.py b/calling-agent/backend/tests/test_commitment_clarify.py
+index 55c5d71..82d23ae 100644
+--- a/calling-agent/backend/tests/test_commitment_clarify.py
++++ b/calling-agent/backend/tests/test_commitment_clarify.py
+@@ -179,7 +179,9 @@ def test_half_hour_phrase():
+ def test_vague_relative_ask_gets_minutes_flavoured_question():
+     r = make_router()
+     resp = drive(r, "thodi der baad call karna")
+-    assert "?" in resp and "minute" in resp.lower()
++    # The Hinglish line switches the router to Hindi, whose bank is now
++    # Devanagari (RUNBOOK §77): "कितने मिनट" is the minutes flavour.
++    assert "?" in resp and ("minute" in resp.lower() or "मिनट" in resp)
+     assert r._pending_clarify is not None
+ 
+ 
+diff --git a/calling-agent/backend/tests/test_callback_indic.py b/calling-agent/backend/tests/test_callback_indic.py
+new file mode 100644
+index 0000000..e99d43a
+--- /dev/null
++++ b/calling-agent/backend/tests/test_callback_indic.py
+@@ -0,0 +1,221 @@
++"""Callback requests in the caller's own script (RUNBOOK §77).
++
++Proves: the Devanagari / Gujarati REQUEST shapes are callbacks and the
++reporting / describing / refusing shapes are not; a Hindi caller's
++"5 मिनट में कॉल बैक" is confirmed in Devanagari and closes the call; a vague
++"बाद में कॉल कर सकते हो?" gets ONE Devanagari clarification (the agent's own
++authored busy line for a busy brush-off, when it has one) and the turn after
++it carries the ━━ CALLBACK REQUESTED ━━ band until the time is settled; a
++day answer confirms in Devanagari; English behaviour is unchanged.
++
++Offline: stub LLM, no live agent YAML. The corpus lists are frozen copies of
++the 2026-10-12 sweep over recordings/ (11,621 caller lines): before the fix
++the detector had 0 Devanagari hits; of the 27 Devanagari hits after, 25 are
++requests to be called or deferrals to a later call, one is the caller saying
++they will call ("बाद में कॉल करता हूँ") and one narrates such a request
++("मैंने एक को बोला मुझे कॉल बैक करो") — both tolerated, both end as a
++polite deferral. Nothing Latin was lost.
++"""
++from __future__ import annotations
++
++import asyncio
++import re
++
++import pytest
++
++from app.agent_definition.schema import AgentDefinition
++from app.voice.conversation import ConversationRouter
++
++
++@pytest.fixture(autouse=True)
++def _offline(stub_llm):
++    """Turns that fall through to the LLM run against the offline stub."""
++
++
++LATIN = re.compile(r"[A-Za-z]")
++BUSY_HI = "बिल्कुल — कब कॉल करूँ तो ठीक रहेगा? मैं तभी कॉल करूँगा।"
++
++
++def make_router(lang: str = "hi", busy_line: bool = True,
++                clarify: bool = True) -> ConversationRouter:
++    ob = {"identity_confirm_line": {"hi": "नमस्ते! क्या मेरी बात {contact_name} जी से हो रही है?",
++                                    "en": "Am I speaking with {contact_name}?"}}
++    if busy_line:
++        ob["busy_response"] = {"hi": BUSY_HI,
++                               "en": "Of course — when would be a better time?"}
++    d = {
++        "agent_id": "t_cb_indic", "version": "1.0.0",
++        "identity": {"agent_name": "Dhaval", "company_name": "TestCo",
++                     "pronouns": "he"},
++        "languages": {"supported": ["hi", "en"], "default": lang,
++                      "tts_voices": {}},
++        "call_flow": {
++            "stages": [
++                {"id": "S1", "order": 0, "goal": "one", "turns_until_advance": 8},
++                {"id": "S2", "order": 1, "goal": "two", "turns_until_advance": 99},
++            ],
++            "callback_policy": {"enabled": True, "capture_exact_time": True},
++        },
++        "follow_up": {"clarify_commitments": {"enabled": clarify}},
++        "calendar": {"mock_slots": []},
++        "response_bank": {"opening_greeting": "hi"},
++        "call_direction": "outbound",
++        "outbound": ob,
++    }
++    agent = AgentDefinition.from_dict(d)
++    r = ConversationRouter(agent_def=agent, default_language=lang)
++    r.call_direction = "outbound"
++    r.state.language = lang
++    r._available_calendar_slots = lambda: []
++    return r
++
++
++def drive(router: ConversationRouter, text: str) -> str:
++    async def _one():
++        out = []
++        async for res in router.process_stream(text):
++            out.append(res.text)
++        return " ".join(t for t in out if t)
++    return asyncio.run(_one())
++
++
++# ── the detector ────────────────────────────────────────────────────────────
++# The three live lines (calls 1061, 1073) first; the rest are the 2026-10-12
++# corpus hits, verbatim. Every one is a request to be called or a deferral
++# to a later call.
++POSITIVE = [
++    "तो आप मुझे पांच मिनट में कॉल बैक कर सकते हैं।",
++    "क्या आप मुझे बाद में कॉल कर सकते हो?",
++    "मैं आपको बाद में कॉल करके बताऊँगी, आप मुझे एक बार कल ग्यारह बजे तक कॉल कर दीजिए।",
++    "हम्म, आप मुझे परसों कॉल कर दीजिए।",
++    "आप मुझे मंडे को कॉल कर सकते हो।",
++    "क्या आपको आप मुझे 10 मिनट बाद कॉल कर सकते हो?",
++    "मुझे आप आराम से 10 मिनट बाद कॉल करना।",
++    "थोड़ी देर बाद कॉल कीजिए, यह कन्फर्म करने के बाद भी आप पूछ रहे हैं",
++    "हाँ, मैं अभी काम में हूँ। मुझे कल सुबह ग्यारह बजे कॉल कीजिए, ठीक है?",
++    "नहीं नहीं नहीं भाई 20 मिनट बाद 20 मिनट बाद ही कॉल करना ठीक है चलो बाय",
++    "हाँ हाँ बाद में तो आप कॉल कर सकते हो मुझे",
++    "रिमाइंडर कॉल कर देना बारह बजे के आसपास।",
++    "आप मुझे एक घंटे बाद कॉल करना, मैं उनको बता दूंगा आपको कॉल करने के लिए।",
++    "कॉल करना आप मुझे, उसमें डिसाइड कर लेंगे हम।",
++    "क्या कल आप मुझे कॉल बैक कर सकती हैं अभी मैं बिजी हूँ",
++    "हाँ, कल दोपहर को तीन बजे कॉल कर दीजिए।",
++    "मेरे पास। मैं कल फ्री हूँ, कल कॉल कर सकते हो मेरे को?",
++    "और बाद में बात करते हैं, थैंक यू।",
++    "कल सुबह बात करते हैं",
++    "મને કાલે કૉલ કરજો",
++    "પછી કૉલ કરશો?",
++]
++# Reporting a call, describing calls, refusing one, a past call, an answer
++# to a question — none of these asks to be called.
++NEGATIVE = [
++    "नहीं नहीं मुझे मत करना कॉल, मैं आपको कॉल कर लूँगा खुद ही।",
++    "आप मुझे मत कॉल करो आप नहीं कर सकते मेरी मदद थैंक यू",
++    "कॉल मत करना मुझे",
++    "अभी तो हमारी इंटरनल टीम ही सेल्स कॉल करती है।",
++    "क्यों कॉल किया आपने?",
++    "मुझे आपका कॉल आया था",
++    "कॉल आया था आपका",
++    "मैं अभी तो vapi में ही हूँ।",
++    "और हम मतलब खुद से ही कॉल करके सब कुछ कर सकते हैं।",
++    "फिर बाद में जो वापस कॉल करेगा।",
++    "नहीं, थोड़ी देर बाद कॉल की थी।",
++    "इन्वेस्टमेंट है।",
++    "कल बात ये है कि मुझे 3 bhk चाहिए",
++    "कल शाम को बात हुई थी आपसे",
++    "मुझे कल कॉल करना है ऑफिस में",
++]
++
++
++@pytest.mark.parametrize("text", POSITIVE)
++def test_indic_request_is_a_callback(text):
++    assert make_router()._detect_callback_request(text) is True
++
++
++@pytest.mark.parametrize("text", NEGATIVE)
++def test_indic_non_request_is_not_a_callback(text):
++    assert make_router()._detect_callback_request(text) is False
++
++
++def test_english_detection_unchanged():
++    r = make_router(lang="en")
++    assert r._detect_callback_request("can you call me back in 5 minutes") is True
++    assert r._detect_callback_request("i got a call from this number 20 minutes back") is False
++
++
++# ── the spoken lines ────────────────────────────────────────────────────────
++def test_precise_hindi_request_is_confirmed_in_devanagari_and_closes():
++    r = make_router()
++    reply = drive(r, "तो आप मुझे पांच मिनट में कॉल बैक कर सकते हैं।")
++    assert "5 मिनट में" in reply
++    assert not LATIN.search(reply), reply
++    assert r.state_mgr.extra_flags["callback_requested"] is True
++    assert r.state_mgr.extra_flags["callback_offset_min"] == 5
++    assert r.call_outcome == "callback_requested"
++    assert r.hangup_pending is True and r.state.is_closing is True
++
++
++def test_vague_hindi_request_gets_one_devanagari_question_then_confirms_the_day():
++    r = make_router()
++    q = drive(r, "क्या आप मुझे बाद में कॉल कर सकते हो?")
++    assert "?" in q and "कॉल" in q and not LATIN.search(q), q
++    assert r._clarify_asked is True and r.state.is_closing is False
++    assert r.state_mgr.extra_flags["callback_requested"] is True
++    confirm = drive(r, "कल सुबह")
++    assert "कल" in confirm and "सुबह" in confirm and not LATIN.search(confirm), confirm
++    assert r.hangup_pending is True
++
++
++def test_busy_brush_off_uses_the_agents_authored_busy_line():
++    r = make_router(busy_line=True)
++    assert drive(r, "अभी busy हूँ, बाद में कॉल कीजिए") == BUSY_HI
++    r2 = make_router(busy_line=False)
++    reply = drive(r2, "अभी busy हूँ, बाद में कॉल कीजिए")
++    assert "कितने मिनट" in reply and not LATIN.search(reply), reply
++
++
++def test_callback_policy_fallback_is_hindi_when_clarify_is_off():
++    # The v2 policy (clarifier off) handles deferrals classified `objection`;
++    # its built-in confirmation was English on every Hindi call.
++    r = make_router(clarify=False)
++    r.state.stage = "S2"      # the objection branch never runs in GREETING
++    reply = drive(r, "क्या आप मुझे बाद में कॉल कर सकते हो?")
++    assert "कॉल करेंगे" in reply and not LATIN.search(reply), reply
++    assert r.state_mgr.extra_flags["callback_requested"] is True
++    assert r.hangup_pending is True
++
++
++def test_english_spoken_lines_unchanged():
++    r = make_router(lang="en")
++    reply = drive(r, "can you call me back in 5 minutes")
++    assert reply == ("Perfect — I'll call you back in about 5 minutes. "
++                     "Thank you, and have a great day!")
++
++
++# ── the band ────────────────────────────────────────────────────────────────
++def test_band_holds_the_model_to_the_callback_until_the_time_is_settled():
++    r = make_router()
++    assert r._callback_pending_band() == []
++    drive(r, "क्या आप मुझे बाद में कॉल कर सकते हो?")        # the one question
++    assert "━━ CALLBACK REQUESTED ━━" in r._build_system_prompt()
++    drive(r, "हाँ ठीक है")                                      # unparseable answer → model
++    band = "\n".join(r._callback_pending_band())
++    assert "do NOT ask a qualification question" in band
++    assert "━━ CALLBACK REQUESTED ━━" in r._build_system_prompt()
++    # The caller repeats the request (the agent "missed" it): no second
++    # question — confirmed in Devanagari and closed.
++    confirm = drive(r, "कल दोपहर को कॉल कर दीजिए")
++    assert "कल दोपहर" in confirm and not LATIN.search(confirm), confirm
++    assert r.state.is_closing is True
++    assert r._callback_pending_band() == []
++
++
++def test_spoken_day_time_localises_only_hi_and_gu():
++    f = ConversationRouter._spoken_day_time
++    assert f("Tomorrow", "evening", "hi") == ("कल", "शाम")
++    assert f("Monday", "11 baje", "hi") == ("सोमवार", "11 बजे")
++    assert f("Tomorrow", "evening", "gu") == ("કાલે", "સાંજે")
++    assert f("Tomorrow", "3 pm", "en") == ("Tomorrow", "3 pm")
++    assert ConversationRouter._offset_phrase(10, "hi") == "10 मिनट में"
++    assert ConversationRouter._offset_phrase(60, "hi") == "1 घंटे में"
++    assert ConversationRouter._offset_phrase(10, "en") == "in about 10 minutes"
+diff --git a/calling-agent/backend/tests/test_good_time_commit.py b/calling-agent/backend/tests/test_good_time_commit.py
+new file mode 100644
+index 0000000..6bbdf77
+--- /dev/null
++++ b/calling-agent/backend/tests/test_good_time_commit.py
+@@ -0,0 +1,73 @@
++"""The authored good-time beat is never rolled back (RUNBOOK §77).
++
++Call 1061: the engine spoke `outbound.good_time_check_line` the moment the
++caller said "हां जी"; a "ठीक है?" fragment landed while it played; the
++continuation merge rolled the provisional turn back — the line left history,
++`_good_time_spoken` was restored to False, the merged "हां जी। ठीक है?" no
++longer qualified for the fast path — and the model re-introduced itself
++from the INTRO stage goal. The beat now commits its turn, exactly as closing
++turns do, so the fragment is simply the next turn.
++
++Offline: stub LLM; the identity harness from test_identity_reconfirm.
++"""
++from __future__ import annotations
++
++import asyncio
++
++import pytest
++
++from app.voice.conversation import ConversationRouter
++from tests.test_identity_reconfirm import make_router
++
++
++@pytest.fixture(autouse=True)
++def _offline(stub_llm):
++    """Model turns run against the offline stub."""
++
++
++def drive(router: ConversationRouter, text: str) -> str:
++    async def _one():
++        out = []
++        async for res in router.process_stream(text):
++            out.append(res.text)
++        return " ".join(t for t in out if t)
++    return asyncio.run(_one())
++
++
++def _turns(r):
++    return [(t.role, t.text) for t in r.memory.turns]
++
++
++def test_good_time_fast_path_commits_its_turn_and_survives_a_fragment():
++    r = make_router()
++    r._continuation_enabled = True
++    reply = drive(r, "हां जी")
++    assert "दो मिनट बात" in reply and r._good_time_spoken is True
++    # §77: committed — nothing for a continuation fragment to supersede.
++    assert r.has_pending_turn() is False
++    assert r.rollback_pending_turn() is None
++    before = _turns(r)
++    assert any(role == "assistant" and "दो मिनट बात" in text for role, text in before)
++    # The fragment that used to roll the beat back is now the next turn.
++    reply2 = drive(r, "ठीक है?")
++    assert r._good_time_spoken is True
++    assert _turns(r)[:len(before)] == before
++    assert "दो मिनट बात" not in reply2
++
++
++def test_an_ordinary_turn_is_still_supersedable():
++    r = make_router()
++    r._continuation_enabled = True
++    drive(r, "हां जी")
++    drive(r, "मुझे एक 3 bhk चाहिए था")
++    assert r.has_pending_turn() is True
++
++
++def test_its_me_after_a_recheck_commits_too():
++    r = make_router()
++    r._continuation_enabled = True
++    drive(r, "नहीं")                      # re-confirmation asked
++    assert r._wrong_number_pending == 1
++    reply = drive(r, "मैं ही हूँ")          # it is them: the good-time beat
++    assert "दो मिनट बात" in reply and r._good_time_spoken is True
++    assert r.has_pending_turn() is False

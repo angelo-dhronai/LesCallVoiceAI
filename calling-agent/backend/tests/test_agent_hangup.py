@@ -118,7 +118,10 @@ def test_wrong_number_close_arms_hangup():
                     outbound={"wrong_number_patterns": ["wrong number"],
                               "wrong_number_close": {"en": "So sorry! Bye."}})
     r.call_direction = "outbound"
+    # RUNBOOK §73: re-confirmed once, then the caller's yes closes it.
     drive(r, "you have the wrong number")
+    assert r.state.is_closing is False
+    drive(r, "yes")
     assert r.state.is_closing is True
     assert r.hangup_pending is True
 

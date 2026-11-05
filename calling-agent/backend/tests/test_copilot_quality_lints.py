@@ -404,3 +404,140 @@ def test_get_agent_digest_has_pace(cop_with_agents):
     assert set(pace) == set(expected) and pace
     for lg, v in expected.items():
         assert pace[lg] == v.get("pace"), lg
+
+
+# ---------------------------------------------------------------------------
+# RUNBOOK §37: the self-transition lint must fire on the path agents are
+# actually edited through.
+#
+# The §35 lint was written for exactly one phrasing — "advance to WRAP_UP" in
+# a stage goal with no branches — and then gated behind include_wiring_lints,
+# which is False for update_agent and update_stage. On 2026-09-08 a Copilot
+# goal rewrite put that phrasing straight back into the agent the lint had
+# been written for, and the tool result came back "quality": [].
+# ---------------------------------------------------------------------------
+
+def _stage_flow(agency_goal: str, branches: list | None = None) -> dict:
+    return {
+        "call_direction": "outbound",
+        "languages": {"supported": ["hi", "en"], "default": "hi",
+                      "tts_voices": {"hi": {}, "en": {}}},
+        "knowledge_base": {"portfolio_prompt_text": "x" * 120},
+        "response_bank": {"opening_greeting": "Hello, am I speaking with X?",
+                          "objection_responses": {"hi": ["ok"]}},
+        "outbound": {"identity_confirm_line": {"hi": "hi"}},
+        "call_flow": {"stages": [
+            {"id": "INTRO", "order": 0, "goal": "Confirm who you are speaking to. " * 3,
+             "branches": [], "advance_when": {"max_turns": 3}},
+            {"id": "AGENCY_CHALLENGES", "order": 1, "goal": agency_goal,
+             "branches": branches or [], "advance_when": {"max_turns": 6}},
+            {"id": "WRAP_UP", "order": 2, "goal": "Close the call politely. " * 3,
+             "branches": [], "advance_when": {"max_turns": 2}},
+        ]},
+    }
+
+
+def _lint_text(cop, warnings: list) -> str:
+    return " ".join(warnings)
+
+
+def test_self_transition_lint_fires_on_an_update_for_the_touched_stage(cop):
+    """The live rev-213 regression: a goal rewrite that ends 'and advance to
+    WRAP_UP' on a stage with no branches."""
+    before = _stage_flow("Ask about their agency challenges and listen. " * 3)
+    after = _stage_flow("Ask about their agency challenges and listen. " * 3
+                        + "and advance to WRAP_UP.")
+
+    touched = cop._changed_stage_ids(before, after)
+    assert touched == {"AGENCY_CHALLENGES"}
+
+    w = cop._quality_warnings(after, include_wiring_lints=False,
+                              touched_stages=touched)
+    assert "AGENCY_CHALLENGES" in _lint_text(cop, w)
+    assert "transition itself" in _lint_text(cop, w)
+
+
+def test_the_same_lint_catches_terminate_the_call(cop):
+    """WRAP_UP's rev-214 goal ended 'Then terminate the call immediately.' The
+    model does not end calls — the platform does, after asking the caller."""
+    before = _stage_flow("Ask about their agency challenges and listen. " * 3)
+    after = _stage_flow("Ask about their agency challenges and listen. " * 3
+                        + "Then terminate the call immediately.")
+    w = cop._quality_warnings(after, include_wiring_lints=False,
+                              touched_stages=cop._changed_stage_ids(before, after))
+    assert "AGENCY_CHALLENGES" in _lint_text(cop, w)
+
+
+def test_a_stage_that_really_branches_there_is_not_flagged(cop):
+    """Wording that describes what the ENGINE does is fine once the stage has
+    a real, immediate way to reach the destination."""
+    goal = ("Ask about their agency challenges and listen. " * 3
+            + "and advance to WRAP_UP.")
+    after = _stage_flow(goal, branches=[
+        {"when_slot": {"name": "marketing_challenges"}, "goto": "WRAP_UP"}])
+    w = cop._quality_warnings(
+        after, include_wiring_lints=False,
+        touched_stages=cop._changed_stage_ids(_stage_flow("a " * 30), after))
+    assert "transition itself" not in _lint_text(cop, w)
+
+
+def test_untouched_stages_are_never_nagged_about(cop):
+    """The reason wiring lints are suppressed on updates in the first place:
+    an edit to one stage must not report someone else's pre-existing wiring."""
+    d = _stage_flow("Ask about their agency challenges. " * 3
+                    + "and advance to WRAP_UP.")
+    w = cop._quality_warnings(d, include_wiring_lints=False,
+                              touched_stages=set())
+    assert "transition itself" not in _lint_text(cop, w)
+
+
+def test_copilot_prompt_names_the_edit_do_not_regenerate_rule(cop):
+    """§37: three Copilot edits each dropped a constraint the user had not
+    mentioned, including the rule stopping invented lead numbers."""
+    p = cop._system_prompt()
+    assert "EDIT A FIELD, DO NOT REGENERATE IT" in p
+    assert "IMPROVISED, NOT CONFIGURED" in p
+    assert "NEVER write \"then terminate the call\"" in p
+
+
+def test_latin_only_decline_patterns_are_flagged_only_when_they_replace(cop):
+    """knowledge_base.objection_patterns decides whether a decline is HEARD.
+    'extend' merges the platform defaults, which now carry both scripts, so
+    such an agent is covered; a 'replace' list in Latin only is blind."""
+    base = {
+        "languages": {"supported": ["hi", "en"], "default": "hi",
+                      "tts_voices": {"hi": {}, "en": {}}},
+        "knowledge_base": {"portfolio_prompt_text": "x" * 120,
+                           "objection_patterns": ["not interested", "abhi nahi"]},
+        "response_bank": {"opening_greeting": "Hello, am I speaking with X?",
+                          "objection_responses": {"hi": ["ok"]}},
+        "call_flow": {"stages": [
+            {"id": "A", "order": 0, "goal": "Do the first thing well. " * 4},
+            {"id": "B", "order": 1, "goal": "Do the second thing well. " * 4},
+        ]},
+    }
+    import copy
+    replaced = copy.deepcopy(base)
+    replaced["knowledge_base"]["objection_patterns_mode"] = "replace"
+    assert any("objection_patterns is Latin-script only" in x
+               for x in cop._quality_warnings(replaced))
+
+    extended = copy.deepcopy(base)
+    extended["knowledge_base"]["objection_patterns_mode"] = "extend"
+    assert not any("objection_patterns is Latin-script only" in x
+                   for x in cop._quality_warnings(extended))
+
+
+def test_a_goal_describing_platform_termination_is_not_flagged(cop):
+    """The §37 WRAP_UP goal says 'the platform ends the call itself … never
+    ask whether to cut the call yourself'. Flagging that would push authors to
+    delete the sentence that stops the model hanging up."""
+    d = _stage_flow(
+        "Close the call politely and thank them. " * 3
+        + "Say nothing after it — the platform ends the call itself, and it "
+          "will ask the caller's permission first. Never ask whether to cut "
+          "the call yourself.")
+    w = cop._quality_warnings(
+        d, include_wiring_lints=False,
+        touched_stages={"AGENCY_CHALLENGES"})
+    assert not any("transition itself" in x for x in w)

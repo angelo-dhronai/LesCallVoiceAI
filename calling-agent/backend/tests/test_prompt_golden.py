@@ -32,6 +32,13 @@ PRAMUKH_AGENT_YAML = AGENTS_DIR / "pramukh_agent" / "agent.yaml"
 
 REGEN = os.environ.get("GOLDEN_REGEN", "") == "1"
 
+# The ━━ RIGHT NOW ━━ band renders the live IST clock, so an un-pinned prompt
+# changes every minute and no byte-identity fixture could ever hold. Freeze it
+# for the whole module — a Wednesday inside the Mon-Fri 10:00-18:00 window, so
+# the fixtures exercise the open-hours branch. Changing this instant means
+# regenerating every fixture.
+FROZEN_NOW = "2026-08-12T15:22:00"
+
 STAGES = ["GREETING", "DISCOVERY", "PROJECT_MATCH",
           "INVITE_VISIT", "CONFIRMATION", "CLOSING"]
 # The Copilot-built production sibling (DID-routed, takes live outbound
@@ -44,6 +51,12 @@ PA_STAGES = ["CONFIRM_IDENTITY", "ASK_LOCATION_PREFERENCES",
              "SCHEDULE_SITE_VISIT", "NO_SITE_VISIT", "CLOSING"]
 LANGS = ["hi", "en", "gu"]
 DIRECTIONS = ["inbound", "outbound"]
+
+
+@pytest.fixture(autouse=True)
+def _freeze_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin ━━ RIGHT NOW ━━ so the rendered prompt is reproducible."""
+    monkeypatch.setenv("PROMPT_NOW_OVERRIDE", FROZEN_NOW)
 
 
 def _make_router(stage: str, lang: str, direction: str,

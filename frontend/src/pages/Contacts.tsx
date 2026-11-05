@@ -1,20 +1,26 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  BookUser, ChevronRight, FolderPlus, Folder, FolderOpen, Pencil, Plus,
-  Trash2, Upload, Users, X,
+  BookUser, CalendarClock, ChevronRight, FolderPlus, Folder, FolderOpen, Pencil,
+  Plus, Trash2, Upload, Users, X,
 } from 'lucide-react'
 import { useGet, useRefresh } from '../api/hooks/useApi'
+import { api } from '../api/client'
 import { post, patch, del, postForm } from '../api/mutate'
-import { Badge, Button, Card, EmptyState, Spinner, cx } from '../components/ui'
+import { Badge, Button, Card, EmptyState, SectionHead, Spinner, cx } from '../components/ui'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   PageHeader, Table, THead, TH, TR, TD, Pagination, SearchInput, Input,
   Textarea, Select, Field, AsyncState,
 } from '../components/kit'
 import { Modal } from '../components/Modal'
 import { useToast } from '../components/Toast'
-import { useConfirm } from '../components/confirm'
+import { useConfirm, usePrompt } from '../components/confirm'
+import {
+  ScheduleDialog, ScheduleList, useSchedules, type ScheduleTarget,
+} from '../components/schedule'
 import { useDebounced, useUrlNumber, useUrlParam } from '../lib/hooks'
+import { fmtDate } from '../lib/format'
 
 type Contact = {
   id: string
@@ -82,6 +88,7 @@ export default function Contacts() {
   const nav = useNavigate()
   const refresh = useRefresh()
   const confirm = useConfirm()
+  const prompt = usePrompt()
   // Group / search / page live in the URL so refresh & share keep the view.
   const [groupRaw, setGroupRaw] = useUrlParam('group', 'all')
   const groupSel: 'all' | 'none' | number =
@@ -96,6 +103,12 @@ export default function Contacts() {
   const [busy, setBusy] = useState(false)
   const [uploading, setUploading] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+  // Ticked rows, by the contact's string handle. Kept across pages so a
+  // selection can be built up page by page; dropped when the view changes,
+  // because "delete the selected" must never act on rows you can no longer see.
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [bulkBusy, setBulkBusy] = useState(false)
+  const [selectingAll, setSelectingAll] = useState(false)
 
   // Search/group changes reset the page (effect, not a second URL-setter call
   // in the same tick — those clobber each other); first run keeps deep links.
@@ -103,8 +116,14 @@ export default function Contacts() {
   useEffect(() => {
     if (firstRun.current) { firstRun.current = false; return }
     if (page !== 1) setPage(1)
+    setSelected(new Set())
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debSearch, groupRaw])
+
+  // Scheduling shares one dialog and one list with Outbound — see
+  // components/schedule.tsx for why this is not a per-page dialog.
+  const [scheduleTarget, setScheduleTarget] = useState<ScheduleTarget | null>(null)
+  const schedulesQ = useSchedules()
 
   const groupsQ = useGet<GroupsResp>(['contact-groups'], '/outbound/groups')
   const groups = groupsQ.data?.groups ?? []
@@ -134,19 +153,86 @@ export default function Contacts() {
 
   const refreshAll = () => refresh(['contacts-book'], ['contact-groups'], ['outbound-contacts'])
 
+  /* ---------------------------------------------------------------- selection */
+
+  const pageIds = rows.map((c) => c.id)
+  const allOnPage = pageIds.length > 0 && pageIds.every((id) => selected.has(id))
+  const toggleOne = (id: string) => setSelected((s) => {
+    const n = new Set(s)
+    if (n.has(id)) n.delete(id)
+    else n.add(id)
+    return n
+  })
+  const togglePage = () => setSelected((s) => {
+    const n = new Set(s)
+    if (allOnPage) pageIds.forEach((id) => n.delete(id))
+    else pageIds.forEach((id) => n.add(id))
+    return n
+  })
+  const clearSelection = () => setSelected(new Set())
+  const viewLabel = groupSel === 'all' ? 'all contacts'
+    : groupSel === 'none' ? 'No group' : (groupName(groupSel) || 'this group')
+
+  /** The page checkbox ticks one page; a group can run to many. This asks the
+   *  server for every id the current group + search matches, so "select all"
+   *  means all of them — the count in the confirm dialog is then the count
+   *  that gets deleted. */
+  const selectAllMatching = async () => {
+    setSelectingAll(true)
+    try {
+      const r = await api<ContactsResp>(
+        `/outbound/contacts?group=${groupParam}&q=${encodeURIComponent(debSearch || '')}`)
+      setSelected(new Set((r.contacts ?? []).map((c) => c.id)))
+    } catch (e: any) {
+      toast(`Could not load the full list: ${e?.message || e}`, 'error')
+    } finally {
+      setSelectingAll(false)
+    }
+  }
+
+  const bulkDelete = async () => {
+    const n = selected.size
+    if (!n) return
+    if (!(await confirm({
+      title: `Delete ${n.toLocaleString('en-IN')} contact${n === 1 ? '' : 's'}?`,
+      description: 'They are removed permanently — call history, notes and details included. '
+        + 'A later import of the same numbers starts them fresh. This cannot be undone.',
+      destructive: true,
+      confirmLabel: `Delete ${n.toLocaleString('en-IN')}`,
+    }))) return
+    setBulkBusy(true)
+    try {
+      const r = await post<{ matched?: number; changed?: number }>(
+        '/outbound/contacts/bulk', { action: 'delete', contact_ids: [...selected] })
+      toast(`${(r?.changed ?? r?.matched ?? n).toLocaleString('en-IN')} contact(s) deleted`, 'success')
+      clearSelection()
+      refreshAll()
+    } catch (e: any) {
+      toast(`Delete failed: ${e?.message || e}`, 'error')
+    } finally {
+      setBulkBusy(false)
+    }
+  }
+
   const saveContact = async () => {
     if (!editor) return
     setBusy(true)
     try {
+      // Phone goes in BOTH directions. It used to be sent only on create, so
+      // the edit dialog accepted a corrected number, said "Contact updated"
+      // and kept the old one — a typo'd number was uneditable here, which is
+      // the single most common reason to open this dialog at all. The server
+      // has always accepted it (Outbound's copy of this dialog sends it).
       const body = {
         name: editor.name.trim(),
+        phone: editor.phone.trim(),
         gender: editor.gender,
         notes: editor.notes.trim(),
         group_id: editor.group_id === '' ? null : editor.group_id,
         details: textToDetails(editor.detailsText),
       }
       if (editor.mode === 'add') {
-        await post('/outbound/contacts', { ...body, phone: editor.phone.trim() })
+        await post('/outbound/contacts', body)
         toast('Contact added', 'success')
       } else {
         await patch(`/outbound/contacts/${editor.id}`, body)
@@ -181,15 +267,41 @@ export default function Contacts() {
     if (!name) return
     setBusy(true)
     try {
-      await post('/outbound/groups', { name })
-      toast(`Group “${name}” created`, 'success')
+      const r = await post<{ group?: { id: number; name: string } }>(
+        '/outbound/groups', { name })
+      toast(`Group “${name}” created — new contacts and imports go here now`, 'success')
       setNewGroupOpen(false)
       setNewGroupName('')
+      // Select what you just made. Creating a group is always the first half of
+      // "…and put these people in it", and leaving the sidebar on All contacts
+      // meant the very next Add or Import silently landed in No group.
+      if (r?.group?.id) setGroupSel(r.group.id)
       refresh(['contact-groups'])
     } catch (e: any) {
       toast(String(e?.message || e).includes('409') ? 'A group with that name already exists' : `Failed: ${e?.message || e}`, 'error')
     } finally {
       setBusy(false)
+    }
+  }
+
+  const renameGroup = async (g: Group) => {
+    const name = await prompt({
+      title: `Rename “${g.name}”`,
+      description: `Its ${g.count} contact(s) stay in it.`,
+      initial: g.name,
+      placeholder: 'Group name',
+      confirmLabel: 'Rename',
+      validate: (v) => (v.trim() ? null : 'Give the group a name'),
+    })
+    if (!name || name.trim() === g.name) return
+    try {
+      await patch(`/outbound/groups/${g.id}`, { name: name.trim() })
+      toast('Group renamed', 'success')
+      refreshAll()
+    } catch (e: any) {
+      toast(String(e?.message || e).includes('409')
+        ? 'A group with that name already exists'
+        : `Rename failed: ${e?.message || e}`, 'error')
     }
   }
 
@@ -214,12 +326,19 @@ export default function Contacts() {
     try {
       const form = new FormData()
       form.append('file', file)
-      const r = await postForm<{ ok: boolean; added?: number; duplicates?: number; parse_errors?: number; reason?: string }>(
-        '/outbound/contacts/upload', form,
-      )
+      // Import into the group you are standing in. Every import used to land in
+      // No group regardless of the sidebar selection, so filling "Marketing"
+      // from a spreadsheet meant re-filing every row by hand afterwards.
+      if (typeof groupSel === 'number') form.append('group_id', String(groupSel))
+      const r = await postForm<{
+        ok: boolean; added?: number; duplicates?: number; moved?: number
+        parse_errors?: number; reason?: string
+      }>('/outbound/contacts/upload', form)
       if (r.ok) {
-        toast(`Imported ${r.added} contact(s)` +
+        const into = typeof groupSel === 'number' ? ` into ${groupName(groupSel)}` : ''
+        toast(`Imported ${r.added} contact(s)${into}` +
           (r.duplicates ? `, ${r.duplicates} duplicate(s) skipped` : '') +
+          (r.moved ? `, ${r.moved} existing moved in` : '') +
           (r.parse_errors ? `, ${r.parse_errors} row(s) unreadable` : ''),
           'success')
         refreshAll()
@@ -234,11 +353,12 @@ export default function Contacts() {
     }
   }
 
-  /** Sidebar row: a real <button> (keyboard operable) + optional delete action
-   *  as a sibling — buttons must not nest. */
+  /** Sidebar row: a real <button> (keyboard operable) + optional rename/delete
+   *  actions as siblings — buttons must not nest. */
   const sidebarItem = (
     active: boolean, label: string, count: number | undefined,
-    onClick: () => void, icon: React.ReactNode, onDelete?: () => void,
+    onClick: () => void, icon: React.ReactNode,
+    onDelete?: () => void, onRename?: () => void,
   ) => (
     <div
       key={label}
@@ -257,6 +377,17 @@ export default function Contacts() {
         <span className="min-w-0 flex-1 truncate">{label}</span>
         {count != null && <span className="tabular-nums text-2xs text-dim">{count}</span>}
       </button>
+      {onRename && (
+        <button
+          type="button"
+          onClick={onRename}
+          aria-label={`Rename group ${label}`}
+          title="Rename group"
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-dim transition-opacity hover:text-soft lg:opacity-0 lg:group-focus-within:opacity-100 lg:group-hover:opacity-100"
+        >
+          <Pencil size={12} />
+        </button>
+      )}
       {onDelete && (
         <button
           type="button"
@@ -312,9 +443,17 @@ export default function Contacts() {
             {groups.map((g) =>
               sidebarItem(groupSel === g.id, g.name, g.count, () => setGroupSel(g.id),
                 groupSel === g.id ? <FolderOpen size={14} /> : <Folder size={14} />,
-                () => removeGroup(g)),
+                () => removeGroup(g), () => renameGroup(g)),
             )}
           </div>
+          {/* Where Add contact and Import CSV will actually put people. Both
+              follow the sidebar selection, which is not obvious until an import
+              lands somewhere you did not expect. */}
+          <p className="mt-3 border-t border-[var(--border)] px-1 pt-3 text-2xs leading-snug text-dim">
+            {typeof groupSel === 'number'
+              ? <>New contacts and CSV imports go into <span className="font-semibold text-soft">{groupName(groupSel)}</span>.</>
+              : 'New contacts and CSV imports start with no group — pick a group first to file them as they arrive.'}
+          </p>
         </Card>
 
         {/* Contact list */}
@@ -326,6 +465,32 @@ export default function Contacts() {
               {total > 0 && <Badge tone="neutral">{total.toLocaleString('en-IN')} contact{total === 1 ? '' : 's'}</Badge>}
             </div>
           </div>
+
+          {/* Bulk bar — present only when there is a selection to act on. Deleting
+              a group only un-files its members (they drop to No group); this is
+              the way to remove the people themselves, one page or a whole group. */}
+          {selected.size > 0 && (
+            <div className="mb-4 flex flex-wrap items-center gap-2 rounded-xl bg-mint-400/10 px-3 py-2 ring-1 ring-mint-400/25">
+              <span className="text-sm font-semibold tabular-nums text-[var(--text)]">
+                {selected.size.toLocaleString('en-IN')} selected
+              </span>
+              {allOnPage && selected.size < total && (
+                <Button variant="ghost" size="sm" onClick={selectAllMatching} disabled={selectingAll || bulkBusy}>
+                  {selectingAll ? <Spinner className="h-3.5 w-3.5" /> : null}
+                  Select all {total.toLocaleString('en-IN')} in {viewLabel}
+                </Button>
+              )}
+              {selected.size >= total && total > pageIds.length && (
+                <span className="text-xs text-dim">All {total.toLocaleString('en-IN')} in {viewLabel} are selected.</span>
+              )}
+              <Button variant="danger" size="sm" onClick={bulkDelete} disabled={bulkBusy || selectingAll}>
+                {bulkBusy ? <Spinner className="h-3.5 w-3.5" /> : <Trash2 size={13} />} Delete
+              </Button>
+              <Button variant="ghost" size="sm" onClick={clearSelection} disabled={bulkBusy}>
+                <X size={13} /> Clear
+              </Button>
+            </div>
+          )}
 
           <AsyncState loading={contactsQ.isLoading} error={contactsQ.error}>
             {rows.length === 0 ? (
@@ -341,6 +506,10 @@ export default function Contacts() {
               <>
                 <Table>
                   <THead>
+                    <TH className="w-8">
+                      <Checkbox aria-label="Select every contact on this page"
+                        checked={allOnPage} onCheckedChange={togglePage} />
+                    </TH>
                     <TH>Name</TH>
                     <TH>Phone</TH>
                     <TH>Gender</TH>
@@ -353,15 +522,25 @@ export default function Contacts() {
                   </THead>
                   <tbody>
                     {rows.map((c) => (
-                      <TR key={c.id} className="group"
+                      <TR key={c.id} className={cx('group', selected.has(c.id) && 'bg-mint-400/5')}
                         onClick={c.db_id ? () => nav(`/contacts/${c.db_id}`) : undefined}>
+                        <TD className="w-8">
+                          {/* The row itself opens the contact; the tick must not. */}
+                          <span onClick={(e) => e.stopPropagation()}
+                            onKeyDown={(e) => e.stopPropagation()}>
+                            <Checkbox
+                              aria-label={`Select ${c.name || c.phone}`}
+                              checked={selected.has(c.id)}
+                              onCheckedChange={() => toggleOne(c.id)} />
+                          </span>
+                        </TD>
                         <TD className="font-medium text-[var(--text)]">{c.name || <span className="text-dim">—</span>}</TD>
                         <TD className="whitespace-nowrap font-mono text-sm">{c.phone}</TD>
                         <TD>{c.gender ? <Badge tone={c.gender === 'female' ? 'rose' : c.gender === 'male' ? 'indigo' : 'neutral'} soft>{c.gender}</Badge> : <span className="text-dim">—</span>}</TD>
                         <TD>{groupName(c.group_id) ? <Badge tone="mint" soft>{groupName(c.group_id)}</Badge> : <span className="text-xs text-dim">No group</span>}</TD>
                         <TD className="tabular-nums">{c.call_count || <span className="text-dim">—</span>}</TD>
                         <TD className="whitespace-nowrap text-xs text-dim">
-                          {c.last_called_at ? c.last_called_at.slice(0, 10) : '—'}
+                          {fmtDate(c.last_called_at)}
                         </TD>
                         <TD className="max-w-[260px]">
                           <span className="block truncate text-xs text-dim" title={detailsPreview(c.details)}>
@@ -381,6 +560,17 @@ export default function Contacts() {
                               className="grid h-9 w-9 place-items-center rounded-md text-dim transition hover:bg-[var(--surface-2)] hover:text-soft lg:h-7 lg:w-7"
                             >
                               <Pencil size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => { e.stopPropagation(); setScheduleTarget({
+                                kind: 'call', contactId: c.id, name: c.name, phone: c.phone,
+                              }) }}
+                              aria-label={`Schedule a call to ${c.name || c.phone}`}
+                              title="Schedule a call"
+                              className="grid h-9 w-9 place-items-center rounded-md text-dim transition hover:bg-[var(--surface-2)] hover:text-soft lg:h-7 lg:w-7"
+                            >
+                              <CalendarClock size={14} />
                             </button>
                             <button
                               type="button"
@@ -407,7 +597,26 @@ export default function Contacts() {
             )}
           </AsyncState>
         </Card>
+
+        {/* Scheduled calls. Shown here rather than only on Outbound because
+            this is where an operator schedules one — a schedule you cannot see
+            from the page that created it is a schedule you do not trust. */}
+        <Card className="p-0">
+          <SectionHead
+            title="Scheduled calls"
+            sub="Calls and campaigns waiting to run. Cancel any of them until they fire."
+          />
+          <div className="px-4 pb-4">
+            <ScheduleList compact />
+          </div>
+        </Card>
       </div>
+
+      <ScheduleDialog
+        target={scheduleTarget}
+        onClose={() => setScheduleTarget(null)}
+        hours={schedulesQ.data?.hours}
+      />
 
       {/* Add / edit contact */}
       <Modal
@@ -417,7 +626,7 @@ export default function Contacts() {
         footer={
           <>
             <Button variant="ghost" onClick={() => setEditor(null)}>Cancel</Button>
-            <Button onClick={saveContact} disabled={busy || (editor?.mode === 'add' && !editor.phone.trim())}>
+            <Button onClick={saveContact} disabled={busy || !editor?.phone.trim()}>
               {busy ? <Spinner className="h-4 w-4" /> : null} {editor?.mode === 'edit' ? 'Save changes' : 'Add contact'}
             </Button>
           </>
@@ -434,7 +643,6 @@ export default function Contacts() {
                   value={editor.phone}
                   onChange={(e) => setEditor({ ...editor, phone: e.target.value })}
                   placeholder="+91 98765 43210"
-                  disabled={editor.mode === 'edit'}
                 />
               </Field>
               <Field label="Gender">

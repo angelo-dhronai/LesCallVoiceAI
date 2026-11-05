@@ -1,0 +1,220 @@
+# Pramukh Swarit — structured project knowledge object (RUNBOOK §55).
+#
+# Sources:
+#   1. https://pramukh.com/swarit.html and https://pramukh.com/vapi.html,
+#      fetched 2026-09-24 — page text, gallery and amenity captions, the
+#      site-layout and 3D renders, the Google Maps link, the footer.
+#   2. The owner's Swarit brief (pasted 2026-09-24): positioning, ideal buyer
+#      profile, key selling points, amenity grouping, family / wellness /
+#      community features, location advantages, customer Q&A, lead
+#      qualification questions, conversion goals.
+#   3. The owner's fact sheet (image, pasted 2026-09-24 afternoon): 46
+#      bungalows, ready to move, home sizes (4 BHK 5,010 sq ft; 5 BHK
+#      5,635–6,880 sq ft), plot sizes (4 BHK 1,960 sq ft; 5 BHK 2,100–5,000
+#      sq ft), pricing ₹2.50 Cr to ₹3.50 Cr. This is the ONLY source for
+#      price and sizes — the website publishes neither.
+# Nothing is inferred beyond what is marked "(from the renders)".
+#
+# Still unpublished, and never to be guessed: floor plans — the page links
+# seven floor-plan images (ground / typical / blocks A–F) and every one is
+# HTTP 404 — and per-unit pricing beyond the owner's range. The brochure is
+# delivered to a WhatsApp number (the site form; the owner's brief says the
+# same); there is no public PDF.
+#
+# The owner's brief also carries two quotable lines (a site-visit pitch and
+# a brochure response). They are NOT authored into the agent as lines: the
+# engine recites a quoted line verbatim on every turn (RUNBOOK §51), so the
+# behaviour is described in the stage goals instead. The brochure response
+# asked the caller to "share your name and WhatsApp number"; this platform
+# never asks a caller to dictate a number (§54) — the agent asks whether the
+# number they are calling from is on WhatsApp.
+#
+# This file is the source of truth for the catalogue item; the Vikrant build
+# script (deploy/build_vikrant_swarit.py) loads it and writes it into both
+# agent YAMLs via store.write_agent. Keys under `catalog_item` that the
+# knowledge band renders are listed in catalog._DETAIL_KEYS; `overview`,
+# `media`, `source`, `faq`, `qualification_questions`, `conversion_goals` and
+# `contact_email` are data only and never reach the spoken prompt.
+
+catalog_item:
+  id: pramukh-swarit
+  name: Pramukh Swarit
+  aliases:
+  - Swarit
+  - Pramukh Swarit Bungalows
+  - Swarit Bungalows
+  - Swarit Vapi
+  location: New Chala, Vapi
+  configurations:
+  - 4 BHK
+  - 5 BHK
+  price_range: ₹2.50 Cr – ₹3.50 Cr
+  availability: Ready to move (owner's sheet and the pramukh.com Vapi listing); on-site
+    photographs updated November 2025
+  positioning_tag: flagship luxury bungalow community in Vapi
+  project_type: luxury residential bungalows (independent homes, not apartments)
+  tagline: Heaven Built On Earth
+  address: Opposite Pramukh Sahaj, New Chala, Vapi, Gujarat – 396191
+  rera: PR/GJ/VALSAD/PARDI/Others/RAA10449/140722
+  pitch_points:
+  - independent luxury bungalow living — spacious 4 and 5 BHK homes for families who
+    want luxury, comfort, privacy and peace together
+  - a serene, peaceful location in New Chala — the neighbourhood Pramukh Group itself
+    titled and developed, with convenient access to Vapi city
+  - modern architecture, premium amenities and lifestyle-focused community spaces
+  - family-oriented planning — dedicated children's and toddler-friendly spaces,
+    sports and fitness, a gathering lawn
+  - built for end-users and long-term homeowners — buyers upgrading from apartments
+    to an independent home
+  - ready to move and RERA registered, from a builder with 30 years and not one
+    stalled project
+  ideal_for:
+  - business owners and industrialists
+  - senior professionals
+  - growing families and families upgrading from apartments
+  - NRI families
+  - buyers who want an independent luxury home with privacy and community living
+  highlights:
+  - premium 4 and 5 BHK bungalow configurations
+  - peaceful, rejuvenating environment
+  - community-focused planning with family-friendly recreation
+  - high-quality construction and planning
+  - luxury lifestyle without compromising comfort
+  amenities:
+  - Swimming Pool
+  - Sun Deck
+  - Gym
+  - Indoor Games
+  - Multipurpose Court
+  - Multipurpose Hall
+  - Badminton Court
+  - Cricket Net
+  - Children's Play Area
+  - Gathering Lawn
+  - Zen Garden
+  - Reading Space / Library
+  - a club house with a basketball court and gazebo seating (from the gallery)
+  lifestyle:
+  - wellness — pool, gym, zen garden, sun deck, open landscaped areas, peaceful surroundings
+  - family — dedicated children's play area, toddler-friendly spaces, family recreation
+    zones, a safe residential environment
+  - sports — badminton court, cricket net, multipurpose court, indoor games
+  - community — multipurpose hall, gathering lawn, reading space, shared recreational areas
+  specifications:
+    homes: 46 bungalows in all (owner's sheet)
+    4 BHK: about 5,010 sq ft home on a plot of about 1,960 sq ft
+    5 BHK: 5,635 to 6,880 sq ft home on plots from 2,100 to 5,000 sq ft
+    pricing: ₹2.50 Cr to ₹3.50 Cr depending on the bungalow; exact unit pricing the
+      team confirms at the visit
+  layout: 46 bungalows in clusters of three and four homes along internal roads,
+    with the club house, pool, court and play area grouped in one corner of the
+    site (owner's sheet; layout render)
+  home_features: ground plus two upper floors with a rooftop terrace, balconies
+    with planters, a private lawn and covered car parking at the door (from the
+    3D renders)
+  connectivity:
+  - premium residential neighbourhood in New Chala with convenient access to Vapi city
+  landmarks:
+  - directly opposite Pramukh Sahaj, New Chala
+  - Pramukh House, the Vapi office, on Vapi–Daman Main Road in Chala
+  - Google Maps plus code 9WW2+J33, Chala, Vapi
+  brochure: sent to the caller's WhatsApp on request — there is no public PDF; ask
+    only whether the number they are calling from is on WhatsApp
+  contact:
+    Vapi office: Pramukh House, Vapi–Daman Main Rd, Chala, Vapi – 396191, +91 74062
+      58000
+  contact_email: inquiry@pramukh.co.in
+  not_published:
+  - floor plans
+  - per-unit pricing beyond the ₹2.50–3.50 Cr range
+  overview: Swarit is a premium luxury bungalow development by Pramukh Group in New
+    Chala, Vapi, designed for families seeking luxury, comfort, privacy and peaceful
+    living — spacious 4 and 5 BHK bungalows with modern architecture, premium
+    amenities, landscaped spaces and lifestyle-focused community facilities.
+  media:
+    video: https://pramukh.com/images/swarit/swarit-video.mp4
+    banner: https://pramukh.com/images/swarit/swarit-banner.jpg
+    gallery:
+    - https://pramukh.com/images/swarit/gallery/swarit-basket-ball.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-bedminton.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-children-play.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-club-entry.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-club-side.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-corner-view.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-cross-street-night.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-entry-view.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-four-unit.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-gazeboo-siting.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-honeycomb.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-swimingpool.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-three-unit.jpg
+    - https://pramukh.com/images/swarit/gallery/swarit-top-view.jpg
+    onsite_updates: November 2025 — eight site photographs
+    map: https://www.google.com/maps/place/Pramukh+Swarit/@20.3965107,72.8960174,16z
+    amenity_icons: https://pramukh.com/images/swarit/amenities/
+  faq:
+  - q: What is Swarit?
+    a: A luxury bungalow project by Pramukh Group in New Chala, Vapi, offering premium
+      4 and 5 BHK homes.
+  - q: What configurations are available?
+    a: Spacious 4 BHK and 5 BHK luxury bungalows.
+  - q: Who is this project suitable for?
+    a: Families looking for an independent luxury home with premium amenities and
+      peaceful surroundings — business owners, senior professionals, growing families,
+      NRI families, buyers upgrading from apartments.
+  - q: Does the project have recreational amenities?
+    a: Yes — swimming pool, gym, indoor games, badminton court, cricket net, children's
+      play area, gathering lawn, reading space, sun deck and zen garden.
+  - q: Is Swarit suitable for families with children?
+    a: Yes — dedicated children's recreational areas, toddler-friendly spaces and
+      family-focused community amenities.
+  - q: What lifestyle does Swarit offer?
+    a: A peaceful, luxurious, community-oriented lifestyle with modern amenities.
+  - q: Is Swarit RERA registered?
+    a: Yes — PR/GJ/VALSAD/PARDI/Others/RAA10449/140722.
+  - q: Where is Swarit?
+    a: Opposite Pramukh Sahaj, New Chala, Vapi – 396191.
+  - q: Is Swarit ready?
+    a: Listed ready to move on pramukh.com, with on-site photographs from November 2025.
+  - q: What does Swarit cost?
+    a: From ₹2.50 Cr to ₹3.50 Cr depending on the bungalow; the team confirms exact
+      unit pricing at the visit.
+  - q: How big are the bungalows?
+    a: A 4 BHK is about 5,010 sq ft on a roughly 1,960 sq ft plot; a 5 BHK is 5,635 to
+      6,880 sq ft on plots from 2,100 to 5,000 sq ft. 46 bungalows in all.
+  - q: Can I get the brochure?
+    a: Yes — it is sent to your WhatsApp number.
+  qualification_questions:
+  - 4 BHK or 5 BHK bungalow?
+  - self-use or investment?
+  - expected purchase timeline?
+  - currently residing in Vapi or outside Vapi?
+  - how many family members will be living in the home?
+  - which amenities matter most?
+  - would you like to schedule a site visit?
+  conversion_goals:
+    primary: schedule a Swarit site visit
+    secondary: collect lead details for follow-up by the sales team
+  source:
+    url: https://pramukh.com/swarit.html
+    listing: https://pramukh.com/vapi.html
+    owner_brief: pasted 2026-09-24
+    owner_fact_sheet: image pasted 2026-09-24 (price, sizes, count)
+    fetched: '2026-09-24'
+    floor_plan_links_dead:
+    - https://pramukh.com/images/swarit/floor-plans/ground.jpg
+    - https://pramukh.com/images/swarit/floor-plans/typical.jpg
+    - https://pramukh.com/images/swarit/floor-plans/block-a-b.jpg
+    - https://pramukh.com/images/swarit/floor-plans/block-c.jpg
+    - https://pramukh.com/images/swarit/floor-plans/block-d.jpg
+    - https://pramukh.com/images/swarit/floor-plans/block-e.jpg
+    - https://pramukh.com/images/swarit/floor-plans/block-f.jpg
+
+# The other Vapi projects the website lists on 2026-09-24 that the owner's
+# brief (deploy/pramukh_prakhar_brief.md) does not carry — NOT added to the
+# agent, because the brief is the owner-approved portfolio and these have no
+# prices or approved copy: Aristo (3/4/5 BHK, Chala, ready), Green County
+# (3/4 BHK ultra-luxury, near Gunjan, ongoing), Vivan (1.5/2 BHK, New Chala,
+# ready), Silver Stone (3/4 BHK, New Chala, under construction), Blue Stone
+# (2/3 BHK and shops, New Chala, under construction). Vedanta is listed there
+# as 3 & 4 BHK, ready to move; the brief has it as "residential apartments".

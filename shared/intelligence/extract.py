@@ -244,14 +244,64 @@ def _normalize(text: str) -> str:
     return _WS_RE.sub("", text).lower()
 
 
-def quote_in_transcript(quote: str, transcript_norm: str) -> bool:
+_SPEAKER_LINE_RE = re.compile(r"^\s*(agent|caller|customer|user)\s*:\s*(.*)$", re.I)
+
+
+def speech_runs(transcript: str) -> list[str]:
+    """Each RUN of consecutive lines by ONE speaker, normalized, as one string.
+
+    The audit transcript writes one line per VAD segment, not per sentence,
+    with a timestamp line between them:
+
+        [01:12.004] [spoke 70.1-71.0s]
+        Caller: i expected
+
+        [01:13.871]
+        Caller: 4 lakh per annum
+
+    A model quoting that answer writes "i expected 4 lakh per annum" — every
+    word the caller's, in order, uninterrupted — and it is not a substring of
+    the transcript, because "Caller" and the timestamp digits sit in the
+    middle of it. 28.7% of caller lines in the live corpus are continuations
+    like this (measured 2026-09-21), so the guard was failing genuine quotes
+    on exactly the callers who pause mid-sentence (RUNBOOK §46).
+
+    A run never crosses a change of speaker, so nothing here lets a quote
+    stitch an agent's question onto a caller's "yes".
+    """
+    runs: list[str] = []
+    who: str | None = None
+    buf: list[str] = []
+    for line in (transcript or "").splitlines():
+        m = _SPEAKER_LINE_RE.match(line)
+        if not m:
+            continue                      # timestamps, "[spoke …]", blanks
+        speaker = m.group(1).lower()
+        if speaker != who and buf:
+            runs.append(_normalize(" ".join(buf)))
+            buf = []
+        who = speaker
+        buf.append(m.group(2))
+    if buf:
+        runs.append(_normalize(" ".join(buf)))
+    return runs
+
+
+def quote_in_transcript(quote: str, transcript_norm: str,
+                        runs: list[str] | None = None) -> bool:
     """Hallucination guard: the (normalized) quote must appear in the
     transcript. Short quotes (<8 normalized chars) are too weak to verify and
-    are accepted."""
+    are accepted.
+
+    `runs` (from `speech_runs`) additionally accepts a quote that spans
+    several consecutive segments of the same speaker. Optional, so a caller
+    holding only normalized text keeps the strict whole-transcript check."""
     q = _normalize(quote or "")
     if len(q) < 8:
         return True
-    return q in transcript_norm
+    if q in transcript_norm:
+        return True
+    return any(q in r for r in (runs or ()))
 
 
 def _future_date(date_s: Any, time_s: Any, call_date: str) -> tuple[str | None, str | None]:
@@ -282,6 +332,7 @@ def parse_and_validate(raw: str, call: dict[str, Any]) -> dict[str, Any]:
 
     call_date = (call.get("started_at") or "")[:10]
     transcript_norm = _normalize(call.get("transcript") or "")
+    transcript_runs = speech_runs(call.get("transcript") or "")
     rec: dict[str, Any] = {"schema_version": SCHEMA_VERSION}
 
     for f in ("summary", "outcome_summary", "customer_intent"):
@@ -338,7 +389,7 @@ def parse_and_validate(raw: str, call: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(c, dict) or not c.get("description"):
             continue
         quote = str(c.get("quote") or "")
-        if quote and not quote_in_transcript(quote, transcript_norm):
+        if quote and not quote_in_transcript(quote, transcript_norm, transcript_runs):
             continue  # hallucinated evidence — drop the commitment
         date_s, time_s = _future_date(c.get("deadline_date"), c.get("deadline_time"), call_date)
         commitments.append({

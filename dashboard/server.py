@@ -23,6 +23,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -31,6 +32,19 @@ from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+
+# This process runs with dashboard/ as its working directory, so the repo root
+# is not importable by default (same bootstrap as billing_api / telephony_api).
+# server.py's other `shared` imports are lazy and get away with riding on
+# whichever sibling module inserted the path first; a top-level import cannot.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# The one rate card (shared/sarvam_pricing.py). Costs shown here are recomputed
+# from raw usage counters through it, never read back from the estimates the
+# tracker froze into credit_log at write time.
+from shared import sarvam_pricing as pricing  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Config
@@ -123,11 +137,17 @@ async def _request_audit(request: Request, call_next):
             import auth as _audit_auth
             session = _audit_auth.read_session_cookie(
                 request.cookies.get(_audit_auth.SESSION_COOKIE))
+            # An API-key request has no session cookie; public_api stamps the
+            # key and owner on request.state so the audit line still says WHO,
+            # not just which IP.
+            api_key_id = getattr(request.state, "api_key_id", None)
             _req_logger.info(json.dumps({
                 "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(
                     timespec="milliseconds").replace("+00:00", "Z"),
                 "ip": request.client.host if request.client else None,
-                "owner": (session or {}).get("email"),
+                "owner": ((session or {}).get("email")
+                          or getattr(request.state, "api_owner", None)),
+                "api_key": api_key_id,
                 "method": request.method,
                 "path": request.url.path,
                 "status": status,
@@ -187,6 +207,8 @@ except Exception as _auth_exc:  # pragma: no cover - never take down the dashboa
 import auth as _auth_assert  # noqa: E402
 _auth_assert.assert_auth_configured()
 
+import contact_names  # noqa: E402
+
 # Billing / subscriptions (deploy/PLAN-razorpay-subscriptions.md). Mounted with
 # an explicit success line: the try/except pattern above is convenient for
 # optional surfaces but a billing router that vanishes silently means quotas
@@ -218,6 +240,45 @@ try:
     logging.getLogger("dashboard").info("Intelligence API mounted")
 except Exception as _intel_exc:  # pragma: no cover - never take down the dashboard
     logging.getLogger("dashboard").error("Intelligence API NOT mounted: %r", _intel_exc)
+
+# Integrations → WhatsApp: playbooks, approvals, the Meta webhook and tracked
+# links (dashboard/whatsapp_api.py). The sender loop lives in this process,
+# like the call scheduler: the queue is rows in Postgres, so a restart costs
+# one poll interval and never a message.
+try:
+    from whatsapp_api import router as whatsapp_router
+    from whatsapp_api import start_sender as _wa_start_sender
+    app.include_router(whatsapp_router)
+
+    @app.on_event("startup")
+    async def _start_whatsapp_sender() -> None:
+        _wa_start_sender()
+
+    logging.getLogger("dashboard").info("WhatsApp integration API mounted")
+except Exception as _wa_exc:  # pragma: no cover - never take down the dashboard
+    logging.getLogger("dashboard").error("WhatsApp integration API NOT mounted: %r",
+                                         _wa_exc, exc_info=True)
+
+# Public integration API (/v1) — API-key authenticated, for customer CRM/ERP
+# systems. Mounted via install() rather than include_router because it also
+# registers the ApiError handler that turns its documented failures into the
+# one error envelope; without that every 403 would surface as an opaque 500.
+try:
+    from public_api import install as install_public_api
+    install_public_api(app)
+    logging.getLogger("dashboard").info("Public API (/v1) mounted")
+except Exception as _papi_exc:  # pragma: no cover - never take down the dashboard
+    logging.getLogger("dashboard").error(
+        "PUBLIC API NOT MOUNTED (customer integrations are DOWN): %r",
+        _papi_exc, exc_info=True)
+
+# Tenant-facing key management for Settings -> API access.
+try:
+    from api_keys_api import router as api_keys_router
+    app.include_router(api_keys_router)
+    logging.getLogger("dashboard").info("API key management mounted")
+except Exception as _keys_exc:  # pragma: no cover
+    logging.getLogger("dashboard").error("API key management NOT mounted: %r", _keys_exc)
 
 _img_dir = STATIC_DIR / "img"
 _img_dir.mkdir(parents=True, exist_ok=True)
@@ -382,6 +443,19 @@ def _aggregate_calls(events: list[dict]) -> list[dict]:
                     duration = max((edt - sdt).total_seconds(), 0.0)
             except Exception:
                 pass
+            # Cost is RECOMPUTED from the raw usage counters, never read back
+            # from the est_* fields the tracker froze into the log at write
+            # time. Those are a snapshot of whatever the rate card said that
+            # day; repricing here means a rate change (or a billing-rule fix)
+            # applies to all history instead of only to calls made after it.
+            billed_chars = ev.get("tts_billed_chars")
+            if billed_chars is None:
+                # Pre-2026-08-06 events: only intended chars were recorded, so
+                # barge-in tails are counted as billed. Upper bound, flagged.
+                billed_chars = ev.get("tts_chars", 0)
+            stt_c = pricing.stt_cost(ev.get("stt_sarvam_billed_seconds", 0.0))
+            tts_c = pricing.tts_cost(billed_chars)
+            whisper_c = pricing.whisper_cost(ev.get("stt_whisper_seconds", 0.0))
             calls.append({
                 "call_id": cid,
                 "start_time": start_ts,
@@ -393,13 +467,13 @@ def _aggregate_calls(events: list[dict]) -> list[dict]:
                 "stt_whisper_seconds": ev.get("stt_whisper_seconds", 0.0),
                 "stt_whisper_calls": ev.get("stt_whisper_calls", 0),
                 "tts_chars": ev.get("tts_chars", 0),
+                "tts_billed_chars": billed_chars,
                 "tts_calls": ev.get("tts_calls", 0),
                 "tts_cancelled_calls": ev.get("tts_cancelled_calls", 0),
-                "est_stt_cost": ev.get("est_stt_cost", 0.0),
-                "est_tts_cost": ev.get("est_tts_cost", 0.0),
-                "est_total_cost": round(
-                    ev.get("est_stt_cost", 0.0) + ev.get("est_tts_cost", 0.0), 6
-                ),
+                "est_stt_cost": stt_c,
+                "est_tts_cost": tts_c,
+                "est_whisper_cost": whisper_c,
+                "est_total_cost": round(stt_c + tts_c + whisper_c, 6),
             })
     calls.sort(key=lambda c: c["end_time"], reverse=True)
     return calls
@@ -443,18 +517,114 @@ def _get_active_calls_from_log(events: list[dict]) -> list[dict]:
     return active
 
 
+def _orphan_usage(events: list[dict]) -> dict:
+    """Usage belonging to calls that never wrote a call_end.
+
+    end_call() is what folds a call's per-event usage into the call_end
+    rollup, so a process that dies mid-call (or is restarted under load)
+    leaves its stt_event/tts_event lines in the log with no rollup to
+    carry them. Summing rollups alone therefore bills less than the API
+    calls we actually made — real requests, really invoiced by Sarvam,
+    invisible to the dashboard. ~169 calls to date.
+
+    Caveat: a call straddling UTC midnight writes its call_end into the
+    next day's file, so a SINGLE-day window can see it as an orphan and
+    the next day counts it again in full. Calls are minutes long, so this
+    touches almost nothing — and it errs toward counting real spend
+    rather than dropping it.
+    """
+    ended = {ev.get("call_id") for ev in events if ev.get("type") == "call_end"}
+    out = {"stt_sarvam_seconds": 0.0, "stt_sarvam_billed_seconds": 0.0,
+           "stt_whisper_seconds": 0.0, "tts_chars": 0, "tts_billed_chars": 0}
+    heard: set = set()   # orphan call_ids where the caller spoke
+    spoke: set = set()   # orphan call_ids where the agent spoke
+    for ev in events:
+        t = ev.get("type")
+        if t not in ("stt_event", "tts_event") or ev.get("call_id") in ended:
+            continue
+        cid = ev.get("call_id")
+        if t == "stt_event":
+            heard.add(cid)
+            sec = float(ev.get("audio_seconds") or 0.0)
+            if ev.get("provider", "sarvam") == "sarvam":
+                out["stt_sarvam_seconds"] += sec
+                out["stt_sarvam_billed_seconds"] += float(
+                    ev.get("billed_seconds") or pricing.stt_billed_seconds(sec))
+            else:
+                out["stt_whisper_seconds"] += sec
+        else:
+            spoke.add(cid)
+            chars = int(ev.get("chars") or 0)
+            out["tts_chars"] += chars
+            out["tts_billed_chars"] += int(ev.get("billed_chars", chars))
+    out["conversations"] = len(heard)
+    out["greeting_only"] = len(spoke - heard)
+    return out
+
+
 def _summarize_range(events: list[dict]) -> dict:
     calls = _aggregate_calls(events)
-    stt_cost = sum(c["est_stt_cost"] for c in calls)
-    tts_cost = sum(c["est_tts_cost"] for c in calls)
+    orphan = _orphan_usage(events)
+    billed_sec = (sum(c["stt_sarvam_billed_seconds"] for c in calls)
+                  + orphan["stt_sarvam_billed_seconds"])
+    whisper_sec = (sum(c["stt_whisper_seconds"] for c in calls)
+                   + orphan["stt_whisper_seconds"])
+    chars = sum(c["tts_chars"] for c in calls) + orphan["tts_chars"]
+    billed_chars = (sum(c["tts_billed_chars"] for c in calls)
+                    + orphan["tts_billed_chars"])
+    stt_cost = pricing.stt_cost(billed_sec)
+    tts_cost = pricing.tts_cost(billed_chars)
+    whisper_cost = pricing.whisper_cost(whisper_sec)
+
+    # What counts as "a call". The tracker opens a record for every inbound
+    # WebSocket, so this log counts CONNECTIONS, and most of them are not
+    # calls — 93% of all records to date carried no caller audio at all.
+    # Reporting connections as calls divided cost-per-call by ~18 and made the
+    # platform look far cheaper per conversation than it is.
+    #
+    #   conversations  — the caller actually spoke. The honest denominator.
+    #   greeting_only  — the agent spoke, nobody ever replied. Billable (TTS
+    #                    went out) but worthless; a spike here is the
+    #                    greeting-before-answer drain re-appearing (June 2026:
+    #                    2,956 of these, ₹935).
+    #   silent         — no audio either way, always ₹0. Now ~3/day; the 5.6k
+    #                    historical bulk is a June 12-15 episode, not steady
+    #                    state, so don't read the all-time ratio as current.
+    conversations = sum(
+        1 for c in calls
+        if c["stt_sarvam_calls"] or c["stt_whisper_calls"]
+    ) + orphan["conversations"]
+    greeting_only = sum(
+        1 for c in calls
+        if not (c["stt_sarvam_calls"] or c["stt_whisper_calls"]) and c["tts_calls"]
+    ) + orphan["greeting_only"]
+    connections = len(calls) + orphan["conversations"] + orphan["greeting_only"]
+
     return {
-        "call_count": len(calls),
+        # call_count keeps its name (callers depend on it) but now means a
+        # real conversation rather than a socket that opened.
+        "call_count": conversations,
+        "conversation_count": conversations,
+        "greeting_only_count": greeting_only,
+        "silent_connection_count": max(connections - conversations - greeting_only, 0),
+        "connection_count": connections,
+        "est_cost_per_conversation": round(
+            (stt_cost + tts_cost + whisper_cost) / conversations, 4
+        ) if conversations else 0.0,
         "est_stt_cost": round(stt_cost, 4),
         "est_tts_cost": round(tts_cost, 4),
-        "est_total_cost": round(stt_cost + tts_cost, 4),
-        "stt_sarvam_billed_seconds": round(
-            sum(c["stt_sarvam_billed_seconds"] for c in calls), 1),
-        "tts_chars": sum(c["tts_chars"] for c in calls),
+        "est_whisper_cost": round(whisper_cost, 4),
+        "est_total_cost": round(stt_cost + tts_cost + whisper_cost, 4),
+        "stt_sarvam_billed_seconds": round(billed_sec, 1),
+        "stt_sarvam_seconds": round(
+            sum(c["stt_sarvam_seconds"] for c in calls)
+            + orphan["stt_sarvam_seconds"], 1),
+        "stt_whisper_seconds": round(whisper_sec, 1),
+        "tts_chars": chars,
+        "tts_billed_chars": billed_chars,
+        # Text synthesized and then thrown away by barge-in. Real money with
+        # nothing to show for it — worth a number, not a footnote.
+        "tts_wasted_chars": max(chars - billed_chars, 0),
     }
 
 
@@ -541,14 +711,55 @@ def _save_call_link(entries: list[dict]) -> None:
     CALL_LINK_FILE.write_text(json.dumps(entries, indent=2))
 
 
+def _resolve_dial_gender(owner: str, phone: str) -> str:
+    """The contact's gender for a dial about to be placed, or "".
+
+    Resolved HERE rather than at each of the five dial origins on purpose.
+    Only two of them (manual dial, campaign) hold a contact dict at all; the
+    automation, autodial and test-call paths carry a name and a phone and
+    nothing else, so plumbing a parameter through would have given the feature
+    to some dial buttons and not others — the exact shape of bug the single
+    `originate_cmd` builder exists to prevent (RUNBOOK §40).
+
+    One indexed read on `idx_contacts_owner_sig`, on the dial path and not the
+    greeting path. Best-effort by design: a contact with no gender, no contact
+    row at all, or a DB hiccup all mean "no honorific", which is the normal
+    case and never a reason to fail a dial.
+    """
+    if not owner or not phone:
+        return ""
+    try:
+        from shared.db.database import get_db
+        from shared.phone import significant_digits
+        sig = significant_digits(phone)
+        if not sig:
+            return ""
+        with get_db() as db:
+            row = db.execute(
+                "SELECT gender FROM contacts WHERE owner=? AND sig_digits=?",
+                (owner, sig)).fetchone()
+        return (row["gender"] or "").strip().lower() if row else ""
+    except Exception as exc:
+        logger.warning("dial gender lookup failed for %s: %r", phone, exc)
+        return ""
+
+
 def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
                  owner: str = "", context_note: str = "",
                  followup_id: int | None = None,
                  placed_by: str = "user",
-                 callback_meta: dict | None = None) -> None:
+                 callback_meta: dict | None = None,
+                 gender: str = "") -> None:
+    # Snapshot the honorific source alongside the name, from the same contact
+    # record, at the same moment — see migration 0027.
+    gender = (gender or "").strip().lower() or _resolve_dial_gender(owner, phone)
     entry = {
         "phone": phone, "contact_id": contact_id, "name": name,
         "dialed_at": _now_iso(),
+        # Optional: "male"/"female" when this tenant's contact list carries a
+        # gender column, "" otherwise. Read back by the telephony bridge to
+        # resolve {honorific} in the opening line.
+        "gender": gender,
         # Which agent this dial was bound to at dial time — read back by the
         # telephony bridge (resolve_agent_slug dial_meta fallback) when the
         # lescall_agent_slug channel variable didn't survive the leg.
@@ -576,12 +787,13 @@ def _record_dial(phone: str, contact_id: str, name: str, agent_slug: str = "",
             row = db.execute(
                 "INSERT INTO call_links (owner, phone, sig_digits, contact_id,"
                 " name, agent_slug, dialed_at, context_note, followup_id,"
-                " placed_by, callback_meta)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+                " placed_by, callback_meta, gender)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
                 (owner, phone, significant_digits(phone), contact_id, name,
                  agent_slug, entry["dialed_at"], context_note or None,
                  followup_id, placed_by,
-                 json.dumps(callback_meta) if callback_meta else None)).fetchone()
+                 json.dumps(callback_meta) if callback_meta else None,
+                 gender or None)).fetchone()
             link_id = row["id"] if row else None
             # Dial records only matter inside the matching windows; prune
             # anything older than a week (replaces the file's last-5000 cap).
@@ -815,50 +1027,10 @@ def _scan_recordings(limit: int = 500) -> list[dict]:
     return records
 
 
-_contact_name_cache: dict[str, tuple[float, dict]] = {}
-_CONTACT_NAME_TTL = 30.0
-
-
-def _contact_name_map(owner: str) -> dict:
-    """{significant digits -> saved contact name} for one tenant.
-
-    Keyed on the last 10 significant digits, the same key the contacts unique
-    index uses, so "+9198…", "098…" and "98…" all resolve to the same person.
-    Short-cached: this is called per list request, and a phone book changes far
-    more slowly than it is rendered.
-    """
-    now = time.monotonic()
-    hit = _contact_name_cache.get(owner)
-    if hit and (now - hit[0]) < _CONTACT_NAME_TTL:
-        return hit[1]
-    out: dict[str, str] = {}
-    try:
-        from shared.db.database import get_db
-        with get_db() as db:
-            for r in db.execute(
-                    "SELECT sig_digits, name FROM contacts "
-                    " WHERE owner=? AND name IS NOT NULL AND name <> ''",
-                    (owner,)).fetchall():
-                row = dict(r)
-                sig = (row.get("sig_digits") or "").strip()
-                if sig:
-                    out[sig] = row["name"]
-    except Exception as exc:
-        logger.warning("contact name map failed for %s: %r", owner, exc)
-    _contact_name_cache[owner] = (now, out)
-    return out
-
-
-def _name_for_phone(phone: str, names: dict) -> str:
-    """Saved contact name for a raw phone string, or '' when it is not in the
-    tenant's phone book."""
-    if not phone:
-        return ""
-    try:
-        from shared.phone import significant_digits
-        return names.get(significant_digits(phone) or "", "")
-    except Exception:
-        return ""
+# The phone-book resolver moved to dashboard/contact_names.py so intel_api can
+# share it (it cannot import server.py — server.py mounts its router).
+_contact_name_map = contact_names.contact_name_map
+_name_for_phone = contact_names.name_for_phone
 
 
 def _is_recording_complete(folder: str) -> bool:
@@ -1031,6 +1203,21 @@ def _count_ai_followups_in_range(start_date: datetime.date, end_date: datetime.d
     return count
 
 
+# A transcript block opens with an elapsed stamp, optionally followed by
+# annotations call_audit.py appends in brackets — today "[spoke 7.26-9.98s]",
+# the live-VAD span it writes for CALLER turns only (commit bacbd82, 2026-08-04).
+# The old pattern anchored "$" straight after the stamp, so every annotated
+# header stopped being a header: from 08-04 on, 76-99% of caller turns per call
+# were parsed as a speaker literally named "[00" and vanished from the
+# transcript view and the AI analysis. Trailing groups stay optional and
+# repeatable so the next annotation added upstream cannot re-break this.
+_TS_HEADER_RE = re.compile(
+    r"^\[(\d+:\d+\.\d+)\]\s*(?:\[spoke\s+([\d.]+-[\d.]+)s\])?(?:\s*\[[^\]]*\])*$")
+# Speaker labels are short bare words ("Agent", "Caller", "Unknown"), never
+# bracketed and never numeric.
+_SPEAKER_RE = re.compile(r"^\s*[A-Za-z][A-Za-z0-9 _-]{0,30}\s*$")
+
+
 def _read_transcript(folder: str) -> list[dict]:
     path = RECORDINGS_DIR / folder / "transcript.txt"
     if not path.exists():
@@ -1045,23 +1232,30 @@ def _read_transcript(folder: str) -> list[dict]:
             if not block:
                 continue
             lines = block.split("\n")
-            ts_match = re.match(r"^\[(\d+:\d+\.\d+)\]$", lines[0].strip())
+            ts_match = _TS_HEADER_RE.match(lines[0].strip())
             if ts_match:
                 current_ts = ts_match.group(1)
+                span = ts_match.group(2) or ""
                 text_line = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
             else:
+                span = ""
                 text_line = block
             if not text_line:
                 continue
             idx = text_line.find(":")
-            if idx > 0:
+            # Only a real speaker token may claim the prefix. Without this a
+            # header the regex failed to match falls through with the whole
+            # block as text, and find(":") splits inside "[00:10.545]" — the
+            # turn is then filed under a speaker named "[00" and no longer
+            # reads as the caller anywhere downstream.
+            if idx > 0 and _SPEAKER_RE.match(text_line[:idx]):
                 speaker = text_line[:idx].strip()
                 text = text_line[idx + 1:].strip()
             else:
                 speaker = "Unknown"
                 text = text_line
             messages.append({"speaker": speaker, "text": text,
-                              "timestamp": current_ts})
+                              "timestamp": current_ts, "span": span})
     except Exception as exc:
         logger.warning("transcript read error %s: %s", folder, exc)
     return messages
@@ -1644,8 +1838,10 @@ def _build_recording_phone_map() -> dict[str, str]:
 
 _ZERO_COST_FIELDS = {"stt_sarvam_seconds": 0.0, "stt_sarvam_billed_seconds": 0.0,
                       "stt_sarvam_calls": 0, "stt_whisper_seconds": 0.0, "stt_whisper_calls": 0,
-                      "tts_chars": 0, "tts_calls": 0, "tts_cancelled_calls": 0,
-                      "est_stt_cost": 0.0, "est_tts_cost": 0.0, "est_total_cost": 0.0}
+                      "tts_chars": 0, "tts_billed_chars": 0, "tts_calls": 0,
+                      "tts_cancelled_calls": 0,
+                      "est_stt_cost": 0.0, "est_tts_cost": 0.0,
+                      "est_whisper_cost": 0.0, "est_total_cost": 0.0}
 
 
 def _as_iso(value) -> str:
@@ -2197,39 +2393,11 @@ def _gcs_object_for(call_key: str) -> str | None:
 
 
 def _stream_recording(call_key: str, gcs_object: str | None, download: bool):
-    """Serve a call's WAV: the FULL two-party recording (call_audio.wav,
-    agent + caller) when it exists, the legacy caller-only file otherwise;
-    local file first, GCS object after the retention cleanup."""
-    headers = {}
-    if download:
-        headers["Content-Disposition"] = f'attachment; filename="{call_key}.wav"'
-    for filename in ("call_audio.wav", "caller_audio.wav"):
-        audio_path = RECORDINGS_DIR / call_key / filename
-        if audio_path.exists():
-            return FileResponse(str(audio_path), media_type="audio/wav", headers=headers)
-    if gcs_object:
-        # Prefer the full-recording object; fall back to the stamped legacy
-        # object (old calls have no call_audio.wav in the bucket).
-        full_object = gcs_object.rsplit("/", 1)[0] + "/call_audio.wav"
-        for obj in (full_object, gcs_object):
-            try:
-                from shared.recording_storage import open_gcs_stream
-                stream = open_gcs_stream(obj)
-                stream.read(1)  # force existence check before we commit
-                stream.seek(0)
-
-                def _iter(s=stream):
-                    try:
-                        while chunk := s.read(256 * 1024):
-                            yield chunk
-                    finally:
-                        s.close()
-
-                return StreamingResponse(_iter(), media_type="audio/wav", headers=headers)
-            except Exception as exc:
-                logger.debug("GCS stream miss for %s (%s): %r", call_key, obj, exc)
-        logger.error("GCS stream failed for %s (%s)", call_key, gcs_object)
-    return JSONResponse({"error": "no audio for this recording"}, status_code=404)
+    """Serve a call's WAV. The implementation lives in recording_response.py so
+    the public API (/v1/calls/{id}/recording) serves byte-for-byte the same
+    file this dashboard plays."""
+    from recording_response import stream_recording
+    return stream_recording(call_key, gcs_object, download)
 
 
 @app.get("/api/calls/recordings/{folder}/audio")
@@ -2272,6 +2440,33 @@ async def voice_sample(speaker: str):
         return JSONResponse({"error": "no sample for this voice"}, status_code=404)
     return FileResponse(str(path), media_type="audio/wav",
                         headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/api/exports/dl/{token}")
+async def export_public_download(token: str):
+    """Public tokenized download of a generated .xlsx export.
+
+    Same contract as the recording link above: the 256-bit random token IS the
+    credential (route is auth-exempt), and every miss — bad shape, unknown
+    token, revoked export — returns the identical 404 so the endpoint never
+    reveals which tokens exist. This is how an export in the private GCS
+    bucket reaches a colleague who has no dashboard login."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{22,128}", token or ""):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        from shared.db.database import get_db
+        with get_db() as db:
+            row = db.execute(
+                "SELECT * FROM call_exports"
+                " WHERE download_token=? AND deleted_at IS NULL",
+                (token,)).fetchone()
+    except Exception as exc:
+        logger.error("export token lookup failed: %r", exc)
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    from intel_api import stream_export
+    return stream_export(dict(row))
 
 
 @app.get("/api/recordings/dl/{token}")
@@ -2593,12 +2788,31 @@ async def api_keys_ack_restart() -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+def _credit_log_first_date() -> datetime.date:
+    """Earliest day the tracker ever wrote. Cheap: filenames are the dates."""
+    dates = []
+    try:
+        for p in CREDIT_LOG_DIR.glob("*.jsonl"):
+            try:
+                dates.append(datetime.date.fromisoformat(p.stem))
+            except ValueError:
+                continue
+    except Exception as exc:
+        logger.warning("credit_log scan failed: %s", exc)
+    return min(dates) if dates else datetime.date.today()
+
+
 @app.get("/api/sarvam/usage")
 async def sarvam_usage(period: str = Query("today")) -> JSONResponse:
     today = datetime.date.today()
     ranges = {"today": 0, "week": 6, "month": 29}
-    days_back = ranges.get(period, 0)
-    start = today - datetime.timedelta(days=days_back)
+    if period == "all":
+        # Lifetime spend. Previously unanswerable from the product at all —
+        # the widest window was 30 days, so "what have we spent so far" had
+        # no endpoint behind it.
+        start = _credit_log_first_date()
+    else:
+        start = today - datetime.timedelta(days=ranges.get(period, 0))
     events = _load_credit_range(start, today)
     calls  = _aggregate_calls(events)
     top10  = sorted(calls, key=lambda c: c["est_total_cost"], reverse=True)[:10]
@@ -2609,7 +2823,8 @@ async def sarvam_usage(period: str = Query("today")) -> JSONResponse:
         d += datetime.timedelta(days=1)
     return JSONResponse({"period": period, "start": start.isoformat(),
                          "end": today.isoformat(), "summary": _summarize_range(events),
-                         "daily": daily, "top_calls": top10})
+                         "daily": daily, "top_calls": top10,
+                         "rates": pricing.rate_card()})
 
 
 @app.get("/api/sarvam/usage/history")
@@ -2660,7 +2875,15 @@ async def log_tail(lines: int = Query(200, ge=1, le=2000)) -> JSONResponse:
 # Outbound contacts
 # ---------------------------------------------------------------------------
 
-CALL_STATUSES   = ("not_called", "answered", "no_answer", "busy", "declined", "failed")
+# `empty_call` is derived, not dialled: the originate result can only ever say
+# "answered", so a contact whose most recent call connected with nobody actually
+# speaking is resolved at READ time from calls.answer_state (see
+# _empty_call_contacts). It is a first-class status everywhere else — stats,
+# the phone-book filter, and the campaign audience — because "redial everyone
+# whose call connected but went nowhere" is a real audience. Before this it was
+# a filter option the API could never return a row for.
+CALL_STATUSES   = ("not_called", "answered", "empty_call", "no_answer", "busy",
+                   "declined", "invalid_number", "failed")
 DISPOSITIONS    = ("not_classified", "interested", "site_visit_booked", "inquiry",
                    "in_doubt", "to_contact_later", "rejected")
 
@@ -2670,10 +2893,13 @@ DISPOSITIONS    = ("not_classified", "interested", "site_visit_booked", "inquiry
 def _fresh_campaign() -> dict:
     return {
         "running": False, "campaign_id": None, "total": 0, "completed": 0,
-        "answered": 0, "no_answer": 0, "busy": 0, "declined": 0, "failed": 0,
+        "answered": 0, "no_answer": 0, "busy": 0, "declined": 0,
+        "invalid_number": 0, "failed": 0,
         "skipped": 0, "dnd_skipped": 0, "capped": False,
         "current_phone": "", "current_name": "",
         "started_at": None, "stopped": False, "error": None,
+        "audience": None, "audience_disposition": None,
+        "audience_group": None, "audience_size": 0,
     }
 
 
@@ -2723,6 +2949,28 @@ def _contact_to_dict(row: dict) -> dict:
     }
 
 
+def _empty_call_contacts(db, owner: str) -> set:
+    """Contact PKs whose MOST RECENT call connected but went nowhere.
+
+    The dial path can only ever stamp 'answered' — whether anybody actually
+    spoke is decided at teardown and lands in calls.answer_state. Folding the
+    latest verdict back over the phone book is what makes the 'Empty call'
+    filter (and audience) return the rows it names instead of always zero.
+
+    Rows with a NULL verdict are read too, and deliberately: they are the
+    LATEST word on that contact when the detector did not run, and skipping
+    them would leave a months-old 'empty' verdict standing over a call that has
+    since connected properly. Unknown is not empty. Indexed by idx_calls_owner.
+    """
+    latest: dict = {}
+    for r in db.execute(
+            "SELECT contact_id, answer_state FROM calls "
+            " WHERE owner=? AND contact_id IS NOT NULL"
+            " ORDER BY started_at", (owner,)).fetchall():
+        latest[r["contact_id"]] = r["answer_state"]      # ordered → last wins
+    return {cid for cid, state in latest.items() if (state or "") == "empty"}
+
+
 def _load_outbound(owner: str) -> list[dict]:
     """Every contact owned by `owner`, newest first."""
     try:
@@ -2730,7 +2978,12 @@ def _load_outbound(owner: str) -> list[dict]:
         with get_db() as db:
             rows = db.execute(
                 "SELECT * FROM contacts WHERE owner=? ORDER BY id", (owner,)).fetchall()
-        return [_contact_to_dict(dict(r)) for r in rows]
+            empties = _empty_call_contacts(db, owner)
+        contacts = [_contact_to_dict(dict(r)) for r in rows]
+        for c in contacts:
+            if c["call_status"] == "answered" and c["db_id"] in empties:
+                c["call_status"] = "empty_call"
+        return contacts
     except Exception as exc:
         logger.error("contacts load failed for %s: %r", owner, exc)
         return []
@@ -2791,58 +3044,31 @@ def _save_outbound(contacts: list[dict], owner: str) -> None:
 
 
 def _detach_contact_references(db, pk: int) -> None:
-    """Re-home intelligence rows before a contact row is deleted.
-
-    Deleting a contact used to strand every row that referenced it: 90 of 154
-    contact-linked followups pointed at nonexistent contacts after one
-    phone-book cleanup (2026-07-23 audit) — the hub 404'd for the owner's
-    most-called number and the follow-up auto-dialer permanently blocked 38
-    live follow-ups with 'no_contact'. Deletion is normal user behavior, so
-    the delete path must leave the data coherent:
-
-      * if another contact with the same significant digits survives (the
-        delete-and-recreate pattern), references move to it;
-      * otherwise they detach to NULL — lists fall back to the raw phone
-        number instead of linking to a 404.
-
-    contact_events and customer_memory are only reachable through a live
-    contact id, so they move on re-bind and are left in place on detach
-    (ids are serial and never reused — the rows are inert, not dangling).
-    """
-    row = db.execute(
-        "SELECT owner, sig_digits FROM contacts WHERE id=?", (pk,)).fetchone()
-    if not row:
-        return
-    survivor = db.execute(
-        "SELECT id FROM contacts WHERE owner=? AND sig_digits=? AND id<>? "
-        "ORDER BY id DESC LIMIT 1",
-        (row["owner"], row["sig_digits"], pk)).fetchone()
-    new_id = survivor["id"] if survivor else None
-    for table in ("calls", "call_intelligence", "commitments", "followups"):
-        db.execute(f"UPDATE {table} SET contact_id=? WHERE contact_id=?",
-                   (new_id, pk))
-    if new_id is not None:
-        db.execute("UPDATE contact_events SET contact_id=? WHERE contact_id=?",
-                   (new_id, pk))
-        # keep at most one memory row: prefer the survivor's if both exist
-        has_target = db.execute(
-            "SELECT 1 FROM customer_memory WHERE contact_id=?",
-            (new_id,)).fetchone()
-        if has_target:
-            db.execute("DELETE FROM customer_memory WHERE contact_id=?", (pk,))
-        else:
-            db.execute(
-                "UPDATE customer_memory SET contact_id=? WHERE contact_id=?",
-                (new_id, pk))
+    """Re-home intelligence rows before a contact row is deleted. Implemented in
+    shared/contacts.py so the public API's DELETE leaves the data exactly as
+    coherent as this one does."""
+    from shared.contacts import detach_contact_references
+    detach_contact_references(db, pk)
 
 
 def _normalize_gender(value: str) -> str:
-    v = (value or "").strip().lower()
-    if v in ("m", "male", "man", "boy"):
-        return "male"
-    if v in ("f", "female", "woman", "girl"):
-        return "female"
-    return v[:32]
+    from shared.contacts import normalize_gender
+    return normalize_gender(value)
+
+
+def _dialable_phone(value) -> str:
+    """A contact's number in +E.164, or "" when nothing dialable was typed.
+
+    One rule for every hand-entry point, matching `_format_phone_digits` (CSV
+    import) and `shared.contacts.upsert_contact` (public API). The phone book
+    used to hold whatever the operator typed; a bare 10-digit row then reached
+    the carrier without a country code and was rejected 404 while the UI said
+    only "declined".
+    """
+    from shared.phone import digits_only, to_e164
+
+    e164 = to_e164((str(value or "")).strip())
+    return e164 if len(digits_only(e164)) >= 7 else ""
 
 
 def _make_contact(phone: str, name: str = "", notes: str = "",
@@ -2900,24 +3126,39 @@ def _excel_sci_to_digits(token: str) -> str | None:
         return None
 
 
+def _xlsx_cell_text(value) -> str:
+    """One spreadsheet cell as the text a human would have typed.
+
+    A phone column stored as a NUMBER comes back from openpyxl as an int or a
+    float; `str(9128692865.0)` is "9128692865.0", and the digit stripper
+    downstream turned that into 91286928650 — an 11-digit number the carrier
+    does not know (RUNBOOK §58). Integral floats print as integers; anything
+    else prints as before.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() and abs(value) < 1e17 else repr(value)
+    return str(value)
+
+
 def _normalize_phone_cell(cell: str) -> str:
-    """Extract digits from a single cell, recovering Excel sci-notation first."""
+    """Extract digits from a single cell, recovering Excel sci-notation and
+    float formatting first (`shared.phone.numeric_text`, the one rule every
+    write path shares)."""
+    from shared.phone import numeric_text
     sci = _excel_sci_to_digits(cell)
-    return sci if sci is not None else re.sub(r"\D", "", cell)
+    return sci if sci is not None else re.sub(r"\D", "", numeric_text(cell))
 
 
 def _format_phone_digits(digits: str) -> str:
     """Format a digit string as a dialable number, assuming India for
-    national-format numbers (10 digits, or 11 with STD leading zero)."""
-    if len(digits) == 11 and digits.startswith("0"):
-        return "+91" + digits[1:]
-    if len(digits) == 10:
-        return "+91" + digits
-    if len(digits) == 12 and digits.startswith("91"):
-        return "+" + digits
-    if 7 <= len(digits) <= 15:
-        return "+" + digits
-    return ""
+    national-format numbers. The rules live in shared/phone.py so the API's
+    contact push normalizes numbers identically to a CSV upload."""
+    from shared.phone import to_e164
+    return to_e164(digits)
 
 
 def _phone_from_contact_cell(cell: str) -> str:
@@ -3119,7 +3360,7 @@ def _parse_uploaded_file(filename: str, raw: bytes) -> tuple[list[dict], int]:
             wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
             for ws in wb.worksheets:
                 for row in ws.iter_rows(values_only=True):
-                    consume([str(c) if c is not None else "" for c in row])
+                    consume([_xlsx_cell_text(c) for c in row])
         except Exception as e:
             logger.warning("xlsx parse error: %r", e)
             errors += 1
@@ -3147,6 +3388,25 @@ def _parse_uploaded_file(filename: str, raw: bytes) -> tuple[list[dict], int]:
     return rows, errors
 
 
+def _filter_by_group(contacts: list[dict], group: str | None) -> list[dict]:
+    """Narrow a contact list to one phone-book group.
+
+    'all'/blank keeps everything, 'none' is the implicit No-group bucket, and
+    anything else is a group id. An unparseable id keeps the list intact rather
+    than silently returning everyone's contacts as if no group were selected —
+    the caller states a group, so a bad one is a no-op, not a widening.
+    """
+    if not group or group == "all":
+        return contacts
+    if group == "none":
+        return [c for c in contacts if not c.get("group_id")]
+    try:
+        gid = int(group)
+    except (TypeError, ValueError):
+        return contacts
+    return [c for c in contacts if c.get("group_id") == gid]
+
+
 @app.get("/api/outbound/contacts")
 async def outbound_list(
     request: Request,
@@ -3162,16 +3422,7 @@ async def outbound_list(
         contacts = [c for c in contacts if c.get("call_status") == call_status]
     if disposition and disposition != "all":
         contacts = [c for c in contacts if c.get("disposition") == disposition]
-    if group and group != "all":
-        # group=none → the implicit "No group" bucket; else a group id.
-        if group == "none":
-            contacts = [c for c in contacts if not c.get("group_id")]
-        else:
-            try:
-                gid = int(group)
-                contacts = [c for c in contacts if c.get("group_id") == gid]
-            except ValueError:
-                pass
+    contacts = _filter_by_group(contacts, group)
     if q:
         ql = q.lower()
         contacts = [c for c in contacts if ql in c.get("phone", "") or ql in c.get("name", "").lower()]
@@ -3189,8 +3440,14 @@ async def outbound_list(
 async def outbound_add(request: Request) -> JSONResponse:
     owner = _acting_owner(request)
     body = await request.json()
-    phone = re.sub(r"[^\d+]", "", (body.get("phone") or "").strip())
-    if not phone or len(re.sub(r"\D", "", phone)) < 7:
+    # Store +E.164, exactly as the CSV import and the public API do. Typing a
+    # 10-digit number into this form is the normal way to add a contact, and
+    # the number that comes out of it is dialled verbatim on a carrier trunk —
+    # without the country code the gateway answers 404 and the operator is told
+    # only "declined" (2026-09-09). `_dialable_phone` rejects what cannot be
+    # made dialable rather than storing a number that will fail at dial time.
+    phone = _dialable_phone(body.get("phone"))
+    if not phone:
         return JSONResponse({"ok": False, "reason": "phone required (min 7 digits)"}, status_code=400)
     from shared.phone import significant_digits
     contacts = _load_outbound(owner)
@@ -3242,6 +3499,11 @@ async def outbound_upload(request: Request) -> JSONResponse:
     raw = await file_field.read()
 
     owner = _acting_owner(request)
+    # Import straight into a group. Without this every CSV landed in the
+    # implicit No-group bucket, so the only way to fill "Marketing" from a
+    # spreadsheet was to import and then re-file every row by hand.
+    group_id = _resolve_group_id(owner, form.get("group_id"),
+                                 form.get("group_name"))
     rows, parse_errors = _parse_uploaded_file(filename, raw)
     if not rows:
         return JSONResponse({"ok": False, "reason": f"No valid phone numbers found in file. parse_errors={parse_errors}"})
@@ -3250,23 +3512,37 @@ async def outbound_upload(request: Request) -> JSONResponse:
     contacts = _load_outbound(owner)
     existing_digits = {significant_digits(c["phone"]) for c in contacts}
     added, dupes = 0, 0
+    # Re-filing an existing contact is not an import, but "import my Marketing
+    # list" plainly means those people end up in Marketing — so a duplicate is
+    # still counted as a duplicate and additionally moved into the group.
+    moved = 0
+    if group_id is not None:
+        by_digits = {significant_digits(c["phone"]): c for c in contacts}
     for row in rows:
         digits = significant_digits(row["phone"])
         if digits in existing_digits:
             dupes += 1
+            if group_id is not None:
+                existing = by_digits.get(digits)
+                if existing is not None and existing.get("group_id") != group_id:
+                    existing["group_id"] = group_id
+                    moved += 1
             continue
         contacts.append(_make_contact(row["phone"], row.get("name", ""),
                                       row.get("notes", ""),
                                       gender=row.get("gender", ""),
-                                      details=row.get("details") or {}))
+                                      details=row.get("details") or {},
+                                      group_id=group_id))
         existing_digits.add(digits)
         added += 1
         time.sleep(0.001)  # ensure unique IDs
 
     _save_outbound(contacts, owner)
     from shared.audit import record as _audit
-    _audit(owner, "contacts_upload", filename, {"added": added, "duplicates": dupes})
+    _audit(owner, "contacts_upload", filename,
+           {"added": added, "duplicates": dupes, "group_id": group_id})
     return JSONResponse({"ok": True, "added": added, "duplicates": dupes,
+                          "moved": moved, "group_id": group_id,
                           "parse_errors": parse_errors, "total_in_file": len(rows)})
 
 
@@ -3297,6 +3573,27 @@ async def outbound_update(contact_id: str, request: Request) -> JSONResponse:
     contacts = _load_outbound(owner)
     for c in contacts:
         if c["id"] == contact_id:
+            # Phone is editable — a typo'd number is the single most common
+            # reason to edit a contact at all, and re-typing the whole person
+            # loses their call history. Same dedupe rule as create: the last 10
+            # significant digits, compared against everyone ELSE.
+            if "phone" in body:
+                from shared.phone import significant_digits
+                # Normalized on the way in for the same reason as create: a
+                # corrected number is dialled, so it has to carry a country code.
+                new_phone = _dialable_phone(body.get("phone"))
+                if not new_phone:
+                    return JSONResponse(
+                        {"ok": False, "reason": "phone required (min 7 digits)"},
+                        status_code=400)
+                if significant_digits(new_phone) != significant_digits(c["phone"]):
+                    clash = {significant_digits(o["phone"]) for o in contacts
+                             if o["id"] != contact_id}
+                    if significant_digits(new_phone) in clash:
+                        return JSONResponse(
+                            {"ok": False, "reason": "number already exists"},
+                            status_code=409)
+                c["phone"] = new_phone
             for field in ("name", "notes", "call_status", "disposition", "call_notes"):
                 if field in body:
                     c[field] = (body[field] or "").strip() if isinstance(body[field], str) else body[field]
@@ -3325,8 +3622,9 @@ async def outbound_update(contact_id: str, request: Request) -> JSONResponse:
         from shared.db.database import get_db
         from shared.intelligence import timeline
         from shared.phone import significant_digits
-        changed = [k for k in ("name", "notes", "call_status", "disposition",
-                               "call_notes", "gender", "details", "group_id")
+        changed = [k for k in ("phone", "name", "notes", "call_status",
+                               "disposition", "call_notes", "gender",
+                               "details", "group_id")
                    if k in body]
         if changed:
             with get_db() as db:
@@ -3345,6 +3643,77 @@ async def outbound_update(contact_id: str, request: Request) -> JSONResponse:
 # Contact groups (phone-book buckets). Contacts with group_id NULL are the
 # implicit "No group" bucket — it is not a row in contact_groups.
 # ---------------------------------------------------------------------------
+
+_RESERVED_GROUP_NAMES = ("all", "no group", "none", "ungrouped")
+
+
+def _resolve_group_id(owner: str, raw_id: Any, raw_name: Any = None) -> int | None:
+    """A caller-supplied group → an id this owner actually owns, or None.
+
+    Accepts either an existing id or a NAME, creating the group when only a
+    name is given. That is what makes "import this CSV into a new group called
+    Marketing" one action instead of three, and it is owner-scoped both ways —
+    an id belonging to another tenant resolves to None (No group), never to
+    their group. Shared with the public API via shared/contacts.py.
+    """
+    from shared.contacts import resolve_group
+    return resolve_group(owner, raw_id, raw_name)
+
+
+@app.post("/api/outbound/contacts/bulk")
+async def outbound_bulk(request: Request) -> JSONResponse:
+    """Apply one change to many contacts at once (ids come from the table's
+    row selection).
+
+    Actions: `group` (re-file, including into a brand-new named group),
+    `disposition`, `delete`. One write of the whole set, because
+    _save_outbound is a full sync — issuing N single-contact PATCHes would be
+    N load-all/save-all round trips over the same rows.
+    """
+    owner = _acting_owner(request)
+    body = await request.json()
+    action = (body.get("action") or "").strip()
+    ids = [str(i) for i in (body.get("contact_ids") or []) if str(i).strip()]
+    if not ids:
+        return JSONResponse({"ok": False, "reason": "contact_ids required"},
+                            status_code=400)
+    wanted = set(ids)
+    contacts = _load_outbound(owner)
+    known = sum(1 for c in contacts if c["id"] in wanted)
+    if not known:
+        return JSONResponse({"ok": False, "reason": "no matching contacts"},
+                            status_code=404)
+
+    if action == "delete":
+        contacts = [c for c in contacts if c["id"] not in wanted]
+        changed = known
+    elif action == "group":
+        gid = _resolve_group_id(owner, body.get("group_id"), body.get("group_name"))
+        changed = 0
+        for c in contacts:
+            if c["id"] in wanted and c.get("group_id") != gid:
+                c["group_id"] = gid
+                changed += 1
+    elif action == "disposition":
+        disp = (body.get("disposition") or "").strip()
+        if disp not in DISPOSITIONS:
+            return JSONResponse({"ok": False, "reason": "unknown disposition"},
+                                status_code=400)
+        changed = 0
+        for c in contacts:
+            if c["id"] in wanted and c.get("disposition") != disp:
+                c["disposition"] = disp
+                changed += 1
+    else:
+        return JSONResponse({"ok": False, "reason": f"unknown action {action!r}"},
+                            status_code=400)
+
+    _save_outbound(contacts, owner)
+    from shared.audit import record as _audit
+    _audit(owner, f"contacts_bulk_{action}", ",".join(ids[:20]),
+           {"count": known, "changed": changed})
+    return JSONResponse({"ok": True, "matched": known, "changed": changed})
+
 
 @app.get("/api/outbound/groups")
 async def contact_groups_list(request: Request) -> JSONResponse:
@@ -3373,7 +3742,7 @@ async def contact_groups_add(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "reason": "name required"}, status_code=400)
     if len(name) > 64:
         return JSONResponse({"ok": False, "reason": "name too long"}, status_code=400)
-    if name.lower() in ("all", "no group", "none", "ungrouped"):
+    if name.lower() in _RESERVED_GROUP_NAMES:
         return JSONResponse({"ok": False, "reason": "reserved name"}, status_code=400)
     from shared.db.database import get_db
     with get_db() as db:
@@ -3389,6 +3758,37 @@ async def contact_groups_add(request: Request) -> JSONResponse:
     from shared.audit import record as _audit
     _audit(owner, "group_create", name)
     return JSONResponse({"ok": True, "group": dict(row)})
+
+
+@app.patch("/api/outbound/groups/{group_id}")
+async def contact_groups_rename(group_id: int, request: Request) -> JSONResponse:
+    """Rename a group. Deleting and recreating was the only way to fix a typo,
+    and that re-files every member into No group on the way through."""
+    owner = _acting_owner(request)
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"ok": False, "reason": "name required"}, status_code=400)
+    if len(name) > 64:
+        return JSONResponse({"ok": False, "reason": "name too long"}, status_code=400)
+    if name.lower() in _RESERVED_GROUP_NAMES:
+        return JSONResponse({"ok": False, "reason": "reserved name"}, status_code=400)
+    from shared.db.database import get_db
+    with get_db() as db:
+        row = db.execute("SELECT id FROM contact_groups WHERE id=? AND owner=?",
+                         (group_id, owner)).fetchone()
+        if not row:
+            return JSONResponse({"ok": False, "reason": "not found"}, status_code=404)
+        dup = db.execute(
+            "SELECT id FROM contact_groups WHERE owner=? AND name=? AND id<>?",
+            (owner, name, group_id)).fetchone()
+        if dup:
+            return JSONResponse({"ok": False, "reason": "group already exists"},
+                                status_code=409)
+        db.execute("UPDATE contact_groups SET name=? WHERE id=?", (name, group_id))
+    from shared.audit import record as _audit
+    _audit(owner, "group_rename", name, {"group_id": group_id})
+    return JSONResponse({"ok": True, "group": {"id": group_id, "name": name}})
 
 
 @app.delete("/api/outbound/groups/{group_id}")
@@ -3900,6 +4300,18 @@ async def _dial_automation_entry(automation_id: str) -> None:
                 _src_agent = _row["agent_slug"]
     except Exception as exc:
         logger.warning("automation source-agent lookup failed: %r", exc)
+    # V1 — an automated callback that plays silence is worse than one never
+    # placed: the customer picks up expecting the call they were promised.
+    _cb_speak_ok, _cb_speak_why = await asyncio.to_thread(_voice_can_speak)
+    if not _cb_speak_ok:
+        _update_automation(automation_id,
+                           {"status": "failed",
+                            "call_outcome": f"not placed: {_cb_speak_why}",
+                            "called_at": _now_iso()})
+        logger.warning("FOLLOWUP_AUTOMATION %s skipped for %s: voice provider "
+                       "has no credits", automation_id, _cb_owner)
+        return
+
     # E4 — the automation callback is a real outbound call placed on the
     # tenant's behalf, so it obeys the same quota as one they click.
     _cb_decision = await asyncio.to_thread(
@@ -4037,6 +4449,15 @@ async def _autodial_once() -> int:
     now = autodial.now_local()
     rows = await asyncio.to_thread(autodial.due_candidates, 200)
     if not rows:
+        return 0
+
+    # V1 — checked once for the whole sweep: if the agent cannot speak, not
+    # one of these follow-ups should go out. Leaving the rows due means they
+    # dial on the next sweep, once credits are back.
+    _sweep_speak_ok, _ = await asyncio.to_thread(_voice_can_speak)
+    if not _sweep_speak_ok:
+        logger.warning("autodial: sweep skipped — voice provider has no "
+                       "credits, %d row(s) left due", len(rows))
         return 0
 
     placed = 0
@@ -4246,15 +4667,27 @@ async def _start_autodialer() -> None:
 
 
 @app.get("/api/outbound/stats")
-async def outbound_stats(request: Request) -> JSONResponse:
-    contacts = _load_outbound(_acting_owner(request))
+async def outbound_stats(request: Request, group: str = Query(None)) -> JSONResponse:
+    """Phone-book tallies, optionally narrowed to one group.
+
+    The campaign runner reads this with the group it is about to dial, so the
+    "up to N contacts" line under Who-to-call counts the same people the run
+    will actually queue. Callers that omit `group` get the whole book, exactly
+    as before.
+
+    The exact "how many will this campaign dial" number comes from
+    /outbound/campaign/preview, which runs the real planner; these are the
+    headline tallies the stat cards show.
+    """
+    contacts = _filter_by_group(_load_outbound(_acting_owner(request)), group)
     stats: dict = {"total": len(contacts)}
     for s in CALL_STATUSES:
         stats[s] = sum(1 for c in contacts if c.get("call_status") == s)
     disp: dict = {}
     for d in DISPOSITIONS:
         disp[d] = sum(1 for c in contacts if c.get("disposition") == d)
-    return JSONResponse({"stats": stats, "dispositions": disp})
+    return JSONResponse({"stats": stats, "dispositions": disp,
+                         "group": group or "all"})
 
 
 # ---------------------------------------------------------------------------
@@ -4427,6 +4860,15 @@ def _fs_originate_cmd(phone: str, agent_slug: str = "", campaign_id: str = "",
                          gateway_name=gateway_name or ADMIN_GATEWAY_NAME)
 
 
+# Hangup causes that mean the NUMBER is wrong — the carrier could not route
+# it — as opposed to a person (or their network) turning the call away. They
+# used to be folded into "declined", which is also what a human pressing
+# reject looks like, so a whole list of mis-typed numbers read as twenty people
+# who did not want to talk (2026-09-09 and again 2026-09-25, RUNBOOK §58).
+_INVALID_NUMBER_CAUSES = ("UNALLOCATED_NUMBER", "UNALLOCATED", "INVALID_NUMBER_FORMAT",
+                          "NO_ROUTE_DESTINATION", "NO_ROUTE_TRANSIT_NET")
+
+
 def _parse_fs_result(stdout: str, stderr: str) -> str:
     """Map fs_cli originate output to a call_status string."""
     out = stdout.strip() + " " + stderr.strip()
@@ -4436,8 +4878,10 @@ def _parse_fs_result(stdout: str, stderr: str) -> str:
         return "no_answer"
     if "USER_BUSY" in out or "BUSY" in out:
         return "busy"
+    if any(x in out for x in _INVALID_NUMBER_CAUSES):
+        return "invalid_number"
     if any(x in out for x in ("NORMAL_CLEARING", "CALL_REJECTED", "USER_NOT_REGISTERED",
-                               "UNALLOCATED", "ORIGINATOR_CANCEL", "SUBSCRIBER_ABSENT")):
+                               "ORIGINATOR_CANCEL", "SUBSCRIBER_ABSENT")):
         return "declined"
     return "failed"
 
@@ -4501,9 +4945,10 @@ def _acting_owner(request: Request) -> str:
 # BILLING enforcement at the dial origins (plan §7, E1-E5).
 #
 # Gate rule: EVERY call site of _fs_esl_exec(_fs_originate_cmd(...)) must be
-# preceded by an entitlement check. There are six origins in this file plus
-# shared/sentinel.py's loopback probe (which is exempt — it is a synthetic
-# self-test marked billable=0 and rings no human).
+# preceded by an entitlement check AND by the voice-capability check below.
+# There are six origins in this file plus shared/sentinel.py's loopback probe
+# (which is exempt from both — it is a synthetic self-test marked billable=0,
+# it rings no human, and it plays a pre-recorded WAV rather than TTS).
 #
 # Admission RESERVES rather than reads: this endpoint returns immediately and
 # originates in a background task, so N parallel POSTs to N different contacts
@@ -4511,6 +4956,53 @@ def _acting_owner(request: Request) -> str:
 # The reservation must be released when the call's ledger row closes — the
 # bridge does that at teardown; a crashed leg's reservation expires on its own.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# VOICE-CAPABILITY gate at the dial origins (2026-09-08, RUNBOOK §34).
+#
+# A dial whose agent cannot speak is worse than no dial: the handset rings,
+# the customer answers, hears NOTHING for ~25s and hangs up — and the platform
+# bills the minutes, marks the contact 'empty_call' and moves on. Two such
+# calls went to a real contact on 2026-09-08 while all 28 Sarvam keys sat
+# marked dead (6 of them wrongly). Refusing to dial is the only response that
+# does not spend the customer's goodwill on a guaranteed-silent call.
+#
+# The authority is the key watchdog's status file, rewritten every 3s. This
+# gate FAILS OPEN on anything unexpected — a missing, stale or unreadable
+# status file must never be able to stop a tenant from calling.
+# ---------------------------------------------------------------------------
+_VOICE_STATUS_FILE = Path(__file__).parent / "sarvam_key_status.json"
+_VOICE_STATUS_MAX_AGE_S = 120.0
+
+
+def _voice_can_speak() -> tuple[bool, str]:
+    """(allowed, reason). Only a FRESH, unambiguous 'all keys exhausted'
+    blocks a dial."""
+    try:
+        raw = json.loads(_VOICE_STATUS_FILE.read_text(encoding="utf-8"))
+        if not raw.get("all_exhausted"):
+            return True, ""
+        updated = raw.get("updated") or ""
+        age = (datetime.datetime.now()
+               - datetime.datetime.fromisoformat(updated)).total_seconds()
+        if age > _VOICE_STATUS_MAX_AGE_S:
+            logger.warning("voice gate: status file is %.0fs stale — allowing dial", age)
+            return True, ""
+        return False, (
+            "The voice provider has no credits left, so this call would "
+            "connect and play silence. Top up Sarvam credits or add a key, "
+            "then dial again."
+        )
+    except Exception as exc:
+        logger.warning("voice gate unavailable (%r) — allowing dial", exc)
+        return True, ""
+
+
+def _voice_refusal_response() -> JSONResponse:
+    _ok, reason = _voice_can_speak()
+    return JSONResponse({"ok": False, "reason": reason, "detail": reason,
+                         "code": "voice_unavailable"}, status_code=503)
+
 
 def _billing_check_dial(owner: str, origin: str):
     """Decision for one outbound origination. Never raises."""
@@ -4559,26 +5051,42 @@ def _billing_refusal_response(decision) -> JSONResponse:
     }, status_code=402)
 
 
-@app.post("/api/outbound/dial/{contact_id}")
-async def outbound_dial(contact_id: str, request: Request) -> JSONResponse:
-    """Trigger a single outbound call. Returns immediately; call runs async.
+class DialRefused(Exception):
+    """A dial the guardrails declined. `payload`/`status` are the HTTP shape the
+    outbound UI already understands, so the endpoint can return it verbatim and
+    the scheduler can record `reason` on the schedule row."""
 
-    The call originates from the ACTING owner's own registered number/trunk as
-    that number's agent — never a shared or another tenant's caller ID.
+    def __init__(self, payload: dict, status: int = 400):
+        super().__init__(payload.get("reason") or "dial refused")
+        self.payload = payload
+        self.status = status
+
+
+async def _place_call(owner: str, contact_id: str, *, origin: str,
+                      force: bool = False, actor_ip: str | None = None) -> dict:
+    """Place ONE outbound call for `owner`, through every dial guardrail.
+
+    The manual Call button and the scheduler both come through here. They MUST:
+    a second copy of this sequence is a second place for the duplicate guard,
+    the voice-capability gate (V1) or the billing admission (E1) to be
+    forgotten, and the gate rule above says every originate call site carries
+    all of them. The scheduler is the seventh dial origin; it does not get its
+    own rules, it gets these.
+
+    Returns the started-dial payload, or raises DialRefused. Origination itself
+    runs in a background task — the caller does not wait 45s for a handset.
     """
-    dial_owner = _acting_owner(request)
-    contacts = _load_outbound(dial_owner)
+    contacts = _load_outbound(owner)
     contact = next((c for c in contacts if c["id"] == contact_id), None)
     if not contact:
-        return JSONResponse({"ok": False, "reason": "contact not found"}, status_code=404)
+        raise DialRefused({"ok": False, "reason": "contact not found"}, 404)
     from shared.audit import record as _audit
-    _audit(dial_owner, "dial", contact.get("phone"),
-           {"contact_id": contact_id},
-           request.client.host if request.client else None)
+    _audit(owner, "dial", contact.get("phone"),
+           {"contact_id": contact_id, "origin": origin}, actor_ip)
 
     phone = re.sub(r"[^\d]", "", contact.get("phone", ""))
     if len(phone) < 7:
-        return JSONResponse({"ok": False, "reason": "invalid phone number"})
+        raise DialRefused({"ok": False, "reason": "invalid phone number"}, 400)
 
     # Duplicate-dial guard. This endpoint returns "dialing" instantly but the
     # handset does not ring for 15-30s, so an operator who sees nothing happen
@@ -4587,38 +5095,48 @@ async def outbound_dial(contact_id: str, request: Request) -> JSONResponse:
     # which reads to everyone as the call being cut for no reason.
     # Window tracks originate_timeout (45s) so a still-ringing leg is covered.
     # ?force=1 re-dials anyway, for a genuine immediate retry.
-    if request.query_params.get("force") not in ("1", "true", "yes"):
-        _recent = _recent_dial_for(phone, dial_owner, within_s=_DUPLICATE_DIAL_WINDOW_S)
+    if not force:
+        _recent = _recent_dial_for(phone, owner, within_s=_DUPLICATE_DIAL_WINDOW_S)
         if _recent is not None:
             logger.info("DIAL blocked as duplicate: %s (previous dial %.0fs ago)",
                         phone, _recent)
-            return JSONResponse({
+            raise DialRefused({
                 "ok": False, "duplicate": True,
                 "reason": f"A call to this contact was already placed "
                           f"{int(_recent)}s ago and may still be connecting. "
                           f"Wait for it to finish, or use Force call to dial anyway.",
                 "seconds_ago": int(_recent),
-            }, status_code=409)
+            }, 409)
+
+    # V1 — before billing, so a refused-for-silence dial burns no
+    # reservation. A call the agent cannot speak on is not worth placing.
+    _speak_ok, _speak_why = _voice_can_speak()
+    if not _speak_ok:
+        logger.warning("DIAL refused for %s: voice provider has no credits", owner)
+        raise DialRefused({"ok": False, "reason": _speak_why, "detail": _speak_why,
+                           "code": "voice_unavailable"}, 503)
 
     # E1 — after the duplicate guard (so a duplicate click does not burn a
     # reservation) and before we resolve an identity or touch FreeSWITCH.
-    _decision = _billing_check_dial(dial_owner, "dial")
+    _decision = _billing_check_dial(owner, origin)
     if not _decision.allowed:
-        logger.info("DIAL refused for %s: %s", dial_owner, _decision.code)
-        return _billing_refusal_response(_decision)
+        logger.info("DIAL refused for %s: %s", owner, _decision.code)
+        raise DialRefused(_decision.detail | {
+            "ok": False, "reason": _decision.reason, "detail": _decision.reason,
+            "code": _decision.code, "upgrade": "/billing"}, 402)
 
     try:
-        ident = _outbound_identity(dial_owner)
+        ident = _outbound_identity(owner)
     except OutboundIdentityError as exc:
         _billing_release(_decision.reservation)
-        return JSONResponse({"ok": False, "reason": str(exc), "detail": str(exc)},
-                            status_code=400)
+        raise DialRefused({"ok": False, "reason": str(exc), "detail": str(exc)}, 400)
 
     _dial_slug = ident["agent_slug"]
     _record_dial(phone, contact_id, contact.get("name", ""), agent_slug=_dial_slug,
-                 owner=dial_owner)
+                 owner=owner, gender=contact.get("gender", ""))
 
     async def _do_dial():
+        fs_out = ""
         try:
             fs_out = await _fs_esl_exec(_fs_originate_cmd(
                     phone, agent_slug=_dial_slug,
@@ -4632,13 +5150,34 @@ async def outbound_dial(contact_id: str, request: Request) -> JSONResponse:
             # is accounted for by its own ledger row — either way the
             # admission hold is done once the originate returns.
             _billing_release(_decision.reservation)
-        _update_contact_after_call(contact_id, cs, dial_owner)
-        logger.info("DIAL %s from %s (%s) → %s", phone, ident["caller_id"],
-                    ident["source"], cs)
+        _update_contact_after_call(contact_id, cs, owner)
+        # The carrier's own words next to our bucket, so "was a call even
+        # placed?" is answered by this log line rather than the FreeSWITCH log.
+        logger.info("DIAL %s from %s (%s, %s) → %s (%s)", phone, ident["caller_id"],
+                    ident["source"], origin, cs, " ".join(fs_out.split())[:120])
 
     asyncio.create_task(_do_dial())
-    return JSONResponse({"ok": True, "phone": phone, "status": "dialing",
-                         "from": ident["caller_id"]})
+    return {"ok": True, "phone": phone, "status": "dialing",
+            "name": contact.get("name", ""), "from": ident["caller_id"]}
+
+
+@app.post("/api/outbound/dial/{contact_id}")
+async def outbound_dial(contact_id: str, request: Request) -> JSONResponse:
+    """Trigger a single outbound call. Returns immediately; call runs async.
+
+    The call originates from the ACTING owner's own registered number/trunk as
+    that number's agent — never a shared or another tenant's caller ID.
+
+    ?force=1 re-dials past the duplicate guard, for a genuine immediate retry.
+    """
+    try:
+        out = await _place_call(
+            _acting_owner(request), contact_id, origin="dial",
+            force=request.query_params.get("force") in ("1", "true", "yes"),
+            actor_ip=request.client.host if request.client else None)
+    except DialRefused as exc:
+        return JSONResponse(exc.payload, status_code=exc.status)
+    return JSONResponse(out)
 
 
 @app.post("/api/numbers/{number_id}/test-call")
@@ -4690,6 +5229,11 @@ async def number_test_call(number_id: int, request: Request) -> JSONResponse:
 
     # E5 — a test call is a real call on a real trunk with a real agent on the
     # line, so it meters and it counts against quota exactly like any other.
+    _speak_ok, _ = _voice_can_speak()
+    if not _speak_ok:
+        logger.warning("TEST CALL refused for %s: voice provider has no credits", owner)
+        return _voice_refusal_response()
+
     _decision = _billing_check_dial(owner, "test")
     if not _decision.allowed:
         return _billing_refusal_response(_decision)
@@ -4741,7 +5285,8 @@ CAMPAIGN_MAX_CALLS = int(os.environ.get("CAMPAIGN_MAX_CALLS", "200"))
 CAMPAIGN_MIN_DELAY_S = float(os.environ.get("CAMPAIGN_MIN_DELAY_SECONDS", "3"))
 
 
-def _campaign_audience(contacts: list[dict], filter_cs: str) -> list[dict]:
+def _campaign_audience(contacts: list[dict], filter_cs: str,
+                       disposition: str | None = None) -> list[dict]:
     """Resolve the audience picker to the contacts it names.
 
     The picker mixes two different columns: 'not_called'/'no_answer' are
@@ -4749,12 +5294,21 @@ def _campaign_audience(contacts: list[dict], filter_cs: str) -> list[dict]:
     call_status — as this did until 2026-07-29 — made the "To contact later"
     audience resolve to zero while the UI counted dozens, and the start call
     then returned ok:false with HTTP 200, which the SPA toasted as success.
+
+    `disposition` is an INDEPENDENT second axis, so the campaign can express
+    the same thing the phone-book filter row does ("answered AND interested").
+    Before it existed the two surfaces could not name the same audience, and
+    the filter you had just narrowed to was not the filter you could dial.
     """
-    if filter_cs == "all":
-        return list(contacts)
-    if filter_cs in DISPOSITIONS:
-        return [c for c in contacts if c.get("disposition") == filter_cs]
-    return [c for c in contacts if c.get("call_status") == filter_cs]
+    out = list(contacts)
+    if filter_cs and filter_cs != "all":
+        if filter_cs in DISPOSITIONS:
+            out = [c for c in out if c.get("disposition") == filter_cs]
+        else:
+            out = [c for c in out if c.get("call_status") == filter_cs]
+    if disposition and disposition != "all":
+        out = [c for c in out if c.get("disposition") == disposition]
+    return out
 
 
 def _campaign_limits(body: dict) -> tuple[float, int]:
@@ -4770,15 +5324,36 @@ def _campaign_limits(body: dict) -> tuple[float, int]:
                    else min(asked, CAMPAIGN_MAX_CALLS))
 
 
-def _campaign_plan(contacts: list[dict], filter_cs: str,
-                   max_calls: int) -> tuple[list[dict], int, bool]:
+def _campaign_plan(contacts: list[dict], filter_cs: str, max_calls: int,
+                   group: str | None = None,
+                   contact_ids: list[str] | None = None,
+                   disposition: str | None = None,
+                   ) -> tuple[list[dict], int, bool]:
     """Who this campaign will actually dial → (to_call, dnd_skipped, capped).
+
+    Three ways to name an audience, narrowest first:
+
+      * `contact_ids` — an explicit selection made in the table. It wins
+        outright: someone who ticked eight rows means those eight, and the
+        status/group pickers are not a second opinion on that.
+      * `group` — one phone-book group ("Marketing"), crossed with…
+      * `filter_cs` + `disposition` — the same two axes the phone-book filter
+        row offers, so "what I am looking at" and "what I will dial" are the
+        same sentence.
 
     Do-not-call is applied BEFORE the cap, so a list full of rejected contacts
     can never silently consume the whole budget, and 'rejected' as an audience
-    resolves to nobody rather than to exactly the people who opted out.
+    resolves to nobody rather than to exactly the people who opted out. It also
+    applies to an explicit selection: ticking a row is not consent from the
+    person on the other end.
     """
-    audience = _campaign_audience(contacts, filter_cs)
+    if contact_ids:
+        wanted = list(dict.fromkeys(contact_ids))          # de-dupe, keep order
+        by_id = {c["id"]: c for c in contacts}
+        audience = [by_id[i] for i in wanted if i in by_id]
+    else:
+        audience = _campaign_audience(_filter_by_group(contacts, group),
+                                      filter_cs, disposition)
     dnd_skipped = sum(1 for c in audience if c.get("disposition") == "rejected")
     to_call = [c for c in audience if c.get("disposition") != "rejected"]
     capped = len(to_call) > max_calls
@@ -4821,20 +5396,95 @@ async def campaign_status(request: Request) -> JSONResponse:
                          "min_delay_seconds": CAMPAIGN_MIN_DELAY_S})
 
 
-@app.post("/api/outbound/campaign/start")
-async def campaign_start(request: Request) -> JSONResponse:
-    camp_owner = _acting_owner(request)
+def _campaign_request(body: dict) -> dict:
+    """The audience half of a campaign body, normalised once.
+
+    Start and preview MUST read the request identically or the number on the
+    button is not the number that dials.
+    """
+    raw_ids = body.get("contact_ids") or []
+    if not isinstance(raw_ids, list):
+        raw_ids = []
+    return {
+        "filter_cs": body.get("call_status_filter") or "not_called",
+        "disposition": body.get("disposition_filter") or None,
+        "group": body.get("group") or None,
+        "contact_ids": [str(i) for i in raw_ids
+                        if str(i).strip()][:CAMPAIGN_MAX_CALLS],
+    }
+
+
+@app.post("/api/outbound/campaign/preview")
+async def campaign_preview(request: Request) -> JSONResponse:
+    """Exactly who a start with this body would dial — no side effects.
+
+    Runs the real planner rather than re-deriving a count in the browser, so
+    the "up to N contacts" line under Who-to-call cannot drift from what the
+    engine queues (it did: the form counted a raw status tally while the
+    engine also dropped do-not-call and applied the per-run cap).
+    """
+    owner = _acting_owner(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    req = _campaign_request(body if isinstance(body, dict) else {})
+    _, max_calls = _campaign_limits(body if isinstance(body, dict) else {})
+    contacts = _load_outbound(owner)
+    to_call, dnd_skipped, capped = _campaign_plan(
+        contacts, req["filter_cs"], max_calls, group=req["group"],
+        contact_ids=req["contact_ids"], disposition=req["disposition"])
+    # Matched-before-cap, so the UI can say "200 of 640" rather than just 200.
+    matched, _, _ = _campaign_plan(
+        contacts, req["filter_cs"], 10 ** 9, group=req["group"],
+        contact_ids=req["contact_ids"], disposition=req["disposition"])
+    return JSONResponse({"ok": True, "will_dial": len(to_call),
+                         "matched": len(matched), "dnd_skipped": dnd_skipped,
+                         "capped": capped, "max_calls": max_calls,
+                         "max_calls_limit": CAMPAIGN_MAX_CALLS})
+
+
+class CampaignRefused(Exception):
+    """A campaign the guardrails declined — same shape contract as DialRefused,
+    so the endpoint returns it verbatim and the scheduler records `reason`."""
+
+    def __init__(self, payload: dict, status: int = 400):
+        super().__init__(payload.get("reason") or "campaign refused")
+        self.payload = payload
+        self.status = status
+
+
+async def _campaign_launch(camp_owner: str, body: dict, *, origin: str,
+                           actor_ip: str | None = None) -> dict:
+    """Plan and start ONE campaign run for `camp_owner`.
+
+    The Start button and the scheduler both come through here, for the reason
+    `_place_call` exists: this function is a stack of guardrails — calling
+    hours, do-not-call, per-call voice capability, per-call billing admission,
+    quota truncation, the inter-call delay — and a scheduled campaign that
+    reimplemented them would be one edit away from obeying a different set. A
+    campaign is the dial origin that MULTIPLIES; it is the last one that should
+    have two implementations.
+
+    Returns the started-run summary, or raises CampaignRefused.
+    """
     camp = _campaign_for(camp_owner)
     if camp.get("running"):
-        return JSONResponse({"ok": False, "reason": "You already have a campaign running"},
-                            status_code=409)
+        raise CampaignRefused(
+            {"ok": False, "reason": "You already have a campaign running"}, 409)
     from shared.audit import record as _audit
-    _audit(camp_owner, "campaign_start", ip=request.client.host if request.client else None)
+    _audit(camp_owner, "campaign_start", None, {"origin": origin}, actor_ip)
 
     from shared.intelligence import autodial, config as intel_config
 
-    body = await request.json()
-    filter_cs   = body.get("call_status_filter", "not_called")   # which contacts to call
+    if body.get("contact_ids") is not None and not isinstance(body["contact_ids"], list):
+        raise CampaignRefused({"ok": False, "reason": "contact_ids must be a list"}, 400)
+    # Audience: a call status, a disposition, one group, or an explicit
+    # tick-the-rows selection (strings — that is the handle the whole outbound
+    # surface keys on: legacy_id, or "db<pk>").
+    req = _campaign_request(body)
+    filter_cs, disposition = req["filter_cs"], req["disposition"]
+    group, contact_ids = req["group"], req["contact_ids"]
     # A floor and a ceiling, not suggestions: dialling with no gap puts a burst
     # of legs on one trunk and reads to the carrier as spam.
     delay_secs, max_calls = _campaign_limits(body)
@@ -4844,33 +5494,34 @@ async def campaign_start(request: Request) -> JSONResponse:
     now_ist = autodial.now_local()
     if not autodial.within_window(now_ist):
         opens = autodial.next_window_open(now_ist)
-        return JSONResponse({"ok": False, "reason":
+        raise CampaignRefused({"ok": False, "code": "outside_hours", "reason":
             f"Outside calling hours ({intel_config.AUTODIAL_HOUR_START:02d}:00–"
             f"{intel_config.AUTODIAL_HOUR_END:02d}:00 IST, Mon–Sat). "
             f"Campaigns can start again {opens.strftime('%a %d %b at %H:%M')} IST."},
-            status_code=400)
+            400)
 
     # Do-not-call is not a preference this screen can override: a contact
     # marked 'rejected' asked us to stop.
     to_call, dnd_skipped, capped = _campaign_plan(
-        _load_outbound(camp_owner), filter_cs, max_calls)
+        _load_outbound(camp_owner), filter_cs, max_calls,
+        group=group, contact_ids=contact_ids, disposition=disposition)
 
     if not to_call:
         reason = ("Every contact in this audience is marked Rejected — they "
                   "asked not to be called") if dnd_skipped else \
-                 "No contacts match the filter"
+                 ("None of the selected contacts could be found"
+                  if contact_ids else "No contacts match the filter")
         # 400, not 200: an ok:false body with a success status was toasted by
         # the SPA as "Campaign started" while nothing had been queued.
-        return JSONResponse({"ok": False, "reason": reason,
-                             "dnd_skipped": dnd_skipped}, status_code=400)
+        raise CampaignRefused({"ok": False, "reason": reason,
+                               "dnd_skipped": dnd_skipped}, 400)
 
     # Resolve the caller's own number/trunk ONCE, up front — the whole campaign
     # dials from it, and we refuse to start if they have no number of their own.
     try:
         camp_ident = _outbound_identity(camp_owner)
     except OutboundIdentityError as exc:
-        return JSONResponse({"ok": False, "reason": str(exc), "detail": str(exc)},
-                            status_code=400)
+        raise CampaignRefused({"ok": False, "reason": str(exc), "detail": str(exc)}, 400)
 
     # E2 — the sixth dial origin, and the one that multiplies. A campaign is
     # the only path that dials a LIST from one click, so an unchecked campaign
@@ -4880,9 +5531,12 @@ async def campaign_start(request: Request) -> JSONResponse:
     #   * the audience is TRUNCATED to what the remaining balance can pay for,
     #     so a 5,000-contact list on a 30-minute plan queues 30 calls, not
     #     5,000 that fail one by one on the trunk.
-    _camp_decision = _billing_check_dial(camp_owner, "campaign")
+    _camp_decision = _billing_check_dial(camp_owner, origin)
     if not _camp_decision.allowed:
-        return _billing_refusal_response(_camp_decision)
+        raise CampaignRefused(_camp_decision.detail | {
+            "ok": False, "reason": _camp_decision.reason,
+            "detail": _camp_decision.reason, "code": _camp_decision.code,
+            "upgrade": "/billing"}, 402)
     _billing_release(_camp_decision.reservation)   # the per-call gate reserves
 
     _quota_capped = 0
@@ -4902,11 +5556,11 @@ async def campaign_start(request: Request) -> JSONResponse:
         logger.error("BILLING campaign sizing failed: %r", exc)
 
     if not to_call:
-        return JSONResponse({
+        raise CampaignRefused({
             "ok": False, "code": "quota_minutes", "upgrade": "/billing",
             "reason": "You have no minutes left this period, so no calls were "
                       "queued. Add minutes or upgrade to run this campaign.",
-            "detail": "no minutes remaining"}, status_code=402)
+            "detail": "no minutes remaining"}, 402)
 
     import uuid as _uuid
     cid = _uuid.uuid4().hex[:8]
@@ -4914,11 +5568,18 @@ async def campaign_start(request: Request) -> JSONResponse:
         "running": True, "campaign_id": cid,
         "total": len(to_call), "completed": 0,
         "answered": 0, "no_answer": 0, "busy": 0,
-        "declined": 0, "failed": 0, "skipped": 0,
+        "declined": 0, "invalid_number": 0, "failed": 0, "skipped": 0,
         "dnd_skipped": dnd_skipped, "capped": capped,
         "current_phone": "", "current_name": "",
         "started_at": datetime.datetime.utcnow().isoformat() + "Z",
         "stopped": False, "error": None,
+        # What this run was aimed at, so the live panel and the last-run
+        # summary can say WHICH audience produced these numbers instead of
+        # showing tallies with no subject.
+        "audience": ("selection" if contact_ids else filter_cs),
+        "audience_disposition": (None if contact_ids else disposition),
+        "audience_group": group or "all",
+        "audience_size": len(to_call),
     })
     if dnd_skipped or capped:
         logger.info("CAMPAIGN [%s owner=%s] queued %s · %s on do-not-call skipped"
@@ -4959,12 +5620,25 @@ async def campaign_start(request: Request) -> JSONResponse:
                     camp["completed"] += 1
                     continue
 
+                # V1 (per call), same reasoning as E2 below: a campaign that
+                # runs into a credit wall must HALT, not keep dialling a list
+                # of real people who will each answer to silence.
+                _c_speak_ok, _c_speak_why = await asyncio.to_thread(_voice_can_speak)
+                if not _c_speak_ok:
+                    camp["stopped"] = True
+                    camp["error"] = _c_speak_why
+                    camp["error_code"] = "voice_unavailable"
+                    logger.warning("CAMPAIGN [%s] halted — voice provider has no "
+                                   "credits, %s undialled", cid,
+                                   camp["total"] - camp["completed"])
+                    break
+
                 # E2 (per call). Re-checked every iteration, not just at start:
                 # a long run burns minutes as it goes, and the whole point is
                 # that call 40 must not go out on a balance that ran dry at
                 # call 12.
                 _c_decision = await asyncio.to_thread(
-                    _billing_check_dial, camp_owner, "campaign")
+                    _billing_check_dial, camp_owner, origin)
                 if not _c_decision.allowed:
                     remaining = camp["total"] - camp["completed"]
                     camp["stopped"] = True
@@ -4980,13 +5654,19 @@ async def campaign_start(request: Request) -> JSONResponse:
                             cid, camp_owner, phone, camp["completed"] + 1, camp["total"])
                 _dial_slug = camp_ident["agent_slug"]
                 _record_dial(phone, contact_id, contact.get("name", ""),
-                             agent_slug=_dial_slug, owner=camp_owner)
+                             agent_slug=_dial_slug, owner=camp_owner,
+                             gender=contact.get("gender", ""))
                 try:
                     fs_out = await _fs_esl_exec(_fs_originate_cmd(
                             phone, agent_slug=_dial_slug,
                             caller_id=camp_ident["caller_id"],
                             gateway_name=camp_ident["gateway_name"]), timeout=55)
                     cs = _parse_fs_result(fs_out, "")
+                    # The carrier's own words, next to our bucket — the line
+                    # that answers "was a call even placed?" without opening
+                    # the FreeSWITCH log.
+                    logger.info("CAMPAIGN [%s] %s -> %s (%s)", cid, phone, cs,
+                                " ".join(fs_out.split())[:120])
                 except asyncio.TimeoutError:
                     cs = "no_answer"
                 except Exception as e:
@@ -5011,13 +5691,299 @@ async def campaign_start(request: Request) -> JSONResponse:
             camp["current_name"] = ""
             logger.info("CAMPAIGN [%s] done: %s", cid, {k: camp[k] for k in
                         ("total","completed","answered","no_answer","busy",
-                         "declined","failed","skipped","dnd_skipped")})
+                         "declined","invalid_number","failed","skipped","dnd_skipped")})
 
     _campaign_tasks[camp_owner] = asyncio.create_task(_run())
-    return JSONResponse({"ok": True, "campaign_id": cid, "total": len(to_call),
-                         "dnd_skipped": dnd_skipped, "capped": capped,
-                         "quota_capped": _quota_capped,
-                         "max_calls": max_calls, "delay_seconds": delay_secs})
+    return {"ok": True, "campaign_id": cid, "total": len(to_call),
+            "dnd_skipped": dnd_skipped, "capped": capped,
+            "quota_capped": _quota_capped,
+            "max_calls": max_calls, "delay_seconds": delay_secs}
+
+
+@app.post("/api/outbound/campaign/start")
+async def campaign_start(request: Request) -> JSONResponse:
+    try:
+        out = await _campaign_launch(
+            _acting_owner(request), await request.json(), origin="campaign",
+            actor_ip=request.client.host if request.client else None)
+    except CampaignRefused as exc:
+        return JSONResponse(exc.payload, status_code=exc.status)
+    return JSONResponse(out)
+
+
+# ---------------------------------------------------------------------------
+# SCHEDULED calls and campaigns (RUNBOOK §40).
+#
+# The seventh and eighth dial origins, and the only ones with nobody watching.
+# Both go through _place_call / _campaign_launch, so they inherit every
+# guardrail the Call button and the Start button obey — see those two functions
+# for why a second implementation is the thing to avoid here.
+#
+# What the executor adds on top, because "later" is different from "now":
+#   * calling hours are re-checked AT FIRE TIME, not only when the row was
+#     created (shared/scheduling.fire_decision);
+#   * a schedule the loop reaches too late is MISSED, never fired late — after
+#     a deploy or an outage, "everything that is due" is a burst of calls at
+#     whatever hour the box came back;
+#   * a claimed row is settled exactly once, and a failed one is not retried.
+# ---------------------------------------------------------------------------
+
+SCHEDULE_POLL_S = int(os.environ.get("SCHEDULE_POLL_S", "30") or 30)
+
+
+def _schedule_when(body: dict):
+    """The instant a schedule body asks for.
+
+    `when` is an ISO-8601 string; the SPA sends one WITH an offset, so the
+    instant is unambiguous. A naive string is read as IST — the operator's
+    wall clock — rather than as UTC, which would silently move every schedule
+    five and a half hours.
+    """
+    from shared.scheduling import ScheduleError, to_utc
+    raw = (body.get("when") or body.get("scheduled_at") or "").strip()
+    if not raw:
+        raise ScheduleError("Pick a date and time for this call.")
+    when = to_utc(raw)
+    if when is None:
+        raise ScheduleError(f"{raw!r} is not a date and time we can read.")
+    return when
+
+
+@app.get("/api/outbound/schedule")
+async def schedule_list(request: Request) -> JSONResponse:
+    """This tenant's scheduled calls and campaigns, pending first."""
+    from shared import scheduling
+    owner = _acting_owner(request)
+    try:
+        rows = await asyncio.to_thread(scheduling.upcoming, owner, limit=200)
+    except Exception as exc:
+        logger.error("schedule list failed for %s: %r", owner, exc)
+        return JSONResponse({"ok": False, "reason": "could not load schedules"},
+                            status_code=500)
+    # The contact may have been renamed or deleted since; resolve names now so
+    # the list says who, not just a handle.
+    names = {c["id"]: c for c in _load_outbound(owner)}
+    out = []
+    for r in rows:
+        c = names.get(r.get("contact_handle") or "")
+        out.append(r | {
+            "contact_name": (c or {}).get("name") or "",
+            "contact_phone": (c or {}).get("phone") or r.get("phone") or "",
+            "contact_missing": bool(r.get("kind") == "call" and c is None),
+            "status_text": scheduling.explain(r.get("status") or "", r),
+        })
+    return JSONResponse({"ok": True, "schedules": out,
+                         "hours": {"start": intel_config_hours()[0],
+                                   "end": intel_config_hours()[1]}})
+
+
+def intel_config_hours() -> tuple[int, int]:
+    from shared.intelligence import config as intel_config
+    return intel_config.AUTODIAL_HOUR_START, intel_config.AUTODIAL_HOUR_END
+
+
+@app.post("/api/outbound/schedule")
+async def schedule_create(request: Request) -> JSONResponse:
+    """Schedule one call, or one campaign run, for a time.
+
+    kind='call'     needs contact_id (the outbound surface's string handle).
+    kind='campaign' takes the SAME body /campaign/start takes, under
+                    `audience` — so what is scheduled is exactly what a Start
+                    would have done, and the planner has one input shape.
+    """
+    from shared import scheduling
+    from shared.scheduling import ScheduleError
+
+    owner = _acting_owner(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    kind = (body.get("kind") or "call").strip()
+
+    try:
+        when = _schedule_when(body)
+        if kind == "call":
+            handle = str(body.get("contact_id") or "").strip()
+            contact = next((c for c in _load_outbound(owner) if c["id"] == handle), None)
+            if contact is None:
+                return JSONResponse({"ok": False, "reason": "contact not found"},
+                                    status_code=404)
+            # Refuse at CREATE time what we would refuse at dial time. A
+            # do-not-call contact must not be schedulable — a row that sits
+            # looking scheduled and silently skips is worse than a refusal the
+            # operator can see.
+            if (contact.get("disposition") or "") == "rejected":
+                return JSONResponse({"ok": False, "reason":
+                    f"{contact.get('name') or handle} is marked Rejected — they "
+                    f"asked not to be called."}, status_code=400)
+            row = await asyncio.to_thread(
+                scheduling.create, owner, kind="call", when=when,
+                label=(body.get("label") or "").strip(),
+                contact_handle=handle, phone=contact.get("phone") or "",
+                created_by=owner)
+        elif kind == "campaign":
+            audience = body.get("audience")
+            if not isinstance(audience, dict):
+                audience = {}
+            # Validate the audience NOW by running the real planner, so an
+            # empty-audience campaign is refused while the operator is looking
+            # at the form rather than at 10am tomorrow.
+            req = _campaign_request(audience)
+            _, max_calls = _campaign_limits(audience)
+            to_call, _dnd, _capped = _campaign_plan(
+                _load_outbound(owner), req["filter_cs"], max_calls,
+                group=req["group"], contact_ids=req["contact_ids"],
+                disposition=req["disposition"])
+            if not to_call:
+                return JSONResponse({"ok": False, "reason":
+                    "No contacts match this audience, so there would be "
+                    "nothing to dial."}, status_code=400)
+            row = await asyncio.to_thread(
+                scheduling.create, owner, kind="campaign", when=when,
+                label=(body.get("label") or "").strip(),
+                audience=audience, created_by=owner)
+            row["will_dial"] = len(to_call)
+        else:
+            return JSONResponse({"ok": False, "reason": f"unknown kind {kind!r}"},
+                                status_code=400)
+    except ScheduleError as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.error("schedule create failed for %s: %r", owner, exc)
+        return JSONResponse({"ok": False, "reason": "could not save this schedule"},
+                            status_code=500)
+
+    from shared.audit import record as _audit
+    _audit(owner, "schedule_create", str(row.get("id")),
+           {"kind": kind, "when": str(row.get("scheduled_at"))},
+           request.client.host if request.client else None)
+    return JSONResponse({"ok": True, "schedule": row})
+
+
+@app.patch("/api/outbound/schedule/{sid}")
+async def schedule_move(sid: int, request: Request) -> JSONResponse:
+    """Move a pending schedule to a different time."""
+    from shared import scheduling
+    from shared.scheduling import ScheduleError
+
+    owner = _acting_owner(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        when = _schedule_when(body if isinstance(body, dict) else {})
+        row = await asyncio.to_thread(scheduling.reschedule, owner, sid, when)
+    except ScheduleError as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.error("schedule move failed for %s: %r", owner, exc)
+        return JSONResponse({"ok": False, "reason": "could not move this schedule"},
+                            status_code=500)
+    if row is None:
+        return JSONResponse({"ok": False, "reason":
+            "That schedule has already run or was cancelled."}, status_code=409)
+    return JSONResponse({"ok": True, "schedule": row})
+
+
+@app.delete("/api/outbound/schedule/{sid}")
+async def schedule_cancel(sid: int, request: Request) -> JSONResponse:
+    from shared import scheduling
+    owner = _acting_owner(request)
+    try:
+        ok = await asyncio.to_thread(scheduling.cancel, owner, sid)
+    except Exception as exc:
+        logger.error("schedule cancel failed for %s: %r", owner, exc)
+        return JSONResponse({"ok": False, "reason": "could not cancel"},
+                            status_code=500)
+    if not ok:
+        return JSONResponse({"ok": False, "reason":
+            "That schedule has already run or was cancelled."}, status_code=409)
+    from shared.audit import record as _audit
+    _audit(owner, "schedule_cancel", str(sid), None,
+           request.client.host if request.client else None)
+    return JSONResponse({"ok": True})
+
+
+async def _fire_schedule(row: dict) -> None:
+    """Run one claimed schedule and settle it. Never raises."""
+    from shared import scheduling
+    sid, owner, kind = row["id"], row["owner"], row.get("kind")
+    try:
+        if kind == "call":
+            # force=True: the duplicate guard exists to catch an operator
+            # double-clicking Call, and a schedule set days ago is not that.
+            # It stays off only for the manual button.
+            out = await _place_call(owner, row.get("contact_handle") or "",
+                                    origin="schedule", force=True)
+            detail = f"dialling {out.get('phone')}"
+        elif kind == "campaign":
+            out = await _campaign_launch(owner, row.get("audience") or {},
+                                         origin="schedule-campaign")
+            detail = f"campaign {out.get('campaign_id')} · {out.get('total')} queued"
+        else:
+            raise ValueError(f"unknown schedule kind {kind!r}")
+    except (DialRefused, CampaignRefused) as exc:
+        reason = exc.payload.get("reason") or str(exc)
+        logger.info("SCHEDULE %s (%s %s) refused: %s", sid, owner, kind, reason)
+        await asyncio.to_thread(scheduling.finish, sid, status="failed",
+                                result=exc.payload, error=reason)
+        return
+    except Exception as exc:
+        logger.exception("SCHEDULE %s (%s %s) crashed: %r", sid, owner, kind, exc)
+        await asyncio.to_thread(
+            scheduling.finish, sid, status="failed", result={},
+            error=f"The scheduler could not place this call: {exc!r}")
+        return
+    logger.info("SCHEDULE %s (%s %s) fired — %s", sid, owner, kind, detail)
+    await asyncio.to_thread(scheduling.finish, sid, status="done", result=out)
+
+
+async def _schedule_once() -> int:
+    """One pass: claim what is due, fire each, settle each. Returns how many
+    fired."""
+    from shared import scheduling
+    import datetime as _dt
+    rows = await asyncio.to_thread(scheduling.claim_due,
+                                   _dt.datetime.now(_dt.timezone.utc))
+    for row in rows:
+        await _fire_schedule(row)
+    return len(rows)
+
+
+async def _schedule_loop() -> None:
+    from shared import scheduling
+    # A row left 'running' belongs to a process that died mid-dial; nothing
+    # else will ever settle it. Swept once at boot, which is when it happened.
+    try:
+        stranded = await asyncio.to_thread(scheduling.release_running)
+        if stranded:
+            logger.warning("scheduler: failed %d schedule(s) stranded mid-dial "
+                           "by a previous restart", stranded)
+    except Exception as exc:
+        logger.error("scheduler: stranded-row sweep failed: %r", exc)
+    while True:
+        try:
+            n = await _schedule_once()
+            if n:
+                logger.info("scheduler: fired %d scheduled item(s)", n)
+        except Exception as exc:
+            logger.error("scheduler pass failed: %r", exc)
+        await asyncio.sleep(max(15, SCHEDULE_POLL_S))
+
+
+@app.on_event("startup")
+async def _start_scheduler() -> None:
+    """The schedule lives in Postgres; only this loop lives in the process, so
+    a deploy costs at most one poll interval — never a pending schedule."""
+    from shared.scheduling import STALE_AFTER
+    logger.info("call scheduler ON — polling every %ds, firing within %d min "
+                "of the scheduled time", max(15, SCHEDULE_POLL_S),
+                int(STALE_AFTER.total_seconds() // 60))
+    asyncio.create_task(_schedule_loop())
 
 
 @app.post("/api/outbound/campaign/stop")

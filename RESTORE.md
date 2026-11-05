@@ -69,12 +69,17 @@ back what you need.
 `containers.txt` and `unsynced_recordings.txt`.
 
 **Database.** This replaces all data, so stop the app containers first and be
-certain you want it. It needs an empty database:
+certain you want it. Keep `ON_ERROR_STOP=1`: without it a failed table can
+swallow the tables after it, and the load still exits 0.
 
 ```bash
+bash deploy/pg_provision_pgvector.sh    # REQUIRED on a new container: the image has no pgvector
 docker exec lescall-pg psql -U lescall postgres -c 'DROP DATABASE lescall' -c 'CREATE DATABASE lescall'
-gunzip -c meta/lescall-db.sql.gz | docker exec -i lescall-pg psql -q -U lescall lescall
+gunzip -c meta/lescall-db.sql.gz | docker exec -i lescall-pg psql -q -v ON_ERROR_STOP=1 -U lescall lescall
 ```
+
+Then compare `select count(*) from calls` with what you expect (1,156 in this
+backup). Tested 2026-11-05 on a throwaway container.
 
 **System configs:** `sudo tar -xzf meta/etc-config.tgz -C /` (FreeSWITCH, nginx,
 Let's Encrypt, systemd units). **Cron:** `crontab meta/crontab.txt`.

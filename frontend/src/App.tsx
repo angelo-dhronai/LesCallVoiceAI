@@ -1,5 +1,5 @@
 import { lazy, Suspense } from 'react'
-import { Routes, Route, Navigate, useParams } from 'react-router-dom'
+import { Routes, Route, Navigate, useLocation, useParams } from 'react-router-dom'
 import { AppShell } from './layout/AppShell'
 import Overview from './pages/Overview'
 import Placeholder from './pages/Placeholder'
@@ -63,15 +63,21 @@ function RouteFallback() {
   )
 }
 
+function OldStudioRedirect() {
+  const { search } = useLocation()
+  return <Navigate to={{ pathname: '/', search }} replace />
+}
+
 export default function App() {
   return (
     <AppShell>
       <Suspense fallback={<RouteFallback />}>
         <Routes>
-          {/* Homepage: Overview dashboard (setup path + daily pulse). The
-              conversational Copilot moved to /copilot (2026-07-22 IA change). */}
-          <Route path="/" element={<Overview />} />
-          <Route path="/copilot" element={<CopilotChat />} />
+          {/* The platform opens in LesCall Studio. /copilot is its old address and
+              keeps ?session= so saved chat links still open their chat. */}
+          <Route path="/" element={<CopilotChat />} />
+          <Route path="/overview" element={<Overview />} />
+          <Route path="/copilot" element={<OldStudioRedirect />} />
           <Route path="/live" element={<Live />} />
           <Route path="/activity" element={<Activity />} />
           <Route path="/recordings" element={<Recordings />} />

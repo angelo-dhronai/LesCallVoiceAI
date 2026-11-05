@@ -617,7 +617,7 @@ export default function Telephony() {
                   // Ordered readiness steps; the first incomplete one is "next".
                   const steps = [
                     { done: ownsAgent, label: 'Create your own agent',
-                      hint: 'Build an agent in Copilot or Create Agent', action: 'agent' },
+                      hint: 'Build an agent in LesCall Studio or Create Agent', action: 'agent' },
                     { done: hasAgent,
                       label: 'Bind an agent to both directions of this number',
                       hint: hasInbound && !hasOutbound

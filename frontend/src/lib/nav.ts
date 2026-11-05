@@ -2,8 +2,8 @@ import {
   Radio, ListChecks, Mic2,
   MessagesSquare, BrainCircuit, Microscope, PhoneOutgoing,
   Boxes, CalendarClock, FileText, LayoutDashboard,
-  MessageCircle, PhoneForwarded, Settings as SettingsIcon, BookUser,
-  CreditCard, Braces, MessageSquareShare,
+  PhoneForwarded, Settings as SettingsIcon, BookUser,
+  CreditCard, Braces, MessageSquareShare, Sparkles,
 } from 'lucide-react'
 
 // Every user sees the same navigation — roles are flattened; there is no
@@ -20,8 +20,8 @@ export const NAV: NavGroup[] = [
   {
     title: 'Home',
     items: [
-      { to: '/', label: 'Overview', icon: LayoutDashboard },
-      { to: '/copilot', label: 'Copilot', icon: MessageCircle },
+      { to: '/', label: 'LesCall Studio', icon: Sparkles },
+      { to: '/overview', label: 'Overview', icon: LayoutDashboard },
     ],
   },
   {

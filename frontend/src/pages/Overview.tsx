@@ -82,7 +82,7 @@ export default function Overview() {
         sub="Your calling operation at a glance."
         actions={
           <>
-            <Button variant="ghost" onClick={() => nav('/copilot')}><MessageCircle size={15} /> Ask Copilot</Button>
+            <Button variant="ghost" onClick={() => nav('/')}><MessageCircle size={15} /> Ask LesCall Studio</Button>
             {(ov.data?.active_calls ?? 0) > 0 && (
               <Button onClick={() => nav('/live')}><LiveDot /> Watch {ov.data!.active_calls} live</Button>
             )}
@@ -104,7 +104,7 @@ export default function Overview() {
           </div>
           <div className="grid gap-0.5 sm:grid-cols-2">
             <SetupStep done={steps.agentDone} label="Create your AI agent"
-              hint="Describe it to the Copilot — it writes the agent for you." to="/copilot" cta="Build" />
+              hint="Describe it to LesCall Studio — it writes the agent for you." to="/" cta="Build" />
             <SetupStep done={steps.numberDone} label="Connect a phone number"
               hint="Bring your own number from Plivo, Twilio, Telnyx or Vonage." to="/telephony" cta="Connect" />
             <SetupStep done={steps.boundDone} label="Put an agent on a number"

@@ -200,8 +200,8 @@ slots only), `llm_config` (model, max_tokens, timeouts, `filler_timeout_s`,
 
 | Route | Page | Does |
 |---|---|---|
-| `/` | Overview | 4 stat tiles, 14-day sparkline, hot leads, 4-step "Get set up" checklist |
-| `/copilot` | Copilot | chat build/edit, sessions, file attach, dictation, change cards (Apply/Discard), interview rail + spec preview, Try/Activate chips, Voice & speed sheet |
+| `/overview` | Overview | 4 stat tiles, 14-day sparkline, hot leads, 4-step "Get set up" checklist |
+| `/` | LesCall Studio (formerly Copilot; `/copilot` redirects here) | chat build/edit, sessions, file attach, dictation, change cards (Apply/Discard), interview rail + spec preview, Try/Activate chips, Voice & speed sheet |
 | `/build/agents` | Agents | cards grouping twins; Activate/Change number, Chat with agent (Try), Edit, Archive, Add other direction, Share link / import |
 | `/build/agents/new` | Create agent | 9-step wizard, "start from a document" |
 | `/build/agents/:name` | Edit agent | tabs listed in §5 |

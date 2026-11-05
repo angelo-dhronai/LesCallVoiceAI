@@ -231,7 +231,7 @@ def _get_client():
         if not base_url or not api_key:
             raise HTTPException(
                 status_code=503,
-                detail="Copilot LLM not configured — set LLM_BASE_URL / LLM_API_KEY in calling-agent/.env",
+                detail="LesCall Studio's AI model is not configured — set LLM_BASE_URL / LLM_API_KEY in calling-agent/.env",
             )
         # Generous retries: Groq free tier rate-limits aggressively (429 with
         # Retry-After up to ~60s) and the SDK honors Retry-After between tries.
@@ -6058,7 +6058,7 @@ def _system_prompt(session: dict | None = None) -> str:
         if iv.get("phase") == "interviewing" or iv.get("draft"):
             progress = interview_progress(iv.get("draft") or {}, iv.get("skipped") or [])
             interview_block = "\n\n" + render_interview_state(progress)
-    return f"""You are the LesCall Agent Copilot — an expert voice-agent designer built into the LesCall dashboard. LesCall runs real-time AI phone agents for Indian businesses (Sarvam STT/TTS + an LLM). An agent is a YAML definition: identity, personality, languages (hi/en/gu), TTS voice, a staged call flow with branching, a knowledge base + product catalog, data-capture slots, canned responses, guardrails, and calendar slots. Inbound calls are answered by the agent bound to the dialed number (currently: {active}).
+    return f"""You are LesCall Studio — an expert voice-agent designer built into the LesCall dashboard. LesCall runs real-time AI phone agents for Indian businesses (Sarvam STT/TTS + an LLM). An agent is a YAML definition: identity, personality, languages (hi/en/gu), TTS voice, a staged call flow with branching, a knowledge base + product catalog, data-capture slots, canned responses, guardrails, and calendar slots. Inbound calls are answered by the agent bound to the dialed number (currently: {active}).
 
 HOW YOU WORK
 0. HARD PLATFORM BOUNDARY — these agents make and answer PHONE CALLS. The
@@ -6979,7 +6979,7 @@ async def _copilot_chat_turn(request: Request, sid: str, owner,
             meta.setdefault("created_at", _now_iso())
             meta["updated_at"] = _now_iso()
             _save_session(sid)
-            raise HTTPException(status_code=502, detail=f"Copilot LLM error: {exc}")
+            raise HTTPException(status_code=502, detail=f"LesCall Studio could not reach its AI model: {exc}")
 
     if _budget_stop:
         # Prepended, not substituted: when the loop did work before it ran out,

@@ -309,7 +309,7 @@ export function Topbar({ title, onToggleSidebar, onOpenMobileNav, services, over
               <div className="eyebrow px-2 pb-2 pt-1">Help</div>
               <div className="flex items-start gap-2 rounded-md px-2 py-2 text-sm text-soft">
                 <MessageCircle size={15} className="mt-0.5 shrink-0 text-indigo-500 dark:text-indigo-300" />
-                <span>Ask the <button type="button" onClick={() => navigate('/copilot')} className="font-medium text-indigo-600 hover:underline dark:text-indigo-300">Copilot</button> anything — it can create and edit agents for you.</span>
+                <span>Ask the <button type="button" onClick={() => navigate('/')} className="font-medium text-indigo-600 hover:underline dark:text-indigo-300">LesCall Studio</button> anything — it can create and edit agents for you.</span>
               </div>
               <div className="flex items-start gap-2 rounded-md px-2 py-2 text-sm text-soft">
                 <Keyboard size={15} className="mt-0.5 shrink-0 text-dim" />

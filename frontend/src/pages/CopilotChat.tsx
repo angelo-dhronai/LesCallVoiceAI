@@ -8,7 +8,7 @@ import {
   type InterviewProgress, type PendingChange, type VoiceSample, type QuickControls,
 } from '../api/copilot'
 import { DOC_ACCEPT, DOC_MAX_MB, DOC_TYPES_HUMAN, docSupported } from '../api/agents'
-import { cx, Badge, Button, EmptyState, IconButton, Spinner } from '../components/ui'
+import { cx, Badge, Button, IconButton, Spinner } from '../components/ui'
 import { TextShimmer } from '../components/motion'
 import { Markdown } from '../components/markdown'
 import { useVoicePrompt } from '../lib/voicePrompt'
@@ -17,9 +17,10 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sh
 import { TryAgentDialog } from '../components/TryAgent'
 import { ActivateAgentModal, type ActivateTarget } from '../components/ActivateAgent'
 import { VoiceSpeedControls } from '../components/VoiceSpeedControls'
+import { StudioGreeting, StudioTips } from '../components/StudioOpening'
 import {
   Sparkles, SendHorizontal, RotateCcw, Check, X, ArrowDown, Info,
-  Plus, Pencil, Radio, Bot, Trash2, MessagesSquare, SquarePen, Lightbulb,
+  Pencil, Radio, Bot, Trash2, MessagesSquare, SquarePen, Lightbulb,
   Paperclip, FileText, ClipboardList, Eye, EyeOff, PlayCircle, Volume2,
   Mic, Square, Languages, SlidersHorizontal,
 } from 'lucide-react'
@@ -542,27 +543,6 @@ function DiffCards({ changes, busy, onApply, onDiscard }: {
   )
 }
 
-const SUGGESTIONS = [
-  {
-    icon: Plus,
-    title: 'Create a new agent',
-    sub: 'I will interview you and build it step by step',
-    prompt: 'I want to create a new voice agent.',
-  },
-  {
-    icon: Pencil,
-    title: 'Edit an existing agent',
-    sub: 'Change the greeting, voice, flow, or knowledge',
-    prompt: 'I want to edit one of my existing agents.',
-  },
-  {
-    icon: Radio,
-    title: 'Which agent is live right now?',
-    sub: 'See what answers your inbound calls',
-    prompt: 'Which agent is live right now?',
-  },
-]
-
 /* Placeholder tip — the four live templates the call engine substitutes into
    authored spoken lines. Shown in the empty state and (dismissibly) above the
    composer so agent builders discover them mid-conversation too.
@@ -604,40 +584,6 @@ function PlaceholderTip({ onDismiss }: { onDismiss?: () => void }) {
   )
 }
 
-/* First-run hero — built on the shared EmptyState, with the suggestion cards
-   and placeholder tip supplied as its action slot. */
-function ChatEmpty({ onPick }: { onPick: (prompt: string) => void }) {
-  return (
-    <div className="flex flex-1 flex-col items-center justify-center text-center">
-      <EmptyState
-        icon={<Sparkles size={22} />}
-        title="Agent Copilot"
-        hint="Describe the voice agent you need — I'll ask a few questions, then build it, wire it up, and put it on your phone line when you're ready."
-        action={
-          <div className="w-[min(42rem,88vw)] space-y-4">
-            <div className="grid gap-3 sm:grid-cols-3">
-              {SUGGESTIONS.map((s) => (
-                <button
-                  key={s.title}
-                  onClick={() => onPick(s.prompt)}
-                  className="card card-hover flex flex-col items-start gap-2 p-4 text-left transition-all"
-                >
-                  <div className="grid h-8 w-8 place-items-center rounded-xl bg-[var(--surface-2)] text-mint-600 ring-1 ring-[var(--border)] dark:text-mint-300">
-                    <s.icon size={15} />
-                  </div>
-                  <div className="text-sm font-semibold leading-tight">{s.title}</div>
-                  <div className="text-xs leading-snug text-dim">{s.sub}</div>
-                </button>
-              ))}
-            </div>
-            <PlaceholderTip />
-          </div>
-        }
-      />
-    </div>
-  )
-}
-
 /* ─────────────────────────── page ─────────────────────────── */
 
 export default function CopilotChat() {
@@ -646,7 +592,9 @@ export default function CopilotChat() {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
-  const [loadingTranscript, setLoadingTranscript] = useState(false)
+  // A ?session= link has a transcript on its way: never flash the blank opening.
+  const [loadingTranscript, setLoadingTranscript] = useState(
+    () => new URLSearchParams(window.location.search).has('session'))
   const [mobileChatsOpen, setMobileChatsOpen] = useState(false)
   const [showJump, setShowJump] = useState(false)
   const [tipDismissed, setTipDismissed] = useState(() => localStorage.getItem(TIP_KEY) === '1')
@@ -814,7 +762,7 @@ export default function CopilotChat() {
         ...m,
         {
           role: 'assistant',
-          content: `Sorry — I hit an error talking to the copilot backend (${e?.message || e}). Please try again.`,
+          content: `Sorry — I hit an error reaching LesCall Studio (${e?.message || e}). Please try again.`,
           actions: [],
           isError: true,
         },
@@ -943,22 +891,39 @@ export default function CopilotChat() {
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`
   }
 
+  // The opening is one question, the composer and a line of tips, nothing else.
+  // Past chats stay one click away behind the Chats button.
+  const isBlank = messages.length === 0 && !busy && !loadingTranscript
+
+  const pickTip = (prompt: string) => {
+    setInput(prompt)
+    requestAnimationFrame(() => {
+      const el = inputRef.current
+      if (!el) return
+      el.focus()
+      autoGrow(el)
+      el.selectionStart = el.selectionEnd = el.value.length
+    })
+  }
+
   return (
-    <div className="mx-auto flex h-[calc(100dvh-140px)] min-h-[420px] w-full max-w-6xl gap-5">
-      <HistorySidebar
-        sessions={sessions}
-        activeSid={sid}
-        onSelect={selectChat}
-        onNew={newChat}
-        onDelete={deleteChat}
-      />
+    <div className="relative mx-auto flex h-[calc(100dvh-140px)] min-h-[420px] w-full max-w-6xl gap-5">
+      {!isBlank && (
+        <HistorySidebar
+          sessions={sessions}
+          activeSid={sid}
+          onSelect={selectChat}
+          onNew={newChat}
+          onDelete={deleteChat}
+        />
+      )}
 
       {/* mobile chat-history sheet (the sidebar is hidden below md) */}
       <Sheet open={mobileChatsOpen} onOpenChange={setMobileChatsOpen}>
         <SheetContent
           side="left"
           aria-describedby={undefined}
-          className="flex w-80 max-w-[85vw] flex-col gap-2 p-4 md:hidden"
+          className={cx('flex w-80 max-w-[85vw] flex-col gap-2 p-4', !isBlank && 'md:hidden')}
         >
           <SheetHeader className="text-left">
             <SheetTitle className="font-display text-base font-bold tracking-tight">Previous chats</SheetTitle>
@@ -995,14 +960,14 @@ export default function CopilotChat() {
         </SheetContent>
       </Sheet>
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className={cx('flex min-w-0 flex-1 flex-col', isBlank && 'mx-auto max-w-2xl justify-center')}>
       {/* header row */}
-      <div className="mb-2 flex items-center justify-between gap-2">
+      <div className={cx('flex items-center justify-between gap-2', isBlank ? 'absolute right-0 top-0' : 'mb-2')}>
         <div className="flex min-w-0 items-center gap-2">
           {messages.length > 0 && (
             <>
               <Sparkles size={15} className="shrink-0 text-mint-600 dark:text-mint-300" />
-              <h1 className="truncate font-display text-base font-bold tracking-tight">Agent Copilot</h1>
+              <h1 className="truncate font-display text-base font-bold tracking-tight">LesCall Studio</h1>
               <span className="hidden truncate text-xs text-dim sm:inline">· builds and manages your voice agents</span>
             </>
           )}
@@ -1022,15 +987,17 @@ export default function CopilotChat() {
               )}
             </Button>
           )}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="md:hidden"
-            onClick={() => setMobileChatsOpen(true)}
-            title="Previous chats"
-          >
-            <MessagesSquare size={13} /> Chats
-          </Button>
+          {(!isBlank || sessions.length > 0) && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className={isBlank ? '' : 'md:hidden'}
+              onClick={() => setMobileChatsOpen(true)}
+              title="Previous chats"
+            >
+              <MessagesSquare size={13} /> Chats
+            </Button>
+          )}
           {messages.length > 0 && (
             <Button variant="ghost" size="sm" onClick={newChat} title="Start a fresh conversation">
               <RotateCcw size={13} /> New chat
@@ -1045,16 +1012,16 @@ export default function CopilotChat() {
       )}
 
       {/* messages */}
-      <div className="relative flex min-h-0 flex-1 flex-col">
-        <div ref={scrollRef} onScroll={onMessagesScroll} data-lenis-prevent className="flex flex-1 flex-col overflow-y-auto pr-1">
+      <div className={cx('relative flex flex-col', isBlank ? 'flex-none' : 'min-h-0 flex-1')}>
+        <div ref={scrollRef} onScroll={onMessagesScroll} data-lenis-prevent className={cx('flex flex-col', isBlank ? '' : 'flex-1 overflow-y-auto pr-1')}>
           {loadingTranscript ? (
             <div className="flex flex-col gap-4 py-2">
               <div className="skeleton h-16 w-2/3 rounded-2xl rounded-tl-md" />
               <div className="skeleton ml-auto h-10 w-1/2 rounded-2xl rounded-br-md" />
               <div className="skeleton h-20 w-3/4 rounded-2xl rounded-tl-md" />
             </div>
-          ) : messages.length === 0 && !busy ? (
-            <ChatEmpty onPick={(p) => send(p)} />
+          ) : isBlank ? (
+            <StudioGreeting />
           ) : (
             <div className="flex flex-col gap-4 py-2">
               {messages.map((m, i) => (
@@ -1086,7 +1053,7 @@ export default function CopilotChat() {
       </div>
 
       {/* composer */}
-      <div className="mt-3">
+      <div className={isBlank ? 'mt-8' : 'mt-3'}>
         {messages.length > 0 && !tipDismissed && (
           <div className="mb-2">
             <PlaceholderTip
@@ -1123,7 +1090,7 @@ export default function CopilotChat() {
             }}
           />
           <IconButton
-            label="Attach a brochure or price sheet — the copilot reads it into the agent"
+            label="Attach a brochure or price sheet — LesCall Studio reads it into the agent"
             disabled={busy || uploading}
             onClick={() => fileRef.current?.click()}
           >
@@ -1154,8 +1121,8 @@ export default function CopilotChat() {
             rows={1}
             value={input}
             disabled={busy}
-            aria-label="Message the copilot"
-            placeholder={busy ? 'Copilot is working…' : 'Message the copilot — e.g. "Create a salon receptionist agent"'}
+            aria-label="Message LesCall Studio"
+            placeholder={busy ? 'LesCall Studio is working…' : isBlank ? 'Describe what you need' : 'Message LesCall Studio'}
             onChange={(e) => { setInput(e.target.value); autoGrow(e.target) }}
             onKeyDown={onKeyDown}
             className="max-h-40 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm leading-relaxed text-[var(--text)] outline-none placeholder:text-dim disabled:opacity-50"
@@ -1187,10 +1154,12 @@ export default function CopilotChat() {
           <p className="mt-1.5 px-1 text-center text-2xs text-dim" role="status">
             <Spinner className="mr-1.5 inline h-3 w-3" /> Writing that down…
           </p>
+        ) : isBlank ? (
+          <StudioTips onPick={pickTip} paused={input.trim().length > 0} />
         ) : (
           <p className="mt-1.5 px-1 text-center text-2xs text-dim">
             Enter to send · Shift+Enter for a new line
-            {voice.supported ? ' · mic to dictate' : ''} · the copilot writes real agents under{' '}
+            {voice.supported ? ' · mic to dictate' : ''} · LesCall Studio writes real agents under{' '}
             <code className="font-mono text-2xs">agents/</code>
           </p>
         )}

@@ -898,7 +898,7 @@ silently undoes it.
 - **Routes are lazy** in `App.tsx` — only Overview + shell are eager. Adding a
   static page import back re-inflates the entry bundle (it was 740 kB; it is
   385 kB).
-- **IA**: `/` is the Overview dashboard; the Copilot chat is `/copilot`.
+- **IA**: `/` is LesCall Studio (the Copilot chat, renamed 2026-11-05; code, API paths and docs may still say Copilot); `/overview` is the dashboard; `/copilot` redirects to `/` and keeps `?session=`.
 - **Copilot quick controls** (`components/VoiceSpeedControls.tsx`, RUNBOOK §67):
   voice + speed by click, via `/api/copilot/sessions/{sid}/quick-controls`
   (agent on disk → both twins through the store; else the interview draft).

@@ -980,6 +980,13 @@ _WRONG_NUMBER_RECONFIRM_DEFAULT = {
           "right one?",
     "gu": "બસ એક વાર confirmation માટે ફરી કહેશો — આ ખોટો નંબર છે કે સાચો?",
 }
+# The re-confirmation question offers both halves — "…wrong number, or the
+# right one?" (RUNBOOK §85).
+_RECONFIRM_EITHER_OR_RE = re.compile(
+    r"(?:या|अथवा|\bor\b|કે)\s*(?:the\s*)?(?:सही|ठीक|right|correct|સાચો|સાચું)"
+    r"|(?:सही|right|correct|સાચો)\s*(?:\S+\s*){0,2}?(?:या|\bor\b|કે)\s*"
+    r"(?:the\s*)?(?:गलत|ग़लत|wrong|ખોટો)",
+    re.IGNORECASE)
 # Built-in apology + close when the wrong number is confirmed
 # (outbound.wrong_number_close overrides per agent).
 _WRONG_NUMBER_CLOSE_DEFAULT = {
@@ -1273,6 +1280,44 @@ def _is_identity_yes(text: str) -> bool:
     if has_hello and all(t in _IDENTITY_YES_WEAK for t in core):
         return False
     return True
+
+
+# RUNBOOK §85 (call 1127): "हाँ हाँ धवल जी से हो रही है बोलिए" is a yes to
+# "am I speaking with Dhaval?" — but the name ("धवल") and the echo of the
+# question ("से हो रही है") are not yes-tokens, so it took a model turn and
+# 3.7 s to reach the good-time line. A strong yes, no negative, no question,
+# no third person, and at most two words the list does not know (the name).
+_IDENTITY_YES_ECHO = frozenset({
+    "से", "हो", "बात", "कर", "रहे", "हैं", "तो", "आप", "जी", "ही", "मेरी",
+    "मेरा", "नाम", "बोलिए", "बोलिये", "बोलो", "बताइए", "बताइये", "बताओ",
+    "कहिए", "कहिये", "बोल", "रहा", "रही", "हूँ", "हूं", "ठीक", "se", "ho",
+    "baat", "kar", "rahe", "hain", "hai", "to", "aap", "bol", "boliye",
+    "bataiye", "kahiye", "speaking", "that's", "thats", "tell", "go",
+    "ahead", "please", "અને", "બોલો", "કહો", "છે", "થઈ", "રહી",
+})
+_IDENTITY_YES_BLOCK = frozenset({
+    "कौन", "क्या", "क्यों", "कहाँ", "कहां", "किस", "कैसे", "who", "what",
+    "why", "where", "which", "kaun", "kya", "kyu", "kyun", "kahan",
+    "भाई", "पति", "पत्नी", "बेटा", "बेटी", "पापा", "पिता", "मम्मी", "माँ",
+    "दोस्त", "husband", "wife", "brother", "son", "father", "mother",
+    "friend", "उनका", "उनकी", "उनके", "वो", "वह", "unka", "woh", "busy",
+    "बिज़ी", "बिजी", "बाद", "later", "wrong", "गलत", "ग़लत", "galat",
+})
+
+
+def _is_identity_yes_wide(text: str) -> bool:
+    if "?" in (text or ""):
+        return False
+    toks = re.sub(r"[^0-9a-z'\u0900-\u0963\u0966-\u097F\u0A80-\u0AFF]+", " ",
+                  (text or "").lower()).split()
+    if not toks or len(toks) > 11:
+        return False
+    if not any(t in _STRONG_YES for t in toks):
+        return False
+    if any(t in _NEG_TOKENS or t in _IDENTITY_YES_BLOCK for t in toks):
+        return False
+    known = _IDENTITY_YES_TOKENS | _IDENTITY_YES_ECHO
+    return sum(1 for t in toks if t not in known) <= 2
 
 
 def _all_tokens_in(text: str, vocab: frozenset) -> bool:
@@ -1591,6 +1636,104 @@ except ValueError:
     _TOOL_TEXT_REISSUE_TIMEOUT_S = 2.5
 # Absolute floor when a tool ran, produced no canned line, and the re-ask
 # missed. Agents override via response_bank.tool_ack_fallbacks.
+# ── RUNBOOK §85 built-ins (call_flow.recovery.<key> overrides each) ────────
+_NO_INTEREST_CLOSE_DEFAULT = {
+    "en": "I'm sorry to have troubled you. I'll take your number off our "
+          "list. Have a good day.",
+    "hi": "माफ़ कीजिए, आपको परेशान करने के लिए। मैं आपका नंबर list से हटा "
+          "देता हूँ। आपका दिन शुभ हो।",
+    "gu": "તમને તકલીફ આપવા બદલ માફ કરશો. હું તમારો નંબર list માંથી કાઢી "
+          "નાખું છું. તમારો દિવસ શુભ રહે.",
+}
+# Owner flow 2026-11-14 (call 1221): "I never showed interest" is offered
+# removal, confirmed once more, and only then closed; a "no" keeps the call.
+_REMOVAL_OFFER_DEFAULT = {
+    "en": "I'm sorry if you are no longer interested. If you'd like, shall "
+          "I take your name off our list?",
+    "hi": "माफ़ कीजिएगा अगर आपको हमारी properties में अब दिलचस्पी नहीं है। "
+          "अगर आप बोलें तो मैं list से आपका नाम हटा दूँ?",
+    "gu": "માફ કરશો જો તમને હવે રસ ન હોય. તમે કહો તો હું list માંથી તમારું "
+          "નામ કાઢી નાખું?",
+}
+_REMOVAL_CONFIRM_DEFAULT = {
+    "en": "Just to confirm one last time, so that we don't call you again "
+          "— shall I remove your name from the contact list?",
+    "hi": "बस confirmation के लिए आख़िरी बार बता दीजिए, ताकि हम आपको इसके "
+          "बाद call न करें — आपका नाम contact list से हटा दूँ?",
+    "gu": "બસ confirmation માટે છેલ્લી વાર કહી દો, જેથી અમે તમને ફરી call "
+          "ન કરીએ — તમારું નામ contact list માંથી કાઢી નાખું?",
+}
+_REMOVAL_KEEP_DEFAULT = {
+    "en": "All right, since you'd like us to keep your name, let's continue.",
+    "hi": "ठीक है, अगर आप चाहते हैं कि हम नाम न हटाएँ तो continue करते हैं।",
+    "gu": "ઠીક છે, તમે ઇચ્છો છો કે અમે નામ ન કાઢીએ તો continue કરીએ.",
+}
+_REMOVAL_CLOSE_DEFAULT = {
+    "en": "I apologise for the trouble. Have a good day.",
+    "hi": "तकलीफ़ के लिए माफ़ी माँगता हूँ, आपका दिन शुभ हो।",
+    "gu": "તકલીફ બદલ માફી માગું છું, તમારો દિવસ શુભ રહે.",
+}
+_SOFT_CLOSE_DEFAULT = {
+    "en": "No problem at all — I won't hold you now. Thank you, and have a "
+          "good day.",
+    "hi": "ठीक है, कोई बात नहीं — अभी मैं आपका समय नहीं लूँगा। धन्यवाद, "
+          "आपका दिन शुभ हो।",
+    "gu": "કોઈ વાંધો નહીં — અત્યારે હું તમારો સમય નહીં લઉં. આભાર, તમારો "
+          "દિવસ શુભ રહે.",
+}
+_SHARE_ACK_DEFAULT = {
+    "en": "Of course — I'll send the complete details to you on WhatsApp "
+          "right after this call.",
+    "hi": "ज़रूर, मैं इस call के तुरंत बाद पूरी details आपके WhatsApp पर "
+          "share कर देता हूँ।",
+    "gu": "ચોક્કસ, આ call પછી તરત જ હું પૂરી details તમારા WhatsApp પર "
+          "share કરી દઉં છું.",
+}
+# The same promise naming the project under discussion ({project}).
+_SHARE_ACK_PROJECT_DEFAULT = {
+    "en": "Of course — I'll send the {project} brochure and details to you "
+          "on WhatsApp right after this call.",
+    "hi": "ज़रूर, मैं इस call के तुरंत बाद {project} का brochure और पूरी "
+          "details आपके WhatsApp पर share कर देता हूँ।",
+    "gu": "ચોક્કસ, આ call પછી તરત જ હું {project} નું brochure અને પૂરી "
+          "details તમારા WhatsApp પર share કરી દઉં છું.",
+}
+_SPEED_APOLOGY_DEFAULT = {
+    "en": "Sorry about that — the line had a slight delay. I'll keep it quick.",
+    "hi": "माफ़ कीजिए, line में थोड़ा delay आ रहा था — मैं जल्दी बात करता हूँ।",
+    "gu": "માફ કરશો, line માં થોડો delay આવતો હતો — હું ઝડપથી વાત કરું છું.",
+}
+# A model failure is OUR hiccup, never the caller's audio: the bridge says
+# so without "I couldn't hear you", and the open question follows it.
+# ── Hedged model request (call 1230, 2026-11-16) ───────────────────────────
+# The primary took ~10 s to its first token on every turn; the fallback was
+# only ever tried AFTER the primary's own timeout, by which time the turn's
+# deadline had passed — so it could never answer and the caller heard the
+# "one moment, say that again?" line three times. The fallback now starts
+# when the primary has been silent for VOICE_LLM_HEDGE_S and the first
+# stream back wins. Two consecutive losses put the fallback FIRST (primary
+# as the hedge) for VOICE_LLM_SLOW_HOLD_S, process-wide. 0 disables hedging.
+_VOICE_LLM_HEDGE_S = float(os.environ.get("VOICE_LLM_HEDGE_S", "2.5"))
+_VOICE_LLM_SLOW_HOLD_S = float(os.environ.get("VOICE_LLM_SLOW_HOLD_S", "180"))
+_PRIMARY_SLOW = {"losses": 0, "until": 0.0}
+_VOICE_WARMUP_REFRESH_S = float(os.environ.get("VOICE_WARMUP_REFRESH_S", "120"))
+
+_PHON_CONFIRM_DEFAULT = {
+    "en": "You said {value} — is that right?",
+    "hi": "आपने {value} कहा — सही है?",
+    "gu": "તમે {value} કહ્યું — બરાબર?",
+}
+_LLM_BRIDGE = {
+    "en": "Right —",
+    "hi": "जी —",
+    "gu": "જી —",
+}
+_LLM_BRIDGE_NO_QUESTION = {
+    "en": "Sorry, one moment — could you say that once more?",
+    "hi": "माफ़ कीजिए, एक second — ज़रा एक बार फिर बताएँगे?",
+    "gu": "માફ કરશો, એક second — જરા ફરી એક વાર કહેશો?",
+}
+
 _TOOL_ACK_FALLBACK = {
     "en": "Got it, thank you — what else can I help you with?",
     "hi": "जी, समझ गया — और कुछ बताइए, मैं कैसे मदद कर सकता हूँ?",
@@ -1837,6 +1980,8 @@ from .address import (  # noqa: E402
 from . import address as _address  # noqa: E402
 from . import machine_line as _machine  # noqa: E402
 from . import ai_disclosure as _ai_disclosure  # noqa: E402
+from . import call_recovery as _rcv  # noqa: E402
+from .state_manager import _word_in as sm_word_in  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -2046,6 +2191,7 @@ class ConversationRouter:
     # Class-level warmup flag: LLM API connection warms at most once per
     # process regardless of how many calls arrive (Issue 6).
     _warmup_done_flag: bool = False
+    _warmed_at: float = 0.0
     # Per-agent, not per-process: a document index belongs to one agent, so a
     # process-wide flag would warm at most one of them.
     _rag_warmed_agents: set = set()
@@ -2148,6 +2294,28 @@ class ConversationRouter:
         # before the call is closed (asks spoken so far; 0 = not pending),
         # and "it's someone else" is remembered so the pitch never follows.
         self._wrong_number_pending: int = 0
+        # RUNBOOK §85: share-request acknowledgements spoken this call (the
+        # open question is re-put after the first two only).
+        self._share_acks: int = 0
+        self._speed_apologies: int = 0
+        # Removal-confirmation flow: 0 idle, 1 offer asked, 2 final
+        # confirmation asked; the question that was open when it began.
+        # Phonetic option match (RUNBOOK §85.12): the candidate awaiting the
+        # caller's yes/no — (slot, value, other_value_or_"") — and the slots
+        # already confirmed this way (one confirmation per slot per call).
+        self._phon_pending: tuple | None = None
+        self._phon_confirmed: tuple = ()
+        self._phon_turn: tuple | None = None
+        self._removal_step: int = 0
+        self._removal_unclear: int = 0
+        self._removal_declined: bool = False
+        self._removal_resume_q: str = ""
+        # Was the first wrong-number signal an explicit phrase ("wrong
+        # number") rather than a bare "no" to the identity question?
+        self._wrong_number_explicit: bool = False
+        self._identity_ack_spoken: bool = False
+        # Canned model-failure lines spoken in a row (never a third).
+        self._llm_failure_spoken: int = 0
         self._identity_other: bool = False
         # RUNBOOK §73 — the caller declined a site visit on this turn index
         # (-1 = never). From then on the per-turn ━━ VISIT DECLINED ━━ band
@@ -2394,6 +2562,19 @@ class ConversationRouter:
         None when no usable fallback exists or it would duplicate the primary.
         """
         if self._fallback_client is not None:
+            return self._fallback_client
+        # RUNBOOK §85: VOICE_LLM_FALLBACK_MODEL names a sibling model on the
+        # PRIMARY endpoint and key (per-model quotas make it a real second
+        # bucket). The OpenAI default below ran out of credit, so from then
+        # on every primary hiccup cost 1.5 s on a 429 and ended in the
+        # canned "sorry, say that again?" (calls 1130, 1131, 1193).
+        _voice_fb = os.environ.get("VOICE_LLM_FALLBACK_MODEL", "").strip()
+        if _voice_fb and _voice_fb != self._model and self._api_key:
+            self._fallback_model = _voice_fb
+            _kwargs = {"api_key": self._api_key, "timeout": self._timeout}
+            if self._base_url:
+                _kwargs["base_url"] = self._base_url
+            self._fallback_client = AsyncOpenAI(**_kwargs)
             return self._fallback_client
         fb_key = (os.environ.get("LLM_FALLBACK_API_KEY", "").strip()
                   or os.environ.get("OPENAI_API_KEY", "").strip())
@@ -2922,6 +3103,14 @@ class ConversationRouter:
             else "en"
         if self._presence_checks == 1:
             q = self._last_question_sentence()
+            # RUNBOOK §85 (call 1130): the last "question" was our own
+            # "sorry, say that again?" — repeating it after "I can hear
+            # you" told the caller twice that we had not heard them. The
+            # question that is really open is put instead.
+            if q and self._is_canned_fallback(q):
+                q = self._pending_question()
+            if q:
+                q = _rcv.strip_leading_apology(q)
             if not q:
                 return ""
             # "I can hear you — can you hear me?" is nonsense: when what we
@@ -3902,6 +4091,31 @@ class ConversationRouter:
                     logger.info("[STT-CTX] %r → %r (answer to a place question)",
                                 t, fixed)
                     return fixed
+            # RUNBOOK §85.12: no listed sound-alike — compare by SOUND. Only
+            # the word standing where the place goes (first word, or the one
+            # before में / से), only against the agent's own cities, and
+            # never when a real city is already in the answer.
+            if (getattr(self._def.languages, "phonetic_match", False)
+                    and cities and len(t.split()) <= 6 and "?" not in t):
+                from . import phonetic_match as _pm
+                low = t.lower()
+                if not any(_pm.similarity(_pm.phonemes(w)[0] if _pm.phonemes(w) else "",
+                                          f) > 0.97
+                           for w in t.split() for c in cities
+                           for f in _pm.spoken_forms(c)):
+                    words = t.split()
+                    cand = [0] + [i - 1 for i, w in enumerate(words)
+                                  if i > 0 and w.strip(",.।!") in
+                                  ("में", "मे", "से", "mein", "me", "se", "માં", "થી")]
+                    for i in dict.fromkeys(cand):
+                        w = words[i].strip(",.।!")
+                        hit = _pm.name_match(w, cities)
+                        if hit:
+                            words[i] = words[i].replace(w, hit)
+                            fixed = " ".join(words)
+                            logger.info("[PHONETIC] place: %r → %r (sounds "
+                                        "like %s)", t, fixed, hit)
+                            return fixed
         except Exception:
             logger.debug("[STT-CTX] city fix failed", exc_info=True)
         return text
@@ -3962,6 +4176,11 @@ class ConversationRouter:
             if _gated is None:
                 return
             text = _gated
+
+        # RUNBOOK §85.12: an answer that only SOUNDS like one of the options
+        # just offered ("पी वी एच के" for "3 BHK") is resolved before
+        # anything reads the turn — the canonical value rides in the text.
+        text = self._phonetic_option_fix(text)
 
         # A new caller utterance cancels a pending agent hangup: "wait, one
         # more question" after the goodbye must be answered, not cut off.
@@ -4562,6 +4781,23 @@ class ConversationRouter:
 
         # --- A bare filler on a scripted stage: the question again, in the
         # owner's words, never the model's own answer to it (RUNBOOK §78) ---
+        if self._phon_turn is not None:
+            _slot, _val, _other = self._phon_turn
+            self._phon_turn = None
+            _cancel_llm()
+            self._phon_pending = (_slot, _val, _other)
+            self._phon_confirmed = tuple(self._phon_confirmed) + (_slot,)
+            _line = _PHON_CONFIRM_DEFAULT.get(
+                (self.state.language or "en")[:2],
+                _PHON_CONFIRM_DEFAULT["en"]).replace("{value}", str(_val))
+            logger.info("[PHONETIC] %s: %r sounds like %r — confirming",
+                        _slot, text[:50], _val)
+            self._refund_turn_ask()
+            self.memory.add_assistant(_line, language=self.state.language)
+            self._store_last_response(_line)
+            yield EngineResult(text=_line, is_shortcut=True, intent="repeat")
+            return
+
         _reask = self._scripted_filler_reask(text)
         if _reask:
             _cancel_llm()
@@ -4676,6 +4912,11 @@ class ConversationRouter:
                     _gt = "" if self._good_time_spoken else self._good_time_line()
                     if _gt:
                         _cancel_llm()
+                        _ack = self._identity_ack_line()
+                        if _ack:
+                            self._identity_ack_spoken = True
+                            yield EngineResult(text=_ack, is_shortcut=True,
+                                               intent="good_time_check")
                         self._good_time_spoken = True
                         self.commit_pending_turn()  # §77: never rolled back
                         self.memory.add_assistant(_gt, language=self.state.language)
@@ -4711,10 +4952,11 @@ class ConversationRouter:
                         return
                     # No authored line: the model continues under the band.
                 else:
-                    # Unclear once: ask the same question one more time.
+                    # Unclear once: ask again — this time the direct
+                    # yes/no identity question (RUNBOOK §85).
                     _cancel_llm()
                     self._wrong_number_pending += 1
-                    resp = self._wrong_number_reconfirm_line()
+                    resp = self._wrong_number_reconfirm_line(direct=True)
                     self.memory.add_assistant(resp, language=self.state.language)
                     self._store_last_response(resp)
                     yield EngineResult(text=resp, is_shortcut=True,
@@ -4726,6 +4968,7 @@ class ConversationRouter:
                 if _line:
                     _cancel_llm()
                     self._wrong_number_pending = 1
+                    self._wrong_number_explicit = bool(_wn_hit)
                     self.state_mgr.extra_flags["wrong_number_suspected"] = True
                     logger.info("[IDENTITY] %s %r — re-confirming before "
                                 "closing", "wrong-number phrase" if _wn_hit
@@ -4750,6 +4993,124 @@ class ConversationRouter:
                     self._store_last_response(resp)
                     yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
                     return
+
+        # --- RUNBOOK §85: a refusal that ends the call on the turn it is
+        # said. "I never showed interest" (call 1136) and "करना ही नहीं है
+        # कॉल" (call 1137) were answered with "I won't take much of your
+        # time — when should I call?", three times over. Opt-in
+        # (call_flow.recovery.enabled). ---
+        if self._removal_step:
+            _rm = self._removal_turn(text)
+            if _rm is not None:
+                _cancel_llm()
+                resp, _closing = _rm
+                if _closing:
+                    self.state.is_closing = True
+                    self.commit_pending_turn()  # closing turn
+                    self.state.stage = STAGE_CLOSING
+                    self._pending_clarify = None
+                    self.hangup_pending = True
+                    self.state_mgr.extra_flags["dnd_requested"] = True
+                    self.state_mgr.extra_flags.setdefault(
+                        "dnd_quote", text[:200])
+                    self.call_outcome = self.call_outcome or "dnd"
+                else:
+                    self._refund_turn_ask()
+                self.memory.add_assistant(resp, language=self.state.language)
+                self._store_last_response(resp)
+                yield EngineResult(
+                    text=resp, is_shortcut=True,
+                    intent="farewell" if _closing else "general")
+                return
+
+        _rk = self._refusal_kind(text)
+        if _rk == "no_interest_shown" and self._removal_confirm_on():
+            _cancel_llm()
+            self._removal_resume_q = _rcv.strip_leading_apology(
+                self._pending_question())
+            self._removal_step, self._removal_unclear = 1, 0
+            self._pending_clarify = None
+            resp = self._recovery_line("removal_offer", _REMOVAL_OFFER_DEFAULT)
+            logger.info("[REMOVAL] %r — offering removal (step 1)", text[:60])
+            self._refund_turn_ask()
+            self.memory.add_assistant(resp, language=self.state.language)
+            self._store_last_response(resp)
+            yield EngineResult(text=resp, is_shortcut=True, intent="general")
+            return
+        if _rk:
+            _cancel_llm()
+            self.state.is_closing = True
+            self.commit_pending_turn()  # closing turn — never rolled back
+            self.state.stage = STAGE_CLOSING
+            self._pending_clarify = None
+            self.state.decline_count += 1
+            self.hangup_pending = True
+            if _rk == "not_interested":
+                self.call_outcome = self.call_outcome or "not_interested"
+                resp = self._lang_response(
+                    self._def.response_bank.decline_farewell,
+                    lang=self._closing_language()) \
+                    or "Thank you for your time. Have a great day!"
+            else:
+                # The line promises removal from the list — so it is one.
+                self.state_mgr.extra_flags["dnd_requested"] = True
+                self.state_mgr.extra_flags.setdefault("dnd_quote", text[:200])
+                self.call_outcome = self.call_outcome or "dnd"
+                resp = self._recovery_line("no_interest_close",
+                                           _NO_INTEREST_CLOSE_DEFAULT)
+            logger.info("[REFUSAL] %s %r — closing on this turn", _rk, text[:60])
+            self.memory.add_assistant(resp, language=self.state.language)
+            self._store_last_response(resp)
+            yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
+            return
+
+        # --- RUNBOOK §85: "why so slow / why the breaks?" is about OUR
+        # delivery — an apology and the open question, never the busy
+        # objection its "टाइम नहीं" used to trigger (call 1193). ---
+        if (self._recovery_on() and _rcv.speed_complaint(text)
+                and not _rcv.says_busy(text)):
+            _cancel_llm()
+            _q = _rcv.strip_leading_apology(self._pending_question())
+            self._speed_apologies += 1
+            if self._speed_apologies == 1:
+                resp = self._recovery_line("speed_apology",
+                                           _SPEED_APOLOGY_DEFAULT)
+            else:
+                # Said once; a second apology is its own delay.
+                resp = _LLM_BRIDGE.get((self.state.language or "en")[:2],
+                                       _LLM_BRIDGE["en"]) if _q else \
+                    self._recovery_line("speed_apology", _SPEED_APOLOGY_DEFAULT)
+            if _q:
+                resp = f"{resp} {_q}"
+            logger.info("[RECOVERY] pace complaint %r — apology + open "
+                        "question", text[:60])
+            self._refund_turn_ask()
+            self.memory.add_assistant(resp, language=self.state.language)
+            self._store_last_response(resp)
+            yield EngineResult(text=resp, is_shortcut=True, intent="general")
+            return
+
+        # --- RUNBOOK §85: "share your cost sheet / send me the details" is
+        # a request with one right answer — yes, on WhatsApp — and the
+        # question still open after it. Call 1131 got "sorry, I couldn't
+        # hear you" and then the price deflection, twice. ---
+        if (self._recovery_on() and _rcv.bare_share_request(text)
+                and self.state.stage != STAGE_GREETING
+                and self._pending_clarify is None):
+            _cancel_llm()
+            _q = self._pending_question()
+            resp = self._share_ack_line(text)
+            if _q and self._share_acks < 2:
+                resp = f"{resp} {_q}"
+            self._share_acks += 1
+            self.state_mgr.extra_flags["whatsapp_details_requested"] = True
+            logger.info("[RECOVERY] share request %r — WhatsApp ack%s",
+                        text[:60], " + open question" if _q else "")
+            self._refund_turn_ask()
+            self.memory.add_assistant(resp, language=self.state.language)
+            self._store_last_response(resp)
+            yield EngineResult(text=resp, is_shortcut=True, intent="general")
+            return
 
         # --- A declined site visit (RUNBOOK §73) — recorded before the
         # objection branch, because "अभी नहीं" / "not now" is also a
@@ -4793,7 +5154,9 @@ class ConversationRouter:
             _cc_resp = None
             if self._pending_clarify is not None:
                 _cc_resp = self._resolve_clarification(text)
-            elif self._detect_callback_request(text):
+            elif self._detect_callback_request(text) or (
+                    self._recovery_on() and _rcv.not_a_good_time(
+                        text, self.last_agent_response or "")):
                 _cc_resp = self._maybe_ask_clarification(text)
             if _cc_resp is not None:
                 _cancel_llm()
@@ -4892,6 +5255,22 @@ class ConversationRouter:
                 return
 
             resp = self._pick_objection_response(text)
+            # RUNBOOK §85: an objection line that asks "when will you be
+            # available?" opens the callback pin-down, so the caller's
+            # "कल शाम को" / "एक हफ़्ते बाद" on the next turn is read as the
+            # answer to it (confirm + close) instead of reaching the model.
+            if (self._recovery_on() and self._clarify_cfg().get("enabled")
+                    and not self._clarify_asked
+                    and self._pending_clarify is None
+                    and _rcv.asks_when(resp)):
+                self._clarify_asked = True
+                self._pending_clarify = {
+                    "kind": "callback", "made_by": "customer",
+                    "description": "Customer asked to be called later",
+                    "quote": text[:300], "day": "", "time": "",
+                    "offset_min": 0, "vague": True, "clarified": False,
+                    "turn": self.state.turn_count}
+                self._suppress_time_match_turns = 2
             self.memory.add_assistant(resp, language=self.state.language)
             self._store_last_response(resp)
             yield EngineResult(text=resp, is_shortcut=True, intent="objection")
@@ -5159,6 +5538,23 @@ class ConversationRouter:
             _cancel_llm()
             logger.info("[SCRIPT] %s entered — authored entry line, no LLM: "
                         "%r", self.state.stage, _el[:60])
+            # The line carries one of this stage's slot questions — note it,
+            # so a "हम्म" / "बोलिए" after it is re-asked verbatim and the
+            # answer passes the ask gate (RUNBOOK §85).
+            try:
+                self._refund_turn_ask()
+                for _n in (getattr(self._stage_def(), "collect", None) or []):
+                    _spec = self.state_mgr.slots.get(_n)
+                    _sq = self._lang_response(
+                        dict(getattr(_spec, "question", None) or {})) \
+                        if _spec else ""
+                    if (_sq and self.state_mgr.state.get(_n) is None
+                            and _norm_letters(_rcv.strip_leading_ack(_sq))
+                            in _norm_letters(_el)):
+                        self.state_mgr.note_asked(_n)
+                        break
+            except Exception:
+                logger.exception("[SCRIPT] entry-line ask note failed")
             self.memory.add_assistant(_el, language=self.state.language)
             self._store_last_response(_el)
             yield EngineResult(text=_el, is_shortcut=True, intent="general")
@@ -5168,6 +5564,14 @@ class ConversationRouter:
         _gt = self._good_time_fastpath_line(text, intent)
         if _gt:
             _cancel_llm()
+            # RUNBOOK §85: the owner's "OK" the moment identity is
+            # confirmed — its own chunk, so it is heard while the longer
+            # line is still being fetched.
+            _ack = self._identity_ack_line()
+            if _ack:
+                self._identity_ack_spoken = True
+                yield EngineResult(text=_ack, is_shortcut=True,
+                                   intent="good_time_check")
             self._good_time_spoken = True
             # RUNBOOK §77: a beat the caller is already hearing is never
             # rolled back. A fragment that landed while this line played
@@ -5189,6 +5593,20 @@ class ConversationRouter:
         # The system prompt guides the LLM through the 9-stage flow naturally.
         # =============================================================
         self.state.llm_cancelled = False
+        # RUNBOOK §85: a yes to the identity question that still needs the
+        # model for the introduction ("हाँ जी, बोल रहा हूँ, आप कौन?") gets
+        # the same instant "OK." first.
+        if (not self._good_time_spoken and not self._identity_ack_spoken
+                and getattr(self, "call_direction", "") == "outbound"
+                and intent not in ("negation", "objection", "farewell",
+                                   "question", "identity_question")
+                and _has_strong_yes(text)
+                and not any(t in _NEG_TOKENS for t in text.lower().split())
+                and self._identity_question_just_asked()):
+            _ack = self._identity_ack_line()
+            if _ack:
+                self._identity_ack_spoken = True
+                yield EngineResult(text=_ack, is_shortcut=True, intent=intent)
         async for result in self._consume_llm_with_filler(
             llm_queue, llm_done, intent, nudge_back=False, user_text=text,
         ):
@@ -5541,6 +5959,13 @@ class ConversationRouter:
         script = getattr(sd, "script", None) if sd else None
         if not isinstance(script, dict) or not script:
             return ""
+        # RUNBOOK §85 (calls 1136, 1137): the model said goodbye — "…मैं
+        # आपको कभी कॉल नहीं करूँगा। आपका दिन शुभ हो।" — and the floor put the
+        # next qualification question right behind it.
+        if _rcv.agent_line_is_goodbye(said):
+            logger.info("[SCRIPT] %s: the reply is a goodbye — no scripted "
+                        "question after it", self.state.stage)
+            return ""
         sm = self.state_mgr
         lang = self.state.language
         extra: list[str] = []
@@ -5568,7 +5993,12 @@ class ConversationRouter:
                 rq = self._lang_response(
                     dict(getattr(sm.slots[noted], "reask_question", None)
                          or {}), lang=lang)
-                if rq and sm.asked_count.get(noted, 0) >= 2:
+                # …but only behind a bare acknowledgement. Behind a reply that
+                # ANSWERED the caller (call 1232: the price, then "माफ़ कीजिए,
+                # ठीक से सुनाई नहीं दिया — location, size…?") an apology for not
+                # hearing is false — the plain question follows instead.
+                if (rq and sm.asked_count.get(noted, 0) >= 2
+                        and len((said or "").split()) < 6):
                     q, rq = rq, q
                 if (q and not self._line_asks(said, q, slot=noted)
                         and not (rq and self._line_asks(said, rq))):
@@ -5605,7 +6035,12 @@ class ConversationRouter:
         script = getattr(sd, "script", None) if sd else None
         if not isinstance(script, dict) or not script.get("ask_verbatim"):
             return ""
-        if self.state.is_closing or not self._is_bare_ack_text(text):
+        # RUNBOOK §85 (call 1130): "बोलिए।" — go ahead — is no more an answer
+        # than "हम्म"; it reached the model, which apologised for not having
+        # heard the caller.
+        if self.state.is_closing or not (
+                self._is_bare_ack_text(text)
+                or (self._recovery_on() and _is_go_ahead_value(text))):
             return ""
         last = (self.last_agent_response or "").rstrip()
         if not last.endswith("?"):
@@ -7296,9 +7731,7 @@ class ConversationRouter:
             except asyncio.TimeoutError:
                 logger.warning("[LLM] Post-filler wait exhausted "
                                "stream_timeout_s — canned fallback")
-                fallback = self._def.response_bank.lang_fallbacks.get(
-                    self.state.language,
-                    self._def.response_bank.response_fallback)
+                fallback = self._llm_failure_reply(user_text)
                 full_parts.append(fallback)
                 yield EngineResult(text=fallback, is_shortcut=False,
                                    intent=intent)
@@ -7481,7 +7914,7 @@ class ConversationRouter:
             # answered every turn with the canned fallback. Streak tracking
             # lets the platform end the loop honestly instead of repeating.
             self._llm_failure_streak += 1
-            fallback = self._def.response_bank.lang_fallbacks.get(self.state.language, self._def.response_bank.response_fallback)
+            fallback = self._llm_failure_reply(text)
             _limit = 0
             try:
                 _limit = int(os.environ.get("LLM_FAILURE_STREAK_LIMIT", "0"))
@@ -7755,8 +8188,14 @@ class ConversationRouter:
             _usage_kwargs = ({"stream_options": {"include_usage": True}}
                              if self._llm_usage_supported else {})
             try:
-                stream = await self._primary_stream_create(
+                stream, _hedged_fb = await self._hedged_stream_create(
                     client, messages, _tool_kwargs, _usage_kwargs, _cache_plan)
+                if _hedged_fb:
+                    if self._fallback_model not in self.llm_models_used:
+                        self.llm_models_used.append(self._fallback_model)
+                    self.llm_fallback_turns += 1
+                    _spoke_model = self._fallback_model
+                    self._turn_cache_tokens = 0
             except asyncio.CancelledError:
                 raise
             except Exception as _primary_exc:
@@ -7927,7 +8366,7 @@ class ConversationRouter:
             return
         except Exception as exc:
             logger.error("[LLM] Stream failed: %s", exc)
-            yield self._def.response_bank.lang_fallbacks.get(self.state.language, self._def.response_bank.response_fallback)
+            yield self._llm_failure_reply(text)
 
     # ------------------------------------------------------------------
     # Cost telemetry
@@ -8024,6 +8463,103 @@ class ConversationRouter:
             self._context_cache_ensure(band, tools)
         except Exception:
             logger.debug("[CTX-CACHE] prewarm failed", exc_info=True)
+
+    async def _hedged_stream_create(self, client, messages, tool_kwargs,
+                                    usage_kwargs, plan):
+        """→ (stream, used_fallback). The primary request, raced against the
+        fallback model once it has been silent for VOICE_LLM_HEDGE_S. A
+        primary that fails FAST raises as before (the sequential fallback
+        below handles it)."""
+        fb = self._get_fallback_client() if _VOICE_LLM_HEDGE_S > 0 else None
+        if fb is None:
+            return (await self._primary_stream_create(
+                client, messages, tool_kwargs, usage_kwargs, plan), False)
+
+        def _primary():
+            return self._primary_stream_create(
+                client, messages, tool_kwargs, usage_kwargs, plan)
+
+        def _fallback():
+            # A sibling model on the primary endpoint takes the same
+            # provider extras (reasoning effort); a foreign one does not.
+            _same = bool(os.environ.get("VOICE_LLM_FALLBACK_MODEL", "").strip())
+            return fb.chat.completions.create(
+                model=self._fallback_model, messages=messages,
+                max_tokens=self._def.llm_config.max_tokens,
+                temperature=0.7, stream=True,
+                **usage_kwargs, **tool_kwargs,
+                **(self._llm_extra if _same else {}))
+
+        fb_first = time.monotonic() < _PRIMARY_SLOW["until"]
+        t_primary = t_fallback = None
+        if fb_first:
+            t_fallback = asyncio.ensure_future(_fallback())
+        else:
+            t_primary = asyncio.ensure_future(_primary())
+        tasks = {t for t in (t_primary, t_fallback) if t is not None}
+        winner = None
+        primary_exc = None
+        try:
+            done, _ = await asyncio.wait(tasks, timeout=_VOICE_LLM_HEDGE_S)
+            if not done:
+                if fb_first:
+                    t_primary = asyncio.ensure_future(_primary())
+                    tasks.add(t_primary)
+                else:
+                    t_fallback = asyncio.ensure_future(_fallback())
+                    tasks.add(t_fallback)
+                    logger.warning(
+                        "[LLM-HEDGE] primary %s silent %.1fs — racing %s",
+                        self._model, _VOICE_LLM_HEDGE_S, self._fallback_model)
+            pending = set(tasks)
+            while pending and winner is None:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    if t.cancelled():
+                        continue
+                    exc = t.exception()
+                    if exc is None:
+                        winner = t
+                        break
+                    if t is t_primary:
+                        primary_exc = exc
+                    if t is t_fallback and t_primary is None:
+                        # Fallback-first and it failed fast: the primary
+                        # gets the turn after all.
+                        t_primary = asyncio.ensure_future(_primary())
+                        tasks.add(t_primary)
+                        pending.add(t_primary)
+                    elif t is t_primary and t_fallback is None:
+                        raise exc     # fast primary failure — legacy path
+            if winner is None:
+                raise primary_exc or RuntimeError("no model answered")
+            used_fb = winner is t_fallback
+            if not fb_first:
+                if used_fb:
+                    _PRIMARY_SLOW["losses"] += 1
+                    if _PRIMARY_SLOW["losses"] >= 2:
+                        _PRIMARY_SLOW["until"] = (time.monotonic()
+                                                  + _VOICE_LLM_SLOW_HOLD_S)
+                        _PRIMARY_SLOW["losses"] = 1
+                        logger.warning(
+                            "[LLM-HEDGE] primary %s slow twice — %s answers "
+                            "first for %.0fs", self._model,
+                            self._fallback_model, _VOICE_LLM_SLOW_HOLD_S)
+                else:
+                    _PRIMARY_SLOW["losses"] = 0
+            return winner.result(), used_fb
+        finally:
+            for t in tasks:
+                if t is winner:
+                    continue
+                if not t.done():
+                    t.cancel()
+                elif not t.cancelled() and t.exception() is None:
+                    try:        # a second stream nobody will read
+                        await t.result().close()
+                    except Exception:
+                        pass
 
     async def _primary_stream_create(self, client, messages, tool_kwargs,
                                      usage_kwargs, plan):
@@ -9025,10 +9561,26 @@ class ConversationRouter:
         near the word "call" — is withheld from a caller who is merely
         telling us they were called.
         """
+        # RUNBOOK §85 (call 1193): "मैं तो ऑलवेज फ्री ही रहता हूँ … आप कभी
+        # भी कॉल कीजिए" is a caller who is free NOW, not one asking to be
+        # rung later — it opened the callback pin-down and, two turns on,
+        # "we'll call you in the morning" + a hang-up nobody asked for.
+        if (_rcv.available_anytime(text) and not _rcv.says_busy(text)
+                and not self._BUSY_NOW_RE.search(text)):
+            logger.info("[COMMITMENT] 'any time' is availability, not a "
+                        "callback request: %r", text[:60])
+            return False
+        # A complaint about OUR pace ("इतना टाइम नहीं रहता … इतना ब्रेक क्यों
+        # ले रहे हैं") is not a deferral either.
+        if _rcv.speed_complaint(text) and not _rcv.says_busy(text):
+            return False
+        # "लेकिन मैंने कब बोला सुबह कॉल करो?" disputes a callback.
+        if _rcv.denies_having_said(text):
+            return False
         if self._CALLBACK_ASK_RE.search(text) \
                 or self._CALLBACK_ASK_INDIC_RE.search(text):
             return True
-        if self._BUSY_NOW_RE.search(text):
+        if self._BUSY_NOW_RE.search(text) or _rcv.says_busy(text):
             return True
         if self._RECEIVED_CALL_RE.search(text):
             logger.info("[COMMITMENT] time word near 'call' ignored — the "
@@ -9281,6 +9833,85 @@ class ConversationRouter:
             return ""
         return line
 
+    def _phonetic_open_slot(self, text: str):
+        """(slot name, {value: [written forms]}) for the option question the
+        caller is answering right now, when exact matching found nothing;
+        None otherwise. The options are the ones the agent's last line
+        offered when it named two or more, else the slot's whole list."""
+        if not getattr(self._def.languages, "phonetic_match", False):
+            return None
+        t = (text or "").strip()
+        if not t or "?" in t or len(t.split()) > 14:
+            return None
+        sm = self.state_mgr
+        noted = sm.last_noted_ask
+        spec = sm.slots.get(noted) if noted else None
+        if (spec is None or getattr(spec, "type", "") != "enum"
+                or sm.state.get(noted) is not None
+                or noted in getattr(sm, "retired", set())):
+            return None
+        last = self.last_agent_response or ""
+        q = self._lang_response(dict(getattr(spec, "question", None) or {}),
+                                lang=self.state.language)
+        if not q or not self._line_asks(last, q, slot=noted):
+            return None
+        if self.stt_recheck_accepts(noted, t):
+            return None
+        # Sound is compared against each option's OWN NAME only. Synonyms
+        # are everyday words ("चाहिए", "खुद") — exact matching has already
+        # tried them, and by sound they match half of what anyone says
+        # (swept over 1,281 Pramukh caller lines: 31 false accepts with
+        # synonyms, 1 without).
+        aliases: dict[str, list[str]] = {}
+        for alias, canon in (spec._synonym_lookup or {}).items():
+            aliases.setdefault(str(canon), []).append(str(alias))
+        forms = {str(v): [str(v)]
+                 for v in (getattr(spec, "enum_values", None) or [])}
+        low = last.lower()
+        offered = {v: f for v, f in forms.items()
+                   if any(a and sm_word_in(a.lower(), low)
+                          for a in [v, *aliases.get(v, [])])}
+        opts = offered if len(offered) >= 2 else forms
+        return (noted, opts) if len(opts) >= 2 else None
+
+    def _phonetic_option_fix(self, text: str) -> str:
+        """Resolve a pending "you said X — right?" and match this turn by
+        sound. Returns the text, with the canonical value appended when one
+        was established; sets `_phon_turn` when the agent should confirm."""
+        self._phon_turn = None
+        try:
+            pending, self._phon_pending = self._phon_pending, None
+            if pending is not None:
+                slot, value, other = pending
+                sm = self.state_mgr
+                if (sm.state.get(slot) is None
+                        and not self.stt_recheck_accepts(slot, text)):
+                    ans = _rcv.yes_no_lead(text)
+                    pick = value if ans == "yes" else (
+                        other if ans == "no" and other else "")
+                    if pick:
+                        logger.info("[PHONETIC] %s: %r to the confirmation → "
+                                    "%r", slot, text[:40], pick)
+                        return f"{text} ({pick})"
+            found = self._phonetic_open_slot(text)
+            if found is None:
+                return text
+            slot, opts = found
+            from . import phonetic_match as _pm
+            value, tier, sim = _pm.best_match(text, opts)
+            if tier == "accept":
+                logger.info("[PHONETIC] %s: %r heard as %r (%.2f) — taken",
+                            slot, text[:50], value, sim)
+                return f"{text} ({value})"
+            if tier == "confirm" and slot not in self._phon_confirmed:
+                others = [v for v in opts if v != value]
+                self._phon_turn = (slot, value,
+                                   others[0] if len(others) == 1 else "")
+            return text
+        except Exception:
+            logger.exception("[PHONETIC] match failed (continuing)")
+            return text
+
     def stt_recheck_slot(self, text: str) -> str:
         """RUNBOOK §81: the enum slot this caller turn answers when the
         agent opted in (`languages.stt_enum_recheck`), STT is locked to one
@@ -9342,11 +9973,31 @@ class ConversationRouter:
         ob = getattr(self._def, "outbound", None)
         if ob is None or getattr(self._def, "call_direction", "") != "outbound":
             return ""
-        if not _is_identity_yes(text):
+        if (not _is_identity_yes(text) and not _is_identity_yes_wide(text)
+                # RUNBOOK §85 (call 1190): "ठीक है।" to "am I speaking with
+                # Anjali?" went to the model, which read it as a yes anyway —
+                # 3.3 s later.
+                and not (self._recovery_on()
+                         and self._is_bare_ack_text(text))):
             return ""
         if not self._identity_question_just_asked():
             return ""
         return self._good_time_line()
+
+    def _identity_ack_line(self) -> str:
+        """outbound.identity_ack_line — the instant "OK." between the
+        caller's "yes, it's me" and the good-time line (RUNBOOK §85). ""
+        when the agent has none or it was already spoken."""
+        if self._identity_ack_spoken:
+            return ""
+        ob = getattr(self._def, "outbound", None)
+        bank = getattr(ob, "identity_ack_line", None) if ob else None
+        if not isinstance(bank, dict) or not bank:
+            return ""
+        try:
+            return str(self._lang_response(dict(bank)) or "").strip()
+        except Exception:
+            return ""
 
     def _good_time_line(self) -> str:
         """The authored, personalised outbound.good_time_check_line; "" when
@@ -9391,14 +10042,337 @@ class ConversationRouter:
                 return True
         return False
 
+    # ── RUNBOOK §85: campaign-call recovery ─────────────────────────────
+
+    def _recovery_cfg(self) -> dict:
+        cfg = getattr(self._def.call_flow, "recovery", None)
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _recovery_on(self) -> bool:
+        return bool(self._recovery_cfg().get("enabled"))
+
+    def _recovery_line(self, key: str, builtin: dict) -> str:
+        """call_flow.recovery.<key> in the call's language, else the
+        built-in — personalised like every authored line."""
+        authored = self._recovery_cfg().get(key)
+        line = ""
+        if isinstance(authored, dict) and authored:
+            line = str(self._lang_response(dict(authored)) or "").strip()
+        if not line:
+            lang = (self.state.language or "en")[:2]
+            line = builtin.get(lang, builtin["en"])
+        try:
+            return self._personalize(line, f"call_flow.recovery.{key}")
+        except Exception:
+            logger.exception("[RECOVERY] line %s failed", key)
+            return line
+
+    @staticmethod
+    def _is_bare_negative(text: str) -> bool:
+        toks = re.sub(r"[^0-9a-z\u0900-\u0963\u0966-\u097F\u0A80-\u0AFF]+",
+                      " ", (text or "").lower()).split()
+        return (bool(toks) and len(toks) <= 4
+                and any(t in _NEG_TOKENS for t in toks)
+                and all(t in _NEG_TOKENS or t in _POLITE_TOKENS
+                        or t in ("जी", "ji", "अभी", "abhi") for t in toks))
+
+    def _is_canned_fallback(self, line: str) -> bool:
+        """Is `line` one of the agent's "sorry, say that again?" lines —
+        never a question worth repeating."""
+        rb = self._def.response_bank
+        n = _norm_letters(line)
+        if not n:
+            return False
+        bank = [rb.response_fallback, *(rb.lang_fallbacks or {}).values(),
+                *_COULDNT_HEAR.values(), *_LLM_BRIDGE_NO_QUESTION.values()]
+        return any(_norm_letters(str(b)) and _norm_letters(str(b)) in n
+                   for b in bank if b)
+
+    def _pending_question(self) -> str:
+        """The question still open on this call, ready to be put again
+        after a deterministic answer — the unanswered slot the agent last
+        asked (its authored text, without the leading "Understood."), else
+        the last real question it spoke. '' when nothing is open."""
+        # The question the agent has JUST put outranks an older unanswered
+        # slot ask (call 1224: the visit-time question was open; the Swarit
+        # size question from three minutes earlier was put again, twice).
+        _recent = self.memory.recent_assistant_texts(1) or []
+        if _recent and _recent[-1] and not self._is_canned_fallback(_recent[-1]):
+            _parts = [p for p in self._split_sentences(_recent[-1])
+                      if "?" in p or "？" in p]
+            if _parts:
+                return _rcv.strip_leading_ack(_parts[-1])
+        sm = self.state_mgr
+        noted = sm.last_noted_ask
+        spec = sm.slots.get(noted) if noted else None
+        if (spec is not None and sm.state.get(noted) is None
+                and noted not in getattr(sm, "retired", set())):
+            q = self._lang_response(
+                dict(getattr(spec, "question", None) or {}),
+                lang=self.state.language)
+            if q:
+                return _rcv.strip_leading_ack(self._personalize(q, "script"))
+        for line in reversed(self.memory.recent_assistant_texts(4) or []):
+            if not line or self._is_canned_fallback(line):
+                continue
+            parts = [p for p in self._split_sentences(line)
+                     if "?" in p or "？" in p]
+            if parts:
+                return _rcv.strip_leading_ack(parts[-1])
+            break
+        return ""
+
+    def turn_is_complete_answer(self, text: str) -> bool:
+        """Is this caller turn, on its face, a finished answer to the
+        question the agent just asked? Read by the pipeline to choose the
+        short `answer_hold_ms` over the full pause hold (RUNBOOK §85).
+
+        Deliberately narrow — a wrong "yes" here costs an interruption:
+        the agent's last line must end in a question, the turn is at most
+        six words with no question of its own, and it is either a bare
+        yes / no / acknowledgement or one of the asked slot's own values
+        (an amount for a money slot)."""
+        t = (text or "").strip()
+        if not t or "?" in t or self.state.is_closing:
+            return False
+        if not (self.last_agent_response or "").rstrip().endswith("?"):
+            return False
+        if len(t.split()) > 6:
+            return False
+        if (self._is_bare_ack_text(t) or self._is_bare_negative(t)
+                or _is_identity_yes(t)):
+            return True
+        try:
+            sm = self.state_mgr
+            noted = sm.last_noted_ask
+            spec = sm.slots.get(noted) if noted else None
+            if spec is None or sm.state.get(noted) is not None:
+                return False
+            typ = getattr(spec, "type", "")
+            if typ in ("enum", "boolean", "location"):
+                return self.stt_recheck_accepts(noted, t)
+            if typ == "money":
+                from .state_manager import _looks_like_amount, _MONEY_UNIT_RE
+                return bool(_looks_like_amount(t) and _MONEY_UNIT_RE.search(t))
+        except Exception:
+            logger.exception("[TURN] complete-answer check failed")
+        return False
+
+    def _next_stage_question(self) -> tuple[str, str]:
+        """(slot, authored question) for the first unanswered slot this
+        stage collects — ("", "") when the stage collects nothing or all of
+        it is in."""
+        sm = self.state_mgr
+        collect = list(getattr(self._stage_def(), "collect", None) or [])
+        if not collect:
+            return "", ""
+        try:
+            missing = sm._stage_missing(
+                sm.detect_missing_slots()["missing"], collect)
+        except Exception:
+            return "", ""
+        for name in missing:
+            spec = sm.slots.get(name)
+            q = self._lang_response(
+                dict(getattr(spec, "question", None) or {}),
+                lang=self.state.language) if spec else ""
+            if q:
+                return name, self._personalize(q, "script")
+        return "", ""
+
+    def _llm_failure_reply(self, user_text: str = "") -> str:
+        """What is said when the model produced nothing (timeout, 429,
+        stream error). The legacy line — "sorry, I couldn't hear you, say
+        that again?" — blamed the caller's audio for OUR failure and was
+        spoken three times running to a caller whose "4 bhk" had been
+        transcribed perfectly (call 1131). With call_flow.recovery on:
+        the caller's words are kept (an enum answer is recorded here, with
+        no model), and the question that is open now is asked."""
+        rb = self._def.response_bank
+        legacy = rb.lang_fallbacks.get(self.state.language,
+                                       rb.response_fallback)
+        if not self._recovery_on():
+            return legacy
+        lang = (self.state.language or "en")[:2]
+        try:
+            sm = self.state_mgr
+            _filled_now = False
+            noted = sm.last_noted_ask
+            spec = sm.slots.get(noted) if noted else None
+            if (spec is not None and sm.state.get(noted) is None
+                    and user_text and getattr(spec, "type", "") == "enum"
+                    and "?" not in user_text):
+                hit, _alias = sm._latest_alias(spec, user_text.lower())
+                if hit is not None:
+                    sm.set_externally(noted, hit, source="answer")
+                    _filled_now = True
+                    logger.info("[RECOVERY] model failed — %s=%r recorded "
+                                "from the caller's own words", noted, hit)
+            _open_slot = (spec is not None and sm.state.get(noted) is None)
+            _last = self.last_agent_response or ""
+            if _open_slot:
+                # The same question is still unanswered. Put it again only
+                # after an acknowledgement / go-ahead; anything else the
+                # caller said deserves an honest "once more, please".
+                q = self._pending_question()
+                if q and (self._is_bare_ack_text(user_text)
+                          or not self._line_asks(_last, q, slot=noted)):
+                    self._llm_failure_spoken = 0
+                    return f"{_LLM_BRIDGE.get(lang, _LLM_BRIDGE['en'])} {q}"
+            else:
+                name, q = self._next_stage_question()
+                if q and not self._line_asks(_last, q, slot=name):
+                    sm.note_asked(name)
+                    self._llm_failure_spoken = 0
+                    logger.info("[RECOVERY] model failed — next scripted "
+                                "question (%s) asked without it", name)
+                    return q
+        except Exception:
+            logger.exception("[RECOVERY] failure reply build failed")
+        self._llm_failure_spoken += 1
+        logger.info("[RECOVERY] model failed — neutral 'once more' (%d in a "
+                    "row)", self._llm_failure_spoken)
+        return _LLM_BRIDGE_NO_QUESTION.get(lang, _LLM_BRIDGE_NO_QUESTION["en"])
+
+    def _share_project_name(self, text: str) -> str:
+        """The project a "send me the details" is about: the one the caller
+        names in the request, else the share tracker's topic, else the last
+        project the agent itself named, else the one being pitched."""
+        kb = self._def.knowledge_base
+        items = [i for i in (getattr(kb, "catalog", None) or [])
+                 if isinstance(i, dict) and i.get("name")]
+        if not items:
+            return ""
+        try:
+            from . import pitch_switch as _ps
+            from . import share_tracker as _st
+            named = [i["name"] for i in items if _ps.mentions(text or "", i)]
+            if named:
+                return str(named[-1])
+            if self._share is not None and self._share.topic_id:
+                return str(_st.name_of(kb, self._share.topic_id) or "")
+            for line in reversed(self.memory.recent_assistant_texts(4) or []):
+                hit = [i["name"] for i in items if _ps.mentions(line, i)]
+                if hit:
+                    return str(hit[-1])
+            pid = self._share_pitch_id()
+            return str(_st.name_of(kb, pid) or "") if pid else ""
+        except Exception:
+            logger.exception("[RECOVERY] share project lookup failed")
+            return ""
+
+    def _share_ack_line(self, text: str) -> str:
+        project = self._share_project_name(text)
+        if project:
+            # {project} is resolved BEFORE the line is personalised —
+            # _personalize strips every token it does not know.
+            authored = self._recovery_cfg().get("share_ack_project")
+            line = ""
+            if isinstance(authored, dict) and authored:
+                line = str(self._lang_response(dict(authored)) or "").strip()
+            if not line:
+                lang = (self.state.language or "en")[:2]
+                line = _SHARE_ACK_PROJECT_DEFAULT.get(
+                    lang, _SHARE_ACK_PROJECT_DEFAULT["en"])
+            if "{project}" in line:
+                line = line.replace("{project}", project)
+                try:
+                    return self._personalize(
+                        line, "call_flow.recovery.share_ack_project")
+                except Exception:
+                    return line
+        return self._recovery_line("share_ack", _SHARE_ACK_DEFAULT)
+
+    def _removal_confirm_on(self) -> bool:
+        return bool(self._recovery_on()
+                    and self._recovery_cfg().get("removal_confirm"))
+
+    def _removal_turn(self, text: str):
+        """The caller's reply inside the removal flow → (line, closing) or
+        None to hand the turn back to the normal flow."""
+        step = self._removal_step
+        ans = _rcv.removal_answer(text)
+        if ans == "yes":
+            self._removal_unclear = 0
+            if step == 1:
+                self._removal_step = 2
+                logger.info("[REMOVAL] yes to the offer — confirming (step 2)")
+                return (self._recovery_line(
+                    "removal_confirm_line", _REMOVAL_CONFIRM_DEFAULT), False)
+            self._removal_step = 0
+            logger.info("[REMOVAL] confirmed — closing, flagged do-not-call")
+            return (self._recovery_line(
+                "removal_close", _REMOVAL_CLOSE_DEFAULT), True)
+        if ans == "no":
+            self._removal_step = 0
+            self._removal_declined = True
+            line = self._recovery_line("removal_keep", _REMOVAL_KEEP_DEFAULT)
+            q = self._removal_resume_q
+            logger.info("[REMOVAL] caller keeps the name — call continues")
+            return ((f"{line} {q}" if q else line), False)
+        # Neither: put the same question once more, then let the call go on.
+        self._removal_unclear += 1
+        if self._removal_unclear <= 1:
+            key, dflt = (("removal_offer", _REMOVAL_OFFER_DEFAULT) if step == 1
+                         else ("removal_confirm_line",
+                               _REMOVAL_CONFIRM_DEFAULT))
+            return (self._recovery_line(key, dflt), False)
+        self._removal_step = 0
+        return None
+
+    def _refusal_kind(self, text: str) -> str:
+        """'no_interest_shown' | 'no_call' | 'not_interested' | '' — a
+        refusal that ends the call on the turn it is said (RUNBOOK §85)."""
+        if not self._recovery_on() or self.state.is_closing:
+            return ""
+        last = self.last_agent_response or ""
+        if _rcv.denies_interest(text):
+            if self._removal_declined:
+                return ""   # they chose to stay; not asked a second time
+            return "no_interest_shown"
+        if _rcv.refuses_any_call(text, last):
+            return "no_call"
+        if _rcv.flat_refusal(text):
+            # A flat "no need" closes at once when nothing has been
+            # qualified yet or the caller has already pushed back; mid-call
+            # it stays an objection (one acknowledgement, then the close).
+            sm = self.state_mgr
+            _early = not any(
+                sm.state.get(n) is not None for n in sm.slots
+                if n not in ("caller_name", "customer_name"))
+            if (_early or self.state.decline_count >= 1
+                    or self._pending_clarify is not None
+                    or self._clarify_asked):
+                return "not_interested"
+        return ""
+
     # ── RUNBOOK §73: wrong-number re-confirmation ───────────────────────
 
-    def _wrong_number_reconfirm_line(self) -> str:
+    # RUNBOOK §85: the SECOND re-confirmation is a plain yes/no question.
+    # The first ("is this the wrong number, or the right one?") is
+    # either/or — a bare "हाँ" answers neither half of it.
+    _RECONFIRM_DIRECT = {
+        "en": "Sorry — just to be sure, am I speaking with {contact_name}?",
+        "hi": "माफ़ कीजिए, बस confirm करना था — क्या मैं {contact_name} जी से "
+              "ही बात कर रहा हूँ?",
+        "gu": "માફ કરશો, બસ confirm કરવું હતું — શું હું {contact_name} "
+              "સાથે જ વાત કરું છું?",
+    }
+
+    def _wrong_number_reconfirm_line(self, direct: bool = False) -> str:
         """The re-confirmation question, per agent (outbound.
         wrong_number_reconfirm_line) else the built-in, in the call's
-        language. "" when the feature is off."""
+        language. "" when the feature is off. `direct` = the second ask."""
         if not WRONG_NUMBER_RECONFIRM:
             return ""
+        if direct and (self.outbound_contact_name or "").strip():
+            lang = (self.state.language or "en")[:2]
+            try:
+                return self._personalize(
+                    self._RECONFIRM_DIRECT.get(lang, self._RECONFIRM_DIRECT["en"]),
+                    "outbound.wrong_number_reconfirm_direct")
+            except Exception:
+                logger.exception("[IDENTITY] direct re-confirm line failed")
         ob = getattr(self._def, "outbound", None)
         authored = getattr(ob, "wrong_number_reconfirm_line", None) if ob else None
         line = ""
@@ -9451,12 +10425,38 @@ class ConversationRouter:
             return "me"
         if self._wrong_number_pattern_hit(lower):
             return "wrong"
+        # RUNBOOK §85 (call 1188): the word that answers the either/or
+        # question — "सही" / "ग़लत" and what STT makes of them ("सही है" →
+        # "भाई है") — is read before the kinship and acknowledgement tests.
+        # Only an EITHER/OR question ("…ग़लत नंबर है या सही?") is answered by
+        # "सही"; to an authored yes/no ("ग़लत नंबर है क्या?") a "सही" or a
+        # "हाँ" still confirms the wrong number, as before.
+        _either_or = bool(_RECONFIRM_EITHER_OR_RE.search(
+            self.last_agent_response or ""))
+        _hint = _rcv.reconfirm_hint(t)
+        if _hint == "right" and _either_or:
+            return "me"
+        if _hint == "wrong":
+            return "wrong"
         if _RIGHT_NUMBER_OTHER_RE.search(lower):
             return "other"
         if _is_identity_no(t):
             return "wrong"
-        if _is_identity_yes(t) or _all_tokens_in(
-                t, _AFFIRM_TOKENS | _POLITE_TOKENS | _NEG_TOKENS):
+        _yes = _is_identity_yes(t)
+        _ackish = _yes or _all_tokens_in(
+            t, _AFFIRM_TOKENS | _POLITE_TOKENS | _NEG_TOKENS)
+        if self._wrong_number_pending >= 2:
+            # The direct "am I speaking with X?" was asked: yes means yes.
+            if _yes or (_ackish and _has_strong_yes(t)):
+                return "me"
+            return "wrong" if _ackish else "unclear"
+        # First ask, EITHER/OR: an acknowledgement or a bare yes answers
+        # neither half — it used to CLOSE the call as a wrong number, which
+        # is how a "हा" after a misheard "सही है" hung up on the right
+        # person. Ask the direct question instead.
+        # …unless the caller's FIRST signal was an explicit "wrong number":
+        # then a yes confirms what they already said in so many words.
+        if _ackish and (not _either_or or self._wrong_number_explicit):
             return "wrong"
         return "unclear"
 
@@ -10453,6 +11453,12 @@ class ConversationRouter:
             return int(tok) if tok.isdigit() else cls._REL_NUM_WORDS.get(tok, 0)
         if cls._REL_HALF_HOUR_RE.search(text):
             return 30
+        # RUNBOOK §85 (call 1126): "एक वीक के बाद फोन कीजिए" had no unit the
+        # parser knew, "बाद" read as "in a bit", and the caller was asked
+        # "after how many minutes?". Days / weeks / months, as minutes.
+        _days = _rcv.long_offset_days(text, explicit_only=True)
+        if _days:
+            return _days * 1440
         m = cls._REL_MIN_RE.search(text)
         if m and _num(m.group(1)):
             return max(1, min(_num(m.group(1)), 24 * 60))
@@ -10468,6 +11474,8 @@ class ConversationRouter:
         """'in about 10 minutes' / '10 मिनट में' — spoken confirmation form,
         in the caller's script (RUNBOOK §77: the hi/gu forms were romanized,
         which Sarvam renders poorly and no authored Pramukh line uses)."""
+        if offset_min >= 1440 and offset_min % 1440 == 0:
+            return _rcv.days_phrase(offset_min // 1440, lang)
         if offset_min % 60 == 0:
             n = offset_min // 60
             unit = {"en": ("hour", "hours"), "hi": ("घंटे", "घंटे"),
@@ -10702,7 +11710,10 @@ class ConversationRouter:
         # Busy flavour only when the brush-off carries NO time hint at all —
         # "busy right now, call me next week" still gets the day question.
         _busy = (not day and not tm
-                 and bool(self._BUSY_NOW_RE.search(text))
+                 and (bool(self._BUSY_NOW_RE.search(text))
+                      or _rcv.says_busy(text)
+                      or _rcv.not_a_good_time(
+                          text, self.last_agent_response or ""))
                  and not self._CALLBACK_TIME_RE.search(text))
         _relative = not day and bool(self._REL_VAGUE_RE.search(text))
         logger.info("[COMMITMENT] vague commitment (%r) — asking clarification",
@@ -10717,6 +11728,13 @@ class ConversationRouter:
         self._pending_clarify = None
         if pending is None:
             return None
+        # A pin-down opened by an objection line (RUNBOOK §85) is recorded
+        # as a commitment only once the caller actually names a time.
+        _unrecorded = not any(c is pending for c in self._commitments)
+
+        def _keep() -> None:
+            if _unrecorded and not any(c is pending for c in self._commitments):
+                self._commitments.append(pending)
         offset_min = self._parse_relative_offset(text)
         if offset_min:
             pending["offset_min"] = offset_min
@@ -10724,6 +11742,7 @@ class ConversationRouter:
             pending["clarified"] = True
             pending["description"] = ("Customer asked to be called "
                                       + self._offset_phrase(offset_min, "en"))
+            _keep()
             self._sync_commitments()
             self._capture_callback_flags("", "", offset_min)
             self._suppress_time_match_turns = 1
@@ -10731,16 +11750,30 @@ class ConversationRouter:
             self._arm_callback_close()
             return self._clarify_confirmation("", "", offset_min)
         day, tm = self._parse_day_time(text)
-        day = day or pending.get("day", "")
-        tm = tm or pending.get("time", "")
+        # RUNBOOK §85 (call 1193): the answer must itself carry a day or a
+        # time. Inheriting the pending half turned a complaint about our
+        # pauses into "we'll call you in the morning" + a hang-up ("सुबह"
+        # came from the PREVIOUS turn's "सुबह से शाम तक … कभी भी").
         if not day and not tm:
             logger.info("[COMMITMENT] clarification answer unparseable — keeping vague")
+            # A busy caller who still names no time gets ONE soft close —
+            # never a third "when should I call?" (call 1137).
+            if (self._recovery_on()
+                    and (_rcv.says_busy(text) or _rcv.says_not_ok(text)
+                         or self._is_bare_negative(text))):
+                self._arm_callback_close()
+                logger.info("[COMMITMENT] still no time from a busy caller "
+                            "— soft close, no pinned callback")
+                return self._recovery_line("soft_close", _SOFT_CLOSE_DEFAULT)
             return None  # let the normal engine handle whatever this turn was
+        day = day or pending.get("day", "")
+        tm = tm or pending.get("time", "")
         pending["day"], pending["time"] = day, tm
         pending["vague"] = not (day and tm)
         pending["clarified"] = True
         pending["description"] = ("Customer asked to be called "
                                   + " ".join(x for x in (day, tm) if x))
+        _keep()
         self._sync_commitments()
         self._capture_callback_flags(day, tm)
         self._suppress_time_match_turns = 1  # cover this turn's extraction too
@@ -11128,8 +12161,22 @@ class ConversationRouter:
             asyncio.ensure_future(asyncio.to_thread(
                 ConversationRouter._warm_rag_index_impl, agent_id))
 
-        if ConversationRouter._warmup_done_flag:
-            logger.debug("[CONV] LLM warmup skipped — already done this process")
+        # RUNBOOK §85.14: "once per process" meant the first call after hours
+        # of quiet met cold connections and a cold model path with no
+        # warm-up at all (first two model turns 6.7 s on 2026-11-14 09:51,
+        # every turn timed out 2026-11-16 06:28). Now once per
+        # VOICE_WARMUP_REFRESH_S of quiet — and the warm-up TIMES the
+        # primary, so a slow one puts the fallback first before the caller's
+        # first real turn instead of after two slow ones.
+        _first = not ConversationRouter._warmup_done_flag
+        if (not _first and time.monotonic() - ConversationRouter._warmed_at
+                < _VOICE_WARMUP_REFRESH_S):
+            logger.debug("[CONV] LLM warmup skipped — warmed %.0fs ago",
+                         time.monotonic() - ConversationRouter._warmed_at)
+            return
+        ConversationRouter._warmed_at = time.monotonic()
+        if not _first:
+            await self._rewarm_llm()
             return
         # Same once-per-process moment, and equally off the call path: ask the
         # provider whether it will actually cache a repeated prompt prefix.
@@ -11151,6 +12198,45 @@ class ConversationRouter:
             logger.info("[CONV] LLM warmup complete (first time this process)")
         except Exception as exc:
             logger.warning("[CONV] LLM warmup failed: %s", exc)
+
+    async def _rewarm_llm(self) -> None:
+        """Re-open the model path after a quiet spell and time the primary.
+        Slower than the hedge delay (or failed) → the fallback answers first
+        for the slow-hold window. The fallback's connection is warmed too."""
+        async def _one(client, model, extra):
+            # 5 s: the pipeline gives all warm-ups 8 s together, and the
+            # verdict ("slow") must be recorded before that expires.
+            t0 = time.monotonic()
+            await asyncio.wait_for(client.chat.completions.create(
+                model=model, messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1, temperature=0.0, **extra), timeout=5.0)
+            return time.monotonic() - t0
+        took = None
+        try:
+            took = await _one(self._get_client(), self._model, self._llm_extra)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[CONV] LLM re-warm: primary %s did not answer "
+                           "(%s)", self._model, str(exc)[:80] or type(exc).__name__)
+        fb = self._get_fallback_client() if _VOICE_LLM_HEDGE_S > 0 else None
+        slow = took is None or took > _VOICE_LLM_HEDGE_S
+        if fb is not None and slow:
+            _PRIMARY_SLOW["until"] = time.monotonic() + _VOICE_LLM_SLOW_HOLD_S
+            _PRIMARY_SLOW["losses"] = 1
+        logger.info("[CONV] LLM re-warm after quiet: primary %s%s",
+                    f"{took * 1000:.0f}ms" if took is not None else "no answer",
+                    f" — slow, {self._fallback_model} answers first"
+                    if (fb is not None and slow) else "")
+        if fb is not None:
+            try:
+                _same = bool(os.environ.get("VOICE_LLM_FALLBACK_MODEL", "").strip())
+                await _one(fb, self._fallback_model,
+                           self._llm_extra if _same else {})
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Localization helpers

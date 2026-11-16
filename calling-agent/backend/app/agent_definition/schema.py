@@ -231,6 +231,10 @@ class LanguageConfig:
     # and the re-read is used only if it names a value. English option
     # words under hi-IN ("Amenities" → "हमें देखिए", call 1092). Off by default.
     stt_enum_recheck: bool = False
+    # RUNBOOK §85.12: an answer that matches none of the asked question's
+    # options is compared to them by SOUND (phonetic_match.py): a clear
+    # winner is taken, a leading candidate is confirmed with the caller.
+    phonetic_match: bool = False
     # RUNBOOK §82: every figure written in DIGITS is spoken in English
     # ("fifty to fifty five lakh", "two point one five crore") — Bulbul read
     # "₹50-55 लाख" digit by digit in Hindi and voiced the hyphen. Only the
@@ -462,6 +466,18 @@ class CallFlowConfig:
     #     arriving while the agent's audio is still playing after synthesis
     #     finished, stops that audio instead of queueing the reply behind it.
     turn_taking: dict = field(default_factory=dict)
+    # Campaign-call recovery (RUNBOOK §85; all keys optional, {} = every
+    # agent byte-identical):
+    #   enabled: bool — the deterministic readings below are acted on.
+    #   no_interest_close: {lang: str} — spoken, then the call ends, when
+    #     the caller says they never showed interest or refuses any call.
+    #   share_ack: {lang: str} — the answer to "send me the cost sheet /
+    #     details"; the question still open is put again after it.
+    #   speed_apology: {lang: str} — the answer to "why so slow / why the
+    #     breaks?"; the open question follows.
+    #   soft_close: {lang: str} — spoken when a busy caller gives no time
+    #     a second time; the call ends without a pinned callback.
+    recovery: dict = field(default_factory=dict)
 
     # Convenience accessors -------------------------------------------------
 
@@ -695,6 +711,10 @@ class OutboundConfig:
     # question, before the call is closed with wrong_number_close. {} = the
     # platform's built-in question in the call's language.
     wrong_number_reconfirm_line: dict[str, str] = field(default_factory=dict)
+    # RUNBOOK §85: a short acknowledgement ("OK.") spoken the instant the
+    # caller confirms it is them, before the good-time line — it covers the
+    # gap while that line is generated/synthesised. {} = nothing extra.
+    identity_ack_line: dict[str, str] = field(default_factory=dict)
     opening_greeting: dict[str, str] = field(default_factory=dict)  # outbound variant
     direction_brief: str = ""
     # Alternatives to outbound.opening_greeting — see
@@ -966,6 +986,7 @@ class AgentDefinition:
             register_notes=_as_dict(lang_d, "register_notes"),
             stt_forced_language=_as_str(lang_d, "stt_forced_language"),
             stt_enum_recheck=_as_bool(lang_d, "stt_enum_recheck", False),
+            phonetic_match=_as_bool(lang_d, "phonetic_match", False),
             tts_numbers_english=_as_bool(lang_d, "tts_numbers_english", False),
             allow_code_mixing=_as_bool(lang_d, "allow_code_mixing", False),
             tts_lang_from_text=_as_bool(lang_d, "tts_lang_from_text", True),
@@ -1021,6 +1042,7 @@ class AgentDefinition:
             termination=_as_dict(cf_d, "termination"),
             connect=_as_dict(cf_d, "connect"),
             turn_taking=_as_dict(cf_d, "turn_taking"),
+            recovery=_as_dict(cf_d, "recovery"),
             recommend_before_schedule=_as_str(
                 cf_d, "recommend_before_schedule", "auto") or "auto",
         )
@@ -1192,6 +1214,7 @@ class AgentDefinition:
             wrong_number_close=_as_dict(ob_d, "wrong_number_close"),
             wrong_number_patterns=[str(x) for x in _as_list(ob_d, "wrong_number_patterns")],
             wrong_number_reconfirm_line=_as_dict(ob_d, "wrong_number_reconfirm_line"),
+            identity_ack_line=_as_dict(ob_d, "identity_ack_line"),
             opening_greeting=_as_dict(ob_d, "opening_greeting"),
             direction_brief=_as_str(ob_d, "direction_brief"),
             opening_variants=_as_variants(ob_d, "opening_variants"),

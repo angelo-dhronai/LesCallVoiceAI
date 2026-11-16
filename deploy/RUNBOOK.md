@@ -9664,3 +9664,371 @@ consented drain. `test_machine_line.py` (37) unchanged and green.
 `Caller:` line in `recordings/*/transcript.txt` with `machine_line.classify`,
 print every hit with its call and what the agent said after, and read the
 hits — a flagged line a PERSON said is a bug, however few.
+
+## 84. Conditional call forwarding: "ring my phone first", the agent as the fallback (2026-11-05) — LIVE since 08:56 UTC (owner's go); no number forwarding until an owner switches one on; first test calls pending
+
+**What it is.** Per number, the owner picks *My agent answers* (every number's
+behaviour until now) or *Ring my phone first*. A forwarded call rings one of
+the owner's own phones FROM the number, over the number's own trunk. The
+person hears "Call on your <line> line, from a number ending 4 3 2 1. Press 1
+to accept this call." and on 1 is bridged straight to the caller. Not taken
+(no answer, busy, off, 1 not pressed) → the agent answers exactly as before,
+or the call ends (`forward_fallback=hangup`). The caller hears an ordinary
+Indian ring throughout; their leg is not answered until the person accepts, so
+ringing costs nothing on either leg.
+
+**Owner decisions (2026-11-05).** Press 1 on by default · the prompt reads the
+caller's last 4 digits AND the line name · phones verified by a voice-code call
+· Indian numbers only · forwarded minutes counted SEPARATELY from AI minutes.
+
+**Where it lives.** `shared/call_forwarding.py` (dialplan renderer, prompts,
+verification, CDR sync) · `dashboard/telephony_api.py` (`/api/forward-contacts`
+CRUD + `/verify-call` + `/verify`, `PATCH /api/numbers/{id}` forward_* fields,
+`/api/forwarded-calls`) · `shared/telephony_admin.py` (remove / disconnect /
+connect / transfer keep forwarding consistent) · migration `0032` ·
+`deploy/install_call_forwarding.sh` · `deploy/workers_entry.sh` (`--sync`) ·
+`frontend/src/components/CallForwarding.tsx` on the Telephony page.
+
+**How it reaches FreeSWITCH.** `public.xml` routes every inbound call through
+the `plivo_inbound` `.*` catch-all. The installer adds ONE include line above it
+for `dialplan/public_forward/*.xml`; the dashboard writes `forward_<did>.xml`
+there when a number is set to forward (and its phone is verified, its trunk is
+its own and applied, it is not disconnected) and deletes it otherwise, then
+`reloadxml` (no runtime restart). A number with no file takes exactly today's
+road. Each file has two extensions — caller ID with ≥4 digits (prompt reads
+them via `$1..$4`) and without — and BOTH refuse a call whose caller ID is the
+number itself: our own forward bouncing back (the person's SIM forwards misses
+to this number) and the sentinel's 08:30 IST loopback probe both reach the
+agent, never the person. The fallback actions are byte-for-byte the catch-all's
+(`test_agent_fallback_is_identical_to_the_live_catch_all` reads the live file).
+
+**Never spoken: `phone_numbers.label`.** It is an admin note ("restored
+2026-09-23 for handover to …"). The prompt reads `forward_line_name`
+(default "LesCall"; letters, digits, spaces; ≤40).
+
+**Rules (server-side).** Phones: +91 and 10 digits (mobile vs landline is not
+decidable from the digits — Bangalore 80xxxxxxxx overlaps the 8-series
+mobiles), never a LesCall number (any account's), ≤5 per account, unusable
+until verified. Verification: we ring the phone from one of the owner's own
+numbers, a voice reads a 4-digit code twice; code lives 10 min, 5 wrong tries
+lock it, 3 code calls per phone per IST day; a prompt-synthesis failure does
+not burn a call. Ring 10–45 s. A forwarded call is cut at 60 min
+(`sched_hangup … ALLOTTED_TIMEOUT` on the person's leg) — with verified Indian
+phones this, not a daily minute cap, is the backstop. A handover resets the
+number to agent mode in the same transaction (the phone belongs to the OLD
+account); even before the reset, a phone whose owner differs from the number's
+is refused.
+
+**Records and minutes.** A forwarded call never reaches the AI: no `calls` row,
+no `usage_ledger` row. The forward extension sets `accountcode=lcfwd_<id>` on
+the caller's leg and, if the bridge fails, `lcfwd_<id>_<originate_disposition>`;
+the workers' `python -m shared.call_forwarding --sync` turns those CDR rows into
+`forwarded_calls` (connected / no_answer / busy / rejected / caller_hung_up /
+failed; ring_s, talk_s). Forwarded minutes = per-call-ceil of connected talk_s
+(`month_summary`), shown on the Telephony page, never added to AI minutes. The
+person's own leg is not in the CDR (`legs="a"`); unmapped dispositions stay
+`failed` with the raw code in `cause` until the first live tests confirm them
+(e.g. answered-but-1-not-pressed).
+
+**Prompts.** Sarvam `bulbul:v3`, speaker `shubh` (`FORWARD_PROMPT_SPEAKER`),
+en-IN, cached as `/etc/freeswitch/lescall_prompts/p_<voice>_<hash>.wav` and
+digits `d_<voice>_<n>.wav`; generated on first use, reused forever (changing
+the voice or the text makes new files).
+
+**Live state (2026-11-05).** Migration 0032 applied (all 5 numbers default to
+agent mode) · installer run 08:52 UTC, backup
+`public.xml.pre-forwarding.20261105-085243.bak`, reloadxml +OK, `xml_locate`
+shows `plivo_inbound` still first · `lescall-api` restarted (only the
+forwarding files had changed since its last start) · prompts pre-generated in
+`/etc/freeswitch/lescall_prompts` (16 WAVs, durations checked against text,
+readable by `freeswitch`) · SPA rebuilt (only the two forwarding files changed
+since the last image) · `lescall-workers` restarted, first `forwarding:` pass
+clean. **`lescall-admin` NOT restarted** — it has run since 2026-09-12 and a
+restart would deploy ~40 unrelated changed files. Until it is, its remove /
+disconnect / transfer do not touch forward files: switch a number back to *My
+agent answers* before disconnecting or handing it over in the admin console.
+
+**Tenant gate.** `/api/forward-contacts` and `/api/forwarded-calls` are in
+`auth._TENANT_API_PREFIXES`; without that every tenant session got 403 "not
+available" (tests calling endpoint functions directly cannot see it —
+`test_the_forwarding_routes_are_reachable_by_tenant_sessions` checks every
+telephony route).
+
+**The other direction (no platform change).** The Telephony page's "Let your
+agent answer your own mobile's missed calls" card shows how to point the
+owner's own SIM at an agent-mode LesCall number (Settings → Call forwarding, or
+`**61*` / `**67*` / `**62*` + number + `#`, off with `##002#`). It lists
+agent-mode numbers only, because combining it with "ring my phone first" on the
+same mobile just bounces the call.
+
+**Go-live (as run, in this order).**
+1. `docker exec -w /home/angelo/lescall lescall-api python -m shared.db.migrate` (0032).
+   BEFORE step 2: a handover would otherwise fail on the missing columns.
+2. `docker restart lescall-api` (`lescall-admin`: see Live state above).
+3. `sudo bash deploy/install_call_forwarding.sh` (backs up public.xml; restores it if reloadxml fails).
+4. `docker compose -f deploy/docker-compose.services.yml up -d --build spa`.
+5. `docker restart lescall-workers` (picks up the `--sync` pass).
+`lescall-runtime` is NOT restarted: nothing in the voice path changed.
+
+**Verify (spare number, the owner's phone).** Add + verify the phone → set the
+number to *Ring my phone first* → from another phone call the number: (a)
+answer + 1 → talk, (b) answer, don't press → agent after 8 s, (c) don't answer
+→ agent after the ring time, (d) phone off → agent, (e) caller hangs up while
+ringing, (f) two calls at once. Then `forwarded_calls` should hold one row per
+call within 5 minutes; check the CDR accountcodes for (b)'s real disposition.
+
+**Rollback.** Per number: switch it back to *My agent answers* (deletes its
+file). Everything: `sudo bash deploy/install_call_forwarding.sh --uninstall`
+(removes the include line, reloadxml). Schema: `0032_call_forwarding.down.sql`.
+
+**Tests.** `test_call_forwarding_dialplan.py` (14: XML shape, loop guard, digits,
+clamping, escape, fallback == live catch-all, installer on a copy of the live
+public.xml incl. restore-on-reject and uninstall) · `test_call_forwarding_api.py`
+(39: Indian-number rule, own-line refusal, limits, privacy, verification
+attempts/expiry/lockout, file written/deleted, line name vs label, server-not-
+ready, delete/disconnect/handover, CDR classification + sync + minutes, every
+route reachable through the tenant gate).
+
+## 85. Pramukh campaign calls on the customer account: nine calls, eleven causes — recovery, answer-aware hold, v3 agents (2026-11-13) — LIVE since 12:07 UTC (owner's instruction; `lescall-runtime` + `lescall-api` restarted, no call in progress), UNCOMMITTED
+
+**Calls.** `patelashishk007@gmail.com`, 2026-10-22 (Aristo test: 1126, 1127,
+1130, 1131, 1136, 1137) and 2026-11-04 (Green County: 1188, 1190, 1193).
+Runtime logs had rotated; diagnosis is from `calls.transcript`, `call_turns`,
+the FreeSWITCH log, the local recordings (never uploaded: GCS billing) and
+calltester replays (`/home/angelo/calltester/scripts/call11*`).
+
+**What was wrong (cause → fix).**
+
+| # | call | what the caller heard | cause | fix |
+|---|---|---|---|---|
+| 1 | 1131, 1130, 1193 | "माफ़ कीजिए, ठीक से सुनाई नहीं दिया" 3× to a perfectly transcribed "4 bhk" | the MODEL failed (first chunk 7–8.5 s / stream error) and all three failure paths speak `lang_fallbacks`; the fallback model was OpenAI gpt-4o-mini, **which has no credit** (429) | `_llm_failure_reply`: the enum answer is recorded from the caller's words, the open/next scripted question is asked; never "couldn't hear". `VOICE_LLM_FALLBACK_MODEL=gemini-3.1-flash-lite` (same key, own quota) |
+| 2 | all | 3.3–4 s per reply | `turn_taking.pause_hold_ms: 1500` charged EVERY turn (speech-end→engine 1.85 s on 94 % of Aristo turns) | `answer_hold_ms` (400): a complete answer to the question just asked (yes/no, the slot's own value, an amount) takes the short hold; `pause_hold_ms` 1500 → 1100 |
+| 3 | 1127, 1190 | 3.7 s between "yes it's me" and the introduction | "हाँ हाँ धवल जी से हो रही है बोलिए" / "ठीक है" were not plain-yes tokens → a model turn | `_is_identity_yes_wide`, bare ack; `outbound.identity_ack_line` ("OK.") spoken first as its own chunk; scripted agents' first requirement line is `script.entry_line` (no model turn) |
+| 4 | 1126 | "I won't take much time" to "I'm a bit busy"; "after how many minutes?" to "call me after a week" | busy regex needed "अभी busy" adjacent; no day/week unit in the offset parser | `says_busy` / `not_a_good_time`; `long_offset_days` ("एक हफ़्ते बाद"); owner's busy wording |
+| 5 | 1136 | "I won't take much time" to "I never showed any interest" | `इंटरेस्ट…नहीं` = objection strike 1 | `denies_interest` → removal line + close + `dnd_requested` |
+| 6 | 1137 | "when should I call?" ×3, then a goodbye with the next qualification question stapled on | "करना ही नहीं है कॉल" = `negation` → model; script floor appended after the model's goodbye | `refuses_any_call` / `flat_refusal` close on the turn; `_script_followup` never follows `agent_line_is_goodbye`; a busy caller who names no time twice gets one soft close |
+| 7 | 1188 | **the agent hung up** on the right person (FS log: our `hangup(NORMAL_CLEARING)`, no close line played) | "सही है" heard as "भाई है"; every token polite/affirmative → verdict `wrong` → close | `reconfirm_hint` (सही/ग़लत + mishearings); a bare yes to the EITHER/OR question gets the direct "am I speaking with X?"; an explicit "wrong number" + yes still closes |
+| 8 | 1131 | "couldn't hear you" + the price deflection twice to "share your cost sheet" | no deterministic path; the goal's "didn't catch it" line was used for a request | `share_request` → WhatsApp ack + the open question (without its "Understood.") |
+| 9 | 1193 | busy objection to "why so slow?"; "we'll call you in the morning" + hang-up nobody asked for | "टाइम नहीं" inside a pace complaint; "कभी भी कॉल कीजिए" = callback; the clarification answer INHERITED the pending "सुबह" | `speed_complaint` (apology once + open question); `available_anytime`; an answer must itself carry a day/time |
+| 10 | 1130 | "I can hear you. Sorry, I couldn't hear you…" | presence check repeated the canned fallback | repeats the real open question, apology head stripped |
+| 11 | 1131 replay | `budget_range = '4 BHK'` | repeated size answer while the budget was asked | a money slot rejects a size with no money unit |
+
+**Not fixed — say so.** (a) Call 1190's lost "रविवार": the recording has it
+(128.2–128.9 s, RMS 900–1800, transcribes cleanly alone) starting ~0.8 s after
+the agent's question ended; which gate dropped it cannot be told without the
+rotated log. Next occurrence: grep `[ECHO-GATE]` / `[SHADOW]` / `[BARGE-IN]`
+around the turn. (b) Call 1188's close line was never played before the
+hangup. (c) Background speech transcribed as turns (1130 "क्वालिटी बहुत है").
+(d) **The Gemini key is on the FREE tier** (`TotalCachedContentStorageTokens
+PerModelFreeTier … limit=0`): no context cache (7–10k-token prompt uncached
+every turn) and free-tier rate limits — the model timeouts in #1 are campaign
+concurrency against that limit. Billing is the owner's fix; nothing here can
+replace it.
+
+**Where.** `app/voice/call_recovery.py` (pure detectors, swept over 11,408
+corpus caller lines) · `conversation.py` (`_refusal_kind`, `_llm_failure_reply`,
+`_pending_question`, `turn_is_complete_answer`, `_reconfirm_verdict`,
+`_identity_ack_line`) · `pipeline._answer_hold_s` · `state_manager._size_not_
+money` · schema `call_flow.recovery`, `outbound.identity_ack_line`,
+`turn_taking.answer_hold_ms`. Everything behavioural is opt-in
+(`call_flow.recovery.enabled`); global: the reconfirm verdict, week offsets,
+"must carry a time", goodbye guard, money check.
+
+**Agents.** `deploy/apply_pramukh_v3.py --apply` wrote all 16 agents on the
+customer account (one revision each); `--copy-v3` created `pramukh_<project>_v3-*`
+(+ `pramukh_ravi_swarit_v3-*`) on angelo@, ids 276–291, inactive.
+
+**Measured.** callsim, same pipeline: speech-end→engine 1.84–1.94 s (1500 hold)
+→ 1.43–1.58 s (1100). The 400 ms answer hold is unit-tested, not yet seen on a
+live call. Replays: 1126 → owner's busy line → "एक हफ़्ते बाद" + close; 1136 →
+removal line + close on turn 2; 1137 → closed on turn 4, no pitch; 1188 →
+good-time line instead of the hangup; 1131 → no "couldn't hear" for "4 bhk",
+cost sheet acknowledged.
+
+**Tests.** `test_call_recovery.py` (107) · `test_identity_reconfirm.py` updated
+for the either/or rule. Full suite: 10 pre-existing failures (missing
+`kaapd_pooja` YAML, date-dependent bookings, stale Green County snapshot), none
+from this change.
+
+**Rollback.** Per agent: `call_flow.recovery.enabled: false` (or the store's
+previous revision). Fallback model: delete `VOICE_LLM_FALLBACK_MODEL` from
+`calling-agent/.env`. Code: revert the files above + restart both containers.
+
+### 85.9 Owner test call 1221 (2026-11-14): removal is OFFERED and CONFIRMED, Gujarati is understood but answered in Hindi
+
+Call 1221 on `pramukh_ravi_swarit_v3-outbound`: "मैंने तो लेकिन कभी इंटरेस्ट
+दिखाया ही नहीं" three times → the busy line, then the escalation handoff.
+`denies_interest` only knew "इंटरेस्ट … नहीं दिखाया" in that order; free word
+order is now one clause holding an interest word and a negated show-verb
+(`_denies_interest_free_order`; 5 hits in 11,425 corpus caller lines, all
+genuine).
+
+The owner replaced the immediate removal line with a flow
+(`call_flow.recovery.removal_confirm: true`; lines `removal_offer`,
+`removal_confirm_line`, `removal_keep`, `removal_close`):
+denial → offer ("…list से आपका नाम हटा दूँ?") → yes → one more confirmation →
+yes → close line + hangup + `dnd_requested`. A "no" at either step speaks the
+keep line + the question that was open and the call continues; the caller is
+not offered removal a second time (`_removal_declined`). Repeating the denial
+counts as a yes; an explicit keep/remove phrase outranks a leading yes/no
+(`call_recovery.removal_answer`). An unclear reply repeats the question once,
+then the turn goes back to the normal flow. "कॉल मत करना" (`no_call`) still
+closes at once with `no_interest_close`. Without `removal_confirm` the §85
+behaviour is unchanged.
+
+Gujarati: only the Ravi pair had `languages.supported: [hi, en, gu]`; the
+other seven families are Hindi-only with STT forced to hi-IN. `gu` is removed
+from `supported` (the reply-language bound) and an always-rule tells the
+model to answer Gujarati in Hindi; the `gu` lines stay in the YAML as dormant
+data (rollback = put `gu` back). STT on Ravi still auto-detects, so real
+Gujarati arrives in Gujarati script and is understood.
+
+Verified with calltester (`/home/angelo/calltester/scripts/v3_removal/`): 24
+offline scenarios (remove / keep at step 1 / keep at step 2 × 8 v3 outbound
+agents) PASS; call 1222 replay and a six-line genuine-Gujarati script on Ravi
+v3 with the real model — every reply Hindi. Tests: `test_call_recovery.py`
+133. Agents: `deploy/apply_pramukh_v3.py --apply --copy-v3` (16 customer
+agents one new revision each; v3 copies → revision 2).
+
+### 85.10 Owner test call 1224 (2026-11-14): an answer absorbed as a stale tail; the share shortcut promised the wrong project
+
+**"तो vapi में ही हूँ" → "माफ़ कीजिए, मुझे आपकी आवाज़ नहीं आई".** The caller
+said "तो" at 09:52:39.8 (before the agent's question had played; rejected by
+STT validation as low quality) and "Vapi में ही हूँ" at 09:52:46.4, 0.7 s
+after the question finished. `_retx_apply` joined both pieces and gave the
+turn the EMPTY piece's start time, so the stale-fragment rule ("speech began
+before the delivered reply") absorbed the answer, nothing replied, and the
+6.3 s dead-air repair spoke the reprompt. Pre-existing (the joined pass is
+from 2026-10-07), not a §85 regression. Fix: speech that ENDED more than
+`STALE_FRAGMENT_END_GRACE_S` (1.5) after the reply started playing is never a
+stale tail.
+
+**Brochure for Swarit after Aura was agreed.** A §85 regression: the
+`share_request` shortcut fired on "शाम को समय ठीक रहेगा और ब्रोशर भी भेज
+देना" (which also answered the visit-time question) and on "डिटेल्स किस चीज़
+की भेजोगे?" (a question), spoke the fixed line and appended
+`_pending_question()` — the unanswered Swarit size slot from three minutes
+earlier. It pre-empted the model and the §72 share tracker. Now: the shortcut
+is `bare_share_request` only (≤ 9 words, not a question); its line names the
+project (`recovery.share_ack_project` with `{project}`: named in the request →
+tracker topic → last project the agent named → pitch; resolved BEFORE
+`_personalize`, which strips unknown tokens); `_pending_question` prefers the
+question the agent has just asked over an older slot ask. The Ravi pair never
+had `follow_up.whatsapp_promise.track_projects` — switched on (+
+`offer_from_roles` like the other seven).
+
+Verified: the call's own context injected into the live router
+(scratchpad `aura_ctx.py`) — Ravi, Green County and Aristo v3 answer "what
+will you send?" with Pramukh Aura; the bare request names Aura and re-puts the
+visit-time question. The stale-fragment change has no audio-level test.
+
+Also seen on 1224, NOT fixed: two model stalls at the 7 s timeout and one
+stream failure (free-tier key, §85), each producing a bridge line and then a
+second reply; a Sarvam key returned 402 at call start and the Whisper
+fallback has no credit (first caller segment lost); the 900 ms splitter hold
+was active on most turns.
+
+### 85.11 Call 1230 (2026-11-16): primary model ~10 s per turn — the fallback could never answer; hedged request
+
+`pramukh_aristo_v3-outbound`, every model turn → "माफ़ कीजिए, एक second — ज़रा
+एक बार फिर बताएँगे?" (LLM: 0 req). Probe on the platform key: `gemini-3.5-
+flash-lite` first token 8–11 s on a one-line prompt (intermittently 1 s);
+`gemini-3.1-flash-lite`, `3.5-flash`, `3.6-flash` ≈ 1 s. The §85 fallback
+only started AFTER the primary's own 7 s timeout, when the turn's deadline
+(`stream_timeout_s`) had already passed — it rescued fast failures (429) and
+never a slow primary.
+
+`_hedged_stream_create`: the fallback starts once the primary has been silent
+`VOICE_LLM_HEDGE_S` (2.5; 0 = off) and the first stream back wins; two
+consecutive losses put the fallback FIRST (primary as hedge) for
+`VOICE_LLM_SLOW_HOLD_S` (180), process-wide. A sibling fallback on the primary
+endpoint now gets the provider extras (reasoning effort). The presence check
+no longer repeats the bridge line (`_is_canned_fallback`). Replay on Aristo v3
+with the primary still slow: every turn answered, 1.3–4.8 s to first token.
+Tests: `tests/test_llm_hedge.py` (5). Live since the 06:4x UTC restart of
+`lescall-runtime`.
+
+Owner-side, unchanged: OpenAI key has no credit (Whisper fallback + old LLM
+fallback dead); GCS billing delinquent (recordings stay local); Gemini key on
+the free tier (context cache refused).
+
+### 85.12 Call 1232 (2026-11-16): answers matched by SOUND against the options just asked
+
+"3 BHK" under hi-IN came back "पी वी एच के", "फिर ही अच्छे", "पीडीएचके"; the
+same question was asked three times (the §81 re-read skips turns over six
+words and returned the same text when it ran).
+
+`app/voice/phonetic_match.py` (pure functions): each option's own name is
+expanded into its spoken forms (digits → three/तीन, letter acronyms → letter
+names), both sides are reduced to one coarse phoneme alphabet (Devanagari,
+Gujarati, Latin) and compared with a weighted edit distance (a vowel costs
+more than a consonant; same-class consonants are cheap). `best_match` →
+`accept` (sim ≥ 0.84, margin ≥ 0.10), `confirm` (≥ 0.76, margin ≥ 0.03) or
+nothing. Opt-in `languages.phonetic_match`.
+
+Engine (`_phonetic_option_fix`, right after the machine gate): only for an
+unanswered ENUM question the agent's last line asked, after exact matching
+found nothing, no "?" and ≤ 14 words. Options = the ones the last line
+offered when it named two or more, else the slot's list. `accept` appends the
+canonical value to the turn text ("… (3 BHK)") so every reader downstream
+agrees; `confirm` speaks "आपने 3 BHK कहा — सही है?" once per slot per call —
+yes stores it, a no with exactly two options stores the other.
+
+Synonyms are NOT matched by sound: they are everyday words ("चाहिए", "खुद")
+and produced 31 false accepts over 1,281 Pramukh caller lines against 1 with
+option names only. Sweep script: scratchpad `sweep.py`; re-run before
+changing a threshold. Cost ≤ 60 ms on the worst slot (a class-overlap
+pre-filter; without it 350 ms on the event loop).
+
+Limits: enum slots only — a free-text city ("Vapi" → "भाभी"), amounts and
+dates are not covered; a wrong confirm on a list of three or more options
+falls back to the normal flow.
+Tests: `tests/test_phonetic_match.py` (20). Replays: Aristo ×3, Ravi, Green
+County v3.
+
+### 85.13 Call 1232 follow-ups (2026-11-16): cities by sound, a false apology behind an answer, the Vivan brochure
+
+- **Cities by sound** (`phonetic_match.name_match`, inside
+  `_contextual_city_fix`, same `languages.phonetic_match` flag): the word
+  where the place goes (first word, or the one before में / से) is compared
+  to `knowledge_base.locations`; ≥ 0.80, a clear lead, length within one
+  phoneme, never an everyday word (`_NOT_A_NAME`). "भाभी में ही हूं" → "Vapi में
+  ही हूं". Sweep over 3,163 short caller lines: "sure"→Surat ×15, "happy",
+  "जरूरत", "shut" before the length rule and the stop list; none after.
+- **"…cost sheet share कर देगी। माफ़ कीजिए, ठीक से सुनाई नहीं दिया — location,
+  size…?"** The model answered the caller's price question; the `ask_verbatim`
+  floor then appended `decision_factor`'s `reask_question` (the "didn't hear"
+  form, used from the second ask). Behind a reply of six words or more the
+  floor now appends the plain question.
+- **Vivan brochure "not received"**: `wa_sends` id 4 (call 1232) `sent`
+  06:51:08 UTC to the dialled number, project Pramukh Vivan, media 6; nginx
+  shows `facebookexternalhit` fetching the whole PDF (200, 5,685,297 bytes)
+  at 06:51:13. Delivery to the handset is not visible to us — the Interakt
+  webhook secret is still unset, so no delivered/read receipt ever arrives.
+
+### 85.14 Parity audit + warm-up after quiet (2026-11-16)
+
+**Owner: "every Pramukh agent must behave like the Aristo v3 I tested."**
+Audit of the 8 families (×2 accounts): Aristo and Blue Stone are the same
+scripted build (10 stages, 6 scripted); Vedanta is the same pattern minus
+DECLINED_CLOSE (9 / 5). Green County, Silver Stone, Swarit, Vivan and the
+Ravi pair are the GENERIC model-led build (7 stages, no script, 160-token /
+400-char replies) — a different flow, not a setting. Aligned now, all 32
+agents: ONE `turn_taking` profile (Aristo's: pause 1100, answer 400,
+backchannel guard, tail barge-in, sustained barge 700, 6 fragments) and
+`stt_enum_recheck` wherever STT is locked. NOT done: converting the five
+generic families to the scripted flow — each scripted agent is ~800 lines of
+project-specific authored lines from the sheet (see
+`build_pramukh_blue_stone_test.py`), and Silver Stone / Swarit still have
+open owner decisions on facts. Ravi keeps English + auto STT.
+
+**"The first calls after a quiet spell are slow."** True, and ours:
+`warmup()` on the LLM, SarvamSTT and SarvamTTS was guarded by a
+once-per-PROCESS flag, so only the first call after a container restart was
+warmed. After hours idle: closed keep-alive connections (STT first turn 1.7 s
+vs 0.2 s median, TTS 0.59 vs 0.24) and a cold model path (first two model
+turns 6.7 s on 2026-11-14 09:51 after 5.5 h idle). Now every call re-warms
+when the last warm-up is older than `VOICE_WARMUP_REFRESH_S` (120), in the
+background while the opening plays, and `_rewarm_llm` TIMES the primary: over
+the hedge delay or no answer → fallback-first before the caller's first
+model turn. Tests: `test_llm_hedge.py` (8). Not yet observed on a live call.

@@ -106,6 +106,21 @@ _AMOUNT_WORD_RE = re.compile(
     r"सत्तर|अस्सी|नब्बे|सौ|डेढ़|ढाई|सवा|साढ़े", re.IGNORECASE)
 
 
+# A flat size is not a budget (RUNBOOK §85): a caller who repeated "4 bhk"
+# while the agent had moved on to the budget question got budget_range =
+# "4 BHK", which killed the budget-fit check for the rest of the call.
+_SIZE_WORD_RE = re.compile(
+    r"bhk|बीएचके|बी\s*एच\s*के|bedroom|\brk\b", re.IGNORECASE)
+_MONEY_UNIT_RE = re.compile(
+    r"लाख|करोड़|करोड|हज़ार|हजार|lakh|lac\b|lacs\b|crore|\bcr\b|₹|\brs\b|"
+    r"rupee|રૂપિય|લાખ|કરોડ|हज़ार|thousand", re.IGNORECASE)
+
+
+def _size_not_money(text: str) -> bool:
+    t = str(text or "")
+    return bool(_SIZE_WORD_RE.search(t)) and not _MONEY_UNIT_RE.search(t)
+
+
 def _looks_like_amount(text: str) -> bool:
     """Carries a digit, or a money unit / number word — nothing about it
     says it is a figure otherwise ("No", "नहीं देखना", "flexible")."""
@@ -840,7 +855,9 @@ class ConversationStateManager:
                 # the value and the caller's words must carry a number or a
                 # money unit.
                 if not _looks_like_amount(str(new)) or (
-                        utterance and not _looks_like_amount(utterance)):
+                        utterance and not _looks_like_amount(utterance)) \
+                        or _size_not_money(str(new)) or (
+                        utterance and _size_not_money(utterance)):
                     self.update_audit_log(
                         key, old, old, source,
                         f"REJECTED {source} write {new!r}: not an amount "

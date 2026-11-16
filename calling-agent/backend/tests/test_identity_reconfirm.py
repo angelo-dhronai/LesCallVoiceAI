@@ -112,7 +112,12 @@ def test_a_wrong_number_phrase_is_reconfirmed_first():
 def test_english_agents_get_the_english_question_and_apology():
     r = make_router(lang="en")
     assert "Just to confirm once more" in said(drive(r, "no"))
+    # RUNBOOK §85: "yes" answers neither half of "wrong number, or the
+    # right one?" — the direct question follows, and a "no" to THAT closes.
     out = said(drive(r, "yes"))
+    assert "am I speaking with Vishal" in out
+    assert not r.state.is_closing and r._wrong_number_pending == 2
+    out = said(drive(r, "no"))
     assert "My apologies" in out
     assert r.state.is_closing and r.hangup_pending
 
@@ -127,9 +132,47 @@ def test_authored_lines_win_over_the_built_ins():
 # ── what the answer to the re-confirmation does ─────────────────────────────
 
 @pytest.mark.parametrize("answer", [
-    "हाँ", "हाँ जी", "जी", "ठीक है", "सही", "हाँ सही है", "बिल्कुल", "ok",
-    "yes", "नहीं", "नहीं गलत नंबर है", "galat number hai", "जी रॉन्ग नंबर।",
-    "मैं वो नहीं हूँ",
+    "हाँ", "हाँ जी", "जी", "ठीक है", "बिल्कुल", "ok", "yes", "हा",
+])
+def test_a_bare_yes_to_the_either_or_question_gets_the_direct_question(answer):
+    """RUNBOOK §85 (call 1188): "ग़लत नंबर है या सही?" → "हा" used to CLOSE
+    the call as a wrong number. It answers neither half."""
+    r = make_router()
+    drive(r, "नहीं")
+    out = said(drive(r, answer))
+    assert "क्या मैं Vishal जी से ही बात कर रहा हूँ" in out, answer
+    assert not r.state.is_closing and not r.hangup_pending
+    assert r._wrong_number_pending == 2
+    # …and a yes to the direct question is a yes.
+    out = said(drive(r, "हाँ"))
+    assert "अभी दो मिनट" in out
+    assert r._good_time_spoken is True and not r.state.is_closing
+
+
+@pytest.mark.parametrize("answer", [
+    "सही", "हाँ सही है", "सही है", "भाई है।", "सई है", "करेक्ट", "sahi hai",
+])
+def test_sahi_and_what_stt_makes_of_it_means_the_right_number(answer):
+    """Call 1188: "सही है" was transcribed "भाई है" and the agent hung up."""
+    r = make_router()
+    drive(r, "नहीं")
+    out = said(drive(r, answer))
+    assert "अभी दो मिनट" in out, answer
+    assert not r.state.is_closing and r._wrong_number_pending == 0
+
+
+def test_a_no_to_the_direct_question_closes():
+    r = make_router()
+    drive(r, "नहीं")
+    drive(r, "हाँ")
+    out = said(drive(r, "नहीं"))
+    assert "तकलीफ़ के लिए माफ़" in out
+    assert r.state.is_closing and r.call_outcome == "wrong_number"
+
+
+@pytest.mark.parametrize("answer", [
+    "नहीं", "नहीं गलत नंबर है", "galat number hai", "जी रॉन्ग नंबर।",
+    "मैं वो नहीं हूँ", "गलत है भाई।",
 ])
 def test_a_yes_an_acknowledgement_or_a_repeated_no_closes_with_the_apology(answer):
     r = make_router()
@@ -185,7 +228,7 @@ def test_an_unclear_answer_is_asked_once_more_then_the_call_is_closed():
     r = make_router()
     drive(r, "नहीं")
     out = said(drive(r, "हम्म क्या मतलब"))
-    assert "confirmation के लिए" in out
+    assert "बस confirm करना था" in out        # the direct yes/no question
     assert r._wrong_number_pending == 2 and not r.state.is_closing
     out = said(drive(r, "अरे कुछ समझ नहीं आया"))
     assert "तकलीफ़ के लिए माफ़" in out

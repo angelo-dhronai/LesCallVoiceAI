@@ -622,6 +622,13 @@ STALE_FRAGMENT_SUPPRESS = os.environ.get(
 # RUNBOOK §55.5) absorbed a 6.1 s, fifteen-word question ("tell me a project
 # name… which projects are available") and the caller never got an answer.
 STALE_FRAGMENT_MAX_MS = float(os.environ.get("STALE_FRAGMENT_MAX_MS", "3000"))
+# Speech that ENDED this long after the delivered reply started playing is
+# an answer to that reply, whatever began it. Call 1224 (2026-11-14): a
+# rejected "तो" spoken before the question was joined with "Vapi में ही हूँ"
+# spoken after it, the joined turn took the "तो"'s start time, and the
+# caller's answer was absorbed as a stale tail → "couldn't hear you".
+STALE_FRAGMENT_END_GRACE_S = float(
+    os.environ.get("STALE_FRAGMENT_END_GRACE_S", "1.5"))
 # RUNBOOK §81: the enum-answer re-read without the STT language lock waits
 # at most this long; past it the locked transcript stands.
 ENUM_RECHECK_TIMEOUT_S = float(os.environ.get("ENUM_RECHECK_TIMEOUT_S", "1.5"))
@@ -3044,6 +3051,33 @@ class VoicePipeline:
         return max(TURN_CONTINUATION_HOLD_MS,
                    self._tt_num("pause_hold_ms")) / 1000.0
 
+    def _answer_hold_s(self, transcript: "Transcript") -> float | None:
+        """The SHORT hold for a turn that is, on its face, a complete answer
+        to the question the agent just asked — a yes/no, one of the asked
+        slot's own values, an amount (call_flow.turn_taking.answer_hold_ms,
+        RUNBOOK §85). None when the agent did not opt in, the segment ran
+        narrative-long, or this caller has twice resumed through a pause.
+
+        `pause_hold_ms` charges EVERY reply its full hold (1.5 s on the
+        scripted Pramukh agents: measured speech-end → engine 1.85 s on 94 %
+        of turns, 2026-10-22) — right for a caller mid-thought, pure dead
+        air after "हाँ" or "4 BHK"."""
+        ms = self._tt_num("answer_hold_ms")
+        if ms <= 0.0:
+            return None
+        if transcript.duration_ms >= TURN_NARRATIVE_SPEECH_MS:
+            return None
+        if TURN_SPLIT_MEMORY and self._caller_split_turns >= 2:
+            return None
+        fn = getattr(self.conversation, "turn_is_complete_answer", None)
+        if not callable(fn):
+            return None
+        try:
+            return ms / 1000.0 if fn(transcript.text) else None
+        except Exception:
+            logger.exception("[ENGINE] complete-answer check failed")
+            return None
+
     def _agent_audio_remaining(self, at_ts: float) -> float:
         """Seconds of OUR audio still to play at `at_ts` — the sink's playback
         clock, which outlives `_tts_playing` (synthesis finishes long before
@@ -3868,12 +3902,25 @@ class VoicePipeline:
                 # The idle guards below still apply, so this only fast-paths
                 # when nothing else is in flight and the caller is not talking.
                 and not _is_self_contained_greeting(transcript.text))
+            # A complete answer to the question just asked takes the agent's
+            # short answer hold in place of the pause hold / fragment hold
+            # (RUNBOOK §85). Never when a capture is armed or the sentence
+            # dangles; a caller already talking again still re-arms below.
+            _answer_s = (None if (_capture_active or _dangling)
+                         else self._answer_hold_s(transcript))
+            _answer_held = False
+            if _answer_s is not None and (_continues or _fragment):
+                merge_wait_s = _answer_s
+                _answer_held = True
+                _continues = ""
+                _fragment = False
             if (
                 TRANSCRIPT_MERGE_SKIP_WHEN_IDLE
                 and not _capture_active
                 and not _dangling
                 and not _continues
                 and not _fragment
+                and not _answer_held
                 and self._transcript_queue.empty()
                 and self._stt_queue.empty()
                 and self._stt_inflight == 0
@@ -3881,6 +3928,11 @@ class VoicePipeline:
             ):
                 merge_wait_s = 0.0
                 logger.info("[ENGINE] Merge window skipped (idle)")
+            elif _answer_held:
+                logger.info(
+                    "[ENGINE] Merge window held %.0fms (complete answer %r "
+                    "— short answer hold)", merge_wait_s * 1000.0,
+                    transcript.text[:24])
             elif _continues and not _dangling:
                 logger.info(
                     "[ENGINE] Merge window held %.0fms (%s — this caller "
@@ -4165,6 +4217,10 @@ class VoicePipeline:
                     and getattr(self, "_last_reply_tts_start", 0.0) > 0.0
                     and transcript.speech_start_ts
                     < self._last_reply_tts_start
+                    and not (transcript.speech_end_ts > 0.0
+                             and transcript.speech_end_ts
+                             > self._last_reply_tts_start
+                             + STALE_FRAGMENT_END_GRACE_S)
                     and getattr(self, "_last_reply_completed_clean", False)):
                 self._turn_accumulator = (
                     (self._turn_accumulator + " " + transcript.text).strip())

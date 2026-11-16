@@ -46,7 +46,15 @@ KNOWN_LEAF_KEYS: dict[str, frozenset[str]] = {
     # deferred-barge override, tail cut).
     "call_flow.turn_taking": frozenset({
         "pause_hold_ms", "max_merged_fragments", "backchannel_guard",
-        "sustained_barge_ms", "tail_barge_in"}),
+        "sustained_barge_ms", "tail_barge_in",
+        # RUNBOOK §85: the shorter hold for a turn that is a complete
+        # answer to the question just asked.
+        "answer_hold_ms"}),
+    # RUNBOOK §85: campaign-call recovery lines + switch.
+    "call_flow.recovery": frozenset({
+        "enabled", "no_interest_close", "share_ack", "speed_apology",
+        "soft_close", "share_ack_project", "removal_confirm", "removal_offer",
+        "removal_confirm_line", "removal_keep", "removal_close"}),
     "call_flow.completed_when": frozenset({
         "required_slots", "require_appointment", "all_collect_filled"}),
     "call_flow.scheduling": frozenset({

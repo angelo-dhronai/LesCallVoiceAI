@@ -57,6 +57,17 @@ _ROUTER_SCALARS = (
     "_identity_other",
     "_visit_declined_turn",
     "_visit_answer_first_turn",
+    # RUNBOOK §85
+    "_share_acks",
+    "_speed_apologies",
+    "_phon_pending",
+    "_phon_confirmed",
+    "_removal_step",
+    "_removal_unclear",
+    "_removal_declined",
+    "_removal_resume_q",
+    "_wrong_number_explicit",
+    "_identity_ack_spoken",
 )
 
 # Router attributes holding flat containers (shallow copy suffices).

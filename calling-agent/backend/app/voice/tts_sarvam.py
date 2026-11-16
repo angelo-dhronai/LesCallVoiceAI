@@ -413,9 +413,15 @@ class SarvamTTS(StreamingTTS):
         httpx per-host pool; errors are silently ignored. Runs at most once
         per process (class flag).
         """
-        if SarvamTTS._warmup_done_flag:
-            logger.debug("[TTS:Sarvam] Warmup skipped — already done this process")
+        # Once per quiet spell, not once per process (RUNBOOK §85.14): an
+        # idle keep-alive connection is closed by the far end, and the first
+        # request of the next call paid the handshake again (STT 1.7 s
+        # against a 0.2 s median on 2026-11-16).
+        import time as _t
+        if (SarvamTTS._warmup_done_flag
+                and _t.monotonic() - getattr(SarvamTTS, "_warmed_at", 0.0) < 120.0):
             return
+        SarvamTTS._warmed_at = _t.monotonic()
         try:
             client = self._get_client()
             await asyncio.wait_for(client.head(SARVAM_TTS_STREAM_URL), timeout=3.0)

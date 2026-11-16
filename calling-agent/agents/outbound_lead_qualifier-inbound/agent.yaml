@@ -12,7 +12,6 @@ languages:
   supported:
   - hi
   - en
-  - gu
   default: hi
   tts_voices:
     hi:
@@ -44,6 +43,9 @@ languages:
       in Gujarati script and leave real-estate and everyday English words in English
       (project, site visit, budget, option, plan).
   stt_forced_language: ''
+  stt_enum_recheck: false
+  phonetic_match: true
+  tts_numbers_english: false
   allow_code_mixing: true
   tts_lang_from_text: true
   evidence_switch: true
@@ -73,6 +75,7 @@ call_flow:
       all_collect_filled: true
       max_turns: 3
     branches: []
+    script: {}
   - id: LET_THEM_TALK
     order: 1
     goal: 'Let them tell you what they''re after and listen for what they volunteer
@@ -100,6 +103,7 @@ call_flow:
       all_collect_filled: true
       max_turns: 4
     branches: []
+    script: {}
   - id: SOFT_QUALIFICATION
     order: 2
     goal: 'If you still don''t know who''ll be living there or the size they need,
@@ -123,6 +127,7 @@ call_flow:
       all_collect_filled: true
       max_turns: 3
     branches: []
+    script: {}
   - id: PRESENT_SWARIT
     order: 3
     goal: 'Now bring it together around Swarit — 4 and 5 BHK bungalows in New Chala,
@@ -154,6 +159,7 @@ call_flow:
       all_collect_filled: true
       max_turns: 3
     branches: []
+    script: {}
   - id: INVITE_SITE_VISIT
     order: 4
     goal: Shift from telling to inviting. Say, in your own words, that photos and
@@ -174,6 +180,7 @@ call_flow:
       appointment_captured: true
       max_turns: 4
     branches: []
+    script: {}
   - id: CONFIRM_AND_CLOSE
     order: 5
     goal: 'Wrap up like a person who is looking forward to meeting them. If a visit
@@ -192,6 +199,7 @@ call_flow:
     collect: []
     advance_when: {}
     branches: []
+    script: {}
   decline_threshold: 2
   call_goal: Understand what this family is looking for, present Pramukh Swarit —
     4 and 5 BHK bungalows in New Chala, Vapi — as the home for them, answer any question
@@ -229,6 +237,52 @@ call_flow:
         कर सकता हूँ?
       gu: નમસ્તે, હું રવિ બોલું છું Pramukh Group માંથી — કહો, આજે હું તમારી શું મદદ
         કરી શકું?
+  turn_taking:
+    answer_hold_ms: 400
+    pause_hold_ms: 1100
+    max_merged_fragments: 6
+    backchannel_guard: true
+    sustained_barge_ms: 700
+    tail_barge_in: true
+  recovery:
+    enabled: true
+    no_interest_close:
+      hi: माफ़ कीजिए, आपको परेशान करने के लिए। मैं आपका नंबर list से हटा देता हूँ।
+        आपका दिन शुभ हो।
+      en: I'm sorry to have troubled you. I'll take your number off our list. Have
+        a good day.
+      gu: તમને તકલીફ આપવા બદલ માફ કરશો. હું તમારો નંબર list માંથી કાઢી નાખું છું.
+        તમારો દિવસ શુભ રહે.
+    share_ack_project:
+      hi: ज़रूर, मैं इस call के तुरंत बाद {project} की complete cost sheet और details
+        आपके WhatsApp पर share कर देता हूँ।
+      en: Of course — I'll send the {project} cost sheet and details to you on WhatsApp
+        right after this call.
+    removal_confirm: true
+    removal_offer:
+      hi: माफ़ कीजिएगा अगर आपको Pramukh properties में अब दिलचस्पी नहीं है। अगर आप
+        बोलें तो मैं list से आपका नाम हटा दूँ?
+      en: I'm sorry if you are no longer interested in Pramukh properties. If you'd
+        like, shall I take your name off the list?
+    removal_confirm_line:
+      hi: बस confirmation के लिए आख़िरी बार बता दीजिए, ताकि हम आपको दोबारा call न
+        करें — आपका नाम contact list से हटा दूँ?
+      en: Just to confirm one last time, so that we don't call you again — shall I
+        remove your name from the contact list?
+    removal_keep:
+      hi: ठीक है {honorific}, अगर आप चाहते हैं कि हम नाम न हटाएँ तो continue करते
+        हैं।
+      en: All right {honorific}, since you'd like us to keep your name, let's continue.
+    removal_close:
+      hi: तकलीफ़ के लिए माफ़ी माँगता हूँ, आपका दिन शुभ हो।
+      en: I apologise for the trouble. Have a good day.
+    share_ack:
+      hi: ज़रूर, मैं इस call के तुरंत बाद complete cost sheet और project details आपके
+        WhatsApp पर share कर देता हूँ।
+      en: Of course — I'll send the complete cost sheet and project details to you
+        on WhatsApp right after this call.
+      gu: ચોક્કસ, આ call પછી તરત જ હું complete cost sheet અને project details તમારા
+        WhatsApp પર share કરી દઉં છું.
 knowledge_base:
   known_projects:
     swarit:
@@ -985,16 +1039,17 @@ response_bank:
   identity_responses: {}
   objection_responses:
     en:
-    - Totally fair — I'll keep it short. Or if it's a bad time, tell me when suits
-      and I'll call then.
+    - No problem at all. If now isn't a good time, just tell me when you'll be available
+      so we can talk.
     - No problem at all. If it comes back on your mind, I'm one call away — thank
       you for your time.
     hi:
-    - बिल्कुल, मैं ज़्यादा टाइम नहीं लूँगा। या अगर अभी ठीक नहीं है तो बताइए कब कॉल
-      करूँ।
+    - कोई बात नहीं। अगर अभी ठीक नहीं है तो बता दीजिएगा आप कब available रहेंगे, ताकि
+      हम बात कर सकें।
     - कोई बात नहीं। कभी भी मन बने तो मैं एक कॉल दूर हूँ — आपके समय के लिए धन्यवाद।
     gu:
-    - ચોક્કસ, હું વધુ સમય નહીં લઉં. અથવા અત્યારે ઠીક ન હોય તો કહો, ક્યારે ફોન કરું.
+    - કોઈ વાંધો નહીં. અત્યારે ઠીક ન હોય તો કહેજો તમે ક્યારે available રહેશો, જેથી
+      આપણે વાત કરી શકીએ.
     - કોઈ વાંધો નહીં. ક્યારેય મન થાય તો હું એક ફોન જેટલો જ દૂર છું — તમારા સમય માટે
       આભાર.
   decline_farewell:
@@ -1135,7 +1190,15 @@ llm_config:
   enable_tools: shadow
   extra_never_rules:
   - invent a price or possession date that is not listed
-  extra_always_rules: []
+  - ask a qualification question, pitch or invite a visit after the caller has declined
+    the call, asked not to be called, or after you have said goodbye or promised a
+    callback
+  extra_always_rules:
+  - use the 'माफ़ कीजिए, ठीक से सुनाई नहीं दिया' re-ask ONLY when the caller's answer
+    was genuinely unintelligible; when they ask a question or make a request instead
+    of answering, answer or acknowledge that first, then ask your question once
+  - reply in Hindi even when the caller speaks Gujarati or their words arrive in Gujarati
+    script — understand what they said and answer it in Hindi
   record_details_on_main_call: false
 personality:
   pronouns: he
@@ -1204,6 +1267,7 @@ slots:
   extract_patterns: []
   depends_on: []
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 2
   reask_question:
@@ -1226,6 +1290,7 @@ slots:
   extract_patterns: []
   depends_on: []
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 1
   reask_question: {}
@@ -1276,6 +1341,7 @@ slots:
   extract_patterns: []
   depends_on: []
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 1
   reask_question: {}
@@ -1295,6 +1361,7 @@ slots:
   extract_patterns: []
   depends_on: []
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 1
   reask_question: {}
@@ -1370,6 +1437,7 @@ slots:
   extract_patterns: []
   depends_on: []
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 2
   reask_question: {}
@@ -1446,6 +1514,7 @@ slots:
   extract_patterns: []
   depends_on: []
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 1
   reask_question: {}
@@ -1469,6 +1538,7 @@ slots:
   depends_on:
   - configuration_required
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 1
   reask_question: {}
@@ -1536,6 +1606,7 @@ slots:
   extract_patterns: []
   depends_on: []
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 0
   reask_question: {}
@@ -1615,6 +1686,7 @@ slots:
   extract_patterns: []
   depends_on: []
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 1
   reask_question: {}
@@ -1669,6 +1741,7 @@ slots:
   extract_patterns: []
   depends_on: []
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 0
   reask_question: {}
@@ -1688,6 +1761,7 @@ slots:
   extract_patterns: []
   depends_on: []
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 0
   reask_question: {}
@@ -1710,6 +1784,7 @@ slots:
   extract_patterns: []
   depends_on: []
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 0
   reask_question: {}
@@ -1729,6 +1804,7 @@ slots:
   extract_patterns: []
   depends_on: []
   merge_policy: free
+  ask_gated: false
   confirm_readback: ''
   max_asks: 0
   reask_question: {}
@@ -1771,9 +1847,20 @@ outbound:
       properties and projects. Is this a good time to talk?
   pitch: {}
   wrong_person_response: {}
-  busy_response: {}
+  busy_response:
+    hi: कोई बात नहीं। अगर अभी ठीक नहीं है तो बता दीजिएगा आप कब available रहेंगे, ताकि
+      हम बात कर सकें।
+    en: No problem at all. If now isn't a good time, just tell me when you'll be available
+      so we can talk.
+    gu: કોઈ વાંધો નહીં. અત્યારે ઠીક ન હોય તો કહેજો તમે ક્યારે available રહેશો, જેથી
+      આપણે વાત કરી શકીએ.
   wrong_number_close: {}
   wrong_number_patterns: []
+  wrong_number_reconfirm_line: {}
+  identity_ack_line:
+    hi: OK.
+    en: OK.
+    gu: OK.
   opening_greeting:
     gu: હેલો
     hi: हेलो
@@ -1853,6 +1940,11 @@ follow_up:
     - Swarit brochure
     - Swarit site location pin (opposite Pramukh Sahaj, New Chala)
     - Ravi's direct number
+    track_projects: true
+    offer_from_roles:
+    - recommend
+    - scheduling
+    - confirmation
   callback:
     enabled: true
   clarify_commitments:
@@ -1895,6 +1987,6 @@ post_call:
   scoring: {}
   lead_profile: {}
 memory: {}
-revision: 14
-updated_at: '2026-09-24T12:07:39Z'
-updated_by: angelo@dhronai.com:ravi-swarit-2026-09-24
+revision: 19
+updated_at: '2026-11-16T08:48:41Z'
+updated_by: tech@dhronai.com:pramukh-v3-2026-11-14

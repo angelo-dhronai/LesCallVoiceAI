@@ -279,9 +279,15 @@ class SarvamSTT(STTProvider):
 
         Runs at most once per process (class-level flag) — Issue 6.
         """
-        if SarvamSTT._warmup_done_flag:
-            logger.debug("[STT:Sarvam] Warmup skipped — already done this process")
+        # Once per quiet spell, not once per process (RUNBOOK §85.14): an
+        # idle keep-alive connection is closed by the far end, and the first
+        # request of the next call paid the handshake again (STT 1.7 s
+        # against a 0.2 s median on 2026-11-16).
+        import time as _t
+        if (SarvamSTT._warmup_done_flag
+                and _t.monotonic() - getattr(SarvamSTT, "_warmed_at", 0.0) < 120.0):
             return
+        SarvamSTT._warmed_at = _t.monotonic()
         try:
             import asyncio
             client = self._get_client()
